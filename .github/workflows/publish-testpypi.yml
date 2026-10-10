@@ -1,0 +1,36 @@
+name: Publish to TestPyPI
+
+# Manual only. A real PyPI release is irreversible — a version number can never be reused, even
+# after deleting it — so this is the rehearsal: check the rendered README and metadata first.
+on:
+  workflow_dispatch:
+
+env:
+  UV_VERSION: "0.11.32"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/gigacrew
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # Exact version, not @v9: setup-uv stops maintaining moving major tags after v7.
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Build
+        run: uv build --no-sources
+
+      - name: Publish to TestPyPI
+        run: uv publish --index testpypi --trusted-publishing always

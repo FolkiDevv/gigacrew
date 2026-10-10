@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+# >=77: SPDX-лицензия и license-files по PEP 639.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,13 +8,24 @@ name = "gigacrew"
 version = "0.5.0"
 description = "Консольный помощник для работы с кодом проекта"
 readme = "README.md"
+authors = [
+    { name = "FolkiDevv", email = "24841390+FolkiDevv@users.noreply.github.com" }
+]
 requires-python = ">=3.13"
-license = { text = "Proprietary" }
+# SPDX-выражение (PEP 639). Классификатора `License ::` нет намеренно: PyPI отклоняет пакет,
+# в котором есть и то, и другое.
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["cli", "agent", "llm", "code", "assistant", "tree-sitter", "lsp"]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: Other/Proprietary License",
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
     "Operating System :: OS Independent",
-    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
 ]
 dependencies = [
     "httpx>=0.27",
@@ -48,8 +60,20 @@ dev = ["pytest>=7.0", "ruff>=0.5"]
 [project.scripts]
 gigacrew = "gigacrew.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/FolkiDevv/gigacrew"
+Repository = "https://github.com/FolkiDevv/gigacrew"
+Issues = "https://github.com/FolkiDevv/gigacrew/issues"
+
 [tool.setuptools.packages.find]
 include = ["gigacrew*"]
+
+# Только для ручного workflow публикации в TestPyPI; `explicit` не пускает индекс в разрешение зависимостей.
+[[tool.uv.index]]
+name = "testpypi"
+url = "https://test.pypi.org/simple/"
+publish-url = "https://test.pypi.org/legacy/"
+explicit = true
 
 [tool.ruff]
 line-length = 100
