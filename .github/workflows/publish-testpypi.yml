@@ -18,6 +18,8 @@ jobs:
       name: testpypi
       url: https://test.pypi.org/p/gigacrew
     permissions:
+      # Job-level permissions replace the workflow-level block, so checkout needs it again.
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v7
