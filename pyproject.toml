@@ -54,7 +54,7 @@ dependencies = [
 
 [dependency-groups]
 # Ставится `uv sync` по умолчанию (PEP 735). Только для разработки — в пакет не попадает.
-dev = ["pytest>=7.0", "ruff>=0.5"]
+dev = ["pytest>=7.0", "pytest-timeout>=2.3", "ruff>=0.5"]
 
 [project.scripts]
 gigacrew = "gigacrew.cli:main"

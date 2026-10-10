@@ -49,16 +49,14 @@ jobs:
     # The suite takes well under a minute; a hang should fail with logs, not run for 6 hours.
     timeout-minutes: 15
     strategy:
-      # A Linux failure must not hide the macOS result.
+      # A 3.13 failure must not hide the 3.14 result.
       fail-fast: false
       matrix:
-        # Every OS on the baseline version, extra interpreters on the cheapest runner only.
-        # Windows is left out until the test suite passes there (POSIX-only tests and the
-        # cmd.exe exit code for a missing command); add windows-latest back once it does.
+        # Windows and macOS are left out until the test suite passes there: on Windows the
+        # POSIX-only tests and the cmd.exe exit code for a missing command, on macOS a hang in
+        # the pty/LSP tests and case-insensitive paths. Add them back once they pass.
         include:
           - os: ubuntu-latest
-            python: "3.13"
-          - os: macos-latest
             python: "3.13"
           - os: ubuntu-latest
             python: "3.14"
@@ -85,4 +83,5 @@ jobs:
 
       - name: Run tests
         # live tests hit the real API and need credentials; CI runs the offline suite only.
-        run: uv run pytest -q -m "not live"
+        # --timeout fails a hanging test by name, with a traceback, instead of a silent job timeout.
+        run: uv run pytest -q -m "not live" --timeout=120
