@@ -1,0 +1,49 @@
+# --- Секреты и локальная конфигурация ---
+.env
+.env.*
+!.env.example
+
+# --- Python: байткод и кеши ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- Сборка / упаковка ---
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+*.egg
+MANIFEST
+
+# --- Виртуальные окружения ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Тесты и покрытие ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- Рабочие данные gigacrew ---
+.gigacrew/
+GIGACREW.local.md
+
+# --- Редакторы и ОС ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

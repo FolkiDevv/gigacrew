@@ -1,0 +1,542 @@
+"""Офлайн-тесты суб-агентов: инструмент task, изоляция контекста, разрешения, остановка,
+ограничители. Родитель и суб-агент берут ходы из одной очереди ScriptedProvider —
+по порядку обращений к модели."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from fakes import FakeTool, RecordingEvents, ScriptedProvider, text_turn, tool_turn
+
+import gigacrew.agent.loop as loop
+from gigacrew.agent.events import Approval
+from gigacrew.agent.guard import LoopGuard
+from gigacrew.agent.prompts import SUBAGENT_PROMPTS
+from gigacrew.agent.subagents import SUBAGENT_USER_STOP_NOTE
+from gigacrew.config import Config
+from gigacrew.llm.base import LLMError
+from gigacrew.llm.types import FunctionCall, Usage
+from gigacrew.permissions import PermissionMode
+from gigacrew.tools.base import build_default_registry
+from gigacrew.tools.task import EXPLORE, SUBAGENT_EXCLUDED, SUBAGENTS
+
+
+def _agent(provider, tmp_path: Path, *, events=None, registry=None, **cfg_kw) -> loop.Agent:
+    cfg_kw.setdefault("auto_approve", True)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, **cfg_kw)
+    return loop.Agent(
+        provider, registry or build_default_registry(), cfg, events or RecordingEvents()
+    )
+
+
+def _task(agent: str = "explore", prompt: str = "найди функцию foo"):
+    return tool_turn("task", {"agent": agent, "prompt": prompt, "description": "поиск foo"})
+
+
+def _results(messages) -> list[str]:
+    return [m.content for m in messages if m.role == "function"]
+
+
+def _assert_well_formed(messages):
+    for i, m in enumerate(messages):
+        if m.role == "function":
+            prev = messages[i - 1]
+            assert prev.role == "assistant" and prev.function_call is not None
+
+
+def _kinds(events) -> list[str]:
+    return [kind for kind, _ in events.events]
+
+
+def _registry_with_fake(tool):
+    reg = build_default_registry()
+    reg.register(tool)
+    return reg
+
+
+class HookProvider(ScriptedProvider):
+    """ScriptedProvider, вызывающий ``hooks[i]`` перед ответом на i-й запрос (с нуля)."""
+
+    def __init__(self, turns, hooks):
+        super().__init__(turns)
+        self.hooks = hooks
+
+    def complete(self, messages, tools=None, **kwargs):
+        hook = self.hooks.get(len(self.requests))
+        if hook is not None and tools is not None:
+            self.requests.append({"messages": list(messages), "tools": tools, **kwargs})
+            hook()
+        return super().complete(messages, tools, **kwargs)
+
+
+# ------------------------------- изоляция ------------------------------- #
+def test_explore_runs_in_own_context(tmp_path):
+    (tmp_path / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            _task(),
+            tool_turn("search_content", {"pattern": "def foo"}),
+            text_turn("foo определена в a.py:1"),
+            text_turn("Нашёл: a.py:1"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("где foo?") == "Нашёл: a.py:1"
+
+    child = provider.requests[1]
+    system, *history = child["messages"]
+    assert "суб-агент" in system.content and "explore" in system.content
+    assert "ask_user" not in system.content
+    assert [(m.role, m.content) for m in history] == [("user", "найди функцию foo")]
+    names = {spec.name for spec in child["tools"]}
+    assert names == set(EXPLORE.tools)
+    assert not names & {"task", "ask_user", "exit_plan_mode", "write_file", "run_shell"}
+
+    # у основного агента — только отчёт, без шагов суб-агента
+    messages = agent.conversation.messages
+    results = _results(messages)
+    assert len(results) == 1 and "foo определена в a.py:1" in results[0]
+    assert all(m.name != "search_content" for m in messages)
+    _assert_well_formed(messages)
+
+    kinds = _kinds(events)
+    start, end = kinds.index("subagent_start"), kinds.index("subagent_end")
+    assert kinds.index("tool_start") < start < kinds.index("subagent_tool_call") < end
+    assert end < kinds.index("tool_end")
+    # текст суб-агента не печатается как ответ основного агента
+    assert [p for k, p in events.events if k == "text"] == ["Нашёл: a.py:1"]
+    assert events.results[-1][1].summary.startswith("explore · инструментов: 1")
+
+
+def test_task_schema_and_registry():
+    reg = build_default_registry()
+    assert "task" in reg
+    assert set(EXPLORE.tools) <= {tool.name for tool in reg}
+    assert set(SUBAGENTS) == set(SUBAGENT_PROMPTS)
+    assert SUBAGENT_EXCLUDED <= {tool.name for tool in reg}
+    params = reg.get("task").spec().parameters
+    assert params["required"] == ["agent", "prompt"]
+
+
+def test_subagent_cannot_spawn_subagents(tmp_path):
+    provider = ScriptedProvider(
+        [_task("general"), _task("explore"), text_turn("сам"), text_turn("ок")]
+    )
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("x")
+    child_results = _results(provider.requests[2]["messages"])
+    assert "не существует" in child_results[-1]
+
+
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        ({"agent": "nope", "prompt": "x"}, "неизвестный суб-агент"),
+        ({"agent": "explore", "prompt": "  "}, "Пустая задача"),
+    ],
+)
+def test_bad_task_arguments(tmp_path, args, error):
+    provider = ScriptedProvider([tool_turn("task", args), text_turn("ок")])
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("x")
+    assert error in _results(agent.conversation.messages)[0]
+    assert provider.calls == 2  # суб-агент не запускался
+
+
+def test_empty_description_uses_prompt(tmp_path):
+    provider = ScriptedProvider(
+        [
+            tool_turn("task", {"agent": "explore", "prompt": "\nпосчитай файлы\nподробно"}),
+            text_turn("3"),
+            text_turn("ок"),
+        ]
+    )
+    events = RecordingEvents()
+    _agent(provider, tmp_path, events=events).run_turn("x")
+    info = next(p for k, p in events.events if k == "subagent_start")
+    assert info.description == "посчитай файлы"
+    call = next(p for k, p in events.events if k == "tool_call")
+    assert call.summary == "explore · посчитай файлы"
+
+
+def test_subagent_uses_current_model(tmp_path):
+    provider = ScriptedProvider([_task(), text_turn("r"), text_turn("ок")])
+    agent = _agent(provider, tmp_path)
+    agent.set_model("Other-Model")
+    agent.run_turn("x")
+    assert provider.requests[1]["model"] == "Other-Model"
+
+
+# ------------------------------ разрешения ------------------------------ #
+def test_explore_cannot_change_even_with_yes_all(tmp_path):
+    provider = ScriptedProvider(
+        [
+            _task(),
+            tool_turn("git", {"subcommand": "commit", "args": ["-m", "x"]}),
+            text_turn("не могу"),
+            text_turn("ок"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, yes_all=True)
+    agent.run_turn("x")
+    assert events.confirms == []
+    child_result = _results(provider.requests[2]["messages"])[-1]
+    assert "только для исследования" in child_result
+    blocked = [r for k, (c, r) in _sub_results(events)]
+    assert blocked[0].summary == "заблокировано: агент только читает"
+
+
+def _sub_results(events):
+    return [(k, p) for k, p in events.events if k == "subagent_tool_result"]
+
+
+def test_general_edit_confirmed_and_always_switches_parent_mode(tmp_path):
+    provider = ScriptedProvider(
+        [
+            _task("general", "создай b.txt"),
+            tool_turn("write_file", {"path": "b.txt", "content": "new\n"}),
+            text_turn("создал b.txt"),
+            text_turn("ок"),
+        ]
+    )
+    events = RecordingEvents(confirm_answer=Approval.ALWAYS)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("x")
+    assert len(events.confirms) == 1 and events.confirms[0][0].name == "write_file"
+    assert agent.mode is PermissionMode.ACCEPT_EDITS  # «всегда» — у основного агента
+    assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "new\n"
+    report = _results(agent.conversation.messages)[0]
+    assert "создал b.txt" in report and "Изменённые файлы: b.txt" in report
+    assert events.results[-1][1].changed
+
+
+def test_rejected_operations_listed_in_report(tmp_path):
+    provider = ScriptedProvider(
+        [
+            _task("general", "создай b.txt"),
+            tool_turn("write_file", {"path": "b.txt", "content": "new\n"}),
+            text_turn("не дали"),
+            text_turn("ок"),
+        ]
+    )
+    agent = _agent(provider, tmp_path, events=RecordingEvents(False), auto_approve=False)
+    agent.run_turn("x")
+    report = _results(agent.conversation.messages)[0]
+    assert "Отклонено пользователем: write_file b.txt" in report
+
+
+def test_parent_mode_change_reaches_running_subagent(tmp_path):
+    holder: dict = {}
+
+    def switch():
+        holder["agent"].set_mode(PermissionMode.PLAN)
+        from gigacrew.tools.base import ToolResult
+
+        return ToolResult(content="ok", summary="ok")
+
+    tool = FakeTool(run=switch)
+    provider = ScriptedProvider(
+        [
+            _task("general", "сделай"),
+            tool_turn("fake_write", {"path": "1"}),
+            tool_turn("fake_write", {"path": "2"}),
+            text_turn("готово"),
+            text_turn("ок"),
+        ]
+    )
+    agent = _agent(provider, tmp_path, registry=_registry_with_fake(tool))
+    holder["agent"] = agent
+    agent.run_turn("x")
+    assert tool.runs == 1  # второй вызов заблокирован режимом плана
+    last = provider.requests[3]["messages"]
+    assert "Не выполнено: включён режим планирования" in _results(last)[-1]
+    assert "РЕЖИМ ПЛАНИРОВАНИЯ" in last[0].content and "exit_plan_mode" not in last[0].content
+
+
+# ------------------------------ токены, сбои ----------------------------- #
+def test_subagent_tokens_billed_to_parent(tmp_path):
+    provider = ScriptedProvider(
+        [
+            tool_turn(
+                "task",
+                {"agent": "explore", "prompt": "x"},
+                Usage(prompt_tokens=100, completion_tokens=10),
+            ),
+            text_turn("r", Usage(prompt_tokens=50, completion_tokens=5)),
+            text_turn("ок", Usage(prompt_tokens=20, completion_tokens=2)),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    agent.run_turn("x")
+    assert agent.billed_tokens == 187
+    stats = events.stats[-1]
+    assert (stats.prompt_tokens, stats.completion_tokens) == (170, 17)
+    assert stats.context_tokens == 22  # контекст — только основного агента
+
+
+def test_ctrl_c_in_subagent_stops_turn_and_keeps_trail(tmp_path):
+    provider = ScriptedProvider(
+        [
+            _task("general", "создай b.txt"),
+            tool_turn("write_file", {"path": "b.txt", "content": "new\n"}),
+            KeyboardInterrupt(),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    messages = agent.conversation.messages
+    _assert_well_formed(messages)
+    assert agent.conversation.pending_call() is None
+    note = _results(messages)[-1]
+    assert "прерван пользователем (Ctrl+C)" in note and "Изменённые файлы: b.txt" in note
+    kinds = _kinds(events)
+    assert "subagent_end" in kinds and kinds[-1] == "tool_end"
+
+
+def test_llm_error_in_subagent_reported_to_model(tmp_path):
+    provider = ScriptedProvider([_task(), LLMError("сбой сети"), text_turn("сделаю сам")])
+    agent = _agent(provider, tmp_path)
+    assert agent.run_turn("x") == "сделаю сам"
+    result = _results(agent.conversation.messages)[0]
+    assert "суб-агент explore: ошибка модели: сбой сети" in result
+    _assert_well_formed(agent.conversation.messages)
+
+
+def test_other_kind_changes_kept_in_trail_on_ctrl_c(tmp_path):
+    # изменяющий вызов не-EDIT вида (как git commit) — тоже в журнале суб-агента
+    provider = ScriptedProvider(
+        [_task("general", "закоммить"), tool_turn("fake_write", {"path": "x"}), KeyboardInterrupt()]
+    )
+    agent = _agent(provider, tmp_path, registry=_registry_with_fake(FakeTool()))
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    assert "Изменяющие операции: fake_write x" in _results(agent.conversation.messages)[-1]
+
+
+def test_llm_error_after_changes_keeps_trail(tmp_path):
+    provider = ScriptedProvider(
+        [
+            _task("general", "создай b.txt"),
+            tool_turn("write_file", {"path": "b.txt", "content": "x\n"}),
+            LLMError("сбой сети"),
+            text_turn("продолжаю"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("x") == "продолжаю"
+    result = _results(agent.conversation.messages)[0]
+    assert "ошибка модели: сбой сети" in result and "Изменённые файлы: b.txt" in result
+    task_result = events.results[-1][1]
+    assert not task_result.ok and task_result.changed
+
+
+def test_parent_repeat_guard_sees_subagent_changes(tmp_path):
+    shell = tool_turn("run_shell", {"command": "echo hi"})
+    provider = ScriptedProvider(
+        [
+            shell,
+            _task("general", "создай b.txt"),
+            tool_turn("write_file", {"path": "b.txt", "content": "x\n"}),
+            text_turn("создал"),
+            shell,
+            shell,
+            shell,
+            text_turn("ок"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("x") == "ок"
+    assert events.stats[-1].stop_reason is None
+
+
+# ------------------------------ остановка ------------------------------- #
+def _stopping_tool(holder: dict, times: int = 1) -> FakeTool:
+    def stop():
+        for _ in range(times):
+            assert holder["agent"].request_subagent_stop()
+        raise KeyboardInterrupt
+
+    return FakeTool(run=stop)
+
+
+def test_request_stop_without_subagent(tmp_path):
+    assert _agent(ScriptedProvider(), tmp_path).request_subagent_stop() is False
+
+
+def test_esc_soft_stop_wraps_up_and_parent_continues(tmp_path):
+    holder: dict = {}
+    provider = ScriptedProvider(
+        [
+            _task("general", "долгая задача"),
+            tool_turn("fake_write", {}),
+            text_turn("успел половину"),
+            text_turn("основной продолжает"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(
+        provider, tmp_path, events=events, registry=_registry_with_fake(_stopping_tool(holder))
+    )
+    holder["agent"] = agent
+    assert agent.run_turn("x") == "основной продолжает"
+    wrap_request = provider.requests[2]["messages"]
+    assert wrap_request[-1].role == "user" and wrap_request[-1].content == SUBAGENT_USER_STOP_NOTE
+    report = _results(agent.conversation.messages)[0]
+    assert "остановлен пользователем досрочно" in report and "успел половину" in report
+    assert ("subagent_activity", ("подвожу итог", True)) in events.events
+    assert events.results[-1][1].summary.endswith("остановлен пользователем")
+
+
+def test_double_esc_aborts_subagent_parent_continues(tmp_path):
+    holder: dict = {}
+    provider = ScriptedProvider(
+        [_task("general", "долгая задача"), tool_turn("fake_write", {}), text_turn("дальше")]
+    )
+    agent = _agent(
+        provider, tmp_path, registry=_registry_with_fake(_stopping_tool(holder, times=2))
+    )
+    holder["agent"] = agent
+    assert agent.run_turn("x") == "дальше"
+    result = _results(agent.conversation.messages)[0]
+    assert "оборван пользователем" in result
+    _assert_well_formed(agent.conversation.messages)
+
+
+def test_esc_during_wrap_up_aborts(tmp_path):
+    holder: dict = {}
+
+    def second_esc():
+        assert holder["agent"].request_subagent_stop()
+        raise KeyboardInterrupt
+
+    provider = HookProvider(
+        [_task("general", "долгая задача"), tool_turn("fake_write", {}), text_turn("дальше")],
+        hooks={2: second_esc},
+    )
+    agent = _agent(provider, tmp_path, registry=_registry_with_fake(_stopping_tool(holder)))
+    holder["agent"] = agent
+    assert agent.run_turn("x") == "дальше"
+    assert "оборван пользователем" in _results(agent.conversation.messages)[0]
+
+
+# ------------------------------ ограничители ---------------------------- #
+def test_subagent_step_limit_wraps_up(tmp_path):
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            _task(),
+            tool_turn("read_file", {"path": "a.txt"}),
+            tool_turn("list_dir", {}),
+            text_turn("частичный итог"),
+            text_turn("ок"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, subagent_max_steps=2)
+    assert agent.run_turn("x") == "ок"
+    assert "РАБОТА ОСТАНОВЛЕНА" in provider.requests[3]["messages"][0].content
+    report = _results(agent.conversation.messages)[0]
+    assert "исчерпан лимит шагов" in report and "частичный итог" in report
+    assert any(level == "warn" and text.startswith("explore: ") for level, text in events.notices)
+    assert events.stats[-1].stop_reason is None  # основной агент не остановлен
+
+
+def test_subagent_token_budget(tmp_path):
+    usage = Usage(prompt_tokens=600)
+    provider = ScriptedProvider(
+        [
+            _task(),
+            tool_turn("list_dir", {}, usage),
+            tool_turn("find_files", {"pattern": "*"}, usage),
+            text_turn("итог"),
+            text_turn("ок"),
+        ]
+    )
+    agent = _agent(provider, tmp_path, subagent_max_tokens=1_000)
+    agent.run_turn("x")
+    assert "исчерпан бюджет токенов" in _results(agent.conversation.messages)[0]
+
+
+def test_subagent_time_limit(tmp_path):
+    provider = ScriptedProvider([_task(), text_turn("итог"), text_turn("ок")])
+    agent = _agent(provider, tmp_path, subagent_timeout=0)
+    agent.run_turn("x")
+    assert "исчерпан лимит времени" in _results(agent.conversation.messages)[0]
+
+
+def test_subagent_similar_calls_warned_then_stopped(tmp_path):
+    (tmp_path / "a.txt").write_text("\n".join(map(str, range(50))), encoding="utf-8")
+    reads = [tool_turn("read_file", {"path": "a.txt", "start_line": i}) for i in range(1, 8)]
+    provider = ScriptedProvider([_task(), *reads, text_turn("итог"), text_turn("ок")])
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("x")
+    child = _results(provider.requests[-2]["messages"])
+    assert len(child) == 7  # 6 выполнено, 7-й — заглушка остановки
+    assert "топчешься" in child[4]
+    assert "похожие вызовы" in _results(agent.conversation.messages)[0]
+
+
+def test_subagent_budget_pressure_note(tmp_path):
+    provider = ScriptedProvider(
+        [
+            _task(),
+            tool_turn("list_dir", {}),
+            tool_turn("find_files", {"pattern": "*"}),
+            text_turn("итог"),
+            text_turn("ок"),
+        ]
+    )
+    agent = _agent(provider, tmp_path, subagent_max_steps=4)
+    agent.run_turn("x")
+    assert "=== БЮДЖЕТ ===" not in provider.requests[1]["messages"][0].content
+    assert "=== БЮДЖЕТ ===" in provider.requests[3]["messages"][0].content  # шаг 3 из 4
+    assert "=== БЮДЖЕТ ===" not in provider.requests[-1]["messages"][0].content  # основной
+
+
+def test_subagent_launches_per_turn_limited(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "MAX_SUBAGENTS_PER_TURN", 1)
+    provider = ScriptedProvider([_task(), text_turn("r1"), _task(prompt="другое"), text_turn("ок")])
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("x")
+    assert "лимит суб-агентов в этом ходе исчерпан" in _results(agent.conversation.messages)[1]
+
+
+# ------------------------------- LoopGuard ------------------------------ #
+def test_guard_new_limits_off_by_default():
+    guard = LoopGuard(max_steps=10, max_failures=3)
+    assert guard.before_step(10**9) is None
+    assert guard.pressure(10**9) is None
+    call = FunctionCall(name="read_file", arguments={"path": "a"})
+    for i in range(3):
+        call = FunctionCall(name="read_file", arguments={"path": "a", "start_line": i})
+        assert guard.before_tool(call).warning is None
+
+
+def test_guard_time_limit_and_pressure_with_fake_clock():
+    now = [0.0]
+    guard = LoopGuard(max_steps=100, max_failures=3, time_limit=10, clock=lambda: now[0])
+    assert guard.before_step() is None and guard.pressure() is None
+    now[0] = 7.5
+    assert "времени 7 из 10 с" in guard.pressure()
+    now[0] = 10
+    assert guard.before_step().kind == "time_limit"
+
+
+def test_guard_similar_reset_by_own_changes():
+    from gigacrew.agent.guard import ToolOutcome
+
+    guard = LoopGuard(max_steps=100, max_failures=3, max_similar=2, max_tokens=10**6)
+    for i in range(5):  # правки одного файла подряд — не топтание
+        call = FunctionCall(name="edit_file", arguments={"path": "a", "old_string": str(i)})
+        check = guard.before_tool(call)
+        assert check.warning is None and check.stop is None
+        guard.after_tool(call, ToolOutcome(ok=True, changed=True))
+    assert guard.changes == 5

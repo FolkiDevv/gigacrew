@@ -1,0 +1,132 @@
+"""Замер окна контекста пробными запросами и хранилище ~/.gigacrew/models.json."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from fakes import WindowProvider
+
+from gigacrew.llm.base import LLMError
+from gigacrew.llm.context_probe import MAX_CONTEXT_WINDOW, MAX_PROBES, probe_context_window
+from gigacrew.llm.model_windows import ModelWindows, default_path
+
+
+@pytest.mark.parametrize(
+    "window", [4_096, 8_192, 32_000, 32_768, 50_000, 128_000, 131_072, 200_000]
+)
+@pytest.mark.parametrize("hint", [False, True])
+def test_result_is_confirmed_and_close(window, hint):
+    provider = WindowProvider(window, hint=hint)
+    steps = []
+    result = probe_context_window(provider, "M", on_step=steps.append)
+    assert result.window <= window  # консервативно: только подтверждённый размер
+    assert result.window >= window * 0.98 - 512
+    assert not result.capped and result.upper_bound is not None
+    assert result.window < result.upper_bound
+    assert result.probes == len(steps) <= MAX_PROBES
+    assert {model for model, _ in provider.measured} == {"M"}
+    # оплачиваются только успешные пробы
+    assert result.billed_tokens == sum(s.prompt_tokens + 1 for s in steps if s.ok)
+
+
+@pytest.mark.parametrize("window", [32_768, 128_000, 131_072])
+def test_standard_window_costs_one_large_probe(window):
+    """Отказы бесплатны; типовое окно находится одной оплачиваемой пробой (+ калибровка)."""
+    steps = []
+    probe_context_window(WindowProvider(window), "M", on_step=steps.append)
+    assert sum(1 for s in steps if s.ok) == 2
+
+
+def test_limit_from_error_text_shortcuts_search():
+    steps = []
+    result = probe_context_window(WindowProvider(50_000, hint=True), "M", on_step=steps.append)
+    assert result.probes <= 4 and sum(1 for s in steps if s.ok) == 2
+    assert 49_000 <= result.window <= 50_000
+
+
+def test_window_above_cap_is_capped():
+    result = probe_context_window(WindowProvider(1_000_000), "M")
+    assert result.capped and result.upper_bound is None
+    assert result.probes == 2
+    assert MAX_CONTEXT_WINDOW * 0.98 <= result.window <= MAX_CONTEXT_WINDOW
+
+
+def test_capped_rechecks_undershoot_after_calibration():
+    """Калибровка на маленьком запросе промахивается (большие служебные токены):
+    прошедший «потолок» с заметным недобором перепроверяется с новым соотношением."""
+    steps = []
+    result = probe_context_window(
+        WindowProvider(1_000_000, overhead=300), "M", on_step=steps.append
+    )
+    assert steps[1].ok and steps[1].prompt_tokens < MAX_CONTEXT_WINDOW * 0.9
+    assert result.capped and result.window >= MAX_CONTEXT_WINDOW * 0.98
+
+
+def test_capped_recheck_rejected_continues_search():
+    result = probe_context_window(WindowProvider(250_000, overhead=300), "M")
+    assert not result.capped and 245_000 <= result.window <= 250_000
+
+
+def test_rejections_without_status_count_as_too_large():
+    result = probe_context_window(WindowProvider(32_768, status=None), "M")
+    assert 32_000 <= result.window <= 32_768
+
+
+def test_calibration_failure_aborts():
+    with pytest.raises(LLMError, match="даже запрос"):
+        probe_context_window(WindowProvider(500), "M")
+    with pytest.raises(LLMError, match="не прошёл: нет модели"):
+        probe_context_window(WindowProvider(32_768, error=LLMError("нет модели")), "M")
+
+
+# ------------------------------ хранилище ------------------------------ #
+def test_store_round_trip_and_merge(tmp_path):
+    path = tmp_path / ".gigacrew" / "models.json"
+    windows, warning = ModelWindows.load(path)
+    assert warning is None and windows.get("A") is None and not path.exists()
+
+    windows.record(probe_context_window(WindowProvider(32_768), "A"), base_url="https://x")
+    # другое окно gigacrew успело записать свою модель — она не теряется
+    other, _ = ModelWindows.load(path)
+    other.record(probe_context_window(WindowProvider(8_192), "B"))
+    windows.record(probe_context_window(WindowProvider(16_384), "A"))
+
+    reloaded, warning = ModelWindows.load(path)
+    assert warning is None
+    assert 16_000 <= reloaded.get("A") <= 16_384
+    assert 8_000 <= reloaded.get("B") <= 8_192
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["version"] == 1 and data["models"]["A"]["capped"] is False
+    assert data["models"]["A"]["base_url"] == ""
+    assert [p.name for p in path.parent.iterdir()] == ["models.json"]  # без .tmp
+
+
+def test_store_broken_file_warns_and_is_overwritten(tmp_path):
+    path = tmp_path / "models.json"
+    path.write_text("{битый", encoding="utf-8")
+    windows, warning = ModelWindows.load(path)
+    assert warning and "models.json" in warning and windows.get("A") is None
+    windows.record(probe_context_window(WindowProvider(8_192), "A"))
+    assert ModelWindows.load(path)[0].get("A") is not None
+
+
+def test_store_in_memory_and_default_path(_isolated_home):
+    windows = ModelWindows()
+    windows.record(probe_context_window(WindowProvider(8_192), "A"))
+    assert windows.get("A") is not None
+    assert not (_isolated_home / ".gigacrew").exists()
+    assert default_path() == _isolated_home / ".gigacrew" / "models.json"
+
+
+def test_window_from_another_endpoint_is_ignored(tmp_path):
+    from gigacrew.llm.model_windows import ModelWindows
+
+    entries = {
+        "M": {"context_window": 32_000, "base_url": "https://external/v1"},
+        "Old": {"context_window": 8_000},  # запись без эндпоинта (старый формат)
+    }
+    assert ModelWindows(entries=entries, base_url="https://external/v1").get("M") == 32_000
+    assert ModelWindows(entries=entries, base_url="https://internal/v1").get("M") is None
+    assert ModelWindows(entries=entries).get("M") == 32_000
+    assert ModelWindows(entries=entries, base_url="https://internal/v1").get("Old") == 8_000
