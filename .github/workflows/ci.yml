@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets release.yml reuse these exact checks instead of duplicating them.
+  workflow_call:
+
+# A new push to a PR makes the previous run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned so a uv release cannot change CI behaviour without a commit.
+  UV_VERSION: "0.11.32"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # Exact version, not @v9: setup-uv publishes releases past v7 but stops maintaining
+        # moving major tags there, so @v9 does not resolve.
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install dependencies
+        # --locked fails the build if uv.lock has drifted from pyproject.toml.
+        run: uv sync --locked --dev
+
+      - name: ruff check
+        run: uv run ruff check --output-format github
+
+      - name: ruff format
+        run: uv run ruff format --check
+
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    # The suite takes well under a minute; a hang should fail with logs, not run for 6 hours.
+    timeout-minutes: 15
+    strategy:
+      # A 3.13 failure must not hide the 3.14 result.
+      fail-fast: false
+      matrix:
+        # Windows and macOS are left out until the test suite passes there: on Windows the
+        # POSIX-only tests and the cmd.exe exit code for a missing command, on macOS a hang in
+        # the pty/LSP tests and case-insensitive paths. Add them back once they pass.
+        include:
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: ubuntu-latest
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure git identity
+        # The git tool tests create commits; without a global identity git refuses to.
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.com"
+
+      - name: Install uv
+        # Exact version, not @v9: setup-uv publishes releases past v7 but stops maintaining
+        # moving major tags there, so @v9 does not resolve.
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Run tests
+        # live tests hit the real API and need credentials; CI runs the offline suite only.
+        # --timeout fails a hanging test by name, with a traceback, instead of a silent job timeout.
+        run: uv run pytest -q -m "not live" --timeout=120

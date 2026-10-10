@@ -16,6 +16,7 @@ ty понимает импорты, псевдонимы и типы, поэто
 from __future__ import annotations
 
 import atexit
+import os
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -219,7 +220,11 @@ class TyServer:
             return Location(unquote(uri), line, units, in_project=False)
         # url2pathname сам раскодирует %XX; netloc — сервер UNC-пути (Windows)
         host = parsed.netloc if parsed.netloc not in ("", "localhost") else ""
-        abs_path = Path(url2pathname(f"//{host}{parsed.path}" if host else parsed.path))
+        if host and os.name != "nt":
+            # С Python 3.14 url2pathname на POSIX отвергает нелокальный хост — собираем сами
+            abs_path = Path(f"//{host}{unquote(parsed.path)}")
+        else:
+            abs_path = Path(url2pathname(f"//{host}{parsed.path}" if host else parsed.path))
         col = _from_units(lines.get(abs_path, line), units, self._encoding)
         try:
             rel = abs_path.relative_to(self.root).as_posix()

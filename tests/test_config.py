@@ -247,11 +247,14 @@ def _self_signed(tmp_path):
     return cert, key
 
 
-def test_mtls_verification_loads_trust_anchors(tmp_path):
+def test_mtls_verification_loads_trust_anchors(tmp_path, monkeypatch):
     """Голый SSLContext без корневых сертификатов не проверил бы ни один сервер."""
     import ssl
 
     cert, key = _self_signed(tmp_path)
+    # Системные корни бывают только в capath (подгружаются лениво, счётчики пусты) —
+    # подменяем хранилище по умолчанию, чтобы проверка не зависела от машины.
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert))
     base = {"GIGACREW_CERT": str(cert), "GIGACREW_KEY": str(key)}
     cfg = Config.load(
         project_root=tmp_path, environ={**base, "GIGACREW_VERIFY_SSL": "1"}, cwd=tmp_path
