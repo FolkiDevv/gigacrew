@@ -1,7 +1,6 @@
 [build-system]
-# >=77: SPDX-лицензия и license-files по PEP 639.
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
 
 [project]
 name = "gigacrew"
@@ -9,7 +8,7 @@ version = "0.5.0"
 description = "Консольный помощник для работы с кодом проекта"
 readme = "README.md"
 authors = [
-    { name = "FolkiDevv", email = "24841390+FolkiDevv@users.noreply.github.com" }
+    { name = "FolkiDevv", email = "hi@folki.dev" }
 ]
 requires-python = ">=3.13"
 # SPDX-выражение (PEP 639). Классификатора `License ::` нет намеренно: PyPI отклоняет пакет,
@@ -65,8 +64,9 @@ Homepage = "https://github.com/FolkiDevv/gigacrew"
 Repository = "https://github.com/FolkiDevv/gigacrew"
 Issues = "https://github.com/FolkiDevv/gigacrew/issues"
 
-[tool.setuptools.packages.find]
-include = ["gigacrew*"]
+[tool.uv.build-backend]
+# Плоская раскладка: пакет лежит в корне репозитория, а не в src/.
+module-root = ""
 
 # Только для ручного workflow публикации в TestPyPI; `explicit` не пускает индекс в разрешение зависимостей.
 [[tool.uv.index]]
