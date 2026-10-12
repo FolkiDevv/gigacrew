@@ -408,11 +408,54 @@ def test_esc_soft_stop_wraps_up_and_parent_continues(tmp_path):
     holder["agent"] = agent
     assert agent.run_turn("x") == "основной продолжает"
     wrap_request = provider.requests[2]["messages"]
-    assert wrap_request[-1].role == "user" and wrap_request[-1].content == SUBAGENT_USER_STOP_NOTE
+    # просьба об итоге — в системном сообщении: задача суб-агента остаётся закреплённой
+    assert SUBAGENT_USER_STOP_NOTE in wrap_request[0].content
+    assert [m.role for m in wrap_request[1:]] == ["user", "assistant", "function"]
+    assert wrap_request[1].content == "долгая задача"
+    assert provider.requests[2]["tool_choice"] == "none"
     report = _results(agent.conversation.messages)[0]
     assert "stopped early by the user" in report and "успел половину" in report
     assert ("subagent_activity", ("подвожу итог", True)) in events.events
     assert events.results[-1][1].summary.endswith("остановлен пользователем")
+
+
+class EscWhileStreaming(ScriptedProvider):
+    """Поток ``i``-го запроса: кусок текста, затем Esc пользователя (мягкая остановка)."""
+
+    def __init__(self, turns, *, at: int, holder: dict):
+        super().__init__(turns)
+        self.at = at
+        self.holder = holder
+
+    def stream(self, messages, tools=None, *, on_delta=None, **kwargs):
+        if len(self.requests) == self.at:
+            self.requests.append({"messages": list(messages), "tools": tools, **kwargs})
+            on_delta("Пока нашёл, что foo")
+            assert self.holder["agent"].request_subagent_stop()
+            raise KeyboardInterrupt
+        return super().stream(messages, tools, on_delta=on_delta, **kwargs)
+
+
+def test_esc_while_subagent_streams_text_wraps_up_without_partial(tmp_path):
+    """Esc посреди текста суб-агента: оборванный текст не сохраняется, запрос итога не
+    кончается репликой ассистента и содержит задачу."""
+    holder: dict = {}
+    provider = EscWhileStreaming(
+        [_task("explore", "найди foo"), text_turn("итог: foo в a.py"), text_turn("дальше")],
+        at=1,
+        holder=holder,
+    )
+    cfg = Config(access_key="x", project_root=tmp_path, stream=True, auto_approve=True)
+    agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents())
+    holder["agent"] = agent
+    assert agent.run_turn("x") == "дальше"
+
+    wrap_request = provider.requests[2]["messages"]
+    assert SUBAGENT_USER_STOP_NOTE in wrap_request[0].content
+    assert [(m.role, m.content) for m in wrap_request[1:]] == [("user", "найди foo")]
+    assert provider.requests[2]["tool_choice"] == "none"
+    report = _results(agent.conversation.messages)[0]
+    assert "stopped early by the user" in report and "итог: foo в a.py" in report
 
 
 def test_double_esc_aborts_subagent_parent_continues(tmp_path):

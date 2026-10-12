@@ -430,7 +430,7 @@ class Agent:
         stats.stop_reason = "user_stop"
         self._events.on_notice("остановлен пользователем — подвожу итог", level="warn")
         return self._wrap_up(
-            specs, USER_STOP_REASON, MODEL_STOP_REASONS["user_stop"], stats, as_user=True
+            specs, USER_STOP_REASON, MODEL_STOP_REASONS["user_stop"], stats, user_stop=True
         )
 
     def _loop(self, specs: list[ToolSpec], guard: LoopGuard, stats: TurnStats) -> str:
@@ -530,7 +530,7 @@ class Agent:
         model_reason: str,
         stats: TurnStats,
         *,
-        as_user: bool = False,
+        user_stop: bool = False,
     ) -> str:
         """Итог модели после остановки ограничителем: что сделано и что дальше.
 
@@ -541,15 +541,14 @@ class Agent:
 
         Просьба подвести итог — дополнение к системному сообщению, а не сообщение
         пользователя: окно истории закрепляет последний запрос пользователя, и такая
-        просьба вытеснила бы из обрезанной истории саму задачу. ``as_user`` — остановка
-        суб-агента пользователем: последним в истории может быть оборванный ответ.
-        ``reason`` — причина для пользователя, ``model_reason`` — для модели.
+        просьба вытеснила бы из обрезанной истории саму задачу. ``user_stop`` — суб-агент
+        остановлен пользователем (Esc). ``reason`` — причина для пользователя,
+        ``model_reason`` — для модели.
         """
         self._wrapping = True
         self._events.on_wrap_up(reason)
-        note = ""
-        if as_user:
-            self._conversation.add_user(SUBAGENT_USER_STOP_NOTE)
+        if user_stop:
+            note = SUBAGENT_USER_STOP_NOTE
         elif self._parent is not None:
             note = SUBAGENT_STOP_NOTE.format(reason=model_reason)
         else:
@@ -732,9 +731,10 @@ class Agent:
 
         ``note`` — дополнение к системному сообщению только для этого запроса;
         ``tool_choice="none"`` — ответ только текстом (итог после остановки).
-        Оборванный поток (Esc, сбой сети) оставляет в истории уже показанный текст с
-        пометкой — модель знает, что её ответ прерван, а следующий запрос не идёт
-        двумя репликами пользователя подряд.
+        Оборванный поток (Esc, сбой сети) оставляет в истории основного агента уже
+        показанный текст с пометкой — модель знает, что её ответ прерван, а следующий
+        запрос не идёт двумя репликами пользователя подряд. У суб-агента текст не
+        показывается и не сохраняется.
         """
         messages = self._build_request(specs, note)
         streamed: list[str] = []
@@ -763,7 +763,9 @@ class Agent:
             )
         except BaseException as e:
             partial = "".join(streamed).rstrip()
-            if partial.strip():
+            # Суб-агенту оборванный текст не нужен: пользователь его не видел, а запрос
+            # итога после остановки (Esc) не должен кончаться репликой ассистента.
+            if partial.strip() and self._parent is None:
                 tail = (
                     INTERRUPTED_ANSWER_NOTE
                     if isinstance(e, KeyboardInterrupt)
