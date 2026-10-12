@@ -37,7 +37,7 @@ IGNORE_DIRS: frozenset[str] = frozenset(
 )
 
 
-TREE_TRUNCATED = "... (дерево обрезано)"
+TREE_TRUNCATED = "... (tree truncated)"
 
 
 def is_ignored_dir(name: str) -> bool:
@@ -192,7 +192,7 @@ def build_file_tree(root: Path, max_entries: int = 200) -> str:
     (лимит делится между ними поровну, не больше :data:`TREE_DIR_CAP` на каталог)
     и так далее вглубь. Поэтому большой первый каталог не вытесняет файлы корня
     (``README.md``, ``pyproject.toml``) и соседние каталоги. Урезанный каталог
-    помечается «… ещё N», нераскрытый — ``name/ …``.
+    помечается «… N more», нераскрытый — ``name/ …``.
 
     Скрытые файлы и каталоги (``.github``, ``.gitignore``) показываются,
     служебные каталоги (``.git``, ``node_modules``…) и исключённое ``.gitignore`` — нет.
@@ -269,7 +269,7 @@ def build_file_tree(root: Path, max_entries: int = 200) -> str:
                 truncated = True
                 lines.append(f"{prefix}{name}/ …")
         if hidden.get(rel_dir):
-            lines.append(f"{prefix}… ещё {hidden[rel_dir]}")
+            lines.append(f"{prefix}… {hidden[rel_dir]} more")
 
     render("", "")
     if truncated:

@@ -18,7 +18,7 @@ from typing import Any
 
 from gigacrew.llm.types import FunctionCall, Message, Usage
 
-INTERRUPTED_NOTE = "Выполнение прервано пользователем (Ctrl+C). Результата нет."
+INTERRUPTED_NOTE = "Execution was interrupted by the user (Ctrl+C). No result."
 
 
 @dataclass(frozen=True)

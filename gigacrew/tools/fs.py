@@ -488,21 +488,18 @@ def _tolerant_find(text: str, pattern: str) -> _Match | None:
 # read_file
 # --------------------------------------------------------------------------- #
 class ReadFileParams(BaseModel):
-    path: str = Field(description="Путь к файлу относительно корня проекта")
-    start_line: int | None = Field(
-        default=None, description="Начальная строка (1-индексация), включительно"
-    )
-    end_line: int | None = Field(
-        default=None, description="Конечная строка (1-индексация), включительно"
-    )
+    path: str = Field(description="File path relative to the project root")
+    start_line: int | None = Field(default=None, description="First line (1-based), inclusive")
+    end_line: int | None = Field(default=None, description="Last line (1-based), inclusive")
 
 
 class ReadFileTool(Tool):
     name = "read_file"
     description = (
-        "Читает содержимое текстового файла. Можно указать диапазон строк "
-        "(start_line/end_line). Возвращает текст с номерами строк; за один вызов — "
-        f"не более {MAX_READ_LINES} строк, для продолжения укажите start_line."
+        "Reads a text file. Returns the text with line numbers. Pass a line range "
+        "(start_line/end_line) to read only the part you need — use file_outline or "
+        f"search to find it. At most {MAX_READ_LINES} lines per call; to continue, pass "
+        "start_line."
     )
     Params = ReadFileParams
 
@@ -592,15 +589,16 @@ def _select_lines(
 # write_file
 # --------------------------------------------------------------------------- #
 class WriteFileParams(BaseModel):
-    path: str = Field(description="Путь к файлу относительно корня проекта")
-    content: str = Field(description="Полное новое содержимое файла")
+    path: str = Field(description="File path relative to the project root")
+    content: str = Field(description="The complete new content of the file")
 
 
 class WriteFileTool(Tool):
     name = "write_file"
     description = (
-        "Создаёт новый файл или полностью перезаписывает существующий заданным "
-        "содержимым. Создаёт родительские директории при необходимости."
+        "Creates a new file or completely overwrites an existing one with the given "
+        "content. Creates parent directories when needed. For changes to an existing "
+        "file prefer edit_file."
     )
     Params = WriteFileParams
     kind = ToolKind.EDIT
@@ -652,22 +650,22 @@ class WriteFileTool(Tool):
 # edit_file
 # --------------------------------------------------------------------------- #
 class EditFileParams(BaseModel):
-    path: str = Field(description="Путь к файлу относительно корня проекта")
-    old_string: str = Field(
-        description="Точный фрагмент, который нужно заменить (должен встречаться)"
+    path: str = Field(description="File path relative to the project root")
+    old_string: str = Field(description="The exact fragment to replace (must be present)")
+    new_string: str = Field(description="The replacement text")
+    replace_all: bool = Field(
+        default=False, description="Replace all occurrences instead of exactly one"
     )
-    new_string: str = Field(description="Текст замены")
-    replace_all: bool = Field(default=False, description="Заменить все вхождения, а не только одно")
 
 
 class EditFileTool(Tool):
     name = "edit_file"
     description = (
-        "Точечно редактирует файл: заменяет old_string на new_string. "
-        "old_string должен встречаться ровно один раз (иначе добавьте контекста "
-        "или укажите replace_all=true для замены всех вхождений). Совпадение "
-        "устойчиво к незначительным различиям в отступах и хвостовых пробелах, "
-        "но фрагмент лучше копировать дословно из содержимого файла."
+        "Edits a file in place: replaces old_string with new_string. old_string must "
+        "occur exactly once (otherwise add surrounding context, or set replace_all=true "
+        "to replace every occurrence). Matching tolerates minor differences in "
+        "indentation and trailing spaces, but copy the fragment verbatim from the file "
+        "content you have read."
     )
     Params = EditFileParams
     kind = ToolKind.EDIT
@@ -767,12 +765,15 @@ MAX_LIST_ENTRIES = 500
 
 
 class ListDirParams(BaseModel):
-    path: str = Field(default=".", description="Путь к директории (по умолчанию корень)")
+    path: str = Field(default=".", description="Directory path (the project root by default)")
 
 
 class ListDirTool(Tool):
     name = "list_dir"
-    description = "Выводит список файлов и поддиректорий (включая скрытые) в указанной директории."
+    description = (
+        "Lists files and subdirectories (including hidden ones) of a directory. For an "
+        "overview with languages and definitions use file_outline."
+    )
     Params = ListDirParams
 
     def run(self, params: ListDirParams, ctx: ToolContext) -> ToolResult:
@@ -795,9 +796,10 @@ MAX_FIND_RESULTS = 1000
 
 class FindFilesParams(BaseModel):
     pattern: str = Field(
-        description="Glob-шаблон: '*.py' — по имени в любом каталоге, 'src/**/*.ts' — путь от корня"
+        description="Glob pattern: '*.py' — by name in any directory, 'src/**/*.ts' — by path "
+        "from the root"
     )
-    max_results: int = Field(default=200, description="Максимум результатов")
+    max_results: int = Field(default=200, description="Maximum number of results")
 
 
 def _check_pattern(pattern: str) -> None:
@@ -813,9 +815,10 @@ def _check_pattern(pattern: str) -> None:
 class FindFilesTool(Tool):
     name = "find_files"
     description = (
-        "Ищет файлы по glob-шаблону (рекурсивно, внутри проекта). Шаблон без '/' "
-        "сравнивается с именем файла, с '/' — с путём от корня ('**' — любые каталоги). "
-        "Игнорирует служебные директории (.git, node_modules и т.п.) и файлы из .gitignore."
+        "Finds files by a glob pattern (recursively, inside the project). A pattern "
+        "without '/' is matched against the file name, with '/' — against the path from "
+        "the root ('**' — any directories). Skips service directories (.git, "
+        "node_modules, etc.) and files ignored by .gitignore."
     )
     Params = FindFilesParams
 

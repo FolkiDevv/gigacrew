@@ -82,24 +82,24 @@ def _branch_is_listing(args: list[str]) -> bool:
 class GitParams(BaseModel):
     subcommand: str = Field(
         description=(
-            "Подкоманда git: status, diff, log, show, branch, add, commit, "
-            "checkout, switch, restore, stash"
+            "git subcommand: status, diff, log, show, branch, add, commit, checkout, "
+            "switch, restore, stash"
         )
     )
     args: list[str] = Field(
         default_factory=list,
-        description="Дополнительные аргументы, например ['-m', 'сообщение'] для commit",
+        description="Additional arguments, e.g. ['-m', 'message'] for commit",
     )
 
 
 class GitTool(Tool):
     name = "git"
     description = (
-        "Выполняет операции git в репозитории проекта. Поддерживаются: "
-        "status, diff, log, show, branch (без аргументов — список веток), "
-        "stash list/show (только чтение); add, commit, checkout, switch, restore, "
-        "stash (изменяющие). Деструктивные операции и опции --output/--no-index "
-        "недоступны. Редактор не открывается — для commit передавайте -m."
+        "Runs git operations in the project repository. Supported: status, diff, log, "
+        "show, branch (without arguments — list branches), stash list/show (read-only); "
+        "add, commit, checkout, switch, restore, stash (changing). Destructive operations "
+        "and the --output/--no-index options are not available. No editor is opened — "
+        "pass -m to commit."
     )
     Params = GitParams
 

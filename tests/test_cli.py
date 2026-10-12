@@ -924,7 +924,7 @@ def test_oneshot_mode_flag_and_env(tmp_path, oneshot, monkeypatch):
     assert _main(tmp_path, "--mode", "plan", "-p", "x", "--no-save") == 0
     monkeypatch.setenv("GIGACREW_MODE", "plan")
     assert _main(tmp_path, "-p", "x", "--no-save") == 0
-    assert all("РЕЖИМ ПЛАНИРОВАНИЯ" in r["messages"][0].content for r in provider.requests)
+    assert all("# Plan mode" in r["messages"][0].content for r in provider.requests)
     with pytest.raises(SystemExit):
         _main(tmp_path, "--mode", "auto", "-p", "x")
 

@@ -41,8 +41,8 @@ SUBAGENT_EXCLUDED: frozenset[str] = frozenset({"task", "ask_user", "exit_plan_mo
 EXPLORE = SubagentSpec(
     name="explore",
     description=(
-        "исследование кодовой базы, только чтение: поиск, навигация по коду, чтение "
-        "файлов, git status/diff/log. Возвращает выжимку с путями и номерами строк"
+        "codebase research, read-only: search, code navigation, reading files, git "
+        "status/diff/log. Returns a digest with paths and line numbers"
     ),
     tools=frozenset(
         {
@@ -64,8 +64,8 @@ EXPLORE = SubagentSpec(
 GENERAL = SubagentSpec(
     name="general",
     description=(
-        "самостоятельная многошаговая подзадача со всеми инструментами (правки файлов, "
-        "команды — с подтверждением по режиму пользователя). Возвращает отчёт о сделанном"
+        "a self-contained multi-step subtask with all tools (file edits and commands — "
+        "with confirmation according to the user's mode). Returns a report on what was done"
     ),
 )
 
@@ -84,30 +84,33 @@ def _agents_list() -> str:
 
 
 class TaskParams(BaseModel):
-    agent: str = Field(description=f"Тип суб-агента: {', '.join(SUBAGENTS)}.")
+    agent: str = Field(description=f"Subagent type: {', '.join(SUBAGENTS)}.")
     prompt: str = Field(
         description=(
-            "Полная постановка задачи. Суб-агент НЕ видит этот диалог: опиши цель, "
-            "известные пути, имена и факты, ограничения и что именно вернуть в отчёте."
+            "The complete task statement. The subagent does NOT see this conversation: "
+            "give the goal, known paths, names and facts, constraints and exactly what "
+            "to return in the report."
         )
     )
     description: str = Field(
-        "", description="Кратко, 3–5 слов: что поручено (показывается пользователю)."
+        "",
+        description="3–5 words in the user's language: what is delegated (shown to the user).",
     )
 
 
 class TaskTool(Tool):
     name = "task"
     description = (
-        "Запускает суб-агента со своим контекстом для самостоятельной подзадачи и "
-        "возвращает его итоговый отчёт; промежуточные шаги суб-агента в твой контекст "
-        f"не попадают. Агенты: {_agents_list()}. Когда использовать: широкое "
-        "исследование, когда неизвестно, где искать, и придётся просмотреть много "
-        "файлов, — explore; самостоятельная многошаговая подзадача — general. "
-        "Точечные вопросы (известен файл или символ) решай сам — так быстрее. "
-        "Суб-агент не видит диалог: в prompt передай всё нужное. Отчёт видишь только "
-        "ты — перескажи пользователю главное. Если пользователь остановил суб-агента, "
-        "не запускай ту же задачу снова без его просьбы."
+        "Runs a subagent with its own context for a self-contained subtask and returns "
+        "its final report; the subagent's intermediate steps do not get into your "
+        f"context. Agents: {_agents_list()}. When to use: broad research where it is "
+        "unknown where to look and many files would have to be looked through — explore; "
+        "a self-contained multi-step subtask — general. Handle pinpoint questions (a "
+        "known file or symbol) yourself, it is faster. The subagent does not see the "
+        "conversation: put everything it needs into prompt, including what exactly to "
+        "find out. Only you see the report — retell the essentials to the user. If the "
+        "user stopped a subagent, do not run the same task again unless asked. "
+        "Independent subtasks can be delegated in parallel in one response."
     )
     Params = TaskParams
 

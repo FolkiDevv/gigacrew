@@ -15,7 +15,14 @@ from fakes import (
 )
 
 from gigacrew.agent.conversation import INTERRUPTED_NOTE
-from gigacrew.agent.loop import REJECTED_NOTE, SKIPPED_NOTE, Agent
+from gigacrew.agent.loop import (
+    LOOP_STOP_NOTE,
+    PLAN_BLOCKED_NOTE,
+    REJECTED_AGAIN_NOTE,
+    REJECTED_NOTE,
+    SKIPPED_NOTE,
+    Agent,
+)
 from gigacrew.config import Config
 from gigacrew.errors import ToolError
 from gigacrew.llm.types import Usage
@@ -55,7 +62,8 @@ def test_loop_stops_after_repeated_failures(tmp_path):
     assert "Прервано" in final
     # должно остановиться на пороге, а не крутить 50 шагов: 4 шага + запрос итога
     assert provider.calls == 5
-    assert "ХОД ОСТАНОВЛЕН" in provider.requests[-1]["messages"][0].content
+    assert "# Turn stopped" in provider.requests[-1]["messages"][0].content
+    assert provider.requests[-1]["tool_choice"] == "none"  # итог — только текстом
     assert len(_function_results(agent)) == 4  # вызов из запроса итога не выполнялся
     assert events.stats[-1].stop_reason == "tool_failures"
     assert events.notices and events.notices[-1][0] == "error"
@@ -78,9 +86,9 @@ def test_loop_stops_on_repeated_identical_calls(tmp_path):
     assert [level for level, _ in events.notices] == ["warn", "error"]
     results = _function_results(agent)
     assert len(results) == 4
-    assert ["ВНИМАНИЕ" in r for r in results] == [False, False, True, False]
+    assert ["WARNING" in r for r in results] == [False, False, True, False]
     assert "hello" in results[2]  # предупреждение дописано к результату
-    assert "зацикливания" in results[3]
+    assert results[3] == LOOP_STOP_NOTE
     assert agent.conversation.pending_calls() == []
     _assert_well_formed(agent.conversation.messages)
 
@@ -104,7 +112,7 @@ def test_change_between_repeats_is_not_a_loop(tmp_path):
     agent = _agent(provider, tmp_path, events=events)
     assert agent.run_turn("x") == "ок"
     assert events.stats[-1].stop_reason is None
-    assert sum("ВНИМАНИЕ" in r for r in _function_results(agent)) == 1  # только 3-е чтение
+    assert sum("WARNING" in r for r in _function_results(agent)) == 1  # только 3-е чтение
 
 
 def test_repeated_rejected_call_is_not_asked_again(tmp_path):
@@ -117,7 +125,7 @@ def test_repeated_rejected_call_is_not_asked_again(tmp_path):
     )
     assert agent.run_turn("x") == "ок"
     assert len(events.confirms) == 1 and tool.runs == 0
-    assert "уже ОТКЛОНИЛ" in _function_results(agent)[-1]
+    assert _function_results(agent)[-1] == REJECTED_AGAIN_NOTE
     # в следующем ходе пользователя спрашивают снова
     agent.run_turn("всё же сделай")
     assert len(events.confirms) == 2
@@ -212,7 +220,7 @@ def test_rejection_does_not_run_and_tells_model(tmp_path):
     call, preview, dangerous = events.confirms[0]
     assert call.name == "fake_write" and preview.kind == "diff" and dangerous is False
     function_msgs = [m for m in agent.conversation.messages if m.role == "function"]
-    assert "ОТКЛОНИЛ" in function_msgs[-1].content
+    assert function_msgs[-1].content == REJECTED_NOTE
 
 
 def test_auto_approve_skips_confirmation(tmp_path):
@@ -651,8 +659,7 @@ def test_plan_mode_blocks_edits_without_asking(tmp_path):
     agent.run_turn("поправь")
     assert tool.runs == 0 and events.confirms == []
     assert events.results[-1][1].summary == "заблокировано: режим планирования"
-    assert "режим планирования" in _function_results(agent)[-1]
-    assert "exit_plan_mode" in _function_results(agent)[-1]
+    assert _function_results(agent)[-1] == PLAN_BLOCKED_NOTE
 
 
 def test_plan_mode_blocks_even_with_auto_approve(tmp_path):
@@ -729,8 +736,8 @@ def test_plan_rules_are_sent_only_in_plan_mode(tmp_path):
     agent.set_mode(PermissionMode.MANUAL)
     agent.run_turn("делай")
     planning, manual = _system_prompts(provider)
-    assert "РЕЖИМ ПЛАНИРОВАНИЯ" in planning
-    assert "РЕЖИМ ПЛАНИРОВАНИЯ" not in manual
+    assert "# Plan mode" in planning
+    assert "# Plan mode" not in manual
 
 
 def test_mode_survives_reset_and_cycles(tmp_path):
@@ -759,7 +766,7 @@ def test_approved_plan_switches_mode_within_the_turn(tmp_path):
     (question,) = events.questions[0]
     assert question.body == "# План\n1. создать a.txt"
     # правила плана — только до одобрения
-    assert ["РЕЖИМ ПЛАНИРОВАНИЯ" in p for p in _system_prompts(provider)] == [True, False, False]
+    assert ["# Plan mode" in p for p in _system_prompts(provider)] == [True, False, False]
 
 
 # ------------------------------ сжатие контекста ------------------------------ #

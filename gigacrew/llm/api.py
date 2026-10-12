@@ -36,7 +36,7 @@ import httpx
 
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMError, LLMProvider, PromptTooLong
-from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec, Usage
+from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolChoice, ToolSpec, Usage
 
 
 class ApiError(LLMError):
@@ -448,6 +448,7 @@ class ApiProvider(LLMProvider):
         model: str | None,
         temperature: float,
         stream: bool = False,
+        tool_choice: ToolChoice = "auto",
     ) -> dict[str, Any]:
         options: dict[str, Any] = {"temperature": temperature}
         payload: dict[str, Any] = {
@@ -460,7 +461,10 @@ class ApiProvider(LLMProvider):
         if tools:
             specs = [self._tool_to_payload(t) for t in tools]
             payload["tools"] = [{"functions": {"specifications": specs}}]
-            options["parallel_tool_calls"] = True
+            if tool_choice == "none":
+                payload["tool_config"] = {"mode": "none"}
+            else:
+                options["parallel_tool_calls"] = True
         return payload
 
     def complete(
@@ -470,8 +474,11 @@ class ApiProvider(LLMProvider):
         *,
         model: str | None = None,
         temperature: float = 0.2,
+        tool_choice: ToolChoice = "auto",
     ) -> AssistantTurn:
-        payload = self._payload(messages, tools, model=model, temperature=temperature)
+        payload = self._payload(
+            messages, tools, model=model, temperature=temperature, tool_choice=tool_choice
+        )
         resp = self._post_chat(payload)
         try:
             resp.raise_for_status()
@@ -543,6 +550,7 @@ class ApiProvider(LLMProvider):
         *,
         model: str | None = None,
         temperature: float = 0.2,
+        tool_choice: ToolChoice = "auto",
         on_delta: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Потоковая генерация. Вызывает on_delta(text) на каждый кусок текста и
@@ -562,7 +570,14 @@ class ApiProvider(LLMProvider):
             state["emitted"] = True
             sink(piece)
 
-        payload = self._payload(messages, tools, model=model, temperature=temperature, stream=True)
+        payload = self._payload(
+            messages,
+            tools,
+            model=model,
+            temperature=temperature,
+            stream=True,
+            tool_choice=tool_choice,
+        )
         url = chat_url(self._cfg.base_url)
         delay = 1.0
         last_exc: Exception | None = None

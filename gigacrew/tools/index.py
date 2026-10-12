@@ -80,30 +80,30 @@ def short_list(items: list[str]) -> str:
 class FindSymbolParams(BaseModel):
     query: str = Field(
         description=(
-            "Имя или часть имени определения (без учёта регистра): 'Agent', 'run_turn'; "
-            "метод класса — 'Agent.run_turn'"
+            "Name or part of the name of a definition (case-insensitive): 'Agent', "
+            "'run_turn'; a class method — 'Agent.run_turn'"
         )
     )
     kind: str | None = Field(
         default=None,
         description=(
-            "Вид определения: function (включая методы), class (включая struct, interface, "
-            "enum…), method, constant, section (заголовок Markdown) и т.п."
+            "Kind of definition: function (including methods), class (including struct, "
+            "interface, enum…), method, constant, section (Markdown heading), etc."
         ),
     )
     glob: str | None = Field(
-        default=None, description="Ограничить файлами по glob: '*.py' или 'src/**/*.ts'"
+        default=None, description="Limit to files matching a glob: '*.py' or 'src/**/*.ts'"
     )
-    max_results: int = Field(default=50, description="Максимум результатов")
+    max_results: int = Field(default=50, description="Maximum number of results")
 
 
 class FindSymbolTool(Tool):
     name = "find_symbol"
     description = (
-        "Ищет определения (классы, функции, методы, типы, константы, заголовки Markdown) "
-        "по имени в индексе проекта. Возвращает path:строки вид имя — сигнатура. "
-        "Быстрее search_content, когда нужно найти, где что-то определено; затем читайте "
-        "нужный диапазон строк через read_file."
+        "Finds definitions (classes, functions, methods, types, constants, Markdown "
+        "headings) by name in the project index. Returns 'path:lines kind name — "
+        "signature'. Faster than search_content for finding where something is defined; "
+        "then read the line range you need with read_file."
     )
     Params = FindSymbolParams
 
@@ -138,7 +138,7 @@ class FindSymbolTool(Tool):
 # file_outline
 # --------------------------------------------------------------------------- #
 class FileOutlineParams(BaseModel):
-    path: str = Field(description="Файл или каталог относительно корня проекта")
+    path: str = Field(description="File or directory relative to the project root")
 
 
 def _entry_line(entry: FileEntry, shown_path: str) -> str:
@@ -155,10 +155,11 @@ def _entry_line(entry: FileEntry, shown_path: str) -> str:
 class FileOutlineTool(Tool):
     name = "file_outline"
     description = (
-        "Оглавление по индексу проекта. Для файла — его определения (классы, функции, "
-        "методы, заголовки) с номерами строк и вложенностью: позволяет прочитать через "
-        "read_file только нужный фрагмент большого файла. Для каталога — файлы с языком, "
-        "числом строк и определений (при большом числе файлов — сводка по подкаталогам)."
+        "Outline from the project index. For a file — its definitions (classes, "
+        "functions, methods, headings) with line numbers and nesting, so you can read "
+        "only the needed part of a large file with read_file. For a directory — its files "
+        "with language, line and definition counts (a summary by subdirectory when there "
+        "are many files)."
     )
     Params = FileOutlineParams
 
@@ -283,21 +284,21 @@ class RepoMapParams(BaseModel):
     focus: list[str] = Field(
         default_factory=list,
         description=(
-            "Фокус карты: файлы или каталоги проекта, с которыми идёт работа, и/или "
-            "имена ('ProjectIndex', 'run_turn'). Пусто — главное во всём проекте."
+            "Focus of the map: project files or directories you are working with and/or "
+            "names ('ProjectIndex', 'run_turn'). Empty — what matters in the whole project."
         ),
     )
-    max_tokens: int = Field(default=1500, description="Объём карты (оценка в токенах)")
+    max_tokens: int = Field(default=1500, description="Size of the map (estimated tokens)")
 
 
 class RepoMapTool(Tool):
     name = "repo_map"
     description = (
-        "Карта проекта: самые важные определения (классы, функции, методы с "
-        "сигнатурами и номерами строк), ранжированные по тому, как часто и откуда на "
-        "них ссылаются. С фокусом — то, что связано с указанными файлами и именами. "
-        "Помогает быстро понять устройство незнакомого проекта или окрестность "
-        "задачи, не читая файлы целиком."
+        "Project map: the most important definitions (classes, functions, methods with "
+        "signatures and line numbers), ranked by how often and from where they are "
+        "referenced. With a focus — what is related to the given files and names. The "
+        "quickest way to understand an unfamiliar project or the area around a task "
+        "without reading whole files."
     )
     Params = RepoMapParams
 

@@ -25,6 +25,7 @@ from gigacrew.agent.events import (
     ToolCallInfo,
     TurnStats,
 )
+from gigacrew.agent.guard import MODEL_STOP_REASONS
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, ToolRegistry, ToolResult
 from gigacrew.tools.task import SubagentSpec, allows_tool
@@ -36,36 +37,38 @@ MAX_SUBAGENTS_PER_TURN = 8
 MAX_REPORT_CHARS = 8_000
 REJECTED_MARK = "отклонено пользователем"
 
+# Заметки для моделей — на английском, как и промпты (пользователь их не видит).
 SUBAGENT_STOP_NOTE = (
-    "=== РАБОТА ОСТАНОВЛЕНА ===\n{reason}\nИнструменты больше не вызывай. Дай итоговый "
-    "отчёт для основного агента: что уже выяснил или сделал (с путями и строками), что "
-    "не успел и что предлагаешь проверить дальше."
+    "STOP: {reason}. Do not call tools anymore. Write the final report for the main "
+    "agent now: what you found out or did (with paths and lines), what you did not get "
+    "to and what you suggest checking next."
 )
 SUBAGENT_USER_STOP_NOTE = (
-    "Пользователь остановил тебя досрочно. Инструменты больше не вызывай. Сразу дай "
-    "итоговый отчёт для основного агента по уже сделанному: что выяснил или сделал (с "
-    "путями и строками), что не успел."
+    "The user stopped you early. Do not call tools anymore. Write the final report for "
+    "the main agent right away, based on what is already done: what you found out or did "
+    "(with paths and lines), what you did not get to."
 )
 READ_ONLY_BLOCKED_NOTE = (
-    "Не выполнено: ты суб-агент только для исследования — любые изменения запрещены. "
-    "Не пытайся их вносить: опиши нужные изменения в итоговом отчёте."
+    "Not executed: you are a research-only subagent, any changes are forbidden. Do not "
+    "try to make them: describe the needed changes in the final report."
 )
 SUBAGENT_PLAN_BLOCKED_NOTE = (
-    "Не выполнено: включён режим планирования, изменения запрещены. Не пытайся вносить "
-    "их: опиши нужные изменения в итоговом отчёте."
+    "Not executed: plan mode is on, changes are forbidden. Do not try to make them: "
+    "describe the needed changes in the final report."
 )
 USER_STOPPED_NOTE = (
-    "Суб-агент {name} остановлен пользователем досрочно — ниже его итог по сделанному, "
-    "он может быть неполным. Не запускай эту задачу снова, если пользователь не попросит."
+    "Subagent {name} was stopped early by the user — below is its summary of what was "
+    "done, it may be incomplete. Do not run this task again unless the user asks."
 )
-LIMIT_STOPPED_NOTE = "Суб-агент {name} остановлен: {reason} — отчёт может быть неполным."
+LIMIT_STOPPED_NOTE = "Subagent {name} was stopped: {reason} — the report may be incomplete."
 ABORTED_NOTE = (
-    "Суб-агент {name} оборван пользователем, отчёта нет. Не запускай эту задачу снова, "
-    "если пользователь не попросит; продолжай сам с тем, что известно."
+    "Subagent {name} was aborted by the user, there is no report. Do not run this task "
+    "again unless the user asks; continue yourself with what is known."
 )
-INTERRUPTED_NOTE = "Суб-агент {name} прерван пользователем (Ctrl+C). Результата нет."
-NO_REPORT_NOTE = "Суб-агент {name} не вернул отчёта."
+INTERRUPTED_NOTE = "Subagent {name} was interrupted by the user (Ctrl+C). No result."
+NO_REPORT_NOTE = "Subagent {name} returned no report."
 
+# Причины остановки — для строки результата task в интерфейсе.
 _STOP_REASONS = {
     "max_steps": "исчерпан лимит шагов",
     "context_limit": "контекст заполнен",
@@ -92,11 +95,11 @@ class SubagentTrail:
     def lines(self) -> list[str]:
         out = []
         if self.changed_files:
-            out.append(f"Изменённые файлы: {', '.join(dict.fromkeys(self.changed_files))}")
+            out.append(f"Changed files: {', '.join(dict.fromkeys(self.changed_files))}")
         if self.operations:
-            out.append(f"Изменяющие операции: {'; '.join(dict.fromkeys(self.operations))}")
+            out.append(f"Changing operations: {'; '.join(dict.fromkeys(self.operations))}")
         if self.rejected:
-            out.append(f"Отклонено пользователем: {'; '.join(dict.fromkeys(self.rejected))}")
+            out.append(f"Rejected by the user: {'; '.join(dict.fromkeys(self.rejected))}")
         return out
 
 
@@ -191,13 +194,14 @@ def subagent_report(
         parts.append(USER_STOPPED_NOTE.format(name=spec.name))
         tail = "остановлен пользователем"
     elif stop is not None:
-        reason = _STOP_REASONS.get(stop, stop)
+        reason = MODEL_STOP_REASONS.get(stop, stop)
         parts.append(LIMIT_STOPPED_NOTE.format(name=spec.name, reason=reason))
-        tail = reason
+        tail = _STOP_REASONS.get(stop, stop)
     if text.strip():
         parts.append(_clip(text))
     else:
         parts.append(NO_REPORT_NOTE.format(name=spec.name))
+        tail = f"{tail} · без отчёта" if tail else "без отчёта"
     facts = trail.lines()
     if facts:
         parts.append("\n".join(facts))
@@ -222,7 +226,7 @@ def aborted_report(spec: SubagentSpec, trail: SubagentTrail) -> ToolResult:
 
 def model_error_report(spec: SubagentSpec, error: Exception, trail: SubagentTrail) -> ToolResult:
     """Суб-агент упал на ошибке модели: ошибка + что он успел сделать до неё."""
-    parts = [f"суб-агент {spec.name}: ошибка модели: {error}", *trail.lines()]
+    parts = [f"Subagent {spec.name}: model error: {error}", *trail.lines()]
     return ToolResult(
         content="\n\n".join(parts),
         ok=False,

@@ -52,8 +52,8 @@ NO_APPROVER_NOTE = (
 class ExitPlanModeParams(BaseModel):
     plan: str = Field(
         description=(
-            "План в Markdown: цель, шаги (какие файлы и что в них изменить), как "
-            "проверить результат. Кратко и конкретно."
+            "The plan in Markdown, in the user's language: the goal, the steps (which "
+            "files and what to change in them), how to check the result. Brief and concrete."
         )
     )
 
@@ -61,10 +61,10 @@ class ExitPlanModeParams(BaseModel):
 class ExitPlanModeTool(Tool):
     name = "exit_plan_mode"
     description = (
-        "Только в режиме планирования: передаёт пользователю готовый план на "
-        "одобрение. Вызывай, когда исследование закончено и план готов. Если "
-        "пользователь одобрит план, режим сменится и ты сразу приступишь к "
-        "выполнению; если пришлёт замечания — доработай план и вызови снова."
+        "Plan mode only: hands the finished plan to the user for approval. Call it when "
+        "the research is done and the plan is ready. If the user approves the plan, the "
+        "mode changes and you start the implementation right away; if the user sends "
+        "remarks, refine the plan and call it again."
     )
     Params = ExitPlanModeParams
 

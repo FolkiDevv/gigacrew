@@ -118,7 +118,7 @@ def test_unbuilt_index_gives_no_map_in_prompt(tmp_path):
     for i in range(250):
         _make(tmp_path, f"pkg/m{i:03}.py", "def f():\n    pass\n")
     prompt = build_system_prompt(Workspace(tmp_path))
-    assert "дерево неполное" in prompt and "Карта проекта" not in prompt
+    assert "the tree is incomplete" in prompt and "Project map" not in prompt
     assert not (tmp_path / ".gigacrew").exists()  # промпт индекс не строит
 
 
@@ -142,11 +142,11 @@ def test_system_prompt_has_repo_map_only_for_large_indexed_projects(tmp_path):
     ws = Workspace(tmp_path)
     with ProjectIndex(ws) as ix:
         ix.refresh()
-    assert "Карта проекта" not in build_system_prompt(ws)  # дерево целиком — карта не нужна
+    assert "Project map" not in build_system_prompt(ws)  # дерево целиком — карта не нужна
     for i in range(250):
         _make(tmp_path, f"pkg/m{i:03}.py", "from core.engine import Engine\n")
     prompt = build_system_prompt(ws)
-    assert "Карта проекта" in prompt and "class Engine:" in prompt
+    assert "Project map" in prompt and "class Engine:" in prompt
 
 
 def test_repo_map_tool_explains_too_small_budget(tmp_path, project, monkeypatch):

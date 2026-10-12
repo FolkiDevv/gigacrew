@@ -162,6 +162,17 @@ def test_parallel_calls_round_trip(provider):
     assert turn2.message.content.strip()
 
 
+def test_tool_choice_none_answers_with_text(provider):
+    """Итог после остановки: инструменты в запросе, но модель отвечает только текстом."""
+    turn = provider.complete(
+        [Message(role="user", content="Какая погода в Москве? Вызови get_weather.")],
+        tools=[WEATHER_TOOL],
+        tool_choice="none",
+    )
+    assert not turn.wants_tool
+    assert turn.message.content.strip()
+
+
 def test_history_without_call_ids_continues(provider):
     """Чат, сохранённый до перехода на v2: у вызова нет id, состояния нет."""
     messages = [

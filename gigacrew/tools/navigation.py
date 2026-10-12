@@ -159,21 +159,21 @@ def _lines_note(lines: list[int]) -> str:
 class FindReferencesParams(BaseModel):
     query: str = Field(
         description=(
-            "Имя определения (точное, без учёта регистра): 'ProjectIndex', 'refresh'; "
-            "метод класса — 'ProjectIndex.refresh'"
+            "Name of the definition (exact, case-insensitive): 'ProjectIndex', 'refresh'; "
+            "a class method — 'ProjectIndex.refresh'"
         )
     )
     kind: str | None = Field(
         default=None,
         description=(
-            "Вид использования: call (вызовы), attr (обращения к атрибуту), name "
-            "(упоминания имени), import (строки импорта); по умолчанию — все"
+            "Kind of usage: call (calls), attr (attribute access), name (mentions of the "
+            "name), import (import lines); all by default"
         ),
     )
     glob: str | None = Field(
-        default=None, description="Ограничить файлами по glob: '*.py' или 'src/**'"
+        default=None, description="Limit to files matching a glob: '*.py' or 'src/**'"
     )
-    max_results: int = Field(default=50, description="Максимум результатов")
+    max_results: int = Field(default=50, description="Maximum number of results")
 
 
 def format_ref_hits(hits: list[RefHit], ctx: ToolContext, labels: dict[str, str]) -> list[str]:
@@ -194,14 +194,13 @@ def format_ref_hits(hits: list[RefHit], ctx: ToolContext, labels: dict[str, str]
 class FindReferencesTool(Tool):
     name = "find_references"
     description = (
-        "Ищет использования определения: вызовы, обращения к атрибуту, упоминания, "
-        "импорты — с функцией или классом, где они встречаются. Отвечает на вопросы "
-        "«кто вызывает», «где используется», «что сломается при изменении». Для Python "
-        "использования подтверждает ty (с учётом импортов и типов) — они идут первыми "
-        "с пометкой «точно (ty)»; остальные — по имени: файлы, импортирующие модуль "
-        "определения, сам файл определения, совпадения только по имени. Для других "
-        "языков индекс знает только вызовы (kind=call); прочие упоминания — "
-        "search_content."
+        "Finds usages of a definition: calls, attribute access, mentions, imports — with "
+        "the function or class they occur in. Answers 'who calls it', 'where is it used', "
+        "'what breaks if it changes'. For Python, usages are confirmed by ty (taking "
+        "imports and types into account) and come first, marked 'точно (ty)'; the rest "
+        "are matched by name: files importing the definition's module, the definition's "
+        "own file, name-only matches. For other languages the index knows only calls "
+        "(kind=call); other mentions — search_content."
     )
     Params = FindReferencesParams
 
@@ -305,10 +304,10 @@ class FindReferencesTool(Tool):
 # goto_definition
 # --------------------------------------------------------------------------- #
 class GotoDefinitionParams(BaseModel):
-    path: str = Field(description="Файл относительно корня проекта")
-    line: int = Field(description="Номер строки (с 1), где встречается имя")
+    path: str = Field(description="File relative to the project root")
+    line: int = Field(description="Line number (1-based) where the name occurs")
     name: str = Field(
-        description="Имя в этой строке: 'ProjectIndex', 'refresh' или 'self.index.refresh'"
+        description="The name on that line: 'ProjectIndex', 'refresh' or 'self.index.refresh'"
     )
 
 
@@ -340,10 +339,11 @@ def _hover_signature(hover: str) -> str:
 class GotoDefinitionTool(Tool):
     name = "goto_definition"
     description = (
-        "Куда ведёт имя в конкретной строке файла: определение (с учётом импортов, "
-        "псевдонимов и типа объекта) и для Python — тип или сигнатура. Полезно, когда "
-        "непонятно, что за функция вызывается в `obj.method()` или откуда взято имя. "
-        "Для Python отвечает ty; без него — индекс по имени и импортам файла."
+        "Where a name on a specific line of a file leads: its definition (taking imports, "
+        "aliases and the object's type into account) and, for Python, its type or "
+        "signature. Useful when it is unclear which function `obj.method()` calls or where "
+        "a name comes from. For Python the answer comes from ty; without it — from the "
+        "index by name and the file's imports."
     )
     Params = GotoDefinitionParams
 
@@ -434,22 +434,22 @@ class GotoDefinitionTool(Tool):
 # --------------------------------------------------------------------------- #
 class CallHierarchyParams(BaseModel):
     query: str = Field(
-        description="Функция или метод: 'helper', 'ProjectIndex.refresh' (точное имя)"
+        description="Function or method: 'helper', 'ProjectIndex.refresh' (exact name)"
     )
     direction: str = Field(
         default="incoming",
-        description="incoming — кто вызывает (по умолчанию); outgoing — что вызывает сама",
+        description="incoming — who calls it (default); outgoing — what it calls",
     )
-    depth: int = Field(default=1, description=f"Глубина дерева: 1–{MAX_DEPTH}")
+    depth: int = Field(default=1, description=f"Depth of the tree: 1–{MAX_DEPTH}")
 
 
 class CallHierarchyTool(Tool):
     name = "call_hierarchy"
     description = (
-        "Дерево вызовов функции или метода: кто её вызывает (incoming) или что она "
-        "вызывает (outgoing), на глубину до 3 уровней, с местами вызовов. Для Python "
-        "отвечает ty (с учётом импортов, псевдонимов и типов); без него — индекс по "
-        "именам."
+        "Call tree of a function or method: who calls it (incoming) or what it calls "
+        f"(outgoing), up to {MAX_DEPTH} levels deep, with the call sites. For Python the "
+        "answer comes from ty (taking imports, aliases and types into account); without "
+        "it — from the index by name."
     )
     Params = CallHierarchyParams
 

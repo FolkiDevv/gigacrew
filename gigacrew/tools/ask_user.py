@@ -17,38 +17,39 @@ DECLINED_NOTE = (
 
 
 class OptionParams(BaseModel):
-    label: str = Field(description="Вариант ответа, коротко (1–5 слов).")
+    label: str = Field(description="The answer option, short (1–5 words).")
     description: str = Field(
-        "", description="Что означает этот вариант: суть, плюсы и минусы, последствия."
+        "", description="What this option means: the gist, pros and cons, consequences."
     )
 
 
 class QuestionParams(BaseModel):
-    question: str = Field(description="Полный текст вопроса, заканчивается знаком «?».")
-    header: str = Field("", description="Короткая метка темы, до 20 символов («База данных»).")
+    question: str = Field(description="The full text of the question, ending with '?'.")
+    header: str = Field("", description="A short topic label, up to 20 characters ('Database').")
     options: list[OptionParams] = Field(
         description=(
-            f"{MIN_OPTIONS}–{MAX_OPTIONS} варианта ответа. Вариант «свой ответ» "
-            "добавляется автоматически — не добавляй его."
+            f"{MIN_OPTIONS}–{MAX_OPTIONS} answer options. An option for a custom answer is "
+            "added automatically — do not add it."
         )
     )
-    multi_select: bool = Field(False, description="true — можно выбрать несколько вариантов сразу.")
+    multi_select: bool = Field(False, description="true — several options can be chosen at once.")
 
 
 class AskUserParams(BaseModel):
     questions: list[QuestionParams] = Field(
-        description=f"1–{MAX_QUESTIONS} вопроса, задаются по очереди."
+        description=f"1–{MAX_QUESTIONS} questions, asked one after another."
     )
 
 
 class AskUserTool(Tool):
     name = "ask_user"
     description = (
-        "Задаёт пользователю вопросы с вариантами ответа и ждёт ответа. Используй, когда "
-        "задача неоднозначна и от ответа зависит решение: выбор между подходами, "
-        "неясные требования, предпочтения. Не спрашивай о том, что можно выяснить "
-        "самому из кода и инструментов. У каждого варианта — короткая метка и "
-        "подробное описание; пользователь может выбрать вариант или написать свой ответ."
+        "Asks the user questions with answer options and waits for the answers. Use it "
+        "when the task is ambiguous and the answer changes the solution: a choice between "
+        "approaches, unclear requirements, preferences. Do not ask about what you can find "
+        "out yourself from the code and tools. Each option has a short label and a "
+        "detailed description; the user can pick an option or write their own answer. "
+        "Write the questions and options in the user's language."
     )
     Params = AskUserParams
 

@@ -81,6 +81,18 @@ def test_payload_v2_layout_with_tools():
     p.close()
 
 
+def test_payload_tool_choice_none_forbids_calls():
+    """Итог после остановки: схемы остаются (история с вызовами), вызывать нельзя."""
+    p = _provider()
+    payload = p._payload(
+        [Message(role="user", content="q")], [TOOL], model="m", temperature=0, tool_choice="none"
+    )
+    assert payload["tool_config"] == {"mode": "none"}
+    assert payload["tools"]
+    assert "parallel_tool_calls" not in payload["model_options"]
+    p.close()
+
+
 def test_payload_without_tools_has_no_tool_options():
     p = _provider()
     payload = p._payload([Message(role="user", content="q")], None, model="m", temperature=0)

@@ -12,6 +12,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Role = Literal["system", "user", "assistant", "function"]
+# Может ли модель вызывать инструменты в этом ответе: "none" — только текст (итог
+# после остановки), хотя схемы инструментов в запросе остаются.
+ToolChoice = Literal["auto", "none"]
 
 
 class FunctionCall(BaseModel):

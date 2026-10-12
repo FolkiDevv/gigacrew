@@ -51,6 +51,18 @@ StopKind = Literal[
 
 # Через сколько похожих вызовов после предупреждения ход останавливается.
 SIMILAR_GRACE = 2
+# Причина остановки — для модели (запрос итога, отчёт суб-агента); пользователю
+# показывается ``StopReason.message``.
+MODEL_STOP_REASONS: dict[str, str] = {
+    "max_steps": "the step limit is reached",
+    "tool_failures": "too many failed tool calls in a row",
+    "tool_repeats": "the same call was repeated without any changes (a loop)",
+    "similar_calls": "similar calls for the same target kept repeating (going in circles)",
+    "context_limit": "the context is full",
+    "time_limit": "the time limit is reached",
+    "user_stop": "the user stopped the work early",
+}
+
 # С какой доли любого лимита модель получает напоминание о бюджете.
 PRESSURE_SHARE = 0.7
 # Поля аргументов, задающие «цель» вызова, — по убыванию приоритета.
@@ -184,21 +196,21 @@ class LoopGuard:
         if self._max_context is None and self._time_limit is None:
             return None
         shares = [self._steps / self._max_steps]
-        parts = [f"шагов {self._steps} из {self._max_steps}"]
+        parts = [f"steps {self._steps} of {self._max_steps}"]
         if self._max_context is not None:
             shares.append(context_tokens / self._max_context)
-            parts.append(f"контекст ~{context_tokens} из {self._max_context} токенов")
+            parts.append(f"context ~{context_tokens} of {self._max_context} tokens")
         if self._time_limit is not None:
             elapsed = self._elapsed()
             shares.append(elapsed / self._time_limit)
-            parts.append(f"времени {int(elapsed)} из {int(self._time_limit)} с")
+            parts.append(f"time {int(elapsed)} of {int(self._time_limit)} s")
         if max(shares) < PRESSURE_SHARE:
             return None
         return (
-            "=== БЮДЖЕТ ===\n"
-            f"Израсходовано: {', '.join(parts)}. Новых направлений не начинай: заверши "
-            "текущую проверку и переходи к итоговому отчёту. На исчерпании любого лимита "
-            "работа будет остановлена."
+            "# Budget\n"
+            f"Used: {', '.join(parts)}. Do not start new directions: finish the current "
+            "check and move on to the final report. When any limit is reached, the work "
+            "will be stopped and you will be asked for the report."
         )
 
     def before_tool(self, call: FunctionCall) -> CallCheck:
@@ -234,16 +246,17 @@ class LoopGuard:
         warning = None
         if repeats == self._max_repeats:
             warning = (
-                f"ВНИМАНИЕ: ты уже {repeats}-й раз вызываешь {call.name} с теми же "
-                "аргументами, а между вызовами ничего не менялось — результат тот же. "
-                "Не повторяй этот вызов: используй уже полученный результат, смени "
-                "подход или ответь пользователю. Следующий такой повтор остановит работу."
+                f"WARNING: this is call #{repeats} of {call.name} with the same arguments, "
+                "and nothing changed in between — the result is the same. Do not repeat "
+                "this call: use the result you already have, change the approach or answer. "
+                "The next such repeat will stop the work."
             )
         elif self._max_similar is not None and similar >= self._max_similar:
             warning = (
-                f"ВНИМАНИЕ: ты уже {similar}-й раз подряд вызываешь {call.name} для той же "
-                "цели. Ты топчешься на месте: используй уже полученные результаты, смени "
-                "подход или переходи к отчёту. Ещё несколько таких вызовов остановят работу."
+                f"WARNING: this is call #{similar} in a row of {call.name} for the same "
+                "target. You are going in circles: use the results you already have, change "
+                "the approach or move on to the report. A few more such calls will stop the "
+                "work."
             )
         return CallCheck(repeats, warning=warning, rejected_before=rejected)
 

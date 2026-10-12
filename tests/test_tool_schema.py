@@ -52,7 +52,7 @@ def test_nested_models_are_inlined():
     assert question["type"] == "object" and question["required"] == ["question", "options"]
     option = question["properties"]["options"]["items"]
     assert option["properties"]["label"] == {
-        "description": "Вариант ответа, коротко (1–5 слов).",
+        "description": "The answer option, short (1–5 words).",
         "type": "string",
     }
     assert "title" not in str(schema)
