@@ -310,6 +310,43 @@ def test_plan_file_is_writable_without_risk(ctx):
             w.run(params, c)
 
 
+@pytest.mark.parametrize("target", [".git/config", ".gigacrew/chats/x.json"])
+def test_symlinked_plan_file_is_not_a_plan(ctx, target):
+    """Ссылка на месте файла плана не уводит запись без вопроса в .git/ или к чатам."""
+    import os
+
+    from gigacrew.security import RiskLevel
+
+    victim = ctx.root / target
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    victim.write_text("orig", encoding="utf-8")
+    pctx = _plan_ctx(ctx)
+    pctx.plan.path.parent.mkdir(parents=True)
+    os.symlink(victim, pctx.plan.path)
+    w = WriteFileTool()
+    params = w.parse({"path": ".gigacrew/plans/chat1.md", "content": "x"})
+    assert w.risk(params, pctx) is RiskLevel.WRITE
+    with pytest.raises(ToolError):
+        w.preview(params, pctx)
+    with pytest.raises(ToolError):
+        w.run(w.parse({"path": target, "content": "x"}), pctx)
+    assert victim.read_text(encoding="utf-8") == "orig" and not pctx.plan.dirty
+
+
+def test_plan_dir_symlinked_into_git_is_rejected(ctx):
+    import os
+
+    git = ctx.root / ".git"
+    git.mkdir()
+    (ctx.root / ".gigacrew").mkdir()
+    os.symlink(git, ctx.workspace.plans_dir)
+    pctx = _plan_ctx(ctx)
+    w = WriteFileTool()
+    with pytest.raises(ToolError, match="Внутренности git"):
+        w.run(w.parse({"path": ".gigacrew/plans/chat1.md", "content": "x"}), pctx)
+    assert list(git.iterdir()) == []
+
+
 def test_plan_file_edit_does_not_mark_other_writes(ctx):
     pctx = _plan_ctx(ctx)
     w = WriteFileTool()

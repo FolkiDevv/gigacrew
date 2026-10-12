@@ -266,6 +266,11 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
     то есть до вопроса о подтверждении.
     """
     p = resolve_in_root(ctx.root, path)
+    if _is_git_internal(ctx.root, p, path):
+        raise ToolError(
+            f"Внутренности git ({GIT_DIR_NAME}/) недоступны для записи: {path}. "
+            "Для операций с репозиторием используйте инструмент git."
+        )
     if ctx.plan is not None and ctx.plan.is_target(p):
         return p
     data_dir = ctx.workspace.data_dir.resolve()  # .gigacrew может быть симлинком
@@ -279,11 +284,6 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
                 if ctx.plan is not None
                 else ""
             )
-        )
-    if _is_git_internal(ctx.root, p, path):
-        raise ToolError(
-            f"Внутренности git ({GIT_DIR_NAME}/) недоступны для записи: {path}. "
-            "Для операций с репозиторием используйте инструмент git."
         )
     return p
 

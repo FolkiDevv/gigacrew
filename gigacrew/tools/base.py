@@ -55,7 +55,13 @@ class PlanFile:
     dirty: bool = False
 
     def is_target(self, path: Path) -> bool:
-        """Указывает ли (уже разрешённый) путь на этот файл плана."""
+        """Указывает ли (уже разрешённый) путь на этот файл плана.
+
+        Файл плана или папка планов — символическая ссылка: не план. Иначе ссылка
+        увела бы запись без вопроса в ``.git/config`` или в файл чата.
+        """
+        if self.path.is_symlink() or self.path.parent.is_symlink():
+            return False
         return Path(path).resolve() == self.path.resolve()
 
 
