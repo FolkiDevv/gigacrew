@@ -260,17 +260,17 @@ def test_turn_stats_split_billed_and_context(tmp_path):
     provider = ScriptedProvider(
         [
             tool_turn(
-                "read_file", {"path": "f.txt"}, Usage(prompt_tokens=100, completion_tokens=10)
+                "read_file", {"path": "f.txt"}, Usage(prompt_tokens=7_000, completion_tokens=10)
             ),
-            text_turn("ок", Usage(prompt_tokens=130, completion_tokens=20)),
+            text_turn("ок", Usage(prompt_tokens=7_030, completion_tokens=20)),
         ]
     )
     events = RecordingEvents()
     _agent(provider, tmp_path, events=events).run_turn("x")
     stats = events.stats[-1]
     assert (stats.steps, stats.tool_calls) == (2, 1)
-    assert stats.billed_tokens == 260
-    assert stats.context_tokens == 150
+    assert stats.billed_tokens == 14_060
+    assert stats.context_tokens == 7_050
 
 
 def _assert_well_formed(messages):
@@ -418,12 +418,12 @@ def test_reset_with_saved_conversation_continues_it(tmp_path):
     saved = Conversation()
     saved.add_user("старый запрос")
     saved.add_assistant(
-        text_turn("старый ответ").message, Usage(prompt_tokens=50, completion_tokens=5)
+        text_turn("старый ответ").message, Usage(prompt_tokens=7_000, completion_tokens=5)
     )
     provider = ScriptedProvider([text_turn("новый ответ")])
     agent = _agent(provider, tmp_path)
     agent.reset(saved)
-    assert agent.conversation is saved and agent.context_tokens == 55
+    assert agent.conversation is saved and agent.context_tokens == 7_005
     agent.run_turn("дальше")
     roles = [(m.role, m.content) for m in provider.requests[-1]["messages"][1:]]
     assert roles == [
@@ -543,19 +543,19 @@ def test_non_stream_error_still_ends_waiting(tmp_path):
 def test_session_counters(tmp_path):
     provider = ScriptedProvider(
         [
-            text_turn("a", Usage(prompt_tokens=100, completion_tokens=10)),
-            text_turn("b", Usage(prompt_tokens=200, completion_tokens=20)),
+            text_turn("a", Usage(prompt_tokens=7_000, completion_tokens=10)),
+            text_turn("b", Usage(prompt_tokens=8_000, completion_tokens=20)),
         ]
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
     assert agent.context_tokens == 0
     agent.run_turn("1")
-    assert agent.context_tokens == 110 and agent.billed_tokens == 110
+    assert agent.context_tokens == 7_010 and agent.billed_tokens == 7_010
     agent.reset()
-    assert agent.context_tokens == 0 and agent.billed_tokens == 110
+    assert agent.context_tokens == 0 and agent.billed_tokens == 7_010
     agent.run_turn("2")
-    assert agent.context_tokens == 220 and agent.billed_tokens == 330
+    assert agent.context_tokens == 8_020 and agent.billed_tokens == 15_030
     assert events.stats[-1].duration_s >= 0
     assert agent.context_budget > 0
 
@@ -1011,7 +1011,8 @@ def test_token_estimate_is_calibrated_by_usage(tmp_path):
     from gigacrew.llm.model_windows import ModelWindows
 
     provider = ScriptedProvider(
-        [text_turn("a", Usage(prompt_tokens=1)), text_turn("b", Usage(prompt_tokens=10**6))]
+        # Размеры правдоподобны: реальных токенов меньше оценки в 2+ раза, затем больше.
+        [text_turn("a", Usage(prompt_tokens=2_500)), text_turn("b", Usage(prompt_tokens=10**6))]
     )
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="M")
     windows = ModelWindows(entries={"M": {"context_window": 40_000}})
@@ -1027,10 +1028,83 @@ def test_token_estimate_is_calibrated_by_usage(tmp_path):
 
 
 def test_explicit_budget_is_not_scaled(tmp_path):
-    provider = ScriptedProvider([text_turn("a", Usage(prompt_tokens=1))])
+    provider = ScriptedProvider([text_turn("a", Usage(prompt_tokens=2_500))])
     agent = _agent(provider, tmp_path, context_budget_tokens=20_000)
     agent.run_turn("x")
     assert agent._estimate_budget() == 20_000
+    # Статус-строка сравнивает реальные токены с бюджетом в тех же единицах.
+    assert agent.token_scale == 0.5 and agent.context_budget == 10_000
+
+
+# --------------------------- счётчик контекста --------------------------- #
+def test_context_counts_cached_part_of_prompt(tmp_path):
+    """API не включил закешированную часть в prompt_tokens: контекст — их сумма."""
+    usage = Usage(prompt_tokens=300, precached_prompt_tokens=8_000, completion_tokens=50)
+    events = RecordingEvents()
+    agent = _agent(ScriptedProvider([text_turn("a", usage)]), tmp_path, events=events)
+    agent.run_turn("x")
+    assert agent.context_tokens == events.stats[-1].context_tokens == 8_350
+    assert agent.token_scale > 1  # калибровка — по полному размеру запроса
+    assert agent.billed_tokens == 350  # оплата — как сообщил API
+
+
+def test_context_without_prompt_usage_falls_back_to_estimate(tmp_path):
+    """Usage без размера запроса не обнуляет контекст и не сдвигает калибровку."""
+    provider = ScriptedProvider(
+        [
+            text_turn("a", Usage(prompt_tokens=7_000, completion_tokens=10)),
+            text_turn("b", Usage(completion_tokens=900)),
+            text_turn("c", Usage(prompt_tokens=100, completion_tokens=900)),
+        ]
+    )
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("1")
+    scale = agent.token_scale
+    for text in ("2", "3"):
+        agent.run_turn(text)
+        assert agent.context_tokens > 6_000
+        assert agent.token_scale == scale
+
+
+def test_context_after_model_switch_is_estimated(tmp_path):
+    from gigacrew.llm.model_windows import ModelWindows
+
+    provider = ScriptedProvider([text_turn("a", Usage(prompt_tokens=20_000, completion_tokens=5))])
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="A")
+    windows = ModelWindows(entries={"A": {"context_window": 40_000}})
+    agent = Agent(provider, build_default_registry(), cfg, RecordingEvents(), windows=windows)
+    agent.run_turn("x")
+    assert agent.context_tokens == 20_005
+    agent.set_model("B")  # другой токенизатор: usage модели A не годится
+    estimate = agent.context_tokens
+    assert 0 < estimate < 20_000
+    agent.set_model("A")
+    assert agent.context_tokens == 20_005
+
+
+def test_resumed_chat_usage_belongs_to_its_model(tmp_path):
+    from gigacrew.agent.conversation import Conversation
+
+    saved = Conversation()
+    saved.add_user("вопрос")
+    saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=7_000, completion_tokens=5))
+    agent = _agent(ScriptedProvider(), tmp_path, model="A")
+    agent.set_model("B")  # resume_chat: модель чата — до reset()
+    agent.reset(saved)
+    assert agent.context_tokens == 7_005
+    agent.set_model("A")
+    assert agent.context_tokens < 7_000  # оценка в токенах модели A
+
+
+def test_resumed_chat_with_implausible_usage_is_estimated(tmp_path):
+    from gigacrew.agent.conversation import Conversation
+
+    saved = Conversation()
+    saved.add_user("вопрос")
+    saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=300, completion_tokens=5))
+    agent = _agent(ScriptedProvider(), tmp_path)
+    agent.reset(saved)
+    assert agent.context_tokens > 1_000
 
 
 # --------------------------- «мягкие» ошибки команд --------------------------- #
