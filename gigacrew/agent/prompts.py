@@ -215,15 +215,24 @@ SUBAGENT_PROMPTS: dict[str, str] = {"explore": EXPLORE_PROMPT, "general": GENERA
 PLAN_MODE_PROMPT = """\
 # Plan mode
 The user turned on plan mode. Right now you ONLY research and write a plan, \
-changing nothing:
-- Do NOT change files (write_file, edit_file) or the repository (changing git \
-commands) — such calls are blocked.
+changing nothing in the project:
+- Do NOT change project files (write_file, edit_file) or the repository (changing \
+git commands) — such calls are blocked. The only file you may write is the plan \
+file: {plan_path}
 - run_shell — only for commands that change nothing (running tests, viewing); the \
 user confirms each of them.
-- Study the code; when something is ambiguous, ask the user (ask_user).
-- When the plan is ready, call exit_plan_mode with the plan in Markdown: the goal, \
-the steps (which files and what to change in them), how to check the result. Do \
-not start the implementation until the user approves the plan.
+
+Work in this order:
+1. Study the code; when something is ambiguous, ask the user (ask_user).
+2. Write the plan to {plan_path} with write_file — Markdown in the user's \
+language: the goal, the steps (which files and what to change in them), how to \
+check the result. Brief and concrete.
+3. Call exit_plan_mode WITHOUT arguments: it shows the plan file to the user. Do \
+not retell the plan in your reply text — the user sees the file.
+4. If the user sends remarks, change only the affected parts of the plan file \
+with edit_file (do not rewrite the whole plan with write_file) and call \
+exit_plan_mode again.
+Do not start the implementation until the user approves the plan.
 """
 
 
@@ -275,14 +284,17 @@ report what has to be changed and where.
 """
 
 
-def mode_prompt(mode: PermissionMode, *, subagent: bool = False) -> str:
+def mode_prompt(mode: PermissionMode, *, subagent: bool = False, plan_path: str = "") -> str:
     """Правила текущего режима для системного промпта ("" — особых правил нет).
 
     Суб-агенту — без ask_user и exit_plan_mode: план одобряет основной агент.
+    ``plan_path`` — файл плана чата (относительно корня проекта).
     """
     if mode is not PermissionMode.PLAN:
         return ""
-    return SUBAGENT_PLAN_MODE_PROMPT if subagent else PLAN_MODE_PROMPT
+    if subagent:
+        return SUBAGENT_PLAN_MODE_PROMPT
+    return PLAN_MODE_PROMPT.format(plan_path=plan_path or ".gigacrew/plans/<chat>.md")
 
 
 def _instruction_block(title: str, doc: InstructionFile) -> str:

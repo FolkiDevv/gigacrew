@@ -1,4 +1,4 @@
-"""Инструмент exit_plan_mode: одобрение плана, замечания, отказ, нет UI."""
+"""Инструмент exit_plan_mode: план из файла, одобрение, замечания, отказ, нет UI."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import pytest
 
 from gigacrew.permissions import PermissionMode
 from gigacrew.project.workspace import Workspace
-from gigacrew.tools.base import ToolContext, ToolError
+from gigacrew.tools.base import PlanFile, ToolContext, ToolError
 from gigacrew.tools.plan import (
     APPROVE_EDITS,
     APPROVE_MANUAL,
@@ -17,6 +17,7 @@ from gigacrew.tools.plan import (
 from gigacrew.tools.questions import Answer, QuestionsUnavailable
 
 PLAN = "## План\n1. Поправить `a.py`\n2. Прогнать тесты"
+PLAN_REL = ".gigacrew/plans/chat1.md"
 
 
 class _Session:
@@ -27,6 +28,7 @@ class _Session:
         self.answers = answers
         self.asked: list = []
         self.ask = ask
+        self.plan: PlanFile | None = None
 
     def ask_user(self, questions):
         self.asked.append(list(questions))
@@ -38,17 +40,28 @@ class _Session:
         self.mode = mode
 
     def context(self, tmp_path) -> ToolContext:
+        workspace = Workspace(tmp_path)
+        self.plan = PlanFile(workspace.plans_dir / "chat1.md", dirty=True)
         return ToolContext(
-            Workspace(tmp_path),
+            workspace,
             ask_user=self.ask_user if self.ask else None,
             get_mode=lambda: self.mode,
             set_mode=self.set_mode,
+            plan=self.plan,
         )
 
 
-def _run(tmp_path, session: _Session, plan: str = PLAN):
+def _write_plan(tmp_path, plan: str = PLAN) -> None:
+    path = tmp_path / PLAN_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(plan, encoding="utf-8")
+
+
+def _run(tmp_path, session: _Session, plan: str | None = PLAN):
+    if plan is not None:
+        _write_plan(tmp_path, plan)
     tool = ExitPlanModeTool()
-    return tool.run(tool.parse({"plan": plan}), session.context(tmp_path))
+    return tool.run(tool.parse({}), session.context(tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -60,9 +73,13 @@ def test_approval_switches_mode(tmp_path, label, mode):
     result = _run(tmp_path, session)
     assert session.mode is mode
     assert result.ok and "одобрил план" in result.content and mode.label in result.content
+    # одобренный план (в итоговой редакции) — в результате: модель выполняет его
+    assert PLAN in result.content and PLAN_REL in result.content
     (question,) = session.asked[0]
-    assert question.body == PLAN and question.header == "План"
+    assert question.body.startswith(PLAN) and PLAN_REL in question.body
+    assert question.header == "План"
     assert [o.label for o in question.options] == [APPROVE_EDITS, APPROVE_MANUAL]
+    assert not session.plan.dirty
 
 
 def test_feedback_keeps_planning(tmp_path):
@@ -71,6 +88,9 @@ def test_feedback_keeps_planning(tmp_path):
     assert session.mode is PermissionMode.PLAN
     assert result.summary == "план на доработку"
     assert "«без новых зависимостей»" in result.content and "exit_plan_mode" in result.content
+    # правки — точечно в файле, а не новым планом целиком
+    assert "edit_file" in result.content and PLAN_REL in result.content
+    assert not session.plan.dirty  # пользователь эту версию видел
 
 
 def test_decline_keeps_planning(tmp_path):
@@ -84,7 +104,7 @@ def test_decline_keeps_planning(tmp_path):
 def test_nobody_to_approve(tmp_path, session):
     result = _run(tmp_path, session)
     assert session.mode is PermissionMode.PLAN
-    assert result.ok and result.content == NO_APPROVER_NOTE
+    assert result.ok and result.content == NO_APPROVER_NOTE.format(path=PLAN_REL)
 
 
 def test_outside_plan_mode_is_an_error(tmp_path):
@@ -97,18 +117,28 @@ def test_outside_plan_mode_is_an_error(tmp_path):
 def test_without_agent_is_an_error(tmp_path):
     tool = ExitPlanModeTool()
     with pytest.raises(ToolError, match="не активен"):
-        tool.run(tool.parse({"plan": PLAN}), ToolContext(Workspace(tmp_path)))
+        tool.run(tool.parse({}), ToolContext(Workspace(tmp_path)))
 
 
-def test_empty_plan_is_an_error(tmp_path):
+@pytest.mark.parametrize("plan", [None, "  \n "])
+def test_missing_or_empty_plan_file_is_an_error(tmp_path, plan):
     session = _Session([Answer((APPROVE_EDITS,))])
-    with pytest.raises(ToolError, match="Пустой план"):
-        _run(tmp_path, session, plan="  \n ")
+    with pytest.raises(ToolError, match="План не записан") as e:
+        _run(tmp_path, session, plan=plan)
+    assert PLAN_REL in str(e.value) and "write_file" in str(e.value)
     assert session.asked == []
 
 
-def test_describe_uses_first_line():
+def test_plan_argument_is_ignored(tmp_path):
+    """Старая привычка модели передавать план в аргументе — не ошибка: план из файла."""
+    _write_plan(tmp_path)
+    session = _Session([Answer((APPROVE_EDITS,))])
     tool = ExitPlanModeTool()
-    assert tool.describe(tool.parse({"plan": "\n## Рефакторинг конфига\n1. ..."})) == (
-        "Рефакторинг конфига"
-    )
+    tool.run(tool.parse({"plan": "другой план"}), session.context(tmp_path))
+    (question,) = session.asked[0]
+    assert question.body.startswith(PLAN)
+
+
+def test_schema_has_no_parameters():
+    params = ExitPlanModeTool().spec().parameters
+    assert params == {"type": "object", "properties": {}}

@@ -1,19 +1,22 @@
 """Инструмент ``exit_plan_mode``: готовый план — пользователю на одобрение.
 
-В режиме планирования агент только исследует код. Закончив, он вызывает этот
-инструмент с планом: пользователь видит план и выбирает, выполнять ли его и в
-каком режиме. После одобрения режим меняется, и агент приступает к выполнению в
-том же ходе; свой ответ пользователя — замечания, план дорабатывается.
+В режиме планирования агент только исследует код и пишет план в файл плана чата
+(``.gigacrew/plans/<id>.md``, обычными write_file/edit_file). Закончив, он
+вызывает этот инструмент без аргументов: пользователь видит план из файла и
+выбирает, выполнять ли его и в каком режиме. После одобрения режим меняется, и
+агент приступает к выполнению в том же ходе; свой ответ пользователя — замечания,
+агент точечно правит файл и отправляет план снова. План не передаётся в
+параметрах: иначе модель переписывала бы его целиком после каждого замечания.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from gigacrew.permissions import PermissionMode
-from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
+from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.questions import Question, QuestionOption, QuestionsUnavailable
 
 APPROVE_EDITS = "Да, правки без вопросов"
@@ -44,49 +47,72 @@ DECLINED_NOTE = (
     "меняй, кратко заверши ответ и дождись указаний пользователя."
 )
 NO_APPROVER_NOTE = (
-    "Одобрить план некому (неинтерактивный режим). Ничего не меняй: выведи план "
-    "итоговым ответом и заверши работу."
+    "Одобрить план некому (неинтерактивный режим). Ничего не меняй: план сохранён в "
+    "{path} — кратко перескажи его суть, назови этот файл и заверши работу."
 )
 
 
+# Без параметров: план читается из файла плана (docstring ушёл бы в схему).
 class ExitPlanModeParams(BaseModel):
-    plan: str = Field(
-        description=(
-            "The plan in Markdown, in the user's language: the goal, the steps (which "
-            "files and what to change in them), how to check the result. Brief and concrete."
+    pass
+
+
+def _plan_path(ctx: ToolContext, plan: PlanFile) -> str:
+    try:
+        return plan.path.relative_to(ctx.root).as_posix()
+    except ValueError:
+        return str(plan.path)
+
+
+def _read_plan(ctx: ToolContext, plan: PlanFile) -> str:
+    path = _plan_path(ctx, plan)
+    try:
+        text = plan.path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        text = ""
+    except (OSError, UnicodeDecodeError) as e:
+        raise ToolError(f"Не удалось прочитать файл плана {path}: {e}") from None
+    if not text:
+        raise ToolError(
+            f"План не записан: сначала запиши его в {path} инструментом write_file, "
+            "затем снова вызови exit_plan_mode (без аргументов)."
         )
-    )
+    return text
 
 
 class ExitPlanModeTool(Tool):
     name = "exit_plan_mode"
     description = (
-        "Plan mode only: hands the finished plan to the user for approval. Call it when "
-        "the research is done and the plan is ready. If the user approves the plan, the "
-        "mode changes and you start the implementation right away; if the user sends "
-        "remarks, refine the plan and call it again."
+        "Plan mode only: hands the plan to the user for approval. First write the plan "
+        "to the plan file named in the plan mode rules (write_file), then call this "
+        "tool WITHOUT arguments — it shows the file to the user. If the user approves "
+        "the plan, the mode changes and you start the implementation right away; if the "
+        "user sends remarks, fix the plan file with edit_file and call it again."
     )
     Params = ExitPlanModeParams
 
-    def describe(self, params: ExitPlanModeParams) -> str:
-        for line in params.plan.splitlines():
-            line = line.strip().lstrip("#").strip()
-            if line:
-                return line[:70]
-        return ""
-
     def run(self, params: ExitPlanModeParams, ctx: ToolContext) -> ToolResult:
-        plan = params.plan.strip()
-        if not plan:
-            raise ToolError("Пустой план: передай его в параметре plan.")
-        if ctx.get_mode is None or ctx.set_mode is None or ctx.get_mode() != PermissionMode.PLAN:
+        plan_file = ctx.plan
+        if (
+            plan_file is None
+            or ctx.get_mode is None
+            or ctx.set_mode is None
+            or ctx.get_mode() != PermissionMode.PLAN
+        ):
             raise ToolError(NOT_PLANNING_NOTE)
+        path = _plan_path(ctx, plan_file)
+        plan = _read_plan(ctx, plan_file)
+        no_approver = ToolResult(
+            content=NO_APPROVER_NOTE.format(path=path), summary="одобрить план некому"
+        )
         if ctx.ask_user is None:
-            return ToolResult(content=NO_APPROVER_NOTE, summary="одобрить план некому")
+            return no_approver
+        body = f"{plan}\n\n---\nФайл плана: `{path}`"
         try:
-            answers = ctx.ask_user([replace(PLAN_QUESTION, body=plan)])
+            answers = ctx.ask_user([replace(PLAN_QUESTION, body=body)])
         except QuestionsUnavailable:
-            return ToolResult(content=NO_APPROVER_NOTE, summary="одобрить план некому")
+            return no_approver
+        plan_file.dirty = False  # пользователь видел эту версию плана
         if not answers:
             return ToolResult(content=DECLINED_NOTE, summary="план не одобрен")
 
@@ -97,8 +123,10 @@ class ExitPlanModeTool(Tool):
             return ToolResult(
                 content=(
                     f"Пользователь не одобрил план и просит доработать: «{feedback}». "
-                    "Режим планирования сохраняется: учти замечания и снова вызови "
-                    "exit_plan_mode с исправленным планом."
+                    "Режим планирования сохраняется. Учти замечания: поправь в файле "
+                    f"плана {path} только нужные места инструментом edit_file (НЕ "
+                    "переписывай план целиком и не пересказывай его текстом), затем "
+                    "снова вызови exit_plan_mode без аргументов."
                 ),
                 summary="план на доработку",
             )
@@ -106,7 +134,8 @@ class ExitPlanModeTool(Tool):
         return ToolResult(
             content=(
                 f"Пользователь одобрил план. Режим теперь «{mode.label}» "
-                f"({mode.description}). Приступай к выполнению плана по шагам."
+                f"({mode.description}). Приступай к выполнению плана по шагам.\n\n"
+                f"Одобренный план ({path}):\n\n{plan}"
             ),
             summary=f"план одобрен · режим «{mode.label}»",
         )

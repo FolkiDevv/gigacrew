@@ -18,6 +18,7 @@ from gigacrew.agent.conversation import INTERRUPTED_NOTE
 from gigacrew.agent.loop import (
     LOOP_STOP_NOTE,
     PLAN_BLOCKED_NOTE,
+    PLAN_NOT_SUBMITTED_NOTE,
     REJECTED_AGAIN_NOTE,
     REJECTED_NOTE,
     SKIPPED_NOTE,
@@ -749,24 +750,126 @@ def test_mode_survives_reset_and_cycles(tmp_path):
     assert [agent.cycle_mode(), agent.cycle_mode()] == [PermissionMode.PLAN, PermissionMode.MANUAL]
 
 
+PLAN_REL = ".gigacrew/plans/chat1.md"
+
+
+def _planning_agent(provider, tmp_path, events=None) -> Agent:
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False, mode=PermissionMode.PLAN)
+    agent.chat_id = "chat1"
+    return agent
+
+
 def test_approved_plan_switches_mode_within_the_turn(tmp_path):
     provider = ScriptedProvider(
         [
-            tool_turn("exit_plan_mode", {"plan": "# План\n1. создать a.txt"}),
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План\n1. создать a.txt"}),
+            tool_turn("exit_plan_mode", {}),
             tool_turn("write_file", {"path": "a.txt", "content": "x"}),
             text_turn("готово"),
         ]
     )
     events = RecordingEvents(confirm_answer=False, answers=[Answer((APPROVE_EDITS,))])
-    agent = _agent(provider, tmp_path, events=events, auto_approve=False, mode=PermissionMode.PLAN)
+    agent = _planning_agent(provider, tmp_path, events)
     assert agent.run_turn("спланируй и сделай") == "готово"
     assert agent.mode is PermissionMode.ACCEPT_EDITS
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
-    assert events.confirms == []  # правка после одобрения — уже без вопроса
+    assert events.confirms == []  # ни план в режиме плана, ни правка после одобрения
     (question,) = events.questions[0]
-    assert question.body == "# План\n1. создать a.txt"
-    # правила плана — только до одобрения
-    assert ["# Plan mode" in p for p in _system_prompts(provider)] == [True, False, False]
+    assert question.body.startswith("# План\n1. создать a.txt")
+    # правила плана (с путём файла плана) — только до одобрения
+    prompts = _system_prompts(provider)
+    assert ["# Plan mode" in p for p in prompts] == [True, True, False, False]
+    assert PLAN_REL in prompts[0]
+
+
+def test_plan_mode_allows_only_the_plan_file(tmp_path):
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": "a.txt", "content": "x"}),
+            tool_turn("write_file", {"path": ".gigacrew/plans/other.md", "content": "x"}),
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            tool_turn("exit_plan_mode", {}),
+            text_turn("жду"),
+        ]
+    )
+    events = RecordingEvents(answers=None)
+    agent = _planning_agent(provider, tmp_path, events)
+    agent.run_turn("спланируй")
+    results = _function_results(agent)
+    assert results[0] == PLAN_BLOCKED_NOTE
+    assert results[1] == PLAN_BLOCKED_NOTE  # чужой план — обычная правка
+    assert (tmp_path / PLAN_REL).read_text(encoding="utf-8") == "# План"
+    assert not (tmp_path / "a.txt").exists() and events.confirms == []
+
+
+def test_unsubmitted_plan_gets_one_reminder(tmp_path):
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            text_turn("Вот план: ..."),  # забыла exit_plan_mode
+            text_turn("План готов, см. файл"),  # и после напоминания — ответ принимается
+        ]
+    )
+    events = RecordingEvents()
+    agent = _planning_agent(provider, tmp_path, events)
+    assert agent.run_turn("спланируй") == "План готов, см. файл"
+    assert len(provider.requests) == 3
+    reminder = provider.requests[2]["messages"]
+    assert PLAN_NOT_SUBMITTED_NOTE in reminder[0].content
+    assert PLAN_NOT_SUBMITTED_NOTE not in provider.requests[1]["messages"][0].content
+    # текст без вызова в историю не попал: запрос не кончается репликой ассистента
+    assert reminder[-1].role == "function"
+    assert [m.content for m in agent.conversation.messages if m.role == "assistant"][-1] == (
+        "План готов, см. файл"
+    )
+    assert any("не отправлен" in text for _, text in events.notices)
+
+
+def test_reminder_leads_to_submission(tmp_path):
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            text_turn("Вот план"),
+            tool_turn("exit_plan_mode", {}),
+            text_turn("жду указаний"),
+        ]
+    )
+    events = RecordingEvents(answers=None)
+    agent = _planning_agent(provider, tmp_path, events)
+    assert agent.run_turn("спланируй") == "жду указаний"
+    assert len(events.questions) == 1  # план показан пользователю
+    assert PLAN_NOT_SUBMITTED_NOTE not in provider.requests[3]["messages"][0].content
+
+
+@pytest.mark.parametrize("mode", [PermissionMode.PLAN, PermissionMode.MANUAL])
+def test_no_reminder_without_plan_changes(tmp_path, mode):
+    provider = ScriptedProvider([text_turn("ответ на вопрос")])
+    agent = _agent(provider, tmp_path, mode=mode)
+    assert agent.run_turn("что делает foo?") == "ответ на вопрос"
+    assert len(provider.requests) == 1
+
+
+def test_submitted_plan_needs_no_reminder(tmp_path):
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            tool_turn("exit_plan_mode", {}),
+            text_turn("жду"),
+        ]
+    )
+    agent = _planning_agent(provider, tmp_path, RecordingEvents(answers=None))
+    assert agent.run_turn("спланируй") == "жду"
+    assert len(provider.requests) == 3
+
+
+def test_chat_id_names_the_plan_file(tmp_path):
+    agent = _agent(ScriptedProvider(), tmp_path)
+    agent.chat_id = "a1"
+    assert agent.plan_path == tmp_path.resolve() / ".gigacrew" / "plans" / "a1.md"
+    agent.reset(chat_id="b2")
+    assert agent.chat_id == "b2" and agent.plan_path.name == "b2.md"
+    agent.reset()
+    assert agent.chat_id not in ("a1", "b2")
 
 
 # ------------------------------ сжатие контекста ------------------------------ #

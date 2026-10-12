@@ -32,6 +32,7 @@ from gigacrew.tools.questions import AskUser
 
 __all__ = [
     "Display",
+    "PlanFile",
     "Tool",
     "ToolContext",
     "ToolError",
@@ -39,6 +40,29 @@ __all__ = [
     "ToolResult",
     "build_default_registry",
 ]
+
+
+@dataclass
+class PlanFile:
+    """Файл плана текущего чата (режим планирования): ``.gigacrew/plans/<id>.md``.
+
+    Агент пишет его обычными write_file/edit_file — единственный файл в
+    ``.gigacrew/``, доступный для записи. ``dirty`` — план менялся после того, как
+    его в последний раз показали пользователю (``exit_plan_mode``).
+    """
+
+    path: Path
+    dirty: bool = False
+
+    def is_target(self, path: Path) -> bool:
+        """Указывает ли (уже разрешённый) путь на этот файл плана.
+
+        Файл плана или папка планов — символическая ссылка: не план. Иначе ссылка
+        увела бы запись без вопроса в ``.git/config`` или в файл чата.
+        """
+        if self.path.is_symlink() or self.path.parent.is_symlink():
+            return False
+        return Path(path).resolve() == self.path.resolve()
 
 
 @dataclass(frozen=True)
@@ -52,6 +76,7 @@ class ToolContext:
     разрешена ли точная навигация через ty (``GIGACREW_TY``). ``run_subagent`` —
     запуск суб-агента (инструмент ``task``): ``(агент, описание, задача) → отчёт``;
     None — запускать некому (в том числе у самого суб-агента: без вложенности).
+    ``plan`` — файл плана чата (None — плана нет: суб-агент, тесты инструментов).
     """
 
     workspace: Workspace
@@ -60,6 +85,7 @@ class ToolContext:
     set_mode: Callable[[PermissionMode], None] | None = None
     semantic: bool = True
     run_subagent: Callable[[str, str, str], ToolResult] | None = None
+    plan: PlanFile | None = None
 
     @property
     def root(self) -> Path:
