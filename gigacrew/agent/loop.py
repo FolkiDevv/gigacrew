@@ -386,7 +386,11 @@ class Agent:
         return final_text
 
     def _new_guard(self) -> LoopGuard:
-        """Ограничители хода; у суб-агента — ещё бюджет токенов, времени и похожие вызовы."""
+        """Ограничители хода; у суб-агента — ещё предел контекста, времени и похожие вызовы.
+
+        Предел контекста — доля окна модели (не замерено — окно по умолчанию), но не
+        больше бюджета запроса: сверх него старые сообщения уже отбрасывались бы.
+        """
         cfg = self._cfg
         if self._parent is None:
             return LoopGuard(
@@ -399,7 +403,10 @@ class Agent:
             max_failures=cfg.max_tool_failures,
             max_repeats=cfg.max_tool_repeats,
             max_similar=SUBAGENT_MAX_SIMILAR,
-            max_tokens=cfg.subagent_max_tokens,
+            max_context=min(
+                int((self.context_window or DEFAULT_CONTEXT_WINDOW) * cfg.subagent_context_share),
+                self._to_real(self._estimate_budget()),
+            ),
             time_limit=cfg.subagent_timeout,
         )
 
@@ -422,12 +429,13 @@ class Agent:
         """Шаги хода до финального ответа модели или остановки ограничителем."""
         compact_failed = False  # не удалось — до конца хода не пытаемся снова
         while True:
-            stop = guard.before_step(stats.billed_tokens)
+            context = self._subagent_context(specs, stats)
+            stop = guard.before_step(context)
             if stop is None:
                 stats.steps = guard.steps
                 if self._cfg.auto_compact and not compact_failed:
                     compact_failed = not self._auto_compact(specs, stats)
-                turn = self._next_turn(specs, note=guard.pressure(stats.billed_tokens) or "")
+                turn = self._next_turn(specs, note=guard.pressure(context) or "")
                 msg = turn.message
                 self._conversation.add_assistant(msg, turn.usage)
                 self._account(turn.usage, stats)
@@ -467,6 +475,17 @@ class Agent:
                 self._conversation.repair(SKIPPED_NOTE)
                 return stop
         return None
+
+    def _subagent_context(self, specs: list[ToolSpec], stats: TurnStats) -> int:
+        """Размер контекста следующего запроса суб-агента в токенах (у основного — 0).
+
+        Оценка всей истории без обрезки окном (с калибровкой по ответам), но не меньше
+        контекста последнего ответа: результаты инструментов после него — тоже контекст.
+        """
+        if self._parent is None:
+            return 0
+        estimate = self._overhead_tokens(specs) + self._history_tokens(self._conversation)
+        return max(self._to_real(estimate), stats.context_tokens)
 
     def _stopped(self, specs: list[ToolSpec], stop: StopReason, stats: TurnStats) -> str:
         stats.stop_reason = stop.kind
@@ -860,7 +879,8 @@ class Agent:
         child = Agent(
             self._provider,
             subagent_registry(self._registry, spec),
-            replace(self._cfg, max_steps=self._cfg.subagent_max_steps),
+            # Без сжатия: предел суб-агента — заполнение контекста, у него он подводит итог.
+            replace(self._cfg, max_steps=self._cfg.subagent_max_steps, auto_compact=False),
             events,
             workspace=self._workspace,
             windows=self._windows,

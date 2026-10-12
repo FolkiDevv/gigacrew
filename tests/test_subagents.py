@@ -16,6 +16,7 @@ from gigacrew.agent.prompts import SUBAGENT_PROMPTS
 from gigacrew.agent.subagents import SUBAGENT_USER_STOP_NOTE
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMError
+from gigacrew.llm.model_windows import ModelWindows
 from gigacrew.llm.types import FunctionCall, Usage
 from gigacrew.permissions import PermissionMode
 from gigacrew.tools.base import build_default_registry
@@ -449,20 +450,66 @@ def test_subagent_step_limit_wraps_up(tmp_path):
     assert events.stats[-1].stop_reason is None  # основной агент не остановлен
 
 
-def test_subagent_token_budget(tmp_path):
-    usage = Usage(prompt_tokens=600)
+def _context_case(tmp_path, prompt_tokens: int, *, windows=None, **cfg_kw):
+    """Суб-агент: вызов инструмента с контекстом ``prompt_tokens``, затем ещё вызов."""
     provider = ScriptedProvider(
         [
             _task(),
-            tool_turn("list_dir", {}, usage),
-            tool_turn("find_files", {"pattern": "*"}, usage),
+            tool_turn("list_dir", {}, Usage(prompt_tokens=prompt_tokens)),
+            tool_turn("find_files", {"pattern": "*"}),
             text_turn("итог"),
             text_turn("ок"),
         ]
     )
-    agent = _agent(provider, tmp_path, subagent_max_tokens=1_000)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="M", **cfg_kw)
+    agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents(), windows=windows)
     agent.run_turn("x")
-    assert "исчерпан бюджет токенов" in _results(agent.conversation.messages)[0]
+    return provider, _results(agent.conversation.messages)[0]
+
+
+def test_subagent_stops_at_context_share_of_unmeasured_window(tmp_path):
+    # окно не замерено — 32k по умолчанию: 80% = 25 600, но бюджет запроса меньше — 21 600
+    provider, report = _context_case(tmp_path, 26_000)
+    assert "контекст заполнен" in report
+    assert "РАБОТА ОСТАНОВЛЕНА" in provider.requests[2]["messages"][0].content  # итог
+    assert "Контекст заполнен" in provider.requests[2]["messages"][0].content
+    assert provider.summary_requests == []  # суб-агент не сжимает историю
+
+    _, report = _context_case(tmp_path, 20_000)
+    assert "контекст заполнен" not in report
+
+
+def test_subagent_context_limit_follows_measured_window_and_share(tmp_path):
+    windows = ModelWindows(entries={"M": {"context_window": 200_000}})
+    _, report = _context_case(tmp_path, 26_000, windows=windows)
+    assert "контекст заполнен" not in report  # 13% окна в 200k
+
+    _, report = _context_case(tmp_path, 26_000, windows=windows, subagent_context_share=0.1)
+    assert "контекст заполнен" in report  # предел 20 000
+
+    windows = ModelWindows(entries={"M": {"context_window": 30_000}})
+    _, report = _context_case(tmp_path, 22_000, windows=windows)  # 73% окна
+    assert "контекст заполнен" in report  # но больше бюджета запроса (19 800)
+
+
+def test_subagent_context_counts_tool_results_after_last_reply(tmp_path):
+    """Большой результат инструмента — контекст следующего запроса, хоть ответ был мал."""
+    line = "строка с текстом, который занимает место в контексте модели"
+    (tmp_path / "big.txt").write_text(f"{line}\n" * 900, encoding="utf-8")  # ~18k токенов
+    provider = ScriptedProvider(
+        [
+            _task(),
+            tool_turn("read_file", {"path": "big.txt"}),
+            tool_turn("list_dir", {}),
+            text_turn("итог"),
+            text_turn("ок"),
+        ]
+    )
+    windows = ModelWindows(entries={"M": {"context_window": 20_000}})  # предел 10 800
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="M")
+    agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents(), windows=windows)
+    agent.run_turn("x")
+    assert "контекст заполнен" in _results(agent.conversation.messages)[0]
 
 
 def test_subagent_time_limit(tmp_path):
@@ -520,6 +567,14 @@ def test_guard_new_limits_off_by_default():
         assert guard.before_tool(call).warning is None
 
 
+def test_guard_context_limit_and_pressure():
+    guard = LoopGuard(max_steps=100, max_failures=3, max_context=1_000)
+    assert guard.before_step(600) is None and guard.pressure(600) is None
+    assert "контекст ~700 из 1000 токенов" in guard.pressure(700)
+    stop = guard.before_step(1_000)
+    assert stop.kind == "context_limit" and "Контекст заполнен" in stop.message
+
+
 def test_guard_time_limit_and_pressure_with_fake_clock():
     now = [0.0]
     guard = LoopGuard(max_steps=100, max_failures=3, time_limit=10, clock=lambda: now[0])
@@ -533,7 +588,7 @@ def test_guard_time_limit_and_pressure_with_fake_clock():
 def test_guard_similar_reset_by_own_changes():
     from gigacrew.agent.guard import ToolOutcome
 
-    guard = LoopGuard(max_steps=100, max_failures=3, max_similar=2, max_tokens=10**6)
+    guard = LoopGuard(max_steps=100, max_failures=3, max_similar=2, max_context=10**6)
     for i in range(5):  # правки одного файла подряд — не топтание
         call = FunctionCall(name="edit_file", arguments={"path": "a", "old_string": str(i)})
         check = guard.before_tool(call)

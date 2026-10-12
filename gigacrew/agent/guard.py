@@ -20,7 +20,8 @@
 Для суб-агентов включаются дополнительные ограничители (у основного агента они
 выключены — значения по умолчанию ``None``):
 
-* бюджет токенов и времени на запуск (``max_tokens``, ``deadline``);
+* заполнение контекста и время на запуск (``max_context``, ``time_limit``): контекст
+  суб-агента растёт с каждым результатом инструмента, у предела он подводит итог;
 * похожие вызовы — тот же инструмент с той же целью (файл, шаблон, запрос) при
   разных прочих аргументах (диапазоны строк, флаги): суб-агент «топчется» на одном
   месте. На ``max_similar``-м — предупреждение, через два — остановка;
@@ -43,7 +44,7 @@ StopKind = Literal[
     "tool_failures",
     "tool_repeats",
     "similar_calls",
-    "token_budget",
+    "context_limit",
     "time_limit",
     "user_stop",
 ]
@@ -116,7 +117,7 @@ class LoopGuard:
         max_failures: int,
         max_repeats: int = 3,
         max_similar: int | None = None,
-        max_tokens: int | None = None,
+        max_context: int | None = None,
         time_limit: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -124,7 +125,7 @@ class LoopGuard:
         self._max_failures = max_failures
         self._max_repeats = max_repeats
         self._max_similar = max_similar
-        self._max_tokens = max_tokens
+        self._max_context = max_context
         self._time_limit = time_limit
         self._clock = clock
         self._started = clock()
@@ -149,10 +150,10 @@ class LoopGuard:
     def _elapsed(self) -> float:
         return self._clock() - self._started
 
-    def before_step(self, tokens_used: int = 0) -> StopReason | None:
+    def before_step(self, context_tokens: int = 0) -> StopReason | None:
         """Вызывается перед обращением к модели; учитывает шаг.
 
-        ``tokens_used`` — токены, уже оплаченные за ход (для ``max_tokens``).
+        ``context_tokens`` — размер контекста, который уйдёт в запросе (для ``max_context``).
         """
         if self._steps >= self._max_steps:
             return StopReason(
@@ -160,11 +161,11 @@ class LoopGuard:
                 f"Достигнут лимит шагов агента ({self._max_steps}). "
                 "Задача может быть не завершена.",
             )
-        if self._max_tokens is not None and tokens_used >= self._max_tokens:
+        if self._max_context is not None and context_tokens >= self._max_context:
             return StopReason(
-                "token_budget",
-                f"Исчерпан бюджет токенов ({tokens_used} из {self._max_tokens}). "
-                "Задача может быть не завершена.",
+                "context_limit",
+                f"Контекст заполнен (~{context_tokens} из допустимых {self._max_context} "
+                "токенов). Задача может быть не завершена.",
             )
         if self._time_limit is not None and self._elapsed() >= self._time_limit:
             return StopReason(
@@ -175,18 +176,18 @@ class LoopGuard:
         self._steps += 1
         return None
 
-    def pressure(self, tokens_used: int = 0) -> str | None:
+    def pressure(self, context_tokens: int = 0) -> str | None:
         """Напоминание о бюджете, если израсходовано ≥70% любого лимита (иначе None).
 
         Только когда заданы лимиты суб-агента (у основного агента — None).
         """
-        if self._max_tokens is None and self._time_limit is None:
+        if self._max_context is None and self._time_limit is None:
             return None
         shares = [self._steps / self._max_steps]
         parts = [f"шагов {self._steps} из {self._max_steps}"]
-        if self._max_tokens is not None:
-            shares.append(tokens_used / self._max_tokens)
-            parts.append(f"токенов ~{tokens_used} из {self._max_tokens}")
+        if self._max_context is not None:
+            shares.append(context_tokens / self._max_context)
+            parts.append(f"контекст ~{context_tokens} из {self._max_context} токенов")
         if self._time_limit is not None:
             elapsed = self._elapsed()
             shares.append(elapsed / self._time_limit)
