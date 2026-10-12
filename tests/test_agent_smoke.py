@@ -67,3 +67,24 @@ def test_agent_reads_and_edits_existing_file(live_config, tmp_path):
 
     text = (tmp_path / "version.txt").read_text(encoding="utf-8")
     assert "2.0.0" in text, f"версия не обновлена:\n{text}"
+
+
+def test_agent_continues_after_tool_call(live_config):
+    """Регрессия: запрос после вызова инструмента на настоящем системном промпте и наборе
+    инструментов. С ``functions_state_id`` в истории API отвечал 422 «Function calls count
+    does not match function results count» (на упрощённом запросе не воспроизводилось).
+
+    Только чтение проекта: правки и команды без подтверждения отклоняются.
+    """
+    cfg = replace(live_config, max_steps=3, ty=False)
+    provider = ApiProvider(cfg)
+    agent = Agent(provider, build_default_registry(), cfg)
+    try:
+        agent.run_turn("расскажи об этом проекте")
+    finally:
+        provider.close()
+
+    roles = [m.role for m in agent.conversation.messages]
+    assert "function" in roles, "модель должна была вызвать инструмент"
+    # после результата инструмента модель ответила — запрос с ним принят
+    assert "assistant" in roles[roles.index("function") + 1 :]

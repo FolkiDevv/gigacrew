@@ -49,7 +49,32 @@ def test_assistant_function_call_serialized():
     )
     payload = p._message_to_payload(msg)
     assert payload["function_call"] == {"name": "read_file", "arguments": {"path": "a.py"}}
-    assert payload["functions_state_id"] == "sid-123"
+    # с ним API отвечает 422 «Function calls count does not match function results count»
+    assert "functions_state_id" not in payload
+    p.close()
+
+
+def test_history_after_tool_call_has_no_state_id():
+    """Регрессия: запрос после вызова инструмента — без functions_state_id нигде."""
+    p = _provider()
+    messages = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="расскажи об этом проекте"),
+        Message(
+            role="assistant",
+            content="Изучу проект.",
+            function_call=FunctionCall(name="file_outline", arguments={"path": "src"}),
+            functions_state_id="sid-1",
+        ),
+        Message(role="function", name="file_outline", content="src: файлов 100"),
+    ]
+    payload = p._payload(messages, None, model="m", temperature=0.2)
+    sent = payload["messages"]
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "function"]
+    assert all("functions_state_id" not in m for m in sent)
+    assert sent[2]["content"] == "Изучу проект."
+    assert sent[2]["function_call"] == {"name": "file_outline", "arguments": {"path": "src"}}
+    assert sent[3]["name"] == "file_outline"
     p.close()
 
 

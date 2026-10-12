@@ -12,7 +12,11 @@ chat/completions с поддержкой function calling. Адреса API и �
     ``name`` и ``arguments`` (arguments — уже распарсенный объект, НЕ строка),
     ``finish_reason == "function_call"`` и непрозрачный ``functions_state_id``;
   * результат инструмента возвращается сообщением ``role: "function"`` с
-    полями ``name`` и ``content``.
+    полями ``name`` и ``content``;
+  * ``functions_state_id`` в историю запроса НЕ возвращается: с ним API сверяет
+    вызовы с результатами по своему состоянию и на реальных запросах агента
+    отвечает 422 «Function calls count does not match function results count»,
+    хотя вызов и результат в истории парные; без него та же история принимается.
 """
 
 from __future__ import annotations
@@ -246,6 +250,8 @@ class ApiProvider(LLMProvider):
 
     @classmethod
     def _message_to_payload(cls, msg: Message) -> dict[str, Any]:
+        """Сообщение истории для запроса. ``functions_state_id`` не отправляется —
+        см. описание модуля."""
         content = msg.content or ""
         if msg.role == "function":
             content = cls._as_json_content(content)
@@ -257,8 +263,6 @@ class ApiProvider(LLMProvider):
                 "name": msg.function_call.name,
                 "arguments": msg.function_call.arguments,
             }
-        if msg.functions_state_id is not None:
-            out["functions_state_id"] = msg.functions_state_id
         return out
 
     @staticmethod

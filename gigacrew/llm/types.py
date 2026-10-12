@@ -33,8 +33,8 @@ class Message(BaseModel):
     content: str = ""
     name: str | None = None  # имя функции для role="function"
     function_call: FunctionCall | None = None
-    # Непрозрачный идентификатор состояния функций — нужно
-    # возвращать вместе с assistant-сообщением, чтобы сохранить контекст.
+    # Непрозрачный идентификатор состояния функций из ответа API. Хранится в
+    # истории, но в запрос не отправляется (см. gigacrew.llm.api).
     functions_state_id: str | None = None
 
 
