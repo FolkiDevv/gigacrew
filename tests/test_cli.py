@@ -429,9 +429,11 @@ def test_clear_starts_new_chat_and_resume_returns(repl_env, capsys):
     old_id = ctx.chats.chat_id
     commands.dispatch("/clear", ctx)
     assert ctx.chats.chat_id != old_id and len(agent.conversation) == 0
+    assert agent.chat_id == ctx.chats.chat_id  # у нового чата — свой файл плана
 
     commands.dispatch(f"/resume {old_id}", ctx)
     assert ctx.chats.chat_id == old_id
+    assert agent.plan_path.name == f"{old_id}.md"  # продолженный чат находит свой план
     out = _out(capsys)
     assert "продолжаем чат «старый вопрос»" in out and "старый ответ" in out
     agent.run_turn("ещё")
@@ -929,15 +931,20 @@ def test_oneshot_mode_flag_and_env(tmp_path, oneshot, monkeypatch):
         _main(tmp_path, "--mode", "auto", "-p", "x")
 
 
-def test_oneshot_plan_without_approver_ends_with_plan(tmp_path, oneshot, capsys):
+def test_oneshot_plan_without_approver_ends_with_plan(tmp_path, oneshot, capsys, monkeypatch):
+    monkeypatch.setattr(ChatStore, "new_id", staticmethod(lambda now=None: "chat1"))
+    plan = ".gigacrew/plans/chat1.md"
     provider = ScriptedProvider(
         [
-            tool_turn("exit_plan_mode", {"plan": "1. поправить a.py"}),
+            tool_turn("write_file", {"path": plan, "content": "1. поправить a.py"}),
+            tool_turn("exit_plan_mode", {}),
             text_turn("План: 1. поправить a.py"),
         ]
     )
     oneshot(provider)
     assert _main(tmp_path, "--mode", "plan", "-p", "спланируй", "--no-save") == 0
+    assert plan in provider.requests[0]["messages"][0].content  # путь — в правилах режима
     function_msgs = [m for m in provider.requests[-1]["messages"] if m.role == "function"]
-    assert "Одобрить план некому" in function_msgs[-1].content
+    assert "Одобрить план некому" in function_msgs[-1].content and plan in function_msgs[-1].content
+    assert (tmp_path / plan).read_text(encoding="utf-8") == "1. поправить a.py"
     assert "План: 1. поправить a.py" in capsys.readouterr().out

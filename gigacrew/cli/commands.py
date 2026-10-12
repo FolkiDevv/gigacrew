@@ -162,9 +162,11 @@ def _mode(ctx: CommandContext, arg: str) -> bool:
 
 
 def _clear(ctx: CommandContext, _arg: str) -> bool:
-    ctx.agent.reset()
-    if ctx.chats is not None:
+    if ctx.chats is None:
+        ctx.agent.reset()
+    else:
         ctx.chats.start_new()  # прежний чат остаётся сохранённым — его вернёт /resume
+        ctx.agent.reset(chat_id=ctx.chats.chat_id)
     ctx.ui.info("история очищена, начат новый чат")
     return True
 
@@ -200,8 +202,9 @@ def resume_chat(
     """Продолжить сохранённый чат: дальнейшие ходы дописываются в него же.
 
     Модель чата становится текущей, если не ``keep_model`` (модель задана явно, ``-m``).
+    Файл плана — тоже этого чата.
     """
-    agent.reset(saved.conversation)
+    agent.reset(saved.conversation, chat_id=saved.info.id)
     if saved.info.model and not keep_model:
         agent.set_model(saved.info.model)
     chats.switch_to(saved.info)

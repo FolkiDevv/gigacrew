@@ -237,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
         agent = Agent(provider, build_default_registry(), config, ui, windows=windows)
         store = ChatStore(agent.workspace)
         chats = ChatRecorder(store, enabled=config.save_chats)
+        agent.chat_id = chats.chat_id  # файл плана назван по id чата
         try:
             saved = _chat_to_resume(args, store, ui)
         except ChatStoreError as e:

@@ -16,9 +16,11 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 
 from pydantic import BaseModel
 
+from gigacrew.agent.chat_store import ChatStore
 from gigacrew.agent.compaction import CompactionError, plan_compaction, summarize
 from gigacrew.agent.context_window import (
     CHARS_PER_TOKEN,
@@ -77,7 +79,7 @@ from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide, nex
 from gigacrew.project.instructions import NestedInstructions
 from gigacrew.project.workspace import Workspace
 from gigacrew.security import RiskLevel
-from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolRegistry, ToolResult
+from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 from gigacrew.tools.task import SUBAGENTS, SubagentSpec
 
 # Заметки для модели — на английском, как и промпты (пользователь их не видит).
@@ -101,7 +103,13 @@ INTERRUPTED_ANSWER_NOTE = "\n\n(ответ прерван пользовател
 BROKEN_ANSWER_NOTE = "\n\n(ответ оборван из-за ошибки)"
 PLAN_BLOCKED_NOTE = (
     "Not executed: plan mode is on, changes are forbidden. Do not try to make them: "
-    "describe the needed changes in the plan and hand it to the user with exit_plan_mode."
+    "describe the needed changes in the plan file and hand it to the user with "
+    "exit_plan_mode."
+)
+PLAN_NOT_SUBMITTED_NOTE = (
+    "# Plan not submitted\nYou changed the plan file but ended the turn without handing "
+    "it to the user. Call exit_plan_mode now (without arguments); do not repeat the plan "
+    "as text. If you need the user's answer first, ask with ask_user."
 )
 
 
@@ -139,6 +147,7 @@ class Agent:
         windows: ModelWindows | None = None,
         parent: Agent | None = None,
         subagent: SubagentSpec | None = None,
+        chat_id: str | None = None,
     ):
         """Конструктор не обращается к файловой системе и сети.
 
@@ -149,6 +158,8 @@ class Agent:
         калибровка токенов, инструкции подкаталогов и контекст проекта — общие с
         основным агентом, расход токенов учитывается и у него; запускать суб-агентов
         и задавать вопросы пользователю суб-агент не может.
+
+        ``chat_id`` — id чата: по нему назван файл плана (по умолчанию — новый id).
         """
         self._provider = provider
         self._registry = registry
@@ -158,6 +169,9 @@ class Agent:
         self._workspace = Workspace(config.project_root) if workspace is None else workspace
         self._parent = parent
         self._subagent = subagent
+        # Файл плана чата — только у основного агента: суб-агент план не пишет.
+        self._chat_id = chat_id or ChatStore.new_id()
+        self._plan = None if parent is not None else PlanFile(self._plan_path(self._chat_id))
         self._ctx = ToolContext(
             workspace=self._workspace,
             ask_user=self._events.ask_user,
@@ -165,6 +179,7 @@ class Agent:
             set_mode=self.set_mode,
             semantic=config.ty,
             run_subagent=None if parent is not None else self._run_subagent,
+            plan=self._plan,
         )
         self._conversation = Conversation() if conversation is None else conversation
         self._model = config.model if parent is None else parent.model
@@ -313,6 +328,26 @@ class Agent:
             raise ValueError("Имя модели не может быть пустым")
         self._model = name
 
+    @property
+    def chat_id(self) -> str:
+        """Id чата (сохранённого — тот же, что у файла чата): по нему назван файл плана."""
+        return self._chat_id
+
+    @chat_id.setter
+    def chat_id(self, value: str) -> None:
+        self._chat_id = value
+        if self._plan is not None:
+            self._plan.path = self._plan_path(value)
+            self._plan.dirty = False
+
+    def _plan_path(self, chat_id: str) -> Path:
+        return self._workspace.plans_dir / f"{chat_id}.md"
+
+    @property
+    def plan_path(self) -> Path | None:
+        """Файл плана чата (None — у суб-агента)."""
+        return None if self._plan is None else self._plan.path
+
     def set_mode(self, mode: PermissionMode) -> None:
         """Сменить режим разрешений (действует со следующего вызова инструмента).
 
@@ -343,11 +378,16 @@ class Agent:
             child._stop_level = 2 if child._wrapping else child._stop_level + 1
             return True
 
-    def reset(self, conversation: Conversation | None = None) -> None:
+    def reset(
+        self, conversation: Conversation | None = None, *, chat_id: str | None = None
+    ) -> None:
         """Начать новый диалог или продолжить сохранённый (``conversation``).
 
-        Контекст проекта будет собран заново; потраченные токены сессии не сбрасываются.
+        ``chat_id`` — id чата (продолженного — его id: агент найдёт его план); по
+        умолчанию — новый. Контекст проекта будет собран заново; потраченные токены
+        сессии не сбрасываются.
         """
+        self.chat_id = chat_id or ChatStore.new_id()
         self._conversation = Conversation() if conversation is None else conversation
         self._project_context = None
         self._nested.reset()
@@ -436,6 +476,8 @@ class Agent:
     def _loop(self, specs: list[ToolSpec], guard: LoopGuard, stats: TurnStats) -> str:
         """Шаги хода до финального ответа модели или остановки ограничителем."""
         compact_failed = False  # не удалось — до конца хода не пытаемся снова
+        plan_reminded = False  # напоминание отправить план — не больше одного за ход
+        note = ""
         while True:
             context = self._subagent_context(specs, stats)
             stop = guard.before_step(context)
@@ -443,16 +485,37 @@ class Agent:
                 stats.steps = guard.steps
                 if self._cfg.auto_compact and not compact_failed:
                     compact_failed = not self._auto_compact(specs, stats)
-                turn = self._next_turn(specs, note=guard.pressure(context) or "")
+                notes = [guard.pressure(context) or "", note]
+                turn = self._next_turn(specs, note="\n\n".join(n for n in notes if n))
+                note = ""
                 msg = turn.message
-                self._conversation.add_assistant(msg, turn.usage)
                 self._account(turn.usage, stats)
+                if not turn.wants_tool and not plan_reminded and self._plan_unsubmitted():
+                    # Ответ текстом не идёт в историю: запрос не должен кончаться
+                    # репликой ассистента, а напоминание — системное, как итог остановки.
+                    plan_reminded = True
+                    note = PLAN_NOT_SUBMITTED_NOTE
+                    self._events.on_notice(
+                        "план изменён, но не отправлен на одобрение — напоминаю модели",
+                        level="warn",
+                    )
+                    continue
+                self._conversation.add_assistant(msg, turn.usage)
 
                 if not turn.wants_tool:
                     return msg.content
                 stop = self._run_calls(msg.function_calls, guard, stats)
             if stop is not None:
                 return self._stopped(specs, stop, stats)
+
+    def _plan_unsubmitted(self) -> bool:
+        """Режим плана, а план менялся после того, как его показали пользователю."""
+        return (
+            self._plan is not None
+            and self._plan.dirty
+            and self._parent is None
+            and self.mode is PermissionMode.PLAN
+        )
 
     def _run_calls(
         self, calls: list[FunctionCall], guard: LoopGuard, stats: TurnStats
@@ -585,9 +648,20 @@ class Agent:
         parts = [
             self.system_prompt(),
             nested_instructions_prompt(self._nested.files),
-            mode_prompt(self.mode, subagent=self._parent is not None),
+            mode_prompt(
+                self.mode, subagent=self._parent is not None, plan_path=self._plan_display()
+            ),
         ]
         return "\n\n".join(part for part in parts if part)
+
+    def _plan_display(self) -> str:
+        """Путь файла плана для промпта — относительно корня проекта."""
+        if self._plan is None:
+            return ""
+        try:
+            return self._plan.path.relative_to(self._workspace.root).as_posix()
+        except ValueError:
+            return str(self._plan.path)
 
     def _overhead_tokens(self, specs: list[ToolSpec]) -> int:
         """Системное сообщение и схемы инструментов (уходят в каждом запросе)."""

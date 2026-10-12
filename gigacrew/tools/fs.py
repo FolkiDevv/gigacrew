@@ -237,22 +237,48 @@ def _is_git_internal(root: Path, path: Path, raw: str = "") -> bool:
     return any(_looks_like_git_dir(d) for d in candidates if d != root and root in d.parents)
 
 
+def _is_plan_file(ctx: ToolContext, path: str) -> bool:
+    """Путь ведёт к файлу плана текущего чата (его можно писать без вопроса)."""
+    if ctx.plan is None:
+        return False
+    try:
+        return ctx.plan.is_target(resolve_in_root(ctx.root, path))
+    except Exception:  # путь вне корня — ошибку сообщит сама запись
+        return False
+
+
+def _plan_written(ctx: ToolContext, p: Path) -> bool:
+    """Отмечает изменение плана после записи; True — записан файл плана."""
+    if ctx.plan is None or not ctx.plan.is_target(p):
+        return False
+    ctx.plan.dirty = True
+    return True
+
+
 def _writable_path(ctx: ToolContext, path: str) -> Path:
     """Путь для записи: внутри корня, не в ``.gigacrew/`` и не во внутренностях git.
 
     В ``.gigacrew/`` лежат индекс, история ввода и чаты агента — модель не должна
-    их править. Запись в ``.git/`` (``config``, хуки) превратила бы правку файла в
-    выполнение команды: ``core.fsmonitor`` и ``diff.external`` запускаются уже на
-    ``git status``/``git diff``, которые выполняются без подтверждения. Проверка
-    срабатывает и в превью, то есть до вопроса о подтверждении.
+    их править. Исключение — файл плана текущего чата (``ctx.plan``). Запись в
+    ``.git/`` (``config``, хуки) превратила бы правку файла в выполнение команды:
+    ``core.fsmonitor`` и ``diff.external`` запускаются уже на ``git status``/``git
+    diff``, которые выполняются без подтверждения. Проверка срабатывает и в превью,
+    то есть до вопроса о подтверждении.
     """
     p = resolve_in_root(ctx.root, path)
+    if ctx.plan is not None and ctx.plan.is_target(p):
+        return p
     data_dir = ctx.workspace.data_dir.resolve()  # .gigacrew может быть симлинком
     # is_data_path — ещё и без учёта регистра: на macOS/Windows .GIGACREW — та же папка.
     if p == data_dir or data_dir in p.parents or ctx.workspace.is_data_path(p):
         raise ToolError(
             f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента) "
             f"недоступна для записи: {path}"
+            + (
+                f". Файл плана этого чата: {_rel(ctx, ctx.plan.path)}"
+                if ctx.plan is not None
+                else ""
+            )
         )
     if _is_git_internal(ctx.root, p, path):
         raise ToolError(
@@ -604,7 +630,8 @@ class WriteFileTool(Tool):
     kind = ToolKind.EDIT
 
     def risk(self, params: WriteFileParams, ctx: ToolContext) -> RiskLevel:
-        return RiskLevel.WRITE
+        # План — данные агента, а не проект: пишется в любом режиме без вопроса.
+        return RiskLevel.SAFE if _is_plan_file(ctx, params.path) else RiskLevel.WRITE
 
     def _prepare(
         self, params: WriteFileParams, ctx: ToolContext
@@ -630,14 +657,17 @@ class WriteFileTool(Tool):
 
     def run(self, params: WriteFileParams, ctx: ToolContext) -> ToolResult:
         p, old, new, repaired = self._prepare(params, ctx)
+        if ctx.plan is not None and ctx.plan.is_target(p):
+            ctx.workspace.ensure_data_dir()  # .gitignore папки — до первого файла в ней
         p.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(p, new.encode())
         verb = "перезаписан" if old is not None else "создан"
+        target = "план" if _plan_written(ctx, p) else _rel(ctx, p)
         n = len(_lines(new.text))
         note = (" (автокоррекция экранирования)" if repaired else "") + new.eol_note()
         return ToolResult(
             content=f"Файл {verb}: {params.path} ({n} строк).{note}",
-            summary=f"{verb} {_rel(ctx, p)}{note}",
+            summary=f"{verb} {target}{note}",
             display=Display(
                 make_diff(old.text if old else "", new.text, params.path),
                 kind="diff",
@@ -671,7 +701,7 @@ class EditFileTool(Tool):
     kind = ToolKind.EDIT
 
     def risk(self, params: EditFileParams, ctx: ToolContext) -> RiskLevel:
-        return RiskLevel.WRITE
+        return RiskLevel.SAFE if _is_plan_file(ctx, params.path) else RiskLevel.WRITE
 
     def _compute(self, params: EditFileParams, ctx: ToolContext):
         p = _writable_path(ctx, params.path)
@@ -751,9 +781,10 @@ class EditFileTool(Tool):
         write_atomic(p, file.encode(new))
         replaced = count if params.replace_all else 1
         note = file.eol_note()
+        target = "план" if _plan_written(ctx, p) else _rel(ctx, p)
         return ToolResult(
             content=f"Отредактирован {params.path}: заменено вхождений — {replaced}.{note}",
-            summary=f"изменён {_rel(ctx, p)}{note}",
+            summary=f"изменён {target}{note}",
             display=Display(make_diff(file.text, new, params.path), kind="diff", title=params.path),
         )
 
