@@ -204,9 +204,10 @@ def resume_chat(
     Модель чата становится текущей, если не ``keep_model`` (модель задана явно, ``-m``).
     Файл плана — тоже этого чата.
     """
-    agent.reset(saved.conversation, chat_id=saved.info.id)
+    # Сначала модель: сохранённый расход токенов чата посчитан в её токенах.
     if saved.info.model and not keep_model:
         agent.set_model(saved.info.model)
+    agent.reset(saved.conversation, chat_id=saved.info.id)
     chats.switch_to(saved.info)
 
 

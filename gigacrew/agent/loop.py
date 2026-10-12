@@ -124,6 +124,9 @@ MIN_SUMMARY_CHARS = 1_000
 # Калибровка оценки токенов по фактическому usage: реальные токены / оценка.
 MIN_TOKEN_SCALE = 0.5
 MAX_TOKEN_SCALE = 1.5
+# Размер запроса по usage меньше этой доли оценки неправдоподобен (оценка ~3 символа на
+# токен, токенизаторы дают 2–5): API не учёл часть запроса — закешированную или всю.
+MIN_PLAUSIBLE_SCALE = 0.25
 
 # Похожие вызовы суб-агента (та же цель): на N-м — предупреждение, затем остановка.
 SUBAGENT_MAX_SIMILAR = 5
@@ -196,8 +199,12 @@ class Agent:
             NestedInstructions(self._workspace.root) if parent is None else parent._nested
         )
         self._billed_tokens = 0  # потрачено за сессию (reset() не сбрасывает)
-        # Оценка контекста после сжатия — пока модель не сообщит настоящий размер.
-        self._compacted_tokens = 0
+        # Размер контекста последнего запроса (реальные токены; None — берётся из
+        # last_usage диалога) и модель, в чьих токенах он и last_usage посчитаны.
+        self._context: int | None = None
+        self._context_model = self._model
+        # Оценка контекста, пока настоящий размер неизвестен: (состояние, оценка).
+        self._context_estimate: tuple[tuple[object, ...], int] | None = None
         self._last_turn: TurnStats | None = None
         # Реальные токены / оценка по модели: оценка ~3 символа на токен грубая, а
         # бюджеты считаются в её единицах (калибруется по prompt_tokens ответов).
@@ -240,23 +247,47 @@ class Agent:
 
     @property
     def context_tokens(self) -> int:
-        """Размер контекста по последнему обращению к модели (0 — диалог пуст).
+        """Размер контекста в токенах текущей модели (0 — диалог пуст).
 
-        После сжатия (и при продолжении сжатого чата) — оценка: настоящий размер
-        станет известен со следующим запросом. Считается один раз — свойство
-        читается при каждой перерисовке статус-строки.
+        Берётся по последнему обращению к модели. Оценка — пока настоящий размер
+        неизвестен: после сжатия, после смены модели (у другой модели свой токенизатор),
+        если сохранённый usage неправдоподобен. Настоящий размер станет известен со
+        следующим запросом.
         """
-        usage = self._conversation.last_usage
-        if usage is not None:
-            return usage.prompt_tokens + usage.completion_tokens
-        if self._conversation.summary is None:
+        conversation = self._conversation
+        if not len(conversation):
             return 0
-        if not self._compacted_tokens:
+        if self._context_model == self._model:
+            if self._context is not None:
+                return self._context
+            usage = conversation.last_usage
+            if usage is not None:  # продолженный чат
+                request = min(self._context_estimate_units(), self._estimate_budget())
+                prompt = self._request_tokens(usage, request)
+                if prompt is not None:
+                    return prompt + usage.completion_tokens
+        return self._to_real(self._context_estimate_units())
+
+    def _context_estimate_units(self) -> int:
+        """Оценка контекста (системное сообщение, схемы, история) в единицах оценки.
+
+        Кешируется по состоянию диалога: свойство ``context_tokens`` читается при
+        каждой перерисовке статус-строки.
+        """
+        conversation = self._conversation
+        key = (
+            id(conversation),
+            len(conversation),
+            conversation.summary,
+            self._model,
+            self.mode,
+            len(self._nested.files),
+        )
+        if self._context_estimate is None or self._context_estimate[0] != key:
             specs = self._registry.specs()
-            self._compacted_tokens = self._to_real(
-                self._overhead_tokens(specs) + self._history_tokens(self._conversation)
-            )
-        return self._compacted_tokens
+            size = self._overhead_tokens(specs) + self._history_tokens(conversation)
+            self._context_estimate = (key, size)
+        return self._context_estimate[1]
 
     @property
     def provider(self) -> LLMProvider:
@@ -273,9 +304,13 @@ class Agent:
 
     @property
     def context_budget(self) -> int:
-        """Бюджет запроса: явный из конфига (в единицах оценки) или от окна модели."""
+        """Бюджет запроса в реальных токенах: от окна модели или явный из конфига.
+
+        Явный ``GIGACREW_CONTEXT_TOKENS`` задан в единицах оценки — переводится в
+        реальные токены, как и размер контекста в статус-строке.
+        """
         if self._cfg.context_budget_tokens is not None:
-            return self._cfg.context_budget_tokens
+            return self._to_real(self._cfg.context_budget_tokens)
         return budget_for_window(self.context_window or DEFAULT_CONTEXT_WINDOW)
 
     @property
@@ -296,6 +331,21 @@ class Agent:
 
     def _to_real(self, estimate: int) -> int:
         return int(estimate * self.token_scale)
+
+    @staticmethod
+    def _request_tokens(usage: Usage, estimate: int) -> int | None:
+        """Размер отправленного запроса по ``usage`` (``estimate`` — его оценка).
+
+        API может не сообщить размер запроса или не включить в ``prompt_tokens`` часть,
+        взятую из кеша (``precached_prompt_tokens``), — тогда контекст «падает» до
+        сотен токенов, меньше одного системного промпта. Размер намного меньше оценки
+        неправдоподобен: пробуется сумма с кешем, иначе None (размер неизвестен).
+        """
+        floor = estimate * MIN_PLAUSIBLE_SCALE
+        for size in (usage.prompt_tokens, usage.prompt_tokens + usage.precached_prompt_tokens):
+            if size > 0 and size >= floor:
+                return size
+        return None
 
     def _calibrate(self, prompt_tokens: int) -> None:
         """Уточнить калибровку по фактическому размеру отправленного запроса.
@@ -391,7 +441,9 @@ class Agent:
         self._conversation = Conversation() if conversation is None else conversation
         self._project_context = None
         self._nested.reset()
-        self._compacted_tokens = 0
+        # usage продолженного чата — в токенах его модели: она становится текущей до reset().
+        self._context = None
+        self._context_model = self._model
 
     # ------------------------------------------------------------------ #
     def run_turn(self, user_input: str) -> str:
@@ -566,12 +618,21 @@ class Agent:
         return text or ("" if self._parent is not None else stop.message)
 
     def _account(self, usage: Usage, stats: TurnStats) -> None:
-        """Учесть расход обращения: статистика хода, сессия, калибровка оценки."""
+        """Учесть расход обращения: статистика хода, сессия, размер контекста, калибровка.
+
+        Неправдоподобный размер запроса (:meth:`_request_tokens`) заменяется оценкой
+        и калибровку не сдвигает.
+        """
         stats.prompt_tokens += usage.prompt_tokens
         stats.completion_tokens += usage.completion_tokens
         self._bill(usage)
-        stats.context_tokens = usage.prompt_tokens + usage.completion_tokens
-        self._calibrate(usage.prompt_tokens)
+        prompt = self._request_tokens(usage, self._last_estimate)
+        if prompt is None:
+            prompt = self._to_real(self._last_estimate)
+        else:
+            self._calibrate(prompt)
+        stats.context_tokens = prompt + usage.completion_tokens
+        self._context, self._context_model = stats.context_tokens, self._model
 
     def _bill(self, usage: Usage) -> None:
         """Оплаченные токены сессии; у суб-агента — ещё и у основного агента."""
@@ -787,10 +848,10 @@ class Agent:
             if after >= before:
                 raise CompactionError("краткое содержание вышло не короче самой истории")
             conversation.set_summary(summary)
-            self._compacted_tokens = self._to_real(overhead + after)
+            self._context, self._context_model = self._to_real(overhead + after), self._model
             result = CompactResult(
                 before_tokens=self._to_real(overhead + before),
-                after_tokens=self._compacted_tokens,
+                after_tokens=self._context,
                 messages=len(plan.messages),
                 auto=auto,
             )

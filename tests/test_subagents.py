@@ -299,19 +299,19 @@ def test_subagent_tokens_billed_to_parent(tmp_path):
             tool_turn(
                 "task",
                 {"agent": "explore", "prompt": "x"},
-                Usage(prompt_tokens=100, completion_tokens=10),
+                Usage(prompt_tokens=7_000, completion_tokens=10),
             ),
-            text_turn("r", Usage(prompt_tokens=50, completion_tokens=5)),
-            text_turn("ок", Usage(prompt_tokens=20, completion_tokens=2)),
+            text_turn("r", Usage(prompt_tokens=5_000, completion_tokens=5)),
+            text_turn("ок", Usage(prompt_tokens=7_200, completion_tokens=2)),
         ]
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
     agent.run_turn("x")
-    assert agent.billed_tokens == 187
+    assert agent.billed_tokens == 19_217
     stats = events.stats[-1]
-    assert (stats.prompt_tokens, stats.completion_tokens) == (170, 17)
-    assert stats.context_tokens == 22  # контекст — только основного агента
+    assert (stats.prompt_tokens, stats.completion_tokens) == (19_200, 17)
+    assert stats.context_tokens == 7_202  # контекст — только основного агента
 
 
 def test_ctrl_c_in_subagent_stops_turn_and_keeps_trail(tmp_path):
