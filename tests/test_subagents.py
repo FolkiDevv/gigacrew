@@ -463,9 +463,8 @@ def test_subagent_step_limit_wraps_up(tmp_path):
     agent = _agent(provider, tmp_path, events=events, subagent_max_steps=2)
     assert agent.run_turn("x") == "ок"
     wrap_up = provider.requests[3]
-    # просьба об итоге — последним сообщением пользователя, вызовы запрещены
-    assert wrap_up["messages"][-1].role == "user"
-    assert wrap_up["messages"][-1].content.startswith("STOP: the step limit is reached")
+    # просьба об итоге — в системном сообщении, вызовы запрещены
+    assert "STOP: the step limit is reached" in wrap_up["messages"][0].content
     assert wrap_up["tool_choice"] == "none"
     report = _results(agent.conversation.messages)[0]
     assert "the step limit is reached" in report and "частичный итог" in report
@@ -494,7 +493,7 @@ def test_subagent_stops_at_context_share_of_unmeasured_window(tmp_path):
     # окно не замерено — 32k по умолчанию: 80% = 25 600, но бюджет запроса меньше — 21 600
     provider, report = _context_case(tmp_path, 26_000)
     assert "the context is full" in report
-    assert provider.requests[2]["messages"][-1].content.startswith("STOP: the context is full")
+    assert "STOP: the context is full" in provider.requests[2]["messages"][0].content
     assert provider.summary_requests == []  # суб-агент не сжимает историю
 
     _, report = _context_case(tmp_path, 20_000)
@@ -532,6 +531,14 @@ def test_subagent_context_counts_tool_results_after_last_reply(tmp_path):
     agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents(), windows=windows)
     agent.run_turn("x")
     assert "the context is full" in _results(agent.conversation.messages)[0]
+
+    # Запрос итога: история больше бюджета и обрезается, но задача суб-агента и его
+    # последние результаты в нём остаются — иначе отчёт не о чем писать.
+    wrap_up = provider.requests[2]["messages"]
+    assert wrap_up[1].role == "user" and wrap_up[1].content == "найди функцию foo"
+    assert "строка с текстом" in wrap_up[-1].content
+    assert "STOP: the context is full" in wrap_up[0].content
+    assert provider.requests[2]["tool_choice"] == "none"
 
 
 def test_subagent_time_limit(tmp_path):
