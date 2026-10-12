@@ -71,8 +71,9 @@ def test_agent_reads_and_edits_existing_file(live_config, tmp_path):
 
 def test_agent_continues_after_tool_call(live_config):
     """Регрессия: запрос после вызова инструмента на настоящем системном промпте и наборе
-    инструментов. С ``functions_state_id`` в истории API отвечал 422 «Function calls count
-    does not match function results count» (на упрощённом запросе не воспроизводилось).
+    инструментов. API v1 отвечал на него 422 «Function calls count does not match function
+    results count»: модель делала несколько вызовов, а v1 показывал только первый
+    (на упрощённом запросе не воспроизводилось).
 
     Только чтение проекта: правки и команды без подтверждения отклоняются.
     """

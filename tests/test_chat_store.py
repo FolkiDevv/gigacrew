@@ -19,7 +19,7 @@ def _conv(request="почини тесты", answer="готово") -> Conversat
     conv = Conversation()
     conv.add_user(request)
     conv.add_assistant(
-        Message(role="assistant", function_call=FunctionCall(name="read_file", arguments={}))
+        Message(role="assistant", function_calls=[FunctionCall(name="read_file", arguments={})])
     )
     conv.add_function_result("read_file", "1\tx")
     conv.add_assistant(Message(role="assistant", content=answer), Usage(prompt_tokens=7))
@@ -60,9 +60,9 @@ def test_file_is_private(store):
 def test_load_repairs_pending_call(store):
     conv = Conversation()
     conv.add_user("x")
-    conv.add_assistant(Message(role="assistant", function_call=FunctionCall(name="run_shell")))
+    conv.add_assistant(Message(role="assistant", function_calls=[FunctionCall(name="run_shell")]))
     store.save("a1", conv)
-    assert store.load("a1").conversation.pending_call() is None
+    assert store.load("a1").conversation.pending_calls() == []
 
 
 def test_load_errors(store):

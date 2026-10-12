@@ -169,7 +169,7 @@ def test_chat_resumed_shows_last_exchange(monkeypatch):
         Message(role="user", content="первый вопрос"),
         Message(role="assistant", content="первый ответ"),
         Message(role="user", content="почини \x1b[31mтесты"),
-        Message(role="assistant", function_call=FunctionCall(name="run_shell")),
+        Message(role="assistant", function_calls=[FunctionCall(name="run_shell")]),
         Message(role="function", name="run_shell", content="ok"),
         Message(role="assistant", content="**Готово**: тесты проходят"),
     ]
@@ -187,7 +187,7 @@ def test_chat_resumed_after_interrupted_turn_shows_no_stale_answer(monkeypatch):
         Message(role="user", content="первый вопрос"),
         Message(role="assistant", content="ответ на первый"),
         Message(role="user", content="второй вопрос"),
-        Message(role="assistant", function_call=FunctionCall(name="run_shell")),
+        Message(role="assistant", function_calls=[FunctionCall(name="run_shell")]),
         Message(role="function", name="run_shell", content="прервано"),
     ]
     ui.chat_resumed(_chat(1, "первый вопрос"), messages)

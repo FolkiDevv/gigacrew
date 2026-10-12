@@ -44,9 +44,9 @@ def estimate_text_tokens(text: str) -> int:
 
 def estimate_message_tokens(message: Message) -> int:
     size = estimate_text_tokens(message.content)
-    if message.function_call is not None:
-        args = json.dumps(message.function_call.arguments, ensure_ascii=False)
-        size += estimate_text_tokens(message.function_call.name + args)
+    for call in message.function_calls:
+        args = json.dumps(call.arguments, ensure_ascii=False)
+        size += estimate_text_tokens(call.name + args)
     return size + MESSAGE_OVERHEAD_TOKENS
 
 

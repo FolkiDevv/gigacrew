@@ -30,9 +30,12 @@ class Summary:
 
 
 class Conversation:
+    # Версия 2 — несколько вызовов инструментов в сообщении (``function_calls``, API v2).
+    # Версия 1 читается: её единственный ``function_call`` приводит :class:`Message`.
     # Ключ ``summary`` необязателен: версия gigacrew без сжатия его не видит и
-    # отправляет журнал целиком, как раньше, — поэтому формат остаётся первой версии.
-    FORMAT_VERSION = 1
+    # отправляет журнал целиком, как раньше.
+    FORMAT_VERSION = 2
+    _READABLE_VERSIONS = (1, 2)
 
     def __init__(
         self,
@@ -113,33 +116,46 @@ class Conversation:
         if usage is not None:
             self._last_usage = usage
 
-    def add_function_result(self, name: str, content: str) -> None:
-        self._messages.append(Message(role="function", name=name, content=content))
+    def add_function_result(self, name: str, content: str, call_id: str | None = None) -> None:
+        """Результат вызова инструмента. Результаты идут по порядку вызовов, поэтому
+        без ``call_id`` берётся id первого вызова, на который ещё нет ответа."""
+        if call_id is None:
+            pending = self.pending_calls()
+            call_id = pending[0].id if pending else None
+        self._messages.append(Message(role="function", name=name, content=content, call_id=call_id))
 
     # ------------------------------------------------------------------ #
-    def pending_call(self) -> FunctionCall | None:
-        """Вызов инструмента, на который ещё нет ответа (последнее сообщение)."""
-        if self._messages and self._messages[-1].role == "assistant":
-            return self._messages[-1].function_call
-        return None
+    def pending_calls(self) -> list[FunctionCall]:
+        """Вызовы последнего assistant-сообщения, на которые ещё нет результатов.
+
+        Результаты идут сразу после сообщения с вызовами, по одному на вызов и по порядку.
+        """
+        answered = 0
+        for message in reversed(self._messages):
+            if message.role == "function":
+                answered += 1
+                continue
+            if message.role == "assistant":
+                return list(message.function_calls[answered:])
+            break
+        return []
 
     def repair(self, note: str = INTERRUPTED_NOTE) -> bool:
-        """Закрывает «висящий» вызов инструмента ответом-заглушкой.
+        """Закрывает «висящие» вызовы инструментов ответами-заглушками.
 
-        Без этого следующий запрос к API содержал бы function_call без
-        результата. Возвращает True, если история была исправлена.
+        Без этого следующий запрос к API содержал бы вызовы без результатов
+        (API отвечает 422). Возвращает True, если история была исправлена.
         """
-        call = self.pending_call()
-        if call is None:
-            return False
-        self.add_function_result(call.name, note)
-        return True
+        pending = self.pending_calls()
+        for call in pending:
+            self.add_function_result(call.name, note, call.id)
+        return bool(pending)
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "version": self.FORMAT_VERSION,
-            "messages": [m.model_dump(exclude_none=True) for m in self._messages],
+            "messages": [m.model_dump(exclude_defaults=True) for m in self._messages],
             "last_usage": self._last_usage.model_dump() if self._last_usage else None,
         }
         if self._summary is not None:
@@ -149,7 +165,7 @@ class Conversation:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Conversation:
         version = data.get("version")
-        if version != cls.FORMAT_VERSION:
+        if version not in cls._READABLE_VERSIONS:
             raise ValueError(f"Неподдерживаемая версия формата диалога: {version!r}")
         messages = [Message.model_validate(m) for m in data.get("messages") or []]
         usage = data.get("last_usage")

@@ -25,7 +25,7 @@ def _turn(conv: Conversation, request: str, results: list[str], answer: str = "�
     conv.add_user(request)
     for i, content in enumerate(results):
         call = FunctionCall(name="read_file", arguments={"path": f"{i}.py"})
-        conv.add_assistant(Message(role="assistant", function_call=call))
+        conv.add_assistant(Message(role="assistant", function_calls=[call]))
         conv.add_function_result("read_file", content)
     if answer:
         conv.add_assistant(Message(role="assistant", content=answer))
@@ -53,7 +53,7 @@ def test_plan_keeps_recent_blocks_and_never_splits_call_and_result():
     last_block = estimate_tokens(conv.messages[-2:])
     plan = plan_compaction(conv, keep_tokens=last_block + 10)
     assert plan.upto == len(conv) - 2  # остался последний блок «вызов + результат»
-    assert conv.messages[plan.upto].function_call is not None
+    assert conv.messages[plan.upto].function_calls
     assert plan.messages[0].content == "ЗАДАЧА"
 
     # Последний блок остаётся, даже если он больше keep_tokens.
@@ -85,7 +85,7 @@ def test_render_message_clips_results_and_shows_calls():
     call = Message(
         role="assistant",
         content="читаю",
-        function_call=FunctionCall(name="read_file", arguments={"path": "a.py"}),
+        function_calls=[FunctionCall(name="read_file", arguments={"path": "a.py"})],
     )
     assert render_message(call) == '## Ассистент\nчитаю\n→ вызов read_file({"path": "a.py"})'
     result = render_message(Message(role="function", name="run_shell", content="A" * 10_000))

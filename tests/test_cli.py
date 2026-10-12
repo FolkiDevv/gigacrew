@@ -389,7 +389,7 @@ def test_interrupted_oneshot_is_saved_consistently(tmp_path, oneshot):
     store = _store(tmp_path)
     (chat,) = store.recent()
     conversation = store.load(chat.id).conversation
-    assert conversation.pending_call() is None
+    assert conversation.pending_calls() == []
     assert [m.role for m in conversation.messages] == ["user", "assistant", "function"]
 
 

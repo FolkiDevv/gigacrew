@@ -107,8 +107,7 @@ def render_message(message: Message) -> str:
     parts = []
     if message.content.strip():
         parts.append(clip_middle(message.content, ASSISTANT_CLIP))
-    call = message.function_call
-    if call is not None:
+    for call in message.function_calls:
         args = json.dumps(call.arguments, ensure_ascii=False, default=str)
         parts.append(f"→ вызов {call.name}({clip_middle(args, ARGS_CLIP)})")
     title = "Ассистент" if message.role == "assistant" else message.role

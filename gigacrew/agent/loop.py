@@ -65,7 +65,7 @@ from gigacrew.agent.subagents import (
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.llm.model_windows import ModelWindows
-from gigacrew.llm.types import AssistantTurn, Message, ToolSpec, Usage
+from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec, Usage
 from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide, next_mode
 from gigacrew.project.instructions import NestedInstructions
 from gigacrew.project.workspace import Workspace
@@ -84,6 +84,7 @@ REJECTED_AGAIN_NOTE = (
 LOOP_STOP_NOTE = (
     "Не выполнено: повтор того же вызова без изменений. Ход остановлен из-за зацикливания."
 )
+SKIPPED_NOTE = "Не выполнено: ход остановлен до этого вызова."
 STOP_SUMMARY_NOTE = (
     "=== ХОД ОСТАНОВЛЕН ===\n{reason}\nИнструменты больше не вызывай. Кратко ответь "
     "пользователю: что уже сделано, что не получилось и почему, что осталось и что "
@@ -433,27 +434,39 @@ class Agent:
 
                 if not turn.wants_tool:
                     return msg.content
-
-                # --- модель просит инструмент ---
-                call = msg.function_call
-                assert call is not None
-                check = guard.before_tool(call)
-                if check.stop is not None:
-                    # Вызов не выполняется; история остаётся согласованной.
-                    self._conversation.repair(LOOP_STOP_NOTE)
-                    stop = check.stop
-                else:
-                    if check.warning:
-                        self._events.on_notice(
-                            f"Модель {check.repeats}-й раз повторяет вызов {call.name} "
-                            "без изменений — предупреждена; следующий повтор остановит ход.",
-                            level="warn",
-                        )
-                    stats.tool_calls += 1
-                    outcome = self._execute_tool_call(msg, check)
-                    stop = guard.after_tool(call, outcome)
+                stop = self._run_calls(msg.function_calls, guard, stats)
             if stop is not None:
                 return self._stopped(specs, stop, stats)
+
+    def _run_calls(
+        self, calls: list[FunctionCall], guard: LoopGuard, stats: TurnStats
+    ) -> StopReason | None:
+        """Выполняет вызовы из ответа модели по очереди.
+
+        На каждый вызов в историю идёт ровно один результат (иначе API отвечает 422):
+        если ограничитель остановил ход посреди пачки, оставшиеся вызовы закрываются
+        заглушкой.
+        """
+        for call in calls:
+            check = guard.before_tool(call)
+            if check.stop is not None:
+                # Вызов не выполняется; история остаётся согласованной.
+                self._conversation.add_function_result(call.name, LOOP_STOP_NOTE)
+                self._conversation.repair(SKIPPED_NOTE)
+                return check.stop
+            if check.warning:
+                self._events.on_notice(
+                    f"Модель {check.repeats}-й раз повторяет вызов {call.name} "
+                    "без изменений — предупреждена; следующий повтор остановит ход.",
+                    level="warn",
+                )
+            stats.tool_calls += 1
+            outcome = self._execute_tool_call(call, check)
+            stop = guard.after_tool(call, outcome)
+            if stop is not None:
+                self._conversation.repair(SKIPPED_NOTE)
+                return stop
+        return None
 
     def _stopped(self, specs: list[ToolSpec], stop: StopReason, stats: TurnStats) -> str:
         stats.stop_reason = stop.kind
@@ -721,14 +734,13 @@ class Agent:
         return turn
 
     # ------------------------------------------------------------------ #
-    def _execute_tool_call(self, msg: Message, check: CallCheck) -> ToolOutcome:
+    def _execute_tool_call(self, function_call: FunctionCall, check: CallCheck) -> ToolOutcome:
         """Выполняет запрошенный моделью инструмент.
 
         ``check.warning`` (предупреждение ограничителя) дописывается к результату,
         который получит модель.
         """
-        assert msg.function_call is not None
-        name = msg.function_call.name
+        name = function_call.name
         tool = self._registry.get(name)
         note = check.warning
 
@@ -739,7 +751,7 @@ class Agent:
 
         # 1) Валидация параметров
         try:
-            params = tool.parse(msg.function_call.arguments)
+            params = tool.parse(function_call.arguments)
         except Exception as e:  # ошибка схемы — возвращаем модели
             invalid = ToolCallInfo(name, "(неверные аргументы)")
             self._events.on_tool_call(invalid)
@@ -747,7 +759,7 @@ class Agent:
 
         call = ToolCallInfo(name, self._describe(tool, params), tool.kind)
         self._events.on_tool_call(call)
-        key = call_key(msg.function_call)
+        key = call_key(function_call)
 
         # 2) Разрешение по режиму: выполнить, спросить или заблокировать
         previewed = False

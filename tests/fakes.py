@@ -121,10 +121,26 @@ def tool_turn(name: str, args: dict, usage: Usage | None = None) -> AssistantTur
         message=Message(
             role="assistant",
             content="",
-            function_call=FunctionCall(name=name, arguments=args),
+            function_calls=[FunctionCall(name=name, arguments=args)],
         ),
         finish_reason="function_call",
         usage=usage or Usage(),
+    )
+
+
+def tools_turn(calls: list[tuple[str, dict]], text: str = "") -> AssistantTurn:
+    """Ход с несколькими вызовами сразу (id — c1, c2, …)."""
+    return AssistantTurn(
+        message=Message(
+            role="assistant",
+            content=text,
+            function_calls=[
+                FunctionCall(name=name, arguments=args, id=f"c{i}")
+                for i, (name, args) in enumerate(calls, 1)
+            ],
+            state_id="S",
+        ),
+        finish_reason="function_call",
     )
 
 

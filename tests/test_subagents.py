@@ -42,7 +42,7 @@ def _assert_well_formed(messages):
     for i, m in enumerate(messages):
         if m.role == "function":
             prev = messages[i - 1]
-            assert prev.role == "assistant" and prev.function_call is not None
+            assert prev.role == "assistant" and prev.function_calls
 
 
 def _kinds(events) -> list[str]:
@@ -292,7 +292,7 @@ def test_ctrl_c_in_subagent_stops_turn_and_keeps_trail(tmp_path):
         agent.run_turn("x")
     messages = agent.conversation.messages
     _assert_well_formed(messages)
-    assert agent.conversation.pending_call() is None
+    assert agent.conversation.pending_calls() == []
     note = _results(messages)[-1]
     assert "прерван пользователем (Ctrl+C)" in note and "Изменённые файлы: b.txt" in note
     kinds = _kinds(events)
