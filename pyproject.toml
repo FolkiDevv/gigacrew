@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "gigacrew"
-version = "0.5.0"
+version = "0.6.0"
 description = "Консольный помощник для работы с кодом проекта"
 readme = "README.md"
 authors = [
