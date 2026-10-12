@@ -87,9 +87,9 @@ class TaskParams(BaseModel):
     agent: str = Field(description=f"Subagent type: {', '.join(SUBAGENTS)}.")
     prompt: str = Field(
         description=(
-            "The complete task statement. The subagent does NOT see this conversation: "
-            "give the goal, known paths, names and facts, constraints and exactly what "
-            "to return in the report."
+            "A complete brief — the subagent does NOT see this conversation: the goal and "
+            "the concrete question(s); known starting points (paths, names, strings, "
+            "errors); what is out of scope; what to return and when to stop."
         )
     )
     description: str = Field(
@@ -103,14 +103,13 @@ class TaskTool(Tool):
     description = (
         "Runs a subagent with its own context for a self-contained subtask and returns "
         "its final report; the subagent's intermediate steps do not get into your "
-        f"context. Agents: {_agents_list()}. When to use: broad research where it is "
-        "unknown where to look and many files would have to be looked through — explore; "
-        "a self-contained multi-step subtask — general. Handle pinpoint questions (a "
-        "known file or symbol) yourself, it is faster. The subagent does not see the "
-        "conversation: put everything it needs into prompt, including what exactly to "
-        "find out. Only you see the report — retell the essentials to the user. If the "
-        "user stopped a subagent, do not run the same task again unless asked. "
-        "Independent subtasks can be delegated in parallel in one response."
+        f"context. Agents: {_agents_list()}. The subagent has a limited number of steps "
+        "and a limited context: give it ONE narrow question or subtask (one subsystem, "
+        "one flow) and split broad research into several such tasks sent in one "
+        "response. Pinpoint questions (a known file or symbol) are faster to answer "
+        "yourself. A report of a subagent stopped by a limit is partial but useful: do "
+        "not rerun the same task — narrow it to what remains. If the user stopped a "
+        "subagent, do not run the same task again unless asked."
     )
     Params = TaskParams
 

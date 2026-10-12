@@ -60,7 +60,12 @@ USER_STOPPED_NOTE = (
     "Subagent {name} was stopped early by the user — below is its summary of what was "
     "done, it may be incomplete. Do not run this task again unless the user asks."
 )
-LIMIT_STOPPED_NOTE = "Subagent {name} was stopped: {reason} — the report may be incomplete."
+LIMIT_STOPPED_NOTE = (
+    "Subagent {name} was stopped: {reason} — the report below may be incomplete. Do not "
+    "rerun the same task: use what it found; if something is still missing, finish it "
+    "yourself or delegate a narrower follow-up that says what is already known and asks "
+    "only for what remains."
+)
 ABORTED_NOTE = (
     "Subagent {name} was aborted by the user, there is no report. Do not run this task "
     "again unless the user asks; continue yourself with what is known."

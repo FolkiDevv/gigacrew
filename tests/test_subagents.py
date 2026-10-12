@@ -221,6 +221,22 @@ def test_general_edit_confirmed_and_always_switches_parent_mode(tmp_path):
     assert events.results[-1][1].changed
 
 
+def test_delegation_rules_only_for_main_agent():
+    """Как ставить задачи суб-агентам — знает основной агент; суб-агент их не ставит."""
+    from gigacrew.agent.prompts import SUBAGENT_PROMPT, SYSTEM_PROMPT
+
+    assert "# Subagents (task)" in SYSTEM_PROMPT
+    assert "# Subagents (task)" not in SUBAGENT_PROMPT
+
+
+def test_limit_stop_report_tells_not_to_rerun_the_same_task():
+    stats = TurnStats(tool_calls=25, stop_reason="max_steps")
+    result = subagent_report(EXPLORE, "частичный итог", stats, SubagentTrail())
+    assert "the step limit is reached" in result.content
+    assert "Do not rerun the same task" in result.content
+    assert "частичный итог" in result.content
+
+
 def test_report_without_text_is_marked_for_user():
     """Суб-агент остановлен и не дал итога: модель узнаёт об этом, пользователь — тоже."""
     stats = TurnStats(tool_calls=25, stop_reason="max_steps")

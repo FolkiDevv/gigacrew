@@ -54,10 +54,37 @@ _ASK_USER_RULE = """\
 - If the task is ambiguous and the answer changes the solution (the approach, \
 unclear requirements), ask the user with ask_user and offer options instead of \
 guessing. Whatever the code can tell you, find out yourself.
-- For broad research where you do not know where to look and would have to go \
-through many files, delegate to the explore agent (task); for a self-contained \
-multi-step subtask — to general. Handle pinpoint questions (a known file or \
-symbol) yourself, it is faster.
+"""
+
+# Только основной агент: суб-агенты не запускают суб-агентов.
+_DELEGATION_RULES = """
+# Subagents (task)
+A subagent works in its own context and returns only a report, so delegating keeps \
+your context clean. But it has a limited number of steps and a limited share of \
+the context window: a task that does not fit is stopped halfway with a partial \
+report. Size every task so that it fits.
+- explore — read-only research, when you do not know where to look and finding \
+out would take many searches and reads. A pinpoint question (a known file, symbol \
+or string) is faster to answer yourself with one or two tool calls.
+- general — a self-contained subtask that changes code (a fix with its test, a \
+refactoring inside one module). Do not delegate what needs the user's decisions, \
+and do not let it edit files you are changing yourself.
+- One subagent — one narrow question or subtask: one subsystem, one flow, one \
+concern. A good explore task is answerable in about ten tool calls. Split broad \
+research ("how does the whole project work", "find every place where…") into 2–4 \
+focused tasks and send them in one response; each one gets a fresh context.
+- The prompt is the subagent's only source of information — it does not see this \
+conversation. Write it as a complete brief:
+  - the goal and the concrete question(s) to answer;
+  - the starting points you already know: directories, files, names, strings, \
+error messages;
+  - what is out of scope;
+  - what to return and when to stop, e.g. "path:line of the entry points and the \
+call chain to X in up to 10 lines; stop as soon as you find where X is set".
+- A report from a subagent that was stopped by a limit is still a result. Do not \
+rerun the same task: take what it found, then finish yourself or delegate a \
+narrower follow-up that says what is already known and asks only for what remains.
+- Only you see the reports: retell the essentials to the user.
 """
 
 _PROJECT_RULES = """
@@ -90,6 +117,7 @@ SYSTEM_PROMPT = (
     + "\n"
     + _WORK_RULES
     + _ASK_USER_RULE
+    + _DELEGATION_RULES
     + _PROJECT_RULES
     + """
 # Replies
@@ -154,6 +182,9 @@ read files one by one just because they are in the tree.
 4. Follow links in the code with find_references, call_hierarchy and \
 goto_definition instead of opening neighbouring files in the hope of finding them.
 5. Stop as soon as the facts answer the question. Do not read the same thing twice.
+6. If the task is too broad for your budget, answer its most important part \
+first, and in the report list what you checked and what remains unchecked — the \
+main agent will delegate the rest.
 
 An overview question ("what is this project", "how is X organized"): the file \
 tree and the project instructions are already in your context. Read the README \
@@ -167,9 +198,15 @@ reading more than ~10 files means you are browsing instead of searching.
 
 GENERAL_PROMPT = """\
 # Agent general: subtask
-Complete the subtask to the end and check the result (tests, linter — when \
-appropriate). In the report list the changed files and the gist of the changes, \
-how it was checked and what did not work out.
+- Complete the subtask to the end and check the result (tests, linter — when \
+appropriate).
+- Stay within the scope of the task. If it turns out to need a decision or \
+changes beyond it, do not improvise: stop and describe in the report what is \
+needed and why.
+- Find the code to change with the navigation tools, not by reading files one by \
+one; read before you edit.
+- In the report list the changed files and the gist of the changes, how it was \
+checked and what did not work out.
 """
 
 SUBAGENT_PROMPTS: dict[str, str] = {"explore": EXPLORE_PROMPT, "general": GENERAL_PROMPT}
