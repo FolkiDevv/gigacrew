@@ -39,7 +39,14 @@ from gigacrew.agent.events import (
     ToolCallInfo,
     TurnStats,
 )
-from gigacrew.agent.guard import CallCheck, LoopGuard, StopReason, ToolOutcome, call_key
+from gigacrew.agent.guard import (
+    MODEL_STOP_REASONS,
+    CallCheck,
+    LoopGuard,
+    StopReason,
+    ToolOutcome,
+    call_key,
+)
 from gigacrew.agent.prompts import (
     SYSTEM_PROMPT,
     build_project_context,
@@ -65,7 +72,7 @@ from gigacrew.agent.subagents import (
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.llm.model_windows import ModelWindows
-from gigacrew.llm.types import AssistantTurn, Message, ToolSpec, Usage
+from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolChoice, ToolSpec, Usage
 from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide, next_mode
 from gigacrew.project.instructions import NestedInstructions
 from gigacrew.project.workspace import Workspace
@@ -73,28 +80,28 @@ from gigacrew.security import RiskLevel
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 from gigacrew.tools.task import SUBAGENTS, SubagentSpec
 
+# Заметки для модели — на английском, как и промпты (пользователь их не видит).
 REJECTED_NOTE = (
-    "Пользователь ОТКЛОНИЛ выполнение этой операции. "
-    "Не повторяй её; предложи альтернативу или уточни план."
+    "The user REJECTED this operation. Do not repeat it; suggest an alternative or "
+    "clarify the plan."
 )
 REJECTED_AGAIN_NOTE = (
-    "Пользователь уже ОТКЛОНИЛ эту операцию в этом ходе, повторно она не предлагается. "
-    "Не повторяй её; предложи альтернативу или уточни план."
+    "The user already REJECTED this operation in this turn, so it was not offered again. "
+    "Do not repeat it; suggest an alternative or clarify the plan."
 )
 LOOP_STOP_NOTE = (
-    "Не выполнено: повтор того же вызова без изменений. Ход остановлен из-за зацикливания."
+    "Not executed: the same call repeated without any changes. The turn was stopped as a loop."
 )
+SKIPPED_NOTE = "Not executed: the turn was stopped before this call."
 STOP_SUMMARY_NOTE = (
-    "=== ХОД ОСТАНОВЛЕН ===\n{reason}\nИнструменты больше не вызывай. Кратко ответь "
-    "пользователю: что уже сделано, что не получилось и почему, что осталось и что "
-    "предлагаешь дальше."
+    "# Turn stopped\nReason: {reason}.\nDo not call tools anymore. Briefly tell the user "
+    "what has been done, what did not work and why, what remains and what you suggest next."
 )
 INTERRUPTED_ANSWER_NOTE = "\n\n(ответ прерван пользователем)"
 BROKEN_ANSWER_NOTE = "\n\n(ответ оборван из-за ошибки)"
 PLAN_BLOCKED_NOTE = (
-    "Не выполнено: включён режим планирования, изменения запрещены. Не пытайся "
-    "вносить их: опиши нужные изменения в плане и передай его пользователю "
-    "инструментом exit_plan_mode."
+    "Not executed: plan mode is on, changes are forbidden. Do not try to make them: "
+    "describe the needed changes in the plan and hand it to the user with exit_plan_mode."
 )
 
 
@@ -385,7 +392,11 @@ class Agent:
         return final_text
 
     def _new_guard(self) -> LoopGuard:
-        """Ограничители хода; у суб-агента — ещё бюджет токенов, времени и похожие вызовы."""
+        """Ограничители хода; у суб-агента — ещё предел контекста, времени и похожие вызовы.
+
+        Предел контекста — доля окна модели (не замерено — окно по умолчанию), но не
+        больше бюджета запроса: сверх него старые сообщения уже отбрасывались бы.
+        """
         cfg = self._cfg
         if self._parent is None:
             return LoopGuard(
@@ -398,7 +409,10 @@ class Agent:
             max_failures=cfg.max_tool_failures,
             max_repeats=cfg.max_tool_repeats,
             max_similar=SUBAGENT_MAX_SIMILAR,
-            max_tokens=cfg.subagent_max_tokens,
+            max_context=min(
+                int((self.context_window or DEFAULT_CONTEXT_WINDOW) * cfg.subagent_context_share),
+                self._to_real(self._estimate_budget()),
+            ),
             time_limit=cfg.subagent_timeout,
         )
 
@@ -415,50 +429,76 @@ class Agent:
         self._conversation.repair()
         stats.stop_reason = "user_stop"
         self._events.on_notice("остановлен пользователем — подвожу итог", level="warn")
-        return self._wrap_up(specs, USER_STOP_REASON, stats, as_user=True)
+        return self._wrap_up(
+            specs, USER_STOP_REASON, MODEL_STOP_REASONS["user_stop"], stats, user_stop=True
+        )
 
     def _loop(self, specs: list[ToolSpec], guard: LoopGuard, stats: TurnStats) -> str:
         """Шаги хода до финального ответа модели или остановки ограничителем."""
         compact_failed = False  # не удалось — до конца хода не пытаемся снова
         while True:
-            stop = guard.before_step(stats.billed_tokens)
+            context = self._subagent_context(specs, stats)
+            stop = guard.before_step(context)
             if stop is None:
                 stats.steps = guard.steps
                 if self._cfg.auto_compact and not compact_failed:
                     compact_failed = not self._auto_compact(specs, stats)
-                turn = self._next_turn(specs, note=guard.pressure(stats.billed_tokens) or "")
+                turn = self._next_turn(specs, note=guard.pressure(context) or "")
                 msg = turn.message
                 self._conversation.add_assistant(msg, turn.usage)
                 self._account(turn.usage, stats)
 
                 if not turn.wants_tool:
                     return msg.content
-
-                # --- модель просит инструмент ---
-                call = msg.function_call
-                assert call is not None
-                check = guard.before_tool(call)
-                if check.stop is not None:
-                    # Вызов не выполняется; история остаётся согласованной.
-                    self._conversation.repair(LOOP_STOP_NOTE)
-                    stop = check.stop
-                else:
-                    if check.warning:
-                        self._events.on_notice(
-                            f"Модель {check.repeats}-й раз повторяет вызов {call.name} "
-                            "без изменений — предупреждена; следующий повтор остановит ход.",
-                            level="warn",
-                        )
-                    stats.tool_calls += 1
-                    outcome = self._execute_tool_call(msg, check)
-                    stop = guard.after_tool(call, outcome)
+                stop = self._run_calls(msg.function_calls, guard, stats)
             if stop is not None:
                 return self._stopped(specs, stop, stats)
+
+    def _run_calls(
+        self, calls: list[FunctionCall], guard: LoopGuard, stats: TurnStats
+    ) -> StopReason | None:
+        """Выполняет вызовы из ответа модели по очереди.
+
+        На каждый вызов в историю идёт ровно один результат (иначе API отвечает 422):
+        если ограничитель остановил ход посреди пачки, оставшиеся вызовы закрываются
+        заглушкой.
+        """
+        for call in calls:
+            check = guard.before_tool(call)
+            if check.stop is not None:
+                # Вызов не выполняется; история остаётся согласованной.
+                self._conversation.add_function_result(call.name, LOOP_STOP_NOTE)
+                self._conversation.repair(SKIPPED_NOTE)
+                return check.stop
+            if check.warning:
+                self._events.on_notice(
+                    f"Модель {check.repeats}-й раз повторяет вызов {call.name} "
+                    "без изменений — предупреждена; следующий повтор остановит ход.",
+                    level="warn",
+                )
+            stats.tool_calls += 1
+            outcome = self._execute_tool_call(call, check)
+            stop = guard.after_tool(call, outcome)
+            if stop is not None:
+                self._conversation.repair(SKIPPED_NOTE)
+                return stop
+        return None
+
+    def _subagent_context(self, specs: list[ToolSpec], stats: TurnStats) -> int:
+        """Размер контекста следующего запроса суб-агента в токенах (у основного — 0).
+
+        Оценка всей истории без обрезки окном (с калибровкой по ответам), но не меньше
+        контекста последнего ответа: результаты инструментов после него — тоже контекст.
+        """
+        if self._parent is None:
+            return 0
+        estimate = self._overhead_tokens(specs) + self._history_tokens(self._conversation)
+        return max(self._to_real(estimate), stats.context_tokens)
 
     def _stopped(self, specs: list[ToolSpec], stop: StopReason, stats: TurnStats) -> str:
         stats.stop_reason = stop.kind
         self._events.on_notice(stop.message, level="error")
-        text = self._wrap_up(specs, stop.message, stats)
+        text = self._wrap_up(specs, stop.message, MODEL_STOP_REASONS[stop.kind], stats)
         # Суб-агенту без итога — пустой ответ: отчёт сам назовёт причину остановки.
         return text or ("" if self._parent is not None else stop.message)
 
@@ -484,28 +524,37 @@ class Agent:
             self._turn_stats.completion_tokens += usage.completion_tokens
 
     def _wrap_up(
-        self, specs: list[ToolSpec], reason: str, stats: TurnStats, *, as_user: bool = False
+        self,
+        specs: list[ToolSpec],
+        reason: str,
+        model_reason: str,
+        stats: TurnStats,
+        *,
+        user_stop: bool = False,
     ) -> str:
         """Итог модели после остановки ограничителем: что сделано и что дальше.
 
         Инструменты в запросе остаются (иначе API не примет историю с вызовами), но
-        вызов из ответа не выполняется — в историю идёт только текст. Сбой обращения
-        к модели не мешает: остаётся сообщение ограничителя.
+        вызывать их модели запрещено (``tool_choice="none"``); вызов, если он всё же
+        пришёл, не выполняется — в историю идёт только текст. Сбой обращения к модели
+        не мешает: остаётся сообщение ограничителя.
 
-        ``as_user`` — просьба подвести итог уходит сообщением пользователя (остановка
-        суб-агента пользователем: последним в истории может быть оборванный ответ).
+        Просьба подвести итог — дополнение к системному сообщению, а не сообщение
+        пользователя: окно истории закрепляет последний запрос пользователя, и такая
+        просьба вытеснила бы из обрезанной истории саму задачу. ``user_stop`` — суб-агент
+        остановлен пользователем (Esc). ``reason`` — причина для пользователя,
+        ``model_reason`` — для модели.
         """
         self._wrapping = True
         self._events.on_wrap_up(reason)
-        note = ""
-        if as_user:
-            self._conversation.add_user(SUBAGENT_USER_STOP_NOTE)
+        if user_stop:
+            note = SUBAGENT_USER_STOP_NOTE
         elif self._parent is not None:
-            note = SUBAGENT_STOP_NOTE.format(reason=reason)
+            note = SUBAGENT_STOP_NOTE.format(reason=model_reason)
         else:
-            note = STOP_SUMMARY_NOTE.format(reason=reason)
+            note = STOP_SUMMARY_NOTE.format(reason=model_reason)
         try:
-            turn = self._next_turn(specs, note=note)
+            turn = self._next_turn(specs, note=note, tool_choice="none")
         except LLMError:
             return ""
         self._account(turn.usage, stats)
@@ -675,13 +724,17 @@ class Agent:
             self._events.on_compact_end(result)
         return result
 
-    def _next_turn(self, specs: list[ToolSpec], note: str = "") -> AssistantTurn:
+    def _next_turn(
+        self, specs: list[ToolSpec], note: str = "", *, tool_choice: ToolChoice = "auto"
+    ) -> AssistantTurn:
         """Один проход модели с выводом текста (потоковым или цельным).
 
-        ``note`` — дополнение к системному сообщению только для этого запроса.
-        Оборванный поток (Esc, сбой сети) оставляет в истории уже показанный текст с
-        пометкой — модель знает, что её ответ прерван, а следующий запрос не идёт
-        двумя репликами пользователя подряд.
+        ``note`` — дополнение к системному сообщению только для этого запроса;
+        ``tool_choice="none"`` — ответ только текстом (итог после остановки).
+        Оборванный поток (Esc, сбой сети) оставляет в истории основного агента уже
+        показанный текст с пометкой — модель знает, что её ответ прерван, а следующий
+        запрос не идёт двумя репликами пользователя подряд. У суб-агента текст не
+        показывается и не сохраняется.
         """
         messages = self._build_request(specs, note)
         streamed: list[str] = []
@@ -698,14 +751,21 @@ class Agent:
                     tools=specs,
                     model=self._model,
                     temperature=self._cfg.temperature,
+                    tool_choice=tool_choice,
                     on_delta=on_delta,
                 )
             turn = self._provider.complete(
-                messages, tools=specs, model=self._model, temperature=self._cfg.temperature
+                messages,
+                tools=specs,
+                model=self._model,
+                temperature=self._cfg.temperature,
+                tool_choice=tool_choice,
             )
         except BaseException as e:
             partial = "".join(streamed).rstrip()
-            if partial.strip():
+            # Суб-агенту оборванный текст не нужен: пользователь его не видел, а запрос
+            # итога после остановки (Esc) не должен кончаться репликой ассистента.
+            if partial.strip() and self._parent is None:
                 tail = (
                     INTERRUPTED_ANSWER_NOTE
                     if isinstance(e, KeyboardInterrupt)
@@ -721,14 +781,13 @@ class Agent:
         return turn
 
     # ------------------------------------------------------------------ #
-    def _execute_tool_call(self, msg: Message, check: CallCheck) -> ToolOutcome:
+    def _execute_tool_call(self, function_call: FunctionCall, check: CallCheck) -> ToolOutcome:
         """Выполняет запрошенный моделью инструмент.
 
         ``check.warning`` (предупреждение ограничителя) дописывается к результату,
         который получит модель.
         """
-        assert msg.function_call is not None
-        name = msg.function_call.name
+        name = function_call.name
         tool = self._registry.get(name)
         note = check.warning
 
@@ -739,7 +798,7 @@ class Agent:
 
         # 1) Валидация параметров
         try:
-            params = tool.parse(msg.function_call.arguments)
+            params = tool.parse(function_call.arguments)
         except Exception as e:  # ошибка схемы — возвращаем модели
             invalid = ToolCallInfo(name, "(неверные аргументы)")
             self._events.on_tool_call(invalid)
@@ -747,7 +806,7 @@ class Agent:
 
         call = ToolCallInfo(name, self._describe(tool, params), tool.kind)
         self._events.on_tool_call(call)
-        key = call_key(msg.function_call)
+        key = call_key(function_call)
 
         # 2) Разрешение по режиму: выполнить, спросить или заблокировать
         previewed = False
@@ -848,7 +907,8 @@ class Agent:
         child = Agent(
             self._provider,
             subagent_registry(self._registry, spec),
-            replace(self._cfg, max_steps=self._cfg.subagent_max_steps),
+            # Без сжатия: предел суб-агента — заполнение контекста, у него он подводит итог.
+            replace(self._cfg, max_steps=self._cfg.subagent_max_steps, auto_compact=False),
             events,
             workspace=self._workspace,
             windows=self._windows,

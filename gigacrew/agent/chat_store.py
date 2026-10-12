@@ -82,7 +82,7 @@ def chat_title(messages: Iterable[Message]) -> str:
 
 def _preview(messages: tuple[Message, ...]) -> str:
     for m in reversed(messages):
-        if m.role == "assistant" and m.function_call is None and m.content.strip():
+        if m.role == "assistant" and not m.function_calls and m.content.strip():
             return _one_line(m.content, PREVIEW_LIMIT)
     return ""
 

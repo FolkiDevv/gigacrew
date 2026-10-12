@@ -822,7 +822,7 @@ class Console(AgentEvents):
                 (
                     m.content
                     for m in reversed(messages[last + 1 :])
-                    if m.role == "assistant" and m.function_call is None and m.content.strip()
+                    if m.role == "assistant" and not m.function_calls and m.content.strip()
                 ),
                 "",
             )

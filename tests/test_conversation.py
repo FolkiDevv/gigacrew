@@ -15,8 +15,8 @@ from gigacrew.llm.types import FunctionCall, Message, Usage
 def _call(name="read_file", **args):
     return Message(
         role="assistant",
-        function_call=FunctionCall(name=name, arguments=args),
-        functions_state_id="s",
+        function_calls=[FunctionCall(name=name, arguments=args)],
+        state_id="s",
     )
 
 
@@ -58,7 +58,7 @@ def test_summary_round_trip_and_old_files_without_it():
     conv = _mid_turn()
     conv.set_summary(Summary("сводка", 5))
     data = json.loads(json.dumps(conv.to_dict(), ensure_ascii=False))
-    assert data["version"] == 1  # ключ summary необязателен — формат прежний
+    assert data["version"] == Conversation.FORMAT_VERSION  # summary — необязательный ключ
     restored = Conversation.from_dict(data)
     assert restored.summary == Summary("сводка", 5)
     assert restored.messages == conv.messages
@@ -123,11 +123,71 @@ def test_repair_closes_pending_call():
     conv.add_user("x")
     assert conv.repair() is False
     conv.add_assistant(_call(path="a"))
-    assert conv.pending_call().name == "read_file"
+    assert [c.name for c in conv.pending_calls()] == ["read_file"]
     assert conv.repair() is True
     assert conv.messages[-1].role == "function" and conv.messages[-1].name == "read_file"
-    assert conv.pending_call() is None
+    assert conv.pending_calls() == []
     assert conv.repair() is False
+
+
+def test_several_calls_get_results_in_order_with_ids():
+    conv = Conversation()
+    conv.add_user("x")
+    calls = [
+        FunctionCall(name="read_file", arguments={"path": "a"}, id="c1"),
+        FunctionCall(name="list_dir", arguments={"path": "."}, id="c2"),
+        FunctionCall(name="read_file", arguments={"path": "b"}, id="c3"),
+    ]
+    conv.add_assistant(Message(role="assistant", function_calls=calls, state_id="S"))
+    assert conv.pending_calls() == calls
+
+    conv.add_function_result("read_file", "A")  # id подставляется по порядку
+    assert conv.messages[-1].call_id == "c1"
+    assert conv.pending_calls() == calls[1:]
+
+    assert conv.repair("прервано") is True  # закрывает все оставшиеся
+    tail = conv.messages[-2:]
+    assert [(m.name, m.call_id, m.content) for m in tail] == [
+        ("list_dir", "c2", "прервано"),
+        ("read_file", "c3", "прервано"),
+    ]
+    assert conv.pending_calls() == []
+
+
+def test_pending_calls_only_for_last_assistant_message():
+    conv = Conversation()
+    conv.add_user("x")
+    conv.add_assistant(_call(path="a"))
+    conv.add_user("новый запрос")  # вызов без результата раньше — не «висящий»
+    assert conv.pending_calls() == []
+
+
+def test_loads_format_1_chat_with_single_function_call():
+    """Чат, сохранённый до API v2: один ``function_call``, состояние старого API."""
+    data = {
+        "version": 1,
+        "messages": [
+            {"role": "user", "content": "x"},
+            {
+                "role": "assistant",
+                "content": "Прочитаю.",
+                "function_call": {"name": "read_file", "arguments": {"path": "a"}},
+                "functions_state_id": "old-state",
+            },
+            {"role": "function", "name": "read_file", "content": "1\tx"},
+        ],
+        "last_usage": None,
+    }
+    conv = Conversation.from_dict(data)
+    assistant = conv.messages[1]
+    assert assistant.function_calls == [FunctionCall(name="read_file", arguments={"path": "a"})]
+    assert assistant.state_id is None  # состояние старого API в новом не действует
+    assert conv.pending_calls() == []
+
+    saved = conv.to_dict()
+    assert saved["version"] == Conversation.FORMAT_VERSION
+    assert "function_call" not in saved["messages"][1]
+    assert Conversation.from_dict(saved).messages == conv.messages
 
 
 # ------------------------------ fit_history ------------------------------ #
@@ -161,7 +221,7 @@ def test_fit_history_pins_task_and_keeps_pairs():
     for i, m in enumerate(fitted):
         if m.role == "function":
             prev = fitted[i - 1]
-            assert prev.role == "assistant" and prev.function_call is not None
+            assert prev.role == "assistant" and prev.function_calls
 
 
 def test_fit_history_keeps_pinned_even_over_budget():

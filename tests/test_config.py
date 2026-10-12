@@ -76,7 +76,8 @@ def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
         {"GIGACREW_COMPACT_THRESHOLD": "99"},
         {"GIGACREW_COMPACT_THRESHOLD": "0.8"},
         {"GIGACREW_SUBAGENT_MAX_STEPS": "0"},
-        {"GIGACREW_SUBAGENT_MAX_TOKENS": "500"},
+        {"GIGACREW_SUBAGENT_CONTEXT": "5"},
+        {"GIGACREW_SUBAGENT_CONTEXT": "99"},
         {"GIGACREW_SUBAGENT_TIMEOUT": "5"},
         {"GIGACREW_SUBAGENT_TIMEOUT": "long"},
     ],
@@ -168,21 +169,21 @@ def test_subagent_limits(tmp_path):
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     cfg = load({})
-    assert (cfg.subagent_max_steps, cfg.subagent_max_tokens, cfg.subagent_timeout) == (
+    assert (cfg.subagent_max_steps, cfg.subagent_context_share, cfg.subagent_timeout) == (
         25,
-        300_000,
+        0.8,
         600,
     )
     cfg = load(
         {
             "GIGACREW_SUBAGENT_MAX_STEPS": "10",
-            "GIGACREW_SUBAGENT_MAX_TOKENS": "50000",
+            "GIGACREW_SUBAGENT_CONTEXT": "60",
             "GIGACREW_SUBAGENT_TIMEOUT": "120",
         }
     )
-    assert (cfg.subagent_max_steps, cfg.subagent_max_tokens, cfg.subagent_timeout) == (
+    assert (cfg.subagent_max_steps, cfg.subagent_context_share, cfg.subagent_timeout) == (
         10,
-        50_000,
+        0.6,
         120,
     )
 

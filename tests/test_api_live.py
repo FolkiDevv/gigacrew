@@ -1,9 +1,9 @@
 """Live-тесты реального API модели.
 
-Проверяют все типы обращений к LLM на живом API:
+Проверяют все типы обращений к LLM на живом API (v2):
   1. простой запрос-ответ;
-  2. одиночный вызов функции (tool call);
-  3. многошаговый диалог с возвратом результата инструмента в модель.
+  2. вызов функции (tool call), в том числе несколько вызовов за ответ;
+  3. многошаговый диалог с возвратом результатов инструментов в модель.
 
 Помечены маркером ``live`` и пропускаются, если нет доступного ключа.
 Запуск только live-тестов:  pytest -m live
@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from gigacrew.llm.api import ApiProvider
-from gigacrew.llm.types import Message, ToolSpec
+from gigacrew.llm.types import FunctionCall, Message, ToolSpec
 
 pytestmark = pytest.mark.live
 
@@ -53,6 +53,8 @@ def test_streaming_text(provider):
     # собранный из дельт текст совпадает с финальным сообщением
     assert "".join(deltas) == turn.message.content
     assert turn.message.content.strip()
+    # завершающее событие не повторяет уже присланный текст
+    assert turn.message.content.lower().count("фиолет") == 1
 
 
 def test_streaming_tool_call(provider):
@@ -63,8 +65,8 @@ def test_streaming_tool_call(provider):
     )
     assert turn.finish_reason == "function_call"
     assert turn.wants_tool
-    assert turn.message.function_call.name == "get_weather"
-    assert "city" in turn.message.function_call.arguments
+    assert turn.message.function_calls[0].name == "get_weather"
+    assert "city" in turn.message.function_calls[0].arguments
 
 
 WEATHER_TOOL = ToolSpec(
@@ -91,13 +93,13 @@ def test_single_tool_call(provider):
     )
     assert turn.finish_reason == "function_call"
     assert turn.wants_tool
-    fc = turn.message.function_call
-    assert fc is not None
+    fc = turn.message.function_calls[0]
     assert fc.name == "get_weather"
     assert isinstance(fc.arguments, dict)
     assert "city" in fc.arguments
-    # API возвращает непрозрачный идентификатор состояния функций
-    assert turn.message.functions_state_id
+    # API возвращает id вызова и непрозрачный идентификатор состояния инструментов
+    assert fc.id
+    assert turn.message.state_id
 
 
 def test_multistep_with_tool_result(provider):
@@ -111,16 +113,77 @@ def test_multistep_with_tool_result(provider):
     turn1 = provider.complete(messages, tools=[WEATHER_TOOL])
     assert turn1.wants_tool, "ожидался вызов функции на первом шаге"
 
-    # кладём ход ассистента и результат функции
+    # кладём ход ассистента и результаты всех его вызовов
     messages.append(turn1.message)
-    messages.append(
-        Message(
-            role="function",
-            name="get_weather",
-            content='{"city": "Москва", "temperature_c": 17, "condition": "ясно"}',
+    for call in turn1.message.function_calls:
+        messages.append(
+            Message(
+                role="function",
+                name=call.name,
+                call_id=call.id,
+                content='{"city": "Москва", "temperature_c": 17, "condition": "ясно"}',
+            )
         )
-    )
     turn2 = provider.complete(messages, tools=[WEATHER_TOOL])
     assert turn2.finish_reason == "stop"
     # модель должна использовать переданное значение температуры
     assert "17" in turn2.message.content
+
+
+def test_parallel_calls_round_trip(provider):
+    """Несколько вызовов за ответ: результаты всех возвращаются одним шагом."""
+    messages = [
+        Message(
+            role="user",
+            content=(
+                "Узнай погоду в Москве и в Казани. Вызови get_weather для обоих городов "
+                "сразу, в одном ответе, потом сравни."
+            ),
+        )
+    ]
+    turn1 = provider.stream(messages, tools=[WEATHER_TOOL])
+    calls = turn1.message.function_calls
+    if len(calls) < 2:
+        pytest.skip(f"модель сделала {len(calls)} вызов(а) — параллельность не проверена")
+    assert len({c.id for c in calls}) == len(calls), "у вызовов должны быть разные id"
+    messages.append(turn1.message)
+    for i, call in enumerate(calls):
+        city = call.arguments.get("city", "?")
+        messages.append(
+            Message(
+                role="function",
+                name=call.name,
+                call_id=call.id,
+                content=f'{{"city": "{city}", "temperature_c": {10 + i}}}',
+            )
+        )
+    turn2 = provider.stream(messages, tools=[WEATHER_TOOL])
+    assert turn2.finish_reason == "stop"
+    assert turn2.message.content.strip()
+
+
+def test_tool_choice_none_answers_with_text(provider):
+    """Итог после остановки: инструменты в запросе, но модель отвечает только текстом."""
+    turn = provider.complete(
+        [Message(role="user", content="Какая погода в Москве? Вызови get_weather.")],
+        tools=[WEATHER_TOOL],
+        tool_choice="none",
+    )
+    assert not turn.wants_tool
+    assert turn.message.content.strip()
+
+
+def test_history_without_call_ids_continues(provider):
+    """Чат, сохранённый до перехода на v2: у вызова нет id, состояния нет."""
+    messages = [
+        Message(role="user", content="Какая погода в Москве? Вызови get_weather."),
+        Message(
+            role="assistant",
+            function_calls=[FunctionCall(name="get_weather", arguments={"city": "Москва"})],
+        ),
+        Message(role="function", name="get_weather", content='{"temperature_c": 17}'),
+        Message(role="user", content="Сколько градусов? Ответь числом."),
+    ]
+    turn = provider.complete(messages, tools=[WEATHER_TOOL])
+    assert turn.finish_reason == "stop"
+    assert "17" in turn.message.content

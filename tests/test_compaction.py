@@ -25,7 +25,7 @@ def _turn(conv: Conversation, request: str, results: list[str], answer: str = "�
     conv.add_user(request)
     for i, content in enumerate(results):
         call = FunctionCall(name="read_file", arguments={"path": f"{i}.py"})
-        conv.add_assistant(Message(role="assistant", function_call=call))
+        conv.add_assistant(Message(role="assistant", function_calls=[call]))
         conv.add_function_result("read_file", content)
     if answer:
         conv.add_assistant(Message(role="assistant", content=answer))
@@ -53,7 +53,7 @@ def test_plan_keeps_recent_blocks_and_never_splits_call_and_result():
     last_block = estimate_tokens(conv.messages[-2:])
     plan = plan_compaction(conv, keep_tokens=last_block + 10)
     assert plan.upto == len(conv) - 2  # остался последний блок «вызов + результат»
-    assert conv.messages[plan.upto].function_call is not None
+    assert conv.messages[plan.upto].function_calls
     assert plan.messages[0].content == "ЗАДАЧА"
 
     # Последний блок остаётся, даже если он больше keep_tokens.
@@ -85,13 +85,13 @@ def test_render_message_clips_results_and_shows_calls():
     call = Message(
         role="assistant",
         content="читаю",
-        function_call=FunctionCall(name="read_file", arguments={"path": "a.py"}),
+        function_calls=[FunctionCall(name="read_file", arguments={"path": "a.py"})],
     )
-    assert render_message(call) == '## Ассистент\nчитаю\n→ вызов read_file({"path": "a.py"})'
+    assert render_message(call) == '## Assistant\nчитаю\n→ call read_file({"path": "a.py"})'
     result = render_message(Message(role="function", name="run_shell", content="A" * 10_000))
-    assert result.startswith("## Результат run_shell\nAAA")
-    assert "вырезано" in result and len(result) < 2_200
-    assert render_message(Message(role="user", content="привет")) == "## Пользователь\nпривет"
+    assert result.startswith("## Result of run_shell\nAAA")
+    assert "chars cut" in result and len(result) < 2_200
+    assert render_message(Message(role="user", content="привет")) == "## User\nпривет"
 
 
 def test_clip_middle_keeps_head_and_tail():
@@ -149,7 +149,7 @@ def test_summarize_chains_chunks_and_keeps_only_recent():
     )
     assert len(provider.summary_requests) == MAX_INPUT_CHUNKS
     first, second = (r["messages"][1].content for r in provider.summary_requests[:2])
-    assert "старая сводка" in first and "опущена" in first
+    assert "старая сводка" in first and "omitted" in first
     assert "запрос 2" in first and "запрос 0" not in first  # старые куски отброшены
     assert "сводка 0" in second  # резюме обновляется итеративно
     assert text == f"сводка {MAX_INPUT_CHUNKS - 1}" and len(usages) == MAX_INPUT_CHUNKS
@@ -169,7 +169,7 @@ def test_summarize_tells_model_the_size_limit():
         provider, _messages(1), model="M", temperature=0.2, input_budget=20_000, max_chars=1_400
     )
     user = provider.summary_requests[0]["messages"][1].content
-    assert "не больше 1400 символов (~200 слов)" in user
+    assert "at most 1400 characters (~200 words)" in user
 
 
 def test_summarize_clips_by_line_keeping_current_state():
@@ -252,7 +252,7 @@ def test_summarize_keeps_latest_request_when_old_chunks_dropped():
     summarize(provider, messages, model="M", temperature=0.2, input_budget=2_500, max_chars=600)
     assert len(provider.summary_requests) == MAX_INPUT_CHUNKS
     first = provider.summary_requests[0]["messages"][1].content
-    assert "ТЕКУЩАЯ ЗАДАЧА" in first and "опущена" in first
+    assert "ТЕКУЩАЯ ЗАДАЧА" in first and "omitted" in first
     assert "запрос 0" not in first and "файл 05" not in first and "файл 06" in first
     last = provider.summary_requests[-1]["messages"][1].content
     assert "файл 11" in last  # свежая переписка — на месте

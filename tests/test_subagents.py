@@ -10,12 +10,20 @@ import pytest
 from fakes import FakeTool, RecordingEvents, ScriptedProvider, text_turn, tool_turn
 
 import gigacrew.agent.loop as loop
-from gigacrew.agent.events import Approval
+from gigacrew.agent.events import Approval, TurnStats
 from gigacrew.agent.guard import LoopGuard
 from gigacrew.agent.prompts import SUBAGENT_PROMPTS
-from gigacrew.agent.subagents import SUBAGENT_USER_STOP_NOTE
+from gigacrew.agent.subagents import (
+    NO_REPORT_NOTE,
+    READ_ONLY_BLOCKED_NOTE,
+    SUBAGENT_PLAN_BLOCKED_NOTE,
+    SUBAGENT_USER_STOP_NOTE,
+    SubagentTrail,
+    subagent_report,
+)
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMError
+from gigacrew.llm.model_windows import ModelWindows
 from gigacrew.llm.types import FunctionCall, Usage
 from gigacrew.permissions import PermissionMode
 from gigacrew.tools.base import build_default_registry
@@ -42,7 +50,7 @@ def _assert_well_formed(messages):
     for i, m in enumerate(messages):
         if m.role == "function":
             prev = messages[i - 1]
-            assert prev.role == "assistant" and prev.function_call is not None
+            assert prev.role == "assistant" and prev.function_calls
 
 
 def _kinds(events) -> list[str]:
@@ -87,7 +95,7 @@ def test_explore_runs_in_own_context(tmp_path):
 
     child = provider.requests[1]
     system, *history = child["messages"]
-    assert "суб-агент" in system.content and "explore" in system.content
+    assert "subagent" in system.content and "Agent explore" in system.content
     assert "ask_user" not in system.content
     assert [(m.role, m.content) for m in history] == [("user", "найди функцию foo")]
     names = {spec.name for spec in child["tools"]}
@@ -184,7 +192,7 @@ def test_explore_cannot_change_even_with_yes_all(tmp_path):
     agent.run_turn("x")
     assert events.confirms == []
     child_result = _results(provider.requests[2]["messages"])[-1]
-    assert "только для исследования" in child_result
+    assert child_result == READ_ONLY_BLOCKED_NOTE
     blocked = [r for k, (c, r) in _sub_results(events)]
     assert blocked[0].summary == "заблокировано: агент только читает"
 
@@ -209,8 +217,36 @@ def test_general_edit_confirmed_and_always_switches_parent_mode(tmp_path):
     assert agent.mode is PermissionMode.ACCEPT_EDITS  # «всегда» — у основного агента
     assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "new\n"
     report = _results(agent.conversation.messages)[0]
-    assert "создал b.txt" in report and "Изменённые файлы: b.txt" in report
+    assert "создал b.txt" in report and "Changed files: b.txt" in report
     assert events.results[-1][1].changed
+
+
+def test_delegation_rules_only_for_main_agent():
+    """Как ставить задачи суб-агентам — знает основной агент; суб-агент их не ставит."""
+    from gigacrew.agent.prompts import SUBAGENT_PROMPT, SYSTEM_PROMPT
+
+    assert "# Subagents (task)" in SYSTEM_PROMPT
+    assert "# Subagents (task)" not in SUBAGENT_PROMPT
+
+
+def test_limit_stop_report_tells_not_to_rerun_the_same_task():
+    stats = TurnStats(tool_calls=25, stop_reason="max_steps")
+    result = subagent_report(EXPLORE, "частичный итог", stats, SubagentTrail())
+    assert "the step limit is reached" in result.content
+    assert "Do not rerun the same task" in result.content
+    assert "частичный итог" in result.content
+
+
+def test_report_without_text_is_marked_for_user():
+    """Суб-агент остановлен и не дал итога: модель узнаёт об этом, пользователь — тоже."""
+    stats = TurnStats(tool_calls=25, stop_reason="max_steps")
+    result = subagent_report(EXPLORE, "", stats, SubagentTrail())
+    assert not result.ok
+    assert NO_REPORT_NOTE.format(name="explore") in result.content
+    assert result.summary.endswith("исчерпан лимит шагов · без отчёта")
+
+    result = subagent_report(EXPLORE, "итог", stats, SubagentTrail())
+    assert result.ok and "без отчёта" not in result.summary
 
 
 def test_rejected_operations_listed_in_report(tmp_path):
@@ -225,7 +261,7 @@ def test_rejected_operations_listed_in_report(tmp_path):
     agent = _agent(provider, tmp_path, events=RecordingEvents(False), auto_approve=False)
     agent.run_turn("x")
     report = _results(agent.conversation.messages)[0]
-    assert "Отклонено пользователем: write_file b.txt" in report
+    assert "Rejected by the user: write_file b.txt" in report
 
 
 def test_parent_mode_change_reaches_running_subagent(tmp_path):
@@ -252,8 +288,8 @@ def test_parent_mode_change_reaches_running_subagent(tmp_path):
     agent.run_turn("x")
     assert tool.runs == 1  # второй вызов заблокирован режимом плана
     last = provider.requests[3]["messages"]
-    assert "Не выполнено: включён режим планирования" in _results(last)[-1]
-    assert "РЕЖИМ ПЛАНИРОВАНИЯ" in last[0].content and "exit_plan_mode" not in last[0].content
+    assert _results(last)[-1] == SUBAGENT_PLAN_BLOCKED_NOTE
+    assert "# Plan mode" in last[0].content and "exit_plan_mode" not in last[0].content
 
 
 # ------------------------------ токены, сбои ----------------------------- #
@@ -292,9 +328,9 @@ def test_ctrl_c_in_subagent_stops_turn_and_keeps_trail(tmp_path):
         agent.run_turn("x")
     messages = agent.conversation.messages
     _assert_well_formed(messages)
-    assert agent.conversation.pending_call() is None
+    assert agent.conversation.pending_calls() == []
     note = _results(messages)[-1]
-    assert "прерван пользователем (Ctrl+C)" in note and "Изменённые файлы: b.txt" in note
+    assert "interrupted by the user (Ctrl+C)" in note and "Changed files: b.txt" in note
     kinds = _kinds(events)
     assert "subagent_end" in kinds and kinds[-1] == "tool_end"
 
@@ -304,7 +340,7 @@ def test_llm_error_in_subagent_reported_to_model(tmp_path):
     agent = _agent(provider, tmp_path)
     assert agent.run_turn("x") == "сделаю сам"
     result = _results(agent.conversation.messages)[0]
-    assert "суб-агент explore: ошибка модели: сбой сети" in result
+    assert "Subagent explore: model error: сбой сети" in result
     _assert_well_formed(agent.conversation.messages)
 
 
@@ -316,7 +352,7 @@ def test_other_kind_changes_kept_in_trail_on_ctrl_c(tmp_path):
     agent = _agent(provider, tmp_path, registry=_registry_with_fake(FakeTool()))
     with pytest.raises(KeyboardInterrupt):
         agent.run_turn("x")
-    assert "Изменяющие операции: fake_write x" in _results(agent.conversation.messages)[-1]
+    assert "Changing operations: fake_write x" in _results(agent.conversation.messages)[-1]
 
 
 def test_llm_error_after_changes_keeps_trail(tmp_path):
@@ -332,7 +368,7 @@ def test_llm_error_after_changes_keeps_trail(tmp_path):
     agent = _agent(provider, tmp_path, events=events)
     assert agent.run_turn("x") == "продолжаю"
     result = _results(agent.conversation.messages)[0]
-    assert "ошибка модели: сбой сети" in result and "Изменённые файлы: b.txt" in result
+    assert "model error: сбой сети" in result and "Changed files: b.txt" in result
     task_result = events.results[-1][1]
     assert not task_result.ok and task_result.changed
 
@@ -388,11 +424,54 @@ def test_esc_soft_stop_wraps_up_and_parent_continues(tmp_path):
     holder["agent"] = agent
     assert agent.run_turn("x") == "основной продолжает"
     wrap_request = provider.requests[2]["messages"]
-    assert wrap_request[-1].role == "user" and wrap_request[-1].content == SUBAGENT_USER_STOP_NOTE
+    # просьба об итоге — в системном сообщении: задача суб-агента остаётся закреплённой
+    assert SUBAGENT_USER_STOP_NOTE in wrap_request[0].content
+    assert [m.role for m in wrap_request[1:]] == ["user", "assistant", "function"]
+    assert wrap_request[1].content == "долгая задача"
+    assert provider.requests[2]["tool_choice"] == "none"
     report = _results(agent.conversation.messages)[0]
-    assert "остановлен пользователем досрочно" in report and "успел половину" in report
+    assert "stopped early by the user" in report and "успел половину" in report
     assert ("subagent_activity", ("подвожу итог", True)) in events.events
     assert events.results[-1][1].summary.endswith("остановлен пользователем")
+
+
+class EscWhileStreaming(ScriptedProvider):
+    """Поток ``i``-го запроса: кусок текста, затем Esc пользователя (мягкая остановка)."""
+
+    def __init__(self, turns, *, at: int, holder: dict):
+        super().__init__(turns)
+        self.at = at
+        self.holder = holder
+
+    def stream(self, messages, tools=None, *, on_delta=None, **kwargs):
+        if len(self.requests) == self.at:
+            self.requests.append({"messages": list(messages), "tools": tools, **kwargs})
+            on_delta("Пока нашёл, что foo")
+            assert self.holder["agent"].request_subagent_stop()
+            raise KeyboardInterrupt
+        return super().stream(messages, tools, on_delta=on_delta, **kwargs)
+
+
+def test_esc_while_subagent_streams_text_wraps_up_without_partial(tmp_path):
+    """Esc посреди текста суб-агента: оборванный текст не сохраняется, запрос итога не
+    кончается репликой ассистента и содержит задачу."""
+    holder: dict = {}
+    provider = EscWhileStreaming(
+        [_task("explore", "найди foo"), text_turn("итог: foo в a.py"), text_turn("дальше")],
+        at=1,
+        holder=holder,
+    )
+    cfg = Config(access_key="x", project_root=tmp_path, stream=True, auto_approve=True)
+    agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents())
+    holder["agent"] = agent
+    assert agent.run_turn("x") == "дальше"
+
+    wrap_request = provider.requests[2]["messages"]
+    assert SUBAGENT_USER_STOP_NOTE in wrap_request[0].content
+    assert [(m.role, m.content) for m in wrap_request[1:]] == [("user", "найди foo")]
+    assert provider.requests[2]["tool_choice"] == "none"
+    report = _results(agent.conversation.messages)[0]
+    assert "stopped early by the user" in report and "итог: foo в a.py" in report
 
 
 def test_double_esc_aborts_subagent_parent_continues(tmp_path):
@@ -406,7 +485,7 @@ def test_double_esc_aborts_subagent_parent_continues(tmp_path):
     holder["agent"] = agent
     assert agent.run_turn("x") == "дальше"
     result = _results(agent.conversation.messages)[0]
-    assert "оборван пользователем" in result
+    assert "aborted by the user" in result
     _assert_well_formed(agent.conversation.messages)
 
 
@@ -424,7 +503,7 @@ def test_esc_during_wrap_up_aborts(tmp_path):
     agent = _agent(provider, tmp_path, registry=_registry_with_fake(_stopping_tool(holder)))
     holder["agent"] = agent
     assert agent.run_turn("x") == "дальше"
-    assert "оборван пользователем" in _results(agent.conversation.messages)[0]
+    assert "aborted by the user" in _results(agent.conversation.messages)[0]
 
 
 # ------------------------------ ограничители ---------------------------- #
@@ -442,34 +521,90 @@ def test_subagent_step_limit_wraps_up(tmp_path):
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, subagent_max_steps=2)
     assert agent.run_turn("x") == "ок"
-    assert "РАБОТА ОСТАНОВЛЕНА" in provider.requests[3]["messages"][0].content
+    wrap_up = provider.requests[3]
+    # просьба об итоге — в системном сообщении, вызовы запрещены
+    assert "STOP: the step limit is reached" in wrap_up["messages"][0].content
+    assert wrap_up["tool_choice"] == "none"
     report = _results(agent.conversation.messages)[0]
-    assert "исчерпан лимит шагов" in report and "частичный итог" in report
+    assert "the step limit is reached" in report and "частичный итог" in report
     assert any(level == "warn" and text.startswith("explore: ") for level, text in events.notices)
     assert events.stats[-1].stop_reason is None  # основной агент не остановлен
 
 
-def test_subagent_token_budget(tmp_path):
-    usage = Usage(prompt_tokens=600)
+def _context_case(tmp_path, prompt_tokens: int, *, windows=None, **cfg_kw):
+    """Суб-агент: вызов инструмента с контекстом ``prompt_tokens``, затем ещё вызов."""
     provider = ScriptedProvider(
         [
             _task(),
-            tool_turn("list_dir", {}, usage),
-            tool_turn("find_files", {"pattern": "*"}, usage),
+            tool_turn("list_dir", {}, Usage(prompt_tokens=prompt_tokens)),
+            tool_turn("find_files", {"pattern": "*"}),
             text_turn("итог"),
             text_turn("ок"),
         ]
     )
-    agent = _agent(provider, tmp_path, subagent_max_tokens=1_000)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="M", **cfg_kw)
+    agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents(), windows=windows)
     agent.run_turn("x")
-    assert "исчерпан бюджет токенов" in _results(agent.conversation.messages)[0]
+    return provider, _results(agent.conversation.messages)[0]
+
+
+def test_subagent_stops_at_context_share_of_unmeasured_window(tmp_path):
+    # окно не замерено — 32k по умолчанию: 80% = 25 600, но бюджет запроса меньше — 21 600
+    provider, report = _context_case(tmp_path, 26_000)
+    assert "the context is full" in report
+    assert "STOP: the context is full" in provider.requests[2]["messages"][0].content
+    assert provider.summary_requests == []  # суб-агент не сжимает историю
+
+    _, report = _context_case(tmp_path, 20_000)
+    assert "the context is full" not in report
+
+
+def test_subagent_context_limit_follows_measured_window_and_share(tmp_path):
+    windows = ModelWindows(entries={"M": {"context_window": 200_000}})
+    _, report = _context_case(tmp_path, 26_000, windows=windows)
+    assert "the context is full" not in report  # 13% окна в 200k
+
+    _, report = _context_case(tmp_path, 26_000, windows=windows, subagent_context_share=0.1)
+    assert "the context is full" in report  # предел 20 000
+
+    windows = ModelWindows(entries={"M": {"context_window": 30_000}})
+    _, report = _context_case(tmp_path, 22_000, windows=windows)  # 73% окна
+    assert "the context is full" in report  # но больше бюджета запроса (19 800)
+
+
+def test_subagent_context_counts_tool_results_after_last_reply(tmp_path):
+    """Большой результат инструмента — контекст следующего запроса, хоть ответ был мал."""
+    line = "строка с текстом, который занимает место в контексте модели"
+    (tmp_path / "big.txt").write_text(f"{line}\n" * 900, encoding="utf-8")  # ~18k токенов
+    provider = ScriptedProvider(
+        [
+            _task(),
+            tool_turn("read_file", {"path": "big.txt"}),
+            tool_turn("list_dir", {}),
+            text_turn("итог"),
+            text_turn("ок"),
+        ]
+    )
+    windows = ModelWindows(entries={"M": {"context_window": 20_000}})  # предел 10 800
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="M")
+    agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents(), windows=windows)
+    agent.run_turn("x")
+    assert "the context is full" in _results(agent.conversation.messages)[0]
+
+    # Запрос итога: история больше бюджета и обрезается, но задача суб-агента и его
+    # последние результаты в нём остаются — иначе отчёт не о чем писать.
+    wrap_up = provider.requests[2]["messages"]
+    assert wrap_up[1].role == "user" and wrap_up[1].content == "найди функцию foo"
+    assert "строка с текстом" in wrap_up[-1].content
+    assert "STOP: the context is full" in wrap_up[0].content
+    assert provider.requests[2]["tool_choice"] == "none"
 
 
 def test_subagent_time_limit(tmp_path):
     provider = ScriptedProvider([_task(), text_turn("итог"), text_turn("ок")])
     agent = _agent(provider, tmp_path, subagent_timeout=0)
     agent.run_turn("x")
-    assert "исчерпан лимит времени" in _results(agent.conversation.messages)[0]
+    assert "the time limit is reached" in _results(agent.conversation.messages)[0]
 
 
 def test_subagent_similar_calls_warned_then_stopped(tmp_path):
@@ -480,8 +615,8 @@ def test_subagent_similar_calls_warned_then_stopped(tmp_path):
     agent.run_turn("x")
     child = _results(provider.requests[-2]["messages"])
     assert len(child) == 7  # 6 выполнено, 7-й — заглушка остановки
-    assert "топчешься" in child[4]
-    assert "похожие вызовы" in _results(agent.conversation.messages)[0]
+    assert "going in circles" in child[4]
+    assert "similar calls" in _results(agent.conversation.messages)[0]
 
 
 def test_subagent_budget_pressure_note(tmp_path):
@@ -496,9 +631,9 @@ def test_subagent_budget_pressure_note(tmp_path):
     )
     agent = _agent(provider, tmp_path, subagent_max_steps=4)
     agent.run_turn("x")
-    assert "=== БЮДЖЕТ ===" not in provider.requests[1]["messages"][0].content
-    assert "=== БЮДЖЕТ ===" in provider.requests[3]["messages"][0].content  # шаг 3 из 4
-    assert "=== БЮДЖЕТ ===" not in provider.requests[-1]["messages"][0].content  # основной
+    assert "# Budget" not in provider.requests[1]["messages"][0].content
+    assert "# Budget" in provider.requests[3]["messages"][0].content  # шаг 3 из 4
+    assert "# Budget" not in provider.requests[-1]["messages"][0].content  # основной
 
 
 def test_subagent_launches_per_turn_limited(tmp_path, monkeypatch):
@@ -520,12 +655,20 @@ def test_guard_new_limits_off_by_default():
         assert guard.before_tool(call).warning is None
 
 
+def test_guard_context_limit_and_pressure():
+    guard = LoopGuard(max_steps=100, max_failures=3, max_context=1_000)
+    assert guard.before_step(600) is None and guard.pressure(600) is None
+    assert "context ~700 of 1000 tokens" in guard.pressure(700)
+    stop = guard.before_step(1_000)
+    assert stop.kind == "context_limit" and "Контекст заполнен" in stop.message
+
+
 def test_guard_time_limit_and_pressure_with_fake_clock():
     now = [0.0]
     guard = LoopGuard(max_steps=100, max_failures=3, time_limit=10, clock=lambda: now[0])
     assert guard.before_step() is None and guard.pressure() is None
     now[0] = 7.5
-    assert "времени 7 из 10 с" in guard.pressure()
+    assert "time 7 of 10 s" in guard.pressure()
     now[0] = 10
     assert guard.before_step().kind == "time_limit"
 
@@ -533,7 +676,7 @@ def test_guard_time_limit_and_pressure_with_fake_clock():
 def test_guard_similar_reset_by_own_changes():
     from gigacrew.agent.guard import ToolOutcome
 
-    guard = LoopGuard(max_steps=100, max_failures=3, max_similar=2, max_tokens=10**6)
+    guard = LoopGuard(max_steps=100, max_failures=3, max_similar=2, max_context=10**6)
     for i in range(5):  # правки одного файла подряд — не топтание
         call = FunctionCall(name="edit_file", arguments={"path": "a", "old_string": str(i)})
         check = guard.before_tool(call)

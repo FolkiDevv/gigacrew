@@ -108,7 +108,7 @@ def test_file_tree_keeps_root_files_when_a_directory_is_big(tmp_path):
     lines = tree.splitlines()
     for name in ("big/", "README.md", "pyproject.toml", "zzz/", "  main.py"):
         assert name in lines
-    assert "  … ещё 270" in lines  # big/ урезан до TREE_DIR_CAP
+    assert "  … 270 more" in lines  # big/ урезан до TREE_DIR_CAP
     assert tree.endswith(TREE_TRUNCATED)
 
 
@@ -201,8 +201,8 @@ def test_oversized_instructions_point_to_file(tmp_path):
     agents, own, local = load_instructions(tmp_path)  # 20K на файл, 30K на все
     assert (len(local.content), len(own.content), agents.content) == (20_000, 10_000, "")
     prompt = build_system_prompt(Workspace(tmp_path))
-    assert "(AGENTS.md): не поместились в контекст" in prompt
-    assert "(GIGACREW.md) (обрезано — полностью: read_file)" in prompt
+    assert "(AGENTS.md): too large for the context" in prompt
+    assert "(GIGACREW.md) (truncated — read the whole file with read_file)" in prompt
 
 
 # ------------------------- инструкции подкаталогов ------------------------- #
@@ -244,8 +244,10 @@ def test_nested_instructions_prompt_limits(tmp_path):
         InstructionFile("b/AGENTS.md", "b" * 30_000),
     ]
     prompt = nested_instructions_prompt(docs)
-    assert "Инструкции каталога a (a/AGENTS.md):\nправило a" in prompt
-    assert "bbbb" not in prompt and "Не поместились" in prompt and "b/AGENTS.md" in prompt
+    assert "Instructions of directory a (a/AGENTS.md):\nправило a" in prompt
+    assert (
+        "bbbb" not in prompt and "Too large for the context" in prompt and "b/AGENTS.md" in prompt
+    )
 
 
 def test_system_prompt_contains_project_context(tmp_path):
@@ -254,13 +256,13 @@ def test_system_prompt_contains_project_context(tmp_path):
     prompt = build_system_prompt(Workspace(tmp_path))
     assert str(tmp_path.resolve()) in prompt
     assert "важная заметка" in prompt
-    assert "Структура проекта" in prompt and "main.py" in prompt
+    assert "Project structure" in prompt and "main.py" in prompt
 
 
 def test_system_prompt_points_large_projects_to_index_tools(tmp_path):
     _make(tmp_path, "small.py")
     assert "find_symbol" in build_system_prompt(Workspace(tmp_path))  # в правилах работы
-    assert "дерево неполное" not in build_system_prompt(Workspace(tmp_path))
+    assert "the tree is incomplete" not in build_system_prompt(Workspace(tmp_path))
     for i in range(250):
         _make(tmp_path, f"pkg/m{i:03}.py")
-    assert "дерево неполное" in build_system_prompt(Workspace(tmp_path))
+    assert "the tree is incomplete" in build_system_prompt(Workspace(tmp_path))

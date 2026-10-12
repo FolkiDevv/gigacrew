@@ -5,9 +5,24 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fakes import FakeTool, RecordingEvents, ScriptedProvider, text_turn, tool_turn
+from fakes import (
+    FakeTool,
+    RecordingEvents,
+    ScriptedProvider,
+    text_turn,
+    tool_turn,
+    tools_turn,
+)
 
-from gigacrew.agent.loop import Agent
+from gigacrew.agent.conversation import INTERRUPTED_NOTE
+from gigacrew.agent.loop import (
+    LOOP_STOP_NOTE,
+    PLAN_BLOCKED_NOTE,
+    REJECTED_AGAIN_NOTE,
+    REJECTED_NOTE,
+    SKIPPED_NOTE,
+    Agent,
+)
 from gigacrew.config import Config
 from gigacrew.errors import ToolError
 from gigacrew.llm.types import Usage
@@ -47,7 +62,8 @@ def test_loop_stops_after_repeated_failures(tmp_path):
     assert "Прервано" in final
     # должно остановиться на пороге, а не крутить 50 шагов: 4 шага + запрос итога
     assert provider.calls == 5
-    assert "ХОД ОСТАНОВЛЕН" in provider.requests[-1]["messages"][0].content
+    assert "# Turn stopped" in provider.requests[-1]["messages"][0].content
+    assert provider.requests[-1]["tool_choice"] == "none"  # итог — только текстом
     assert len(_function_results(agent)) == 4  # вызов из запроса итога не выполнялся
     assert events.stats[-1].stop_reason == "tool_failures"
     assert events.notices and events.notices[-1][0] == "error"
@@ -70,10 +86,10 @@ def test_loop_stops_on_repeated_identical_calls(tmp_path):
     assert [level for level, _ in events.notices] == ["warn", "error"]
     results = _function_results(agent)
     assert len(results) == 4
-    assert ["ВНИМАНИЕ" in r for r in results] == [False, False, True, False]
+    assert ["WARNING" in r for r in results] == [False, False, True, False]
     assert "hello" in results[2]  # предупреждение дописано к результату
-    assert "зацикливания" in results[3]
-    assert agent.conversation.pending_call() is None
+    assert results[3] == LOOP_STOP_NOTE
+    assert agent.conversation.pending_calls() == []
     _assert_well_formed(agent.conversation.messages)
 
 
@@ -96,7 +112,7 @@ def test_change_between_repeats_is_not_a_loop(tmp_path):
     agent = _agent(provider, tmp_path, events=events)
     assert agent.run_turn("x") == "ок"
     assert events.stats[-1].stop_reason is None
-    assert sum("ВНИМАНИЕ" in r for r in _function_results(agent)) == 1  # только 3-е чтение
+    assert sum("WARNING" in r for r in _function_results(agent)) == 1  # только 3-е чтение
 
 
 def test_repeated_rejected_call_is_not_asked_again(tmp_path):
@@ -109,7 +125,7 @@ def test_repeated_rejected_call_is_not_asked_again(tmp_path):
     )
     assert agent.run_turn("x") == "ок"
     assert len(events.confirms) == 1 and tool.runs == 0
-    assert "уже ОТКЛОНИЛ" in _function_results(agent)[-1]
+    assert _function_results(agent)[-1] == REJECTED_AGAIN_NOTE
     # в следующем ходе пользователя спрашивают снова
     agent.run_turn("всё же сделай")
     assert len(events.confirms) == 2
@@ -204,7 +220,7 @@ def test_rejection_does_not_run_and_tells_model(tmp_path):
     call, preview, dangerous = events.confirms[0]
     assert call.name == "fake_write" and preview.kind == "diff" and dangerous is False
     function_msgs = [m for m in agent.conversation.messages if m.role == "function"]
-    assert "ОТКЛОНИЛ" in function_msgs[-1].content
+    assert function_msgs[-1].content == REJECTED_NOTE
 
 
 def test_auto_approve_skips_confirmation(tmp_path):
@@ -258,10 +274,18 @@ def test_turn_stats_split_billed_and_context(tmp_path):
 
 
 def _assert_well_formed(messages):
-    for i, m in enumerate(messages):
-        if m.role == "function":
-            prev = messages[i - 1]
-            assert prev.role == "assistant" and prev.function_call is not None
+    """На каждый вызов — ровно один результат (то же имя и id), сразу после вызовов."""
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        assert m.role != "function", f"результат без вызова: {i}"
+        i += 1
+        calls = m.function_calls if m.role == "assistant" else []
+        results = messages[i : i + len(calls)]
+        assert [(r.role, r.name, r.call_id) for r in results] == [
+            ("function", c.name, c.id) for c in calls
+        ]
+        i += len(calls)
 
 
 def test_ctrl_c_during_tool_repairs_history(tmp_path):
@@ -273,10 +297,95 @@ def test_ctrl_c_during_tool_repairs_history(tmp_path):
     agent = _agent(provider, tmp_path, registry=_registry_with(tool))
     with pytest.raises(KeyboardInterrupt):
         agent.run_turn("x")
-    assert agent.conversation.pending_call() is None
+    assert agent.conversation.pending_calls() == []
     # следующий ход отправляет корректную историю
     assert agent.run_turn("продолжай") == "снова тут"
     _assert_well_formed(provider.requests[-1]["messages"])
+
+
+# ------------------------- несколько вызовов за ответ ------------------------- #
+def _with_fake(tool) -> ToolRegistry:
+    reg = build_default_registry()
+    reg.register(tool)
+    return reg
+
+
+def test_parallel_calls_run_in_order_and_each_gets_result(tmp_path):
+    (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("BBB", encoding="utf-8")
+    batch = tools_turn([("read_file", {"path": "a.txt"}), ("read_file", {"path": "b.txt"})])
+    provider = ScriptedProvider([batch, text_turn("готово")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+
+    assert agent.run_turn("прочитай оба") == "готово"
+    assert provider.calls == 2  # оба вызова — за один шаг
+    results = [m for m in agent.conversation.messages if m.role == "function"]
+    assert [r.call_id for r in results] == ["c1", "c2"]
+    assert "AAA" in results[0].content and "BBB" in results[1].content
+    shown = [c.summary for kind, c in events.events if kind == "tool_call"]
+    assert len(shown) == 2 and "a.txt" in shown[0] and "b.txt" in shown[1]
+    assert events.stats[-1].tool_calls == 2
+    _assert_well_formed(provider.requests[-1]["messages"][1:])
+
+
+def test_rejected_call_in_batch_does_not_block_the_rest(tmp_path):
+    (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
+    tool = FakeTool()
+    batch = tools_turn([("fake_write", {}), ("read_file", {"path": "a.txt"})])
+    provider = ScriptedProvider([batch, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(provider, tmp_path, events=events, registry=_with_fake(tool), auto_approve=False)
+
+    agent.run_turn("x")
+    assert tool.runs == 0
+    rejected, read = [m for m in agent.conversation.messages if m.role == "function"]
+    assert rejected.content == REJECTED_NOTE and rejected.call_id == "c1"
+    assert "AAA" in read.content and read.call_id == "c2"
+    _assert_well_formed(agent.conversation.messages)
+
+
+def test_guard_stop_mid_batch_closes_remaining_calls(tmp_path):
+    (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
+    batch = tools_turn(
+        [
+            ("read_file", {"path": "nope1.txt"}),
+            ("read_file", {"path": "nope2.txt"}),
+            ("read_file", {"path": "a.txt"}),
+        ]
+    )
+    provider = ScriptedProvider([batch, text_turn("итог")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, max_tool_failures=2)
+
+    assert agent.run_turn("x") == "итог"
+    assert events.stats[-1].stop_reason == "tool_failures"
+    results = [m for m in agent.conversation.messages if m.role == "function"]
+    assert [r.call_id for r in results] == ["c1", "c2", "c3"]
+    assert results[2].content == SKIPPED_NOTE  # третий вызов не выполнялся
+    _assert_well_formed(agent.conversation.messages)
+    _assert_well_formed(provider.requests[-1]["messages"][1:])
+
+
+def test_ctrl_c_mid_batch_closes_all_remaining_calls(tmp_path):
+    def interrupted():
+        raise KeyboardInterrupt
+
+    (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
+    tool = FakeTool(run=interrupted)
+    batch = tools_turn([("fake_write", {}), ("read_file", {"path": "a.txt"})])
+    provider = ScriptedProvider([batch, text_turn("снова тут")])
+    agent = _agent(provider, tmp_path, registry=_with_fake(tool))
+
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    results = [m for m in agent.conversation.messages if m.role == "function"]
+    assert [(r.call_id, r.content) for r in results] == [
+        ("c1", INTERRUPTED_NOTE),
+        ("c2", INTERRUPTED_NOTE),
+    ]
+    assert agent.run_turn("продолжай") == "снова тут"
+    _assert_well_formed(provider.requests[-1]["messages"][1:])
 
 
 def test_set_model_is_passed_to_provider(tmp_path):
@@ -550,8 +659,7 @@ def test_plan_mode_blocks_edits_without_asking(tmp_path):
     agent.run_turn("поправь")
     assert tool.runs == 0 and events.confirms == []
     assert events.results[-1][1].summary == "заблокировано: режим планирования"
-    assert "режим планирования" in _function_results(agent)[-1]
-    assert "exit_plan_mode" in _function_results(agent)[-1]
+    assert _function_results(agent)[-1] == PLAN_BLOCKED_NOTE
 
 
 def test_plan_mode_blocks_even_with_auto_approve(tmp_path):
@@ -628,8 +736,8 @@ def test_plan_rules_are_sent_only_in_plan_mode(tmp_path):
     agent.set_mode(PermissionMode.MANUAL)
     agent.run_turn("делай")
     planning, manual = _system_prompts(provider)
-    assert "РЕЖИМ ПЛАНИРОВАНИЯ" in planning
-    assert "РЕЖИМ ПЛАНИРОВАНИЯ" not in manual
+    assert "# Plan mode" in planning
+    assert "# Plan mode" not in manual
 
 
 def test_mode_survives_reset_and_cycles(tmp_path):
@@ -658,7 +766,7 @@ def test_approved_plan_switches_mode_within_the_turn(tmp_path):
     (question,) = events.questions[0]
     assert question.body == "# План\n1. создать a.txt"
     # правила плана — только до одобрения
-    assert ["РЕЖИМ ПЛАНИРОВАНИЯ" in p for p in _system_prompts(provider)] == [True, False, False]
+    assert ["# Plan mode" in p for p in _system_prompts(provider)] == [True, False, False]
 
 
 # ------------------------------ сжатие контекста ------------------------------ #
@@ -679,7 +787,8 @@ def test_auto_compaction_summarizes_old_steps_and_keeps_task(tmp_path):
         tmp_path,
         events=events,
         registry=_registry_with(_big_tool()),
-        context_budget_tokens=4_000,
+        # бюджет зависит от размера системного промпта: при его росте сжатий станет больше
+        context_budget_tokens=5_000,
     )
     assert agent.run_turn("ЗАДАЧА") == "готово"
 
@@ -767,7 +876,7 @@ def test_interrupted_compaction_leaves_conversation_intact(tmp_path):
     )
     with pytest.raises(KeyboardInterrupt):
         agent.run_turn("ЗАДАЧА")
-    assert agent.conversation.summary is None and agent.conversation.pending_call() is None
+    assert agent.conversation.summary is None and agent.conversation.pending_calls() == []
     assert events.compactions == [None]
 
 
@@ -873,7 +982,7 @@ def test_stop_by_guard_asks_model_for_summary(tmp_path):
     assert agent.run_turn("прочитай") == summary
     assert events.stats[-1].stop_reason == "tool_failures"
     last = agent.conversation.messages[-1]
-    assert last.role == "assistant" and last.content == summary and last.function_call is None
+    assert last.role == "assistant" and last.content == summary and not last.function_calls
     assert ("error", events.notices[-1][1]) == events.notices[-1]  # причина остановки видна
     _assert_well_formed(agent.conversation.messages)
 

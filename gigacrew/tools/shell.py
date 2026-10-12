@@ -17,17 +17,20 @@ _SHELL_FAILURES = (126, 127)
 
 
 class RunShellParams(BaseModel):
-    command: str = Field(description="Команда для выполнения через /bin/sh")
-    timeout: int = Field(default=120, description="Таймаут в секундах (1–600)")
+    command: str = Field(description="Command to run with /bin/sh")
+    timeout: int = Field(
+        default=120, description=f"Timeout in seconds ({MIN_TIMEOUT}–{MAX_TIMEOUT})"
+    )
 
 
 class RunShellTool(Tool):
     name = "run_shell"
     description = (
-        "Выполняет shell-команду в корне проекта и возвращает stdout/stderr и код "
-        "возврата. Используйте для сборки, запуска тестов, утилит. Ввод с клавиатуры "
-        "недоступен (stdin пуст) — используйте неинтерактивные флаги. "
-        "Сетевые команды (curl/wget) запрещены политикой безопасности."
+        "Runs a shell command in the project root and returns stdout/stderr and the exit "
+        "code. Use it to build, run tests and utilities — not to read or search files "
+        "(read_file, search_content and the navigation tools are faster and safer). There "
+        "is no keyboard input (stdin is empty) — use non-interactive flags. Network "
+        "commands (curl/wget) are forbidden by the security policy."
     )
     Params = RunShellParams
     kind = ToolKind.COMMAND

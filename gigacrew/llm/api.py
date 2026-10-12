@@ -1,33 +1,42 @@
-"""HTTP-провайдер модели.
+"""HTTP-провайдер модели (API v2).
 
 Реализует авторизацию OAuth (Basic access-key -> Bearer access_token) с
 автоматическим обновлением токена по истечении срока (или mTLS), и вызов
 chat/completions с поддержкой function calling. Адреса API и выдачи токена
 берутся только из конфигурации — значений по умолчанию нет.
 
-Формат function calling:
-  * запрос содержит массив ``functions`` (а не ``tools``) и
-    ``function_call: "auto"``;
-  * ответ при вызове инструмента: ``message.function_call`` с полями
-    ``name`` и ``arguments`` (arguments — уже распарсенный объект, НЕ строка),
-    ``finish_reason == "function_call"`` и непрозрачный ``functions_state_id``;
-  * результат инструмента возвращается сообщением ``role: "function"`` с
-    полями ``name`` и ``content``.
+Адреса: ``GIGACREW_API_URL`` — база API вида ``…/v1``. Чат идёт на ``…/v2/chat/completions``
+(хвост ``/vN`` заменяется на ``/v2``), список моделей — на ``…/v1/models``.
+
+Формат v2 (function calling — несколько вызовов за ответ):
+  * сообщение — ``role`` и ``content``: список частей ``{"text": …}``,
+    ``{"function_call": {"id", "name", "arguments"}}``, ``{"function_result": …}``;
+  * инструменты — ``tools: [{"functions": {"specifications": [...]}}]``, параметры
+    генерации — в ``model_options`` (там же ``parallel_tool_calls``);
+  * ответ — ``messages``: ``role: "reasoning"`` (рассуждения, не сохраняются) и
+    ``role: "assistant"`` с текстом, вызовами и ``tool_state_id``; ``finish_reason`` и
+    ``usage`` (``input_tokens``/``output_tokens``) — на верхнем уровне;
+  * результаты вызовов возвращаются одним сообщением ``role: "tool"`` с тем же
+    ``tools_state_id``: по части ``function_result`` (``id`` вызова, ``name``,
+    ``result`` — JSON-объект) на каждый вызов, иначе API отвечает 422;
+  * поток — SSE-события ``response.message.delta`` (куски текста) и
+    ``response.message.done`` (вызовы, состояние, finish_reason, usage).
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 import httpx
 
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMError, LLMProvider, PromptTooLong
-from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec, Usage
+from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolChoice, ToolSpec, Usage
 
 
 class ApiError(LLMError):
@@ -78,6 +87,129 @@ _OVERSIZE_EXC = (
     httpx.ReadError,
     httpx.WriteError,
 )
+
+
+_VERSION_SUFFIX = re.compile(r"/v\d+$")
+
+
+def chat_url(base_url: str) -> str:
+    """Адрес чата v2: хвост ``/vN`` базы заменяется на ``/v2`` (без хвоста — база как есть)."""
+    return _VERSION_SUFFIX.sub("/v2", base_url.rstrip("/")) + "/chat/completions"
+
+
+def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str | None, str]]:
+    """События SSE: (имя из ``event:`` или None, склеенные строки ``data:``)."""
+    event: str | None = None
+    data: list[str] = []
+    for line in lines:
+        if not line:
+            if data:
+                yield event, "\n".join(data)
+            event, data = None, []
+            continue
+        if line.startswith(":"):  # комментарий
+            continue
+        name, sep, value = line.partition(":")
+        if not sep:
+            continue
+        value = value.removeprefix(" ")
+        if name == "event":
+            if data:  # событие без пустой строки-разделителя
+                yield event, "\n".join(data)
+                data = []
+            event = value
+        elif name == "data":
+            data.append(value)
+    if data:
+        yield event, "\n".join(data)
+
+
+def _build_function_call(raw: Any) -> FunctionCall | None:
+    if not isinstance(raw, Mapping) or not raw.get("name"):
+        return None
+    args = raw.get("arguments", {})
+    # Обычно arguments — уже объект; подстраховка на случай строки.
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except json.JSONDecodeError:
+            args = {}
+    call_id = raw.get("id")
+    return FunctionCall(
+        name=raw["name"],
+        arguments=args if isinstance(args, dict) else {},
+        id=str(call_id) if call_id else None,
+    )
+
+
+class _TurnBuilder:
+    """Собирает ход ассистента из ответа v2 — целого или по кускам потока.
+
+    Рассуждения (``role: "reasoning"``) пропускаются. Вызов с уже встречавшимся
+    ``id`` заменяет прежний (поток может прислать его повторно).
+    """
+
+    def __init__(self) -> None:
+        self._text: list[str] = []
+        self._calls: dict[str, FunctionCall] = {}
+        self._state_id: str | None = None
+        self._finish_reason: str | None = None
+        self._usage: Any = None
+
+    def add(self, data: Mapping[str, Any]) -> str:
+        """Учесть ответ или кусок потока; возвращает пришедший в нём текст."""
+        pieces: list[str] = []
+        for msg in data.get("messages") or []:
+            if not isinstance(msg, Mapping) or msg.get("role") != "assistant":
+                continue
+            state_id = msg.get("tools_state_id") or msg.get("tool_state_id")
+            if state_id:
+                self._state_id = str(state_id)
+            content = msg.get("content")
+            if isinstance(content, str):
+                content = [{"text": content}]
+            for part in content or []:
+                if not isinstance(part, Mapping):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    pieces.append(text)
+                call = _build_function_call(part.get("function_call"))
+                if call is not None:
+                    self._calls[call.id or f"#{len(self._calls)}"] = call
+        if data.get("finish_reason"):
+            self._finish_reason = str(data["finish_reason"])
+        if data.get("usage"):
+            self._usage = data["usage"]
+        text = "".join(pieces)
+        self._text.append(text)
+        return text
+
+    def turn(self) -> AssistantTurn:
+        calls = list(self._calls.values())
+        message = Message(
+            role="assistant",
+            content="".join(self._text),
+            function_calls=calls,
+            # Состояние нужно только результатам вызовов.
+            state_id=self._state_id if calls else None,
+        )
+        finish = self._finish_reason or ("function_call" if calls else "stop")
+        return AssistantTurn(
+            message=message, finish_reason=finish, usage=Usage.from_raw(self._usage)
+        )
+
+
+def _stream_error(event: str | None, data: Mapping[str, Any]) -> str | None:
+    """Текст ошибки, если событие потока — ошибка API (иначе None)."""
+    if event and "error" in event.lower():
+        return json.dumps(data, ensure_ascii=False)[:_ERROR_BODY_CHARS]
+    if "messages" in data:
+        return None
+    status = data.get("status")
+    if data.get("error") or (isinstance(status, int) and status >= 400):
+        return json.dumps(data, ensure_ascii=False)[:_ERROR_BODY_CHARS]
+    return None
 
 
 class ApiProvider(LLMProvider):
@@ -229,8 +361,8 @@ class ApiProvider(LLMProvider):
     # Сериализация / разбор
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _as_json_content(content: str) -> str:
-        """API требует, чтобы content сообщения role=function был JSON-объектом.
+    def _result_object(content: str) -> dict[str, Any]:
+        """API требует, чтобы ``result`` части ``function_result`` был JSON-объектом.
 
         Объект передаётся как есть, всё остальное — текст, но и голые JSON-значения
         (``42``, ``true``, ``[]`` — например, листинг из одного файла ``1``) —
@@ -238,27 +370,55 @@ class ApiProvider(LLMProvider):
         в истории и ломало бы каждый следующий запрос этого чата."""
         text = content or ""
         try:
-            if isinstance(json.loads(text), dict):
-                return text
+            value = json.loads(text)
         except ValueError:
-            pass
-        return json.dumps({"result": text}, ensure_ascii=False)
+            value = None
+        return value if isinstance(value, dict) else {"result": text}
+
+    @staticmethod
+    def _assistant_payload(msg: Message) -> dict[str, Any]:
+        parts: list[dict[str, Any]] = []
+        if msg.content:
+            parts.append({"text": msg.content})
+        for call in msg.function_calls:
+            fc: dict[str, Any] = {"name": call.name, "arguments": call.arguments}
+            if call.id:
+                fc["id"] = call.id
+            parts.append({"function_call": fc})
+        out: dict[str, Any] = {"role": "assistant", "content": parts or [{"text": ""}]}
+        if msg.function_calls and msg.state_id:
+            out["tools_state_id"] = msg.state_id
+        return out
 
     @classmethod
-    def _message_to_payload(cls, msg: Message) -> dict[str, Any]:
-        content = msg.content or ""
-        if msg.role == "function":
-            content = cls._as_json_content(content)
-        out: dict[str, Any] = {"role": msg.role, "content": content}
-        if msg.name is not None:
-            out["name"] = msg.name
-        if msg.function_call is not None:
-            out["function_call"] = {
-                "name": msg.function_call.name,
-                "arguments": msg.function_call.arguments,
-            }
-        if msg.functions_state_id is not None:
-            out["functions_state_id"] = msg.functions_state_id
+    def _messages_payload(cls, messages: Sequence[Message]) -> list[dict[str, Any]]:
+        """История для запроса. Результаты вызовов одного assistant-сообщения (идут
+        подряд) склеиваются в одно сообщение ``role: "tool"`` с его ``tools_state_id``."""
+        out: list[dict[str, Any]] = []
+        state_id: str | None = None  # состояние assistant-сообщения перед результатами
+        for msg in messages:
+            if msg.role == "function":
+                result: dict[str, Any] = {
+                    "name": msg.name or "",
+                    "result": cls._result_object(msg.content),
+                }
+                if msg.call_id:
+                    result = {"id": msg.call_id, **result}
+                part = {"function_result": result}
+                if out and out[-1]["role"] == "tool":
+                    out[-1]["content"].append(part)
+                else:
+                    tool: dict[str, Any] = {"role": "tool", "content": [part]}
+                    if state_id:
+                        tool["tools_state_id"] = state_id
+                    out.append(tool)
+                continue
+            if msg.role == "assistant":
+                out.append(cls._assistant_payload(msg))
+                state_id = msg.state_id if msg.function_calls else None
+                continue
+            state_id = None
+            out.append({"role": msg.role, "content": [{"text": msg.content or ""}]})
         return out
 
     @staticmethod
@@ -270,38 +430,12 @@ class ApiProvider(LLMProvider):
         }
 
     @staticmethod
-    def _build_function_call(fc_raw: dict[str, Any] | None) -> FunctionCall | None:
-        if not fc_raw:
-            return None
-        args = fc_raw.get("arguments", {})
-        # Обычно arguments — уже объект; подстраховка на случай строки.
-        if isinstance(args, str):
-            try:
-                args = json.loads(args) if args.strip() else {}
-            except json.JSONDecodeError:
-                args = {}
-        return FunctionCall(name=fc_raw["name"], arguments=args or {})
-
-    def _parse_response(self, data: dict[str, Any]) -> AssistantTurn:
-        try:
-            choice = data["choices"][0]
-            raw = choice["message"]
-        except (KeyError, IndexError, TypeError) as e:
-            raise ApiError(f"Неожиданный формат ответа API: {data}") from e
-
-        function_call = self._build_function_call(raw.get("function_call"))
-
-        message = Message(
-            role="assistant",
-            content=raw.get("content") or "",
-            function_call=function_call,
-            functions_state_id=raw.get("functions_state_id"),
-        )
-        return AssistantTurn(
-            message=message,
-            finish_reason=choice.get("finish_reason", "stop"),
-            usage=Usage.from_raw(data.get("usage")),
-        )
+    def _parse_response(data: dict[str, Any]) -> AssistantTurn:
+        if not isinstance(data.get("messages"), list):
+            raise ApiError(f"Неожиданный формат ответа API: {str(data)[:_ERROR_BODY_CHARS]}")
+        builder = _TurnBuilder()
+        builder.add(data)
+        return builder.turn()
 
     # ------------------------------------------------------------------ #
     # Основной вызов
@@ -314,17 +448,23 @@ class ApiProvider(LLMProvider):
         model: str | None,
         temperature: float,
         stream: bool = False,
+        tool_choice: ToolChoice = "auto",
     ) -> dict[str, Any]:
+        options: dict[str, Any] = {"temperature": temperature}
         payload: dict[str, Any] = {
             "model": model or self._cfg.model,
-            "messages": [self._message_to_payload(m) for m in messages],
-            "temperature": temperature,
+            "messages": self._messages_payload(messages),
+            "model_options": options,
         }
         if stream:
             payload["stream"] = True
         if tools:
-            payload["functions"] = [self._tool_to_payload(t) for t in tools]
-            payload["function_call"] = "auto"
+            specs = [self._tool_to_payload(t) for t in tools]
+            payload["tools"] = [{"functions": {"specifications": specs}}]
+            if tool_choice == "none":
+                payload["tool_config"] = {"mode": "none"}
+            else:
+                options["parallel_tool_calls"] = True
         return payload
 
     def complete(
@@ -334,8 +474,11 @@ class ApiProvider(LLMProvider):
         *,
         model: str | None = None,
         temperature: float = 0.2,
+        tool_choice: ToolChoice = "auto",
     ) -> AssistantTurn:
-        payload = self._payload(messages, tools, model=model, temperature=temperature)
+        payload = self._payload(
+            messages, tools, model=model, temperature=temperature, tool_choice=tool_choice
+        )
         resp = self._post_chat(payload)
         try:
             resp.raise_for_status()
@@ -354,7 +497,7 @@ class ApiProvider(LLMProvider):
         ``send`` — как отправлять сам запрос (по умолчанию ``_request_with_retry``);
         получение токена идёт мимо него, его ошибки — обычные ``ApiError``.
         """
-        url = f"{self._cfg.base_url}/chat/completions"
+        url = chat_url(self._cfg.base_url)
         headers = {"Content-Type": "application/json", **self._auth_headers()}
         send = send or self._request_with_retry
 
@@ -381,9 +524,8 @@ class ApiProvider(LLMProvider):
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
         payload = {
             "model": model or self._cfg.model,
-            "messages": [{"role": "user", "content": text}],
-            "max_tokens": 1,
-            "temperature": 0,
+            "messages": [{"role": "user", "content": [{"text": text}]}],
+            "model_options": {"max_tokens": 1, "temperature": 0},
         }
         resp = self._post_chat(payload, self._send_probe)
         status = resp.status_code
@@ -408,14 +550,15 @@ class ApiProvider(LLMProvider):
         *,
         model: str | None = None,
         temperature: float = 0.2,
+        tool_choice: ToolChoice = "auto",
         on_delta: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Потоковая генерация. Вызывает on_delta(text) на каждый кусок текста и
         возвращает финальный AssistantTurn (идентичный complete()).
 
-        Формат SSE API: строки ``data: {json}`` с ``choices[0].delta`` и
-        терминатор ``data: [DONE]``. Текст приходит в ``delta.content``; вызов
-        функции — целиком в одном чанке (``delta.function_call`` + finish_reason).
+        Формат SSE: события ``response.message.delta`` — куски текста в тех же
+        ``messages``, что и у обычного ответа; ``response.message.done`` — вызовы
+        функций, ``tool_state_id``, ``finish_reason`` и ``usage``.
 
         Повтор при сетевом сбое выполняется, только пока пользователю не отдан
         ни один кусок текста — иначе он увидел бы ответ дважды.
@@ -427,8 +570,15 @@ class ApiProvider(LLMProvider):
             state["emitted"] = True
             sink(piece)
 
-        payload = self._payload(messages, tools, model=model, temperature=temperature, stream=True)
-        url = f"{self._cfg.base_url}/chat/completions"
+        payload = self._payload(
+            messages,
+            tools,
+            model=model,
+            temperature=temperature,
+            stream=True,
+            tool_choice=tool_choice,
+        )
+        url = chat_url(self._cfg.base_url)
         delay = 1.0
         last_exc: Exception | None = None
         refreshed = False
@@ -471,19 +621,12 @@ class ApiProvider(LLMProvider):
             f"{self._max_retries} попыток): {last_exc}"
         ) from last_exc
 
-    def _consume_sse(self, resp: httpx.Response, emit: Callable[[str], None]) -> AssistantTurn:
+    @staticmethod
+    def _consume_sse(resp: httpx.Response, emit: Callable[[str], None]) -> AssistantTurn:
         """Разбирает SSE-поток, отдавая текстовые дельты в ``emit``."""
-        content_parts: list[str] = []
-        function_call = None
-        state_id: str | None = None
-        finish_reason = "stop"
-        usage: dict[str, Any] = {}
-
-        for raw_line in resp.iter_lines():
-            if not raw_line or not raw_line.startswith("data:"):
-                continue
-            data = raw_line[len("data:") :].lstrip()
-            if data == "[DONE]":
+        builder = _TurnBuilder()
+        for event, data in _iter_sse_events(resp.iter_lines()):
+            if data.strip() == "[DONE]":
                 break
             try:
                 chunk = json.loads(data)
@@ -491,32 +634,13 @@ class ApiProvider(LLMProvider):
                 continue
             if not isinstance(chunk, dict):
                 continue
-            choices = chunk.get("choices") or []
-            if choices:
-                choice = choices[0]
-                delta = choice.get("delta", {}) or {}
-                piece = delta.get("content")
-                if piece:
-                    content_parts.append(piece)
-                    emit(piece)
-                if delta.get("function_call") and function_call is None:
-                    function_call = self._build_function_call(delta["function_call"])
-                if delta.get("functions_state_id"):
-                    state_id = delta["functions_state_id"]
-                if choice.get("finish_reason"):
-                    finish_reason = choice["finish_reason"]
-            if chunk.get("usage"):
-                usage = chunk["usage"]
-
-        message = Message(
-            role="assistant",
-            content="".join(content_parts),
-            function_call=function_call,
-            functions_state_id=state_id,
-        )
-        return AssistantTurn(
-            message=message, finish_reason=finish_reason, usage=Usage.from_raw(usage)
-        )
+            error = _stream_error(event, chunk)
+            if error is not None:
+                raise ApiError(f"API вернул ошибку в потоке: {error}")
+            piece = builder.add(chunk)
+            if piece:
+                emit(piece)
+        return builder.turn()
 
     def list_models(self) -> list[str]:
         """Чат-модели (``type == "chat"``): эмбеддеры и прочие в выборе не нужны."""

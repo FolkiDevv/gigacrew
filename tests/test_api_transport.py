@@ -38,9 +38,13 @@ def _auth_response():
     )
 
 
-def _sse(*chunks: dict) -> bytes:
-    lines = [f"data: {json.dumps(c, ensure_ascii=False)}\n\n" for c in chunks]
-    return ("".join(lines) + "data: [DONE]\n\n").encode()
+def _event(data: dict, name: str = "response.message.delta") -> str:
+    return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _text(text: str) -> dict:
+    """Кусок потока / ответ v2 с текстом ассистента."""
+    return {"messages": [{"role": "assistant", "content": [{"text": text}]}]}
 
 
 class _BrokenStream(httpx.SyncByteStream):
@@ -69,7 +73,7 @@ def test_stream_broken_after_first_chunk_is_not_retried():
         if str(request.url) == AUTH_URL:
             return _auth_response()
         chat_calls.append(request)
-        first = 'data: {"choices":[{"delta":{"content":"При"}}]}\n\n'.encode()
+        first = _event(_text("При")).encode()
         return httpx.Response(200, stream=_BrokenStream(first))
 
     deltas: list[str] = []
@@ -90,8 +94,8 @@ def test_stream_retries_connect_error_before_output():
         attempts["n"] += 1
         if attempts["n"] == 1:
             raise httpx.ConnectError("boom", request=request)
-        body = _sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})
-        return httpx.Response(200, content=body)
+        body = _event({**_text("ok"), "finish_reason": "stop"}, "response.message.done")
+        return httpx.Response(200, content=body.encode())
 
     deltas: list[str] = []
     p = _provider(handler)
@@ -157,19 +161,21 @@ def test_model_override_per_call():
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == AUTH_URL:
             return _auth_response()
-        seen.append(json.loads(request.content)["model"])
+        seen.append((str(request.url), json.loads(request.content)["model"]))
         return httpx.Response(
             200,
             json={
-                "choices": [{"message": {"role": "assistant", "content": "x"}}],
-                "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
+                **_text("x"),
+                "finish_reason": "stop",
+                "usage": {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
             },
         )
 
     p = _provider(handler)
     turn = p.complete(_msgs())
     p.complete(_msgs(), model="M-other")
-    assert seen == ["M-default", "M-other"]
+    chat = "https://api.test/v2/chat/completions"
+    assert seen == [(chat, "M-default"), (chat, "M-other")]
     assert turn.usage == Usage(prompt_tokens=7, completion_tokens=2, total_tokens=9)
     p.close()
 
@@ -186,8 +192,8 @@ def _chat_reply(prompt_tokens: int) -> httpx.Response:
     return httpx.Response(
         200,
         json={
-            "choices": [{"message": {"role": "assistant", "content": "."}}],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 1},
+            **_text("."),
+            "usage": {"input_tokens": prompt_tokens, "output_tokens": 1},
         },
     )
 
@@ -205,9 +211,9 @@ def test_measure_prompt_sends_one_token_request():
     assert p.supports_measure
     assert p.measure_prompt("текст", model="M-probe") == 1234
     (body,) = bodies
-    assert body["max_tokens"] == 1 and body["model"] == "M-probe"
-    assert body["messages"] == [{"role": "user", "content": "текст"}]
-    assert "functions" not in body
+    assert body["model_options"]["max_tokens"] == 1 and body["model"] == "M-probe"
+    assert body["messages"] == [{"role": "user", "content": [{"text": "текст"}]}]
+    assert "tools" not in body
     p.close()
 
 
@@ -251,7 +257,7 @@ def test_measure_prompt_timeout_is_oversize_but_other_errors_are_not():
     def no_usage(request: httpx.Request) -> httpx.Response:
         if str(request.url) == AUTH_URL:
             return _auth_response()
-        return httpx.Response(200, json={"choices": []})
+        return httpx.Response(200, json={"messages": []})
 
     p = _provider(no_usage)
     with pytest.raises(ApiError, match="usage"):

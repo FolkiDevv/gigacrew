@@ -209,10 +209,11 @@ class Config:
     # Точная навигация по Python-коду через ty (LSP-сервер, запускается лениво);
     # False — только индекс проекта.
     ty: bool = True
-    # Ограничители одного запуска суб-агента (инструмент task): шаги, оплаченные
-    # токены и время, с. На исчерпании суб-агент подводит итог.
+    # Ограничители одного запуска суб-агента (инструмент task): шаги, доля окна
+    # контекста модели, которую может занять его контекст, и время, с. На исчерпании
+    # суб-агент подводит итог.
     subagent_max_steps: int = 25
-    subagent_max_tokens: int = 300_000
+    subagent_context_share: float = 0.8
     subagent_timeout: int = 600
 
     @classmethod
@@ -272,9 +273,10 @@ class Config:
             auto_measure=_env_bool(env, "GIGACREW_AUTO_MEASURE", True),
             ty=_env_bool(env, "GIGACREW_TY", True),
             subagent_max_steps=_env_int(env, "GIGACREW_SUBAGENT_MAX_STEPS", 25),
-            subagent_max_tokens=_env_int(
-                env, "GIGACREW_SUBAGENT_MAX_TOKENS", 300_000, minimum=1_000
-            ),
+            subagent_context_share=_env_int(
+                env, "GIGACREW_SUBAGENT_CONTEXT", 80, minimum=10, maximum=95
+            )
+            / 100,
             subagent_timeout=_env_int(env, "GIGACREW_SUBAGENT_TIMEOUT", 600, minimum=10),
         )
 

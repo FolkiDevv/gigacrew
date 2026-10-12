@@ -95,23 +95,22 @@ def clip_middle(text: str, limit: int) -> str:
     head = limit * 2 // 3
     tail = limit - head
     cut = len(text) - head - tail
-    return f"{text[:head]}\n…[вырезано {cut} симв.]…\n{text[len(text) - tail :]}"
+    return f"{text[:head]}\n…[{cut} chars cut]…\n{text[len(text) - tail :]}"
 
 
 def render_message(message: Message) -> str:
     """Сообщение диалога плоским текстом (вызовы инструментов — тоже текстом)."""
     if message.role == "user":
-        return f"## Пользователь\n{clip_middle(message.content, USER_CLIP)}"
+        return f"## User\n{clip_middle(message.content, USER_CLIP)}"
     if message.role == "function":
-        return f"## Результат {message.name or ''}\n{clip_middle(message.content, RESULT_CLIP)}"
+        return f"## Result of {message.name or ''}\n{clip_middle(message.content, RESULT_CLIP)}"
     parts = []
     if message.content.strip():
         parts.append(clip_middle(message.content, ASSISTANT_CLIP))
-    call = message.function_call
-    if call is not None:
+    for call in message.function_calls:
         args = json.dumps(call.arguments, ensure_ascii=False, default=str)
-        parts.append(f"→ вызов {call.name}({clip_middle(args, ARGS_CLIP)})")
-    title = "Ассистент" if message.role == "assistant" else message.role
+        parts.append(f"→ call {call.name}({clip_middle(args, ARGS_CLIP)})")
+    title = "Assistant" if message.role == "assistant" else message.role
     return f"## {title}\n" + "\n".join(parts)
 
 
@@ -174,17 +173,17 @@ def _request_text(
     parts = []
     if previous:
         parts.append(
-            "Краткое содержание более ранней части диалога (обнови его, ничего важного "
-            f"не теряя):\n{previous}"
+            "Summary of the earlier part of the conversation (update it without losing "
+            f"anything important):\n{previous}"
         )
     if omitted:
-        parts.append("(Самая ранняя часть диалога не поместилась и опущена.)")
-    parts.append(f"Фрагмент диалога для сжатия:\n{chunk}")
+        parts.append("(The earliest part of the conversation did not fit and is omitted.)")
+    parts.append(f"Conversation fragment to compress:\n{chunk}")
     if instructions.strip():
-        parts.append(f"Пожелания пользователя к краткому содержанию: {instructions.strip()}")
+        parts.append(f"The user's wishes for the summary: {instructions.strip()}")
     parts.append(
-        f"Составь краткое содержание по правилам. Объём — не больше {max_chars} символов "
-        f"(~{max(max_chars // CHARS_PER_WORD, 1)} слов)."
+        f"Write the summary following the rules. Size — at most {max_chars} characters "
+        f"(~{max(max_chars // CHARS_PER_WORD, 1)} words)."
     )
     return "\n\n".join(parts)
 

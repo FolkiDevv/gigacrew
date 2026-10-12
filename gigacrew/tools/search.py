@@ -17,23 +17,26 @@ _MAX_SNIPPET = 200
 
 
 class SearchContentParams(BaseModel):
-    pattern: str = Field(description="Регулярное выражение для поиска по содержимому")
-    path: str = Field(default=".", description="Директория или файл для поиска (от корня проекта)")
+    pattern: str = Field(description="Regular expression to search for in file contents")
+    path: str = Field(
+        default=".", description="Directory or file to search in (relative to the project root)"
+    )
     glob: str | None = Field(
         default=None,
-        description="Ограничить поиск файлами по glob: '*.py' (по имени) или 'src/**/*.py'",
+        description="Limit the search to files matching a glob: '*.py' (by name) or 'src/**/*.py'",
     )
-    ignore_case: bool = Field(default=False, description="Игнорировать регистр")
-    max_results: int = Field(default=100, description="Максимум совпадений")
+    ignore_case: bool = Field(default=False, description="Case-insensitive search")
+    max_results: int = Field(default=100, description="Maximum number of matches")
 
 
 class SearchContentTool(Tool):
     name = "search_content"
     description = (
-        "Ищет строки, соответствующие регулярному выражению, по файлам проекта. "
-        "Возвращает совпадения в формате path:line:текст. Аналог grep -rn. "
-        "Пропускает служебные каталоги, файлы из .gitignore, бинарные и очень большие "
-        "файлы, а также .env."
+        "Searches project files for lines matching a regular expression, like grep -rn. "
+        "Returns matches as path:line:text. Use it for strings, messages, config keys and "
+        "other text; to find where a class or function is defined, find_symbol is faster. "
+        "Skips service directories, files ignored by .gitignore, binary and very large "
+        "files, and .env."
     )
     Params = SearchContentParams
 

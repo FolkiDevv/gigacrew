@@ -9,9 +9,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Role = Literal["system", "user", "assistant", "function"]
+# Может ли модель вызывать инструменты в этом ответе: "none" — только текст (итог
+# после остановки), хотя схемы инструментов в запросе остаются.
+ToolChoice = Literal["auto", "none"]
 
 
 class FunctionCall(BaseModel):
@@ -19,23 +22,43 @@ class FunctionCall(BaseModel):
 
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    # Идентификатор вызова от API: результат возвращается с тем же id.
+    id: str | None = None
 
 
 class Message(BaseModel):
     """Универсальное сообщение диалога.
 
     - system/user/assistant: обычный текст в ``content``.
-    - assistant с function_call: модель просит вызвать инструмент.
-    - function: результат выполнения инструмента (``name`` + ``content``).
+    - assistant с ``function_calls``: модель просит вызвать инструменты (один или
+      несколько за раз); на каждый вызов по порядку идёт свой результат.
+    - function: результат одного вызова (``name`` + ``content``, ``call_id`` — id вызова).
     """
 
     role: Role
     content: str = ""
     name: str | None = None  # имя функции для role="function"
-    function_call: FunctionCall | None = None
-    # Непрозрачный идентификатор состояния функций — нужно
-    # возвращать вместе с assistant-сообщением, чтобы сохранить контекст.
-    functions_state_id: str | None = None
+    function_calls: list[FunctionCall] = Field(default_factory=list)
+    call_id: str | None = None  # id вызова, на который отвечает role="function"
+    # Непрозрачный идентификатор состояния инструментов из ответа API: возвращается
+    # с assistant-сообщением и результатами его вызовов.
+    state_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_fields(cls, data: Any) -> Any:
+        """Чаты, сохранённые до перехода на API v2: один ``function_call`` и
+        ``functions_state_id`` (состояние старого API в новом не действует)."""
+        if not isinstance(data, Mapping) or (
+            "function_call" not in data and "functions_state_id" not in data
+        ):
+            return data
+        data = dict(data)
+        call = data.pop("function_call", None)
+        data.pop("functions_state_id", None)
+        if call is not None and not data.get("function_calls"):
+            data["function_calls"] = [call]
+        return data
 
 
 class ToolSpec(BaseModel):
@@ -44,6 +67,10 @@ class ToolSpec(BaseModel):
     name: str
     description: str
     parameters: dict[str, Any]
+
+
+# Имена полей ``usage`` в ответе API v2.
+_USAGE_V2_KEYS = {"prompt_tokens": "input_tokens", "completion_tokens": "output_tokens"}
 
 
 class Usage(BaseModel):
@@ -63,13 +90,24 @@ class Usage(BaseModel):
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any] | None) -> Usage:
-        """Терпимый разбор поля ``usage`` ответа API (мусор → нули)."""
+        """Терпимый разбор поля ``usage`` ответа API (мусор → нули).
+
+        Понимает обе схемы: ``prompt_tokens``/``completion_tokens`` и
+        ``input_tokens``/``output_tokens`` (+ ``input_tokens_details.cached_tokens``).
+        """
         if not isinstance(raw, Mapping):
             return cls()
+        details = raw.get("input_tokens_details")
+        cached = details.get("cached_tokens") if isinstance(details, Mapping) else None
         values: dict[str, int] = {}
         for name in cls.model_fields:
+            value = raw.get(name)
+            if value is None and name in _USAGE_V2_KEYS:
+                value = raw.get(_USAGE_V2_KEYS[name])
+            if value is None and name == "precached_prompt_tokens":
+                value = cached
             try:
-                values[name] = max(int(raw.get(name) or 0), 0)
+                values[name] = max(int(value or 0), 0)
             except (TypeError, ValueError):
                 values[name] = 0
         return cls(**values)
@@ -84,4 +122,4 @@ class AssistantTurn(BaseModel):
 
     @property
     def wants_tool(self) -> bool:
-        return self.message.function_call is not None
+        return bool(self.message.function_calls)

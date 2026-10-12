@@ -9,7 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 
-from gigacrew.llm.types import AssistantTurn, Message, ToolSpec
+from gigacrew.llm.types import AssistantTurn, Message, ToolChoice, ToolSpec
 
 
 class LLMError(RuntimeError):
@@ -69,12 +69,14 @@ class LLMProvider(ABC):
         *,
         model: str | None = None,
         temperature: float = 0.2,
+        tool_choice: ToolChoice = "auto",
     ) -> AssistantTurn:
         """Один проход модели.
 
         Принимает историю диалога и (опционально) доступные инструменты,
         возвращает ход ассистента: либо текст, либо запрос на вызов функции.
-        ``model`` переопределяет модель провайдера на этот вызов.
+        ``model`` переопределяет модель провайдера на этот вызов; ``tool_choice="none"``
+        запрещает вызовы (схемы остаются — история с вызовами без них не принимается).
         Ошибки обращения бросаются как :class:`LLMError`.
         """
 
@@ -85,6 +87,7 @@ class LLMProvider(ABC):
         *,
         model: str | None = None,
         temperature: float = 0.2,
+        tool_choice: ToolChoice = "auto",
         on_delta: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Потоковая версия complete().
@@ -93,7 +96,9 @@ class LLMProvider(ABC):
         одним куском — провайдеры без поддержки SSE работают без изменений.
         Провайдеры с потоком переопределяют метод.
         """
-        turn = self.complete(messages, tools, model=model, temperature=temperature)
+        turn = self.complete(
+            messages, tools, model=model, temperature=temperature, tool_choice=tool_choice
+        )
         if on_delta and turn.message.content:
             on_delta(turn.message.content)
         return turn
