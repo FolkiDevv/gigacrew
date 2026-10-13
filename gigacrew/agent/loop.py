@@ -487,6 +487,8 @@ class Agent:
             raise
 
     def _run_turn(self, user_input: str) -> str:
+        # Рассуждения прошлых ходов модели больше не нужны (GIGACREW_REASONING=turn).
+        self._conversation.forget_reasoning()
         self._conversation.add_user(user_input)
         specs = self._registry.specs()
         guard = self._new_guard()
@@ -1083,6 +1085,10 @@ class Agent:
         shown = self._cfg.stream and not quiet  # текст уже показан потоком
         if not shown and turn.message.content.strip() and (turn.wants_tool or not quiet):
             self._events.on_assistant_text(turn.message.content)
+        if self._cfg.reasoning == "off" and turn.message.reasoning:
+            # Не возвращаются модели — и не хранятся: размер истории равен отправляемому.
+            message = turn.message.model_copy(update={"reasoning": ""})
+            turn = turn.model_copy(update={"message": message})
         return turn
 
     def _notify_wait(self, text: str) -> None:

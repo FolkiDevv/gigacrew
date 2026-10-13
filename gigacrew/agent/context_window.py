@@ -47,6 +47,8 @@ def estimate_message_tokens(message: Message) -> int:
     for call in message.function_calls:
         args = json.dumps(call.arguments, ensure_ascii=False)
         size += estimate_text_tokens(call.name + args)
+    if message.reasoning:  # уходит отдельным сообщением перед ответом
+        size += estimate_text_tokens(message.reasoning) + MESSAGE_OVERHEAD_TOKENS
     return size + MESSAGE_OVERHEAD_TOKENS
 
 

@@ -738,6 +738,7 @@ class RecordingProvider(LLMProvider):
                 "cached_tokens": usage.precached_prompt_tokens,
                 "calls": [call.name for call in turn.message.function_calls],
                 "finish_reason": turn.finish_reason,
+                "reasoning_chars": len(turn.message.reasoning),
                 "text": bool(turn.message.content.strip()),
                 "tool_choice": kwargs.get("tool_choice", "auto"),
                 "duration_s": round(time.monotonic() - started, 2),
@@ -1270,6 +1271,7 @@ class EvalSession:
             "label": self.label,
             "git": git_revision(),
             "temperature": self.config.temperature,
+            "reasoning": self.config.reasoning,
             "models": self.models,
             "runs": self.runs,
             "windows": {model: self.windows.get(model) for model in self.models},
@@ -1405,6 +1407,8 @@ def _describe(meta: Mapping[str, Any]) -> str:
         if meta.get(key):
             parts.append(str(meta[key]))
     parts.append(f"T={meta.get('temperature')}")
+    if meta.get("reasoning") not in (None, "off"):
+        parts.append(f"reasoning={meta['reasoning']}")
     return " · ".join(parts)
 
 

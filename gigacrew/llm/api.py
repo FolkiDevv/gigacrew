@@ -189,6 +189,7 @@ class _TurnBuilder:
 
     def __init__(self) -> None:
         self._text: list[str] = []
+        self._reasoning: list[str] = []
         # Начало ответа, пока неясно, не утёкший ли это тег рассуждений (None — ясно);
         # после убранного тега пропускаются пустые строки до самого ответа.
         self._head: str | None = ""
@@ -207,14 +208,23 @@ class _TurnBuilder:
         """Учесть ответ или кусок потока; возвращает пришедший в нём текст."""
         pieces: list[str] = []
         for msg in data.get("messages") or []:
-            if not isinstance(msg, Mapping) or msg.get("role") != "assistant":
+            if not isinstance(msg, Mapping):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                content = [{"text": content}]
+            if msg.get("role") == "reasoning":
+                self._reasoning += [
+                    part["text"]
+                    for part in content or []
+                    if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+                ]
+                continue
+            if msg.get("role") != "assistant":
                 continue
             state_id = msg.get("tools_state_id") or msg.get("tool_state_id")
             if state_id:
                 self._state_id = str(state_id)
-            content = msg.get("content")
-            if isinstance(content, str):
-                content = [{"text": content}]
             for part in content or []:
                 if not isinstance(part, Mapping):
                     continue
@@ -267,6 +277,7 @@ class _TurnBuilder:
             function_calls=calls,
             # Состояние нужно только результатам вызовов.
             state_id=self._state_id if calls else None,
+            reasoning="".join(self._reasoning),
         )
         finish = self._finish_reason or (
             "function_call" if calls else "stop" if complete else "incomplete"
@@ -498,7 +509,8 @@ class ApiProvider(LLMProvider):
     @classmethod
     def _messages_payload(cls, messages: Sequence[Message]) -> list[dict[str, Any]]:
         """История для запроса. Результаты вызовов одного assistant-сообщения (идут
-        подряд) склеиваются в одно сообщение ``role: "tool"`` с его ``tools_state_id``."""
+        подряд) склеиваются в одно сообщение ``role: "tool"`` с его ``tools_state_id``.
+        Рассуждения ответа — сообщение ``role: "reasoning"`` перед ним, как в ответе API."""
         out: list[dict[str, Any]] = []
         state_id: str | None = None  # состояние assistant-сообщения перед результатами
         for msg in messages:
@@ -519,6 +531,8 @@ class ApiProvider(LLMProvider):
                     out.append(tool)
                 continue
             if msg.role == "assistant":
+                if msg.reasoning:
+                    out.append({"role": "reasoning", "content": [{"text": msg.reasoning}]})
                 out.append(cls._assistant_payload(msg))
                 state_id = msg.state_id if msg.function_calls else None
                 continue

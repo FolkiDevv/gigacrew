@@ -37,6 +37,10 @@ class Message(BaseModel):
     ``meta`` — служебное user-сообщение harness'а (одобрение плана, самопроверка): модель
     получает его как обычное, но это не запрос пользователя — не заголовок чата, не
     счётчик запросов, не закреплённая задача.
+
+    ``reasoning`` — рассуждения модели перед этим ответом (``role: "reasoning"`` в API v2).
+    Хранятся, только если их возвращают модели (``GIGACREW_REASONING=turn``), и лишь до
+    следующего запроса пользователя.
     """
 
     role: Role
@@ -48,6 +52,7 @@ class Message(BaseModel):
     # с assistant-сообщением и результатами его вызовов.
     state_id: str | None = None
     meta: bool = False
+    reasoning: str = ""
 
     @property
     def is_request(self) -> bool:

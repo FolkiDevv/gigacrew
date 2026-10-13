@@ -1077,6 +1077,33 @@ def test_chat_id_names_the_plan_file(tmp_path):
     assert agent.chat_id not in ("a1", "b2")
 
 
+# ------------------------------ рассуждения ------------------------------ #
+def _thinking(turn, reasoning: str):
+    turn.message.reasoning = reasoning
+    return turn
+
+
+@pytest.mark.parametrize("mode", ["off", "turn"])
+def test_reasoning_is_returned_only_within_the_turn(tmp_path, mode):
+    (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            _thinking(tool_turn("read_file", {"path": "f.txt"}), "прочитаю f.txt"),
+            _thinking(text_turn("там hello"), "ответ готов"),
+            text_turn("ещё раз: hello"),
+        ]
+    )
+    agent = _agent(provider, tmp_path, reasoning=mode)
+    agent.run_turn("что в f.txt?")
+    second = provider.requests[1]["messages"]
+    call = next(m for m in second if m.function_calls)
+    assert call.reasoning == ("прочитаю f.txt" if mode == "turn" else "")
+    agent.run_turn("повтори")
+    # следующий запрос пользователя — рассуждения прошлого хода модели больше не нужны
+    assert all(not m.reasoning for m in provider.requests[2]["messages"])
+    assert all(not m.reasoning for m in agent.conversation.messages)
+
+
 # ------------------------------ сжатие контекста ------------------------------ #
 def _big_tool() -> FakeTool:
     return FakeTool(run=lambda: ToolResult(content="z" * 3000, summary="ok"))  # ~1000 токенов

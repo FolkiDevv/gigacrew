@@ -393,6 +393,9 @@ def test_report_is_written_after_each_run_and_compared(shop, tmp_path):
     assert all(name in compared[3] for name in ("err", "rem", "chk", "txt", "res"))
     assert main(["show", str(session.path)]) == 0
     assert main(["digest", str(session.path)]) == 0
+    assert report["meta"]["reasoning"] == "off" and "reasoning=" not in compared[0]
+    turn_meta = {**newer["meta"], "reasoning": "turn"}
+    assert "reasoning=turn" in compare_reports(report, {**newer, "meta": turn_meta})[1]
 
 
 def test_digest_fits_a_chat_message():

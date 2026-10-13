@@ -145,6 +145,17 @@ def test_truncate_drops_the_tail_but_never_summarized_messages():
     assert len(conv) == 5
 
 
+def test_reasoning_is_estimated_and_forgotten():
+    plain = Message(role="assistant", content="ответ")
+    thinking = plain.model_copy(update={"reasoning": "р" * 300})
+    assert estimate_tokens([thinking]) > estimate_tokens([plain]) + 100
+    conv = Conversation()
+    conv.add_user("вопрос")
+    conv.add_assistant(thinking)
+    conv.forget_reasoning()
+    assert conv.messages[-1] == plain
+
+
 def test_set_summary_does_not_move_back():
     conv = _mid_turn()
     conv.set_summary(Summary("сводка", 5))

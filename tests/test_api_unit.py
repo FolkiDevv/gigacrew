@@ -104,6 +104,21 @@ def test_payload_without_tools_has_no_tool_options():
     p.close()
 
 
+def test_reasoning_goes_before_its_answer():
+    """Рассуждения ответа — сообщение role=reasoning перед ним (формат проверен пробой)."""
+    call = FunctionCall(name="read_file", arguments={"path": "a"}, id="c1")
+    history = [
+        Message(role="user", content="?"),
+        Message(role="assistant", function_calls=[call], state_id="S", reasoning="надо прочитать"),
+        Message(role="function", name="read_file", content="x", call_id="c1"),
+        Message(role="assistant", content="готово"),  # без рассуждений
+    ]
+    sent = ApiProvider._messages_payload(history)
+    assert [m["role"] for m in sent] == ["user", "reasoning", "assistant", "tool", "assistant"]
+    assert sent[1] == {"role": "reasoning", "content": [{"text": "надо прочитать"}]}
+    assert sent[3]["tools_state_id"] == "S"
+
+
 def test_several_calls_and_results_serialized_as_one_tool_message():
     """Все результаты вызовов одного ответа — одно сообщение role=tool с тем же
     состоянием и id вызовов (иначе 422 «Function calls count does not match…»)."""
@@ -241,6 +256,7 @@ def test_parse_response_with_reasoning_text_and_parallel_calls():
     assert turn.wants_tool
     assert turn.finish_reason == "function_call"
     assert turn.message.content == "Вызываю get_weather для обоих городов:"  # без рассуждений
+    assert turn.message.reasoning == "Сделаю оба вызова сразу."  # отдельно от текста
     assert turn.message.function_calls == [
         FunctionCall(name="get_weather", arguments={"city": "Москва"}, id="ba12"),
         FunctionCall(name="get_weather", arguments={"city": "Казань"}, id="4552"),
@@ -319,6 +335,7 @@ def test_consume_sse_parallel_calls():
     turn = ApiProvider._consume_sse(_FakeSSE(PARALLEL_STREAM), deltas.append)
     assert deltas == ["Получаю погоду ", "для обоих городов:"]  # рассуждения не показываются
     assert turn.message.content == "Получаю погоду для обоих городов:"
+    assert turn.message.reasoning == "Оба вызова сразу."
     assert [c.id for c in turn.message.function_calls] == ["8879", "bd7a"]
     assert turn.message.function_calls[1].arguments == {"city": "Казань"}
     assert turn.message.state_id == "01a12ea7"

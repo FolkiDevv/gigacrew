@@ -152,6 +152,12 @@ class Conversation:
             self.add_function_result(call.name, note, call.id)
         return bool(pending)
 
+    def forget_reasoning(self) -> None:
+        """Убрать рассуждения модели из истории: они нужны ей только в пределах хода."""
+        self._messages = [
+            m.model_copy(update={"reasoning": ""}) if m.reasoning else m for m in self._messages
+        ]
+
     def truncate(self, length: int) -> None:
         """Убрать сообщения после первых ``length`` (откат служебного обмена репликами).
 

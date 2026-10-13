@@ -136,6 +136,16 @@ def _env_mode(env: Mapping[str, str], name: str) -> PermissionMode:
         raise ConfigError(f"{name}: {e}") from e
 
 
+def _env_choice(env: Mapping[str, str], name: str, choices: tuple[str, ...]) -> str:
+    """Значение из списка (первое — по умолчанию)."""
+    raw = (env.get(name) or "").strip().lower()
+    if not raw:
+        return choices[0]
+    if raw not in choices:
+        raise ConfigError(f"{name}: ожидается одно из {', '.join(choices)}, получено {raw!r}")
+    return raw
+
+
 def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, hi: float) -> float:
     raw = env.get(name)
     if raw is None or not raw.strip():
@@ -199,6 +209,9 @@ class Config:
     max_tool_repeats: int = 3
     temperature: float = 0.2
     stream: bool = True  # потоковый (посимвольный) вывод ответа модели
+    # Возвращать ли модели её рассуждения: "off" — нет, "turn" — в пределах хода (до
+    # следующего запроса пользователя), как советуют вендоры моделей с рассуждениями.
+    reasoning: str = "off"
     # Бюджет контекста (оценка в токенах), в который укладывается история при
     # отправке модели; старые сообщения сверх бюджета отбрасываются. None — от
     # замеренного окна модели (~/.gigacrew/models.json), число — явное переопределение.
@@ -271,6 +284,7 @@ class Config:
             mode=mode or _env_mode(env, "GIGACREW_MODE"),
             stream=stream,
             temperature=_env_float(env, "GIGACREW_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
+            reasoning=_env_choice(env, "GIGACREW_REASONING", ("off", "turn")),
             context_budget_tokens=_env_optional_int(env, "GIGACREW_CONTEXT_TOKENS", minimum=4_000),
             auto_compact=_env_bool(env, "GIGACREW_AUTO_COMPACT", True),
             compact_threshold=_env_int(
