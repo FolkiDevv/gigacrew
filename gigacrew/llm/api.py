@@ -60,6 +60,14 @@ _RETRYABLE_EXC = (
 
 # HTTP-статусы, которые имеет смысл повторить (лимит/временная недоступность).
 _RETRY_STATUS = {429, 500, 502, 503, 504}
+# Лимит частоты запросов (429) шлюз считает за минуту, а обычные повторы (5 попыток с
+# паузами 1–8 с) укладываются в ~15 с. На 429 — свой бюджет ожидания на запрос
+# (``GIGACREW_RATE_LIMIT_WAIT``) и паузы длиннее; Retry-After шлюза — в приоритете.
+_RATE_LIMIT_FIRST_DELAY = 5.0
+_RATE_LIMIT_MAX_DELAY = 30.0
+# Закрывающий тег рассуждений, который шлюз оставляет в начале текста ответа: сами
+# рассуждения ушли в ``role: "reasoning"``, а тег — в ответ (MiniMax: ``</mm:think>``).
+_LEAKED_REASONING_TAGS = ("</mm:think>", "</think>")
 
 # Замер окна: 4xx с этими статусами — не про размер запроса (авторизация, нет
 # модели, лимит частоты); остальные 4xx и 5xx считаются «запрос не помещается».
@@ -145,6 +153,33 @@ def _build_function_call(raw: Any) -> FunctionCall | None:
     )
 
 
+class _RateLimitWait:
+    """Ожидание при 429 в пределах бюджета одного запроса (``budget`` секунд).
+
+    Паузы растут от :data:`_RATE_LIMIT_FIRST_DELAY` вдвое до :data:`_RATE_LIMIT_MAX_DELAY`;
+    Retry-After шлюза важнее, но не меньше секунды — нулевая пауза крутила бы повторы, не
+    расходуя бюджет. О каждой паузе сообщает ``on_wait``.
+    """
+
+    def __init__(self, budget: float, on_wait: Callable[[str], None] | None):
+        self._left = float(budget)
+        self._delay = _RATE_LIMIT_FIRST_DELAY
+        self._on_wait = on_wait
+
+    def wait(self, resp: httpx.Response) -> bool:
+        """Подождать перед повтором; False — бюджет исчерпан, 429 — ошибка."""
+        if self._left <= 0:
+            return False
+        pause = max(ApiProvider._retry_after(resp, self._delay), 1.0)
+        pause = min(pause, _RATE_LIMIT_MAX_DELAY, self._left)
+        if self._on_wait is not None:
+            self._on_wait(f"лимит запросов шлюза (429) — жду {pause:.0f} с и повторяю")
+        time.sleep(pause)
+        self._left -= pause
+        self._delay = min(self._delay * 2, _RATE_LIMIT_MAX_DELAY)
+        return True
+
+
 class _TurnBuilder:
     """Собирает ход ассистента из ответа v2 — целого или по кускам потока.
 
@@ -154,6 +189,10 @@ class _TurnBuilder:
 
     def __init__(self) -> None:
         self._text: list[str] = []
+        # Начало ответа, пока неясно, не утёкший ли это тег рассуждений (None — ясно);
+        # после убранного тега пропускаются пустые строки до самого ответа.
+        self._head: str | None = ""
+        self._after_tag = False
         self._calls: dict[str, FunctionCall] = {}
         self._state_id: str | None = None
         self._finish_reason: str | None = None
@@ -189,9 +228,33 @@ class _TurnBuilder:
             self._finish_reason = str(data["finish_reason"])
         if data.get("usage"):
             self._usage = data["usage"]
-        text = "".join(pieces)
+        text = self._clean_head("".join(pieces))
         self._text.append(text)
         return text
+
+    def _clean_head(self, text: str) -> str:
+        """Текст без утёкшего закрывающего тега рассуждений в самом начале ответа.
+
+        Пока по началу ответа не ясно, тег ли это, текст копится и не отдаётся.
+        """
+        if self._head is None:
+            if self._after_tag:
+                text = text.lstrip()
+                self._after_tag = not text
+            return text
+        head = self._head + text
+        stripped = head.lstrip()
+        for tag in _LEAKED_REASONING_TAGS:
+            if stripped.startswith(tag):
+                self._head = None
+                rest = stripped[len(tag) :].lstrip()
+                self._after_tag = not rest
+                return rest
+        if any(tag.startswith(stripped) for tag in _LEAKED_REASONING_TAGS):
+            self._head = head  # может оказаться тегом — ждём продолжения
+            return ""
+        self._head = None
+        return head
 
     def turn(self, *, complete: bool = True) -> AssistantTurn:
         """Ход ассистента. ``complete=False`` — поток кончился без окончания ответа:
@@ -200,7 +263,7 @@ class _TurnBuilder:
         calls = list(self._calls.values())
         message = Message(
             role="assistant",
-            content="".join(self._text),
+            content="".join(self._text) + (self._head or ""),  # недособранное начало
             function_calls=calls,
             # Состояние нужно только результатам вызовов.
             state_id=self._state_id if calls else None,
@@ -249,7 +312,8 @@ class ApiProvider(LLMProvider):
         self._mtls = config.auth_mode == "mtls"
         self._token: str | None = None
         self._token_exp: float = 0.0  # unix-время истечения токена
-        self._max_retries = 5  # повторы при транзиентных сбоях (сеть/429/5xx)
+        self._max_retries = 5  # повторы при транзиентных сбоях (сеть/5xx)
+        self._rate_limit_wait = config.rate_limit_wait  # ожидание при 429, с на запрос
 
     @property
     def model(self) -> str:
@@ -273,12 +337,15 @@ class ApiProvider(LLMProvider):
         *,
         attempts: int | None = None,
         silent_attempts: int | None = None,
+        on_wait: Callable[[str], None] | None = None,
     ) -> httpx.Response:
         """Выполняет HTTP-запрос, повторяя транзиентные сбои.
 
         Повторяем (с экспоненциальной задержкой):
           * сетевые ошибки/таймауты — сеть до API Сбера бывает нестабильна;
-          * 429 Too Many Requests и 5xx — временная недоступность/лимит.
+          * 5xx — временная недоступность;
+          * 429 Too Many Requests — в пределах своего бюджета ожидания (не в счёт
+            попыток), о каждой паузе сообщает ``on_wait``.
         Прочие HTTP-ответы (включая 4xx) возвращаем как есть — их разбирает
         вызывающая сторона. Неповторяемые ошибки транспорта → ApiError.
         ``attempts`` — число попыток вместо ``_max_retries``; ``silent_attempts`` —
@@ -288,7 +355,9 @@ class ApiProvider(LLMProvider):
         delay = 1.0
         last_exc: Exception | None = None
         silences = 0
-        for attempt in range(attempts):
+        limit = _RateLimitWait(self._rate_limit_wait, on_wait)
+        attempt = 0
+        while attempt < attempts:
             try:
                 resp = do_request()
             except _RETRYABLE_EXC as e:
@@ -297,16 +366,22 @@ class ApiProvider(LLMProvider):
                     silences += 1
                     if silences >= silent_attempts:
                         raise ApiError(self._silence_message()) from e
-                if attempt < attempts - 1:
+                attempt += 1
+                if attempt < attempts:
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)
                 continue
             except httpx.HTTPError as e:
                 raise ApiError(f"Ошибка соединения с API: {e}") from e
 
+            if resp.status_code == 429:
+                if limit.wait(resp):
+                    continue
+                return resp
             if resp.status_code in _RETRY_STATUS and attempt < attempts - 1:
                 time.sleep(self._retry_after(resp, delay))
                 delay = min(delay * 2, 8.0)
+                attempt += 1
                 continue
             return resp
 
@@ -505,11 +580,16 @@ class ApiProvider(LLMProvider):
         model: str | None = None,
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
+        on_wait: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         payload = self._payload(
             messages, tools, model=model, temperature=temperature, tool_choice=tool_choice
         )
-        resp = self._post_chat(payload, self._send_chat, timeout=self._chat_timeout)
+
+        def send(do_request: Callable[[], httpx.Response]) -> httpx.Response:
+            return self._send_chat(do_request, on_wait=on_wait)
+
+        resp = self._post_chat(payload, send, timeout=self._chat_timeout)
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
@@ -542,10 +622,17 @@ class ApiProvider(LLMProvider):
             resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
         return resp
 
-    def _send_chat(self, do_request: Callable[[], httpx.Response]) -> httpx.Response:
+    def _send_chat(
+        self,
+        do_request: Callable[[], httpx.Response],
+        *,
+        on_wait: Callable[[str], None] | None = None,
+    ) -> httpx.Response:
         """Отправка запроса чата: молчание модели дольше ожидания чтения — не больше
         :data:`_SILENT_ATTEMPTS` попыток."""
-        return self._request_with_retry(do_request, silent_attempts=_SILENT_ATTEMPTS)
+        return self._request_with_retry(
+            do_request, silent_attempts=_SILENT_ATTEMPTS, on_wait=on_wait
+        )
 
     def _silence_message(self) -> str:
         seconds = int(self._chat_timeout.read or 0)
@@ -598,6 +685,7 @@ class ApiProvider(LLMProvider):
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
         on_delta: Callable[[str], None] | None = None,
+        on_wait: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Потоковая генерация. Вызывает on_delta(text) на каждый кусок текста и
         возвращает финальный AssistantTurn (идентичный complete()).
@@ -629,8 +717,10 @@ class ApiProvider(LLMProvider):
         last_exc: Exception | None = None
         refreshed = False
         silences = 0  # попыток, на которые модель молчала дольше ожидания чтения
+        limit = _RateLimitWait(self._rate_limit_wait, on_wait)
 
-        for attempt in range(self._max_retries):
+        attempt = 0
+        while attempt < self._max_retries:
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
@@ -644,11 +734,17 @@ class ApiProvider(LLMProvider):
                         resp.read()
                         self._ensure_token(force=True)
                         refreshed = True
+                        attempt += 1
                         continue
-                    if resp.status_code in _RETRY_STATUS and attempt < self._max_retries - 1:
+                    if resp.status_code == 429:
+                        resp.read()
+                        if limit.wait(resp):
+                            continue
+                    elif resp.status_code in _RETRY_STATUS and attempt < self._max_retries - 1:
                         resp.read()
                         time.sleep(self._retry_after(resp, delay))
                         delay = min(delay * 2, 8.0)
+                        attempt += 1
                         continue
                     if resp.status_code >= 400:
                         resp.read()
@@ -666,7 +762,8 @@ class ApiProvider(LLMProvider):
                     raise ApiError(f"Сетевой сбой во время потоковой передачи: {e}") from e
                 if silences >= _SILENT_ATTEMPTS:
                     raise ApiError(self._silence_message()) from e
-                if attempt < self._max_retries - 1:
+                attempt += 1
+                if attempt < self._max_retries:
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)
             except httpx.HTTPError as e:

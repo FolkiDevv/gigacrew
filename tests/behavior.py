@@ -75,6 +75,8 @@ DEFAULT_TIMEOUT = 1800  # с на один прогон сценария
 HARNESS_PLAN_NOTICES = ("не отправлен на одобрение",)
 # Первая строка вопроса самопроверки: так её служебное сообщение видно в истории.
 SELF_CHECK_MARK = SELF_CHECK_NOTE.splitlines()[0]
+# Уведомление о паузе из-за лимита запросов шлюза (429).
+RATE_LIMIT_MARK = "(429)"
 # Инструменты исследования кода: их вызовы основным агентом — «работа вместо суб-агента».
 RESEARCH_TOOLS = frozenset(
     {
@@ -1147,6 +1149,7 @@ def _metrics(
         "cached_tokens": sum(c["cached_tokens"] for c in recorder.calls),
         "text_with_calls": sum(1 for c in main_requests if c["text"] and c["calls"]),
         "cut_retries": sum(s.cut_retries for s in user.stats),
+        "rate_limit_waits": sum(1 for _, text in user.notices if RATE_LIMIT_MARK in text),
         "max_completion_tokens": max((c["completion_tokens"] for c in recorder.calls), default=0),
         "max_request_s": max((c["duration_s"] for c in recorder.calls), default=0.0),
         "steps": sum(s.steps for s in user.stats),
@@ -1528,6 +1531,12 @@ def digest_report(report: Mapping[str, Any]) -> list[str]:
         lines += [_problem(r) for r in failed[:DIGEST_PROBLEMS]]
         if len(failed) > DIGEST_PROBLEMS:
             lines.append(f"… и ещё {len(failed) - DIGEST_PROBLEMS}")
+    waits = [r.get("rate_limit_waits") or 0 for r in runs]
+    if any(waits):
+        lines += [
+            "",
+            f"Пауз из-за лимита запросов (429): {sum(waits)} в {sum(1 for w in waits if w)} прогонах",
+        ]
     errors = Counter(_clip(r["error"]) for r in runs if r.get("error"))
     if errors:
         lines += ["", "Частые ошибки:"]

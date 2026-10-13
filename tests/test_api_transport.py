@@ -467,3 +467,82 @@ def test_error_body_is_clipped():
 def test_negative_retry_after_does_not_crash():
     resp = httpx.Response(429, headers={"Retry-After": "-5"})
     assert ApiProvider._retry_after(resp, 1.0) == 0.0
+
+
+# ------------------------------ лимит запросов (429) ------------------------------ #
+def _limited(times: int, *, stream: bool = False, retry_after: str | None = None):
+    """Шлюз отвечает 429 ``times`` раз подряд, потом — нормально."""
+    calls = {"chat": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        calls["chat"] += 1
+        if calls["chat"] <= times:
+            headers = {"Retry-After": retry_after} if retry_after is not None else {}
+            return httpx.Response(429, headers=headers, json={"message": "Too many requests"})
+        if stream:
+            body = _event({**_text("ok"), "finish_reason": "stop"}, "response.message.done")
+            return httpx.Response(200, content=body.encode())
+        return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+    return handler, calls
+
+
+def _sleeps(monkeypatch) -> list[float]:
+    pauses: list[float] = []
+    monkeypatch.setattr(api.time, "sleep", pauses.append)
+    return pauses
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_rate_limit_waits_longer_than_other_retries(monkeypatch, streaming):
+    pauses = _sleeps(monkeypatch)
+    handler, calls = _limited(6, stream=streaming)  # больше обычных 5 попыток
+    p = _provider(handler)
+    waits: list[str] = []
+    call = p.stream if streaming else p.complete
+    assert call(_msgs(), on_wait=waits.append).message.content == "ok"
+    assert calls["chat"] == 7
+    assert pauses == [5.0, 10.0, 20.0, 30.0, 30.0, 25.0]  # до бюджета 120 с
+    assert len(waits) == 6 and "лимит запросов шлюза (429) — жду 5 с" in waits[0]
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_rate_limit_gives_up_when_budget_is_spent(monkeypatch, streaming):
+    pauses = _sleeps(monkeypatch)
+    handler, _ = _limited(100, stream=streaming)
+    p = _provider(handler)
+    call = p.stream if streaming else p.complete
+    with pytest.raises(ApiError, match="429"):
+        call(_msgs())
+    assert sum(pauses) == 120.0
+    p.close()
+
+
+@pytest.mark.parametrize(("header", "pause"), [("12", 12.0), ("0", 1.0), ("600", 30.0)])
+def test_rate_limit_respects_retry_after(monkeypatch, header, pause):
+    pauses = _sleeps(monkeypatch)
+    handler, _ = _limited(1, retry_after=header)
+    p = _provider(handler)
+    p.complete(_msgs())
+    assert pauses == [pause]  # не меньше секунды и не дольше 30 с
+    p.close()
+
+
+def test_rate_limit_wait_can_be_turned_off(monkeypatch):
+    pauses = _sleeps(monkeypatch)
+    handler, calls = _limited(1)
+    cfg = Config(
+        access_key="dummy",
+        auth_url=AUTH_URL,
+        base_url=BASE_URL,
+        model="M-default",
+        rate_limit_wait=0,
+    )
+    p = ApiProvider(cfg, transport=httpx.MockTransport(handler))
+    with pytest.raises(ApiError, match="429"):
+        p.complete(_msgs())
+    assert pauses == [] and calls["chat"] == 1
+    p.close()

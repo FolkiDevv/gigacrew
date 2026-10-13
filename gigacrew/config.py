@@ -182,6 +182,8 @@ class Config:
     # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план, файл),
     # байты не идут — обычный timeout оборвал бы такой ответ.
     read_timeout: int = 600
+    # Сколько ждать при 429 (лимит запросов шлюза) на один запрос, с; 0 — не ждать.
+    rate_limit_wait: int = 120
 
     # --- Агент / окружение ---
     project_root: Path = field(default_factory=Path.cwd)
@@ -262,6 +264,7 @@ class Config:
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             timeout=_env_int(env, "GIGACREW_TIMEOUT", 120),
             read_timeout=_env_int(env, "GIGACREW_READ_TIMEOUT", 600),
+            rate_limit_wait=_env_int(env, "GIGACREW_RATE_LIMIT_WAIT", 120, minimum=0),
             project_root=root,
             auto_approve=auto_approve or yes_all,
             yes_all=yes_all,

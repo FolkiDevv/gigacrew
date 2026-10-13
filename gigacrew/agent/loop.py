@@ -1053,6 +1053,7 @@ class Agent:
                     temperature=self._cfg.temperature,
                     tool_choice=tool_choice,
                     on_delta=on_delta,
+                    on_wait=self._notify_wait,
                 )
             else:
                 turn = self._provider.complete(
@@ -1061,6 +1062,7 @@ class Agent:
                     model=self._model,
                     temperature=self._cfg.temperature,
                     tool_choice=tool_choice,
+                    on_wait=self._notify_wait,
                 )
         except BaseException as e:
             partial = "".join(streamed).rstrip()
@@ -1082,6 +1084,10 @@ class Agent:
         if not shown and turn.message.content.strip() and (turn.wants_tool or not quiet):
             self._events.on_assistant_text(turn.message.content)
         return turn
+
+    def _notify_wait(self, text: str) -> None:
+        """Провайдер ждёт перед повтором (лимит запросов шлюза) — сказать пользователю."""
+        self._events.on_notice(text, level="warn")
 
     # ------------------------------------------------------------------ #
     def _execute_tool_call(self, function_call: FunctionCall, check: CallCheck) -> ToolOutcome:

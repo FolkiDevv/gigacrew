@@ -411,6 +411,7 @@ def test_digest_fits_a_chat_message():
     ]
     runs.append(run(1, "plan_question", ok=False, stop_reasons=["tool_failures"], answer=""))
     old = {**runs[0]}
+    runs[0]["rate_limit_waits"] = 3
     for key in ("self_checks", "max_completion_tokens", "max_request_s"):
         del old[key]  # отчёт до этапа 3
     report = {"meta": {"created": "20261013-120000", "temperature": 1.0}, "runs": [*runs, old]}
@@ -420,6 +421,7 @@ def test_digest_fits_a_chat_message():
     assert "Неуспешные прогоны: 41 из 82" in text and "… и ещё 11" in text
     assert "40× LLMError: The read operation timed out" in text
     assert "стоп tool_failures" in text
+    assert "Пауз из-за лимита запросов (429): 3 в 1 прогонах" in text
     row = next(line for line in lines if line.startswith("model-1") and "plan_exit" in line)
     assert "6.5" in row and "205.0" in row
 

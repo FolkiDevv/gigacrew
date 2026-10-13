@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from gigacrew.config import Config
@@ -367,6 +369,43 @@ def test_consume_sse_stream_without_end_is_incomplete(tail, finish):
     assert turn.message.content == "Сейчас запишу план"
     assert turn.finish_reason == finish
     assert not turn.wants_tool
+
+
+def _delta(text: str) -> str:
+    chunk = {"messages": [{"role": "assistant", "content": [{"text": text}]}]}
+    return f"event: response.message.delta\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+_DONE = 'event: response.message.done\ndata: {"messages":[],"finish_reason":"stop"}\n\n'
+
+
+@pytest.mark.parametrize(
+    ("pieces", "shown", "content"),
+    [
+        # шлюз убрал рассуждения, а закрывающий тег оставил в начале ответа (MiniMax)
+        (["</mm:", "think>", "\n\nОтвет"], ["Ответ"], "Ответ"),
+        (["</mm:think>План записан"], ["План записан"], "План записан"),
+        (["\n</think>\n", "Готово"], ["Готово"], "Готово"),
+        # не тег — текст как есть, с исходными пробелами
+        (["  При", "вет"], ["  При", "вет"], "  Привет"),
+        (["<b>жирный</b>"], ["<b>жирный</b>"], "<b>жирный</b>"),
+        (["</", "mm:", "thinking"], ["</mm:thinking"], "</mm:thinking"),
+        (["Ответ </think>"], ["Ответ </think>"], "Ответ </think>"),
+        # ответ кончился, так и не став тегом, — в истории он целиком
+        (["</mm"], [], "</mm"),
+    ],
+)
+def test_leaked_reasoning_tag_is_dropped_from_the_start(pieces, shown, content):
+    stream = "".join(_delta(piece) for piece in pieces) + _DONE
+    deltas: list[str] = []
+    turn = ApiProvider._consume_sse(_FakeSSE(stream), deltas.append)
+    assert deltas == shown
+    assert turn.message.content == content
+
+
+def test_leaked_reasoning_tag_is_dropped_from_whole_response():
+    data = {"messages": [{"role": "assistant", "content": [{"text": "</mm:think>Ответ"}]}]}
+    assert ApiProvider._parse_response(data).message.content == "Ответ"
 
 
 def test_parse_response_without_finish_reason_is_complete():

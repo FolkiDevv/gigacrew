@@ -344,6 +344,27 @@ def test_subagent_answer_in_plan_mode_gets_no_self_check(tmp_path):
     assert provider.requests[3]["messages"][-1].meta
 
 
+class _WaitingProvider(ScriptedProvider):
+    """Перед каждым ответом провайдер «ждёт» лимита запросов и сообщает об этом."""
+
+    def complete(self, messages, tools=None, **kwargs):
+        on_wait = kwargs.get("on_wait")
+        if on_wait is not None:
+            on_wait("лимит запросов шлюза (429) — жду 5 с и повторяю")
+        return super().complete(messages, tools, **kwargs)
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["complete", "stream"])
+def test_rate_limit_waits_are_shown_to_the_user(tmp_path, stream):
+    provider = _WaitingProvider([_task(), text_turn("нашёл"), text_turn("ок")])
+    events = RecordingEvents()
+    cfg = Config(access_key="x", project_root=tmp_path, stream=stream, auto_approve=True)
+    loop.Agent(provider, build_default_registry(), cfg, events).run_turn("x")
+    waits = [(level, text) for level, text in events.notices if "(429)" in text]
+    assert [level for level, _ in waits] == ["warn"] * 3
+    assert waits[1][1].startswith("explore: ")  # пауза в запросе суб-агента
+
+
 # ------------------------------ токены, сбои ----------------------------- #
 def test_subagent_tokens_billed_to_parent(tmp_path):
     provider = ScriptedProvider(

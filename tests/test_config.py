@@ -198,6 +198,17 @@ def test_read_timeout(tmp_path):
     assert load({"GIGACREW_READ_TIMEOUT": "900"}).read_timeout == 900
 
 
+def test_rate_limit_wait(tmp_path):
+    def load(env):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+
+    assert load({}).rate_limit_wait == 120
+    assert load({"GIGACREW_RATE_LIMIT_WAIT": "300"}).rate_limit_wait == 300
+    assert load({"GIGACREW_RATE_LIMIT_WAIT": "0"}).rate_limit_wait == 0  # не ждать
+    with pytest.raises(ConfigError):
+        load({"GIGACREW_RATE_LIMIT_WAIT": "-1"})
+
+
 def test_yes_all_implies_auto_approve(tmp_path):
     cfg = Config.load(project_root=tmp_path, yes_all=True, environ={}, cwd=tmp_path)
     assert cfg.auto_approve and cfg.yes_all

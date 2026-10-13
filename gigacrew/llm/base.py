@@ -70,6 +70,7 @@ class LLMProvider(ABC):
         model: str | None = None,
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
+        on_wait: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Один проход модели.
 
@@ -77,7 +78,8 @@ class LLMProvider(ABC):
         возвращает ход ассистента: либо текст, либо запрос на вызов функции.
         ``model`` переопределяет модель провайдера на этот вызов; ``tool_choice="none"``
         запрещает вызовы (схемы остаются — история с вызовами без них не принимается).
-        Ошибки обращения бросаются как :class:`LLMError`.
+        ``on_wait`` — сообщение пользователю, что провайдер ждёт перед повтором (лимит
+        запросов шлюза). Ошибки обращения бросаются как :class:`LLMError`.
         """
 
     def stream(
@@ -89,6 +91,7 @@ class LLMProvider(ABC):
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
         on_delta: Callable[[str], None] | None = None,
+        on_wait: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Потоковая версия complete().
 
@@ -97,7 +100,12 @@ class LLMProvider(ABC):
         Провайдеры с потоком переопределяют метод.
         """
         turn = self.complete(
-            messages, tools, model=model, temperature=temperature, tool_choice=tool_choice
+            messages,
+            tools,
+            model=model,
+            temperature=temperature,
+            tool_choice=tool_choice,
+            on_wait=on_wait,
         )
         if on_delta and turn.message.content:
             on_delta(turn.message.content)
