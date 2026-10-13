@@ -290,10 +290,12 @@ def build_default_registry() -> ToolRegistry:
     from gigacrew.tools.plan import ExitPlanModeTool
     from gigacrew.tools.search import SearchContentTool
     from gigacrew.tools.shell import RunShellTool
-    from gigacrew.tools.task import TaskTool
+    from gigacrew.tools.task import ExploreTool, TaskTool
 
     reg = ToolRegistry()
     for tool in (
+        # Первым: исследование через суб-агента — выбор по умолчанию для вопросов о коде.
+        ExploreTool(),
         ReadFileTool(),
         WriteFileTool(),
         EditFileTool(),

@@ -1071,6 +1071,7 @@ def _metrics(
     messages = agent.conversation.messages
     calls = list(_calls(messages))
     tasks = [call for call in calls if call.name == "task"]
+    explores = sum(1 for call in calls if call.name == "explore")
     plan_path = agent.plan_path
     try:
         plan_text = plan_path.read_text(encoding="utf-8").strip() if plan_path else ""
@@ -1120,16 +1121,17 @@ def _metrics(
         ),
         "blocked_calls": sum(1 for text in results if text.startswith(PLAN_BLOCKED_NOTE)),
         "final_mode": agent.mode.value,
-        # делегирование
-        "task_calls": len(tasks),
-        "explore_calls": sum(1 for call in tasks if _subagent_type(call) == "explore"),
+        # делегирование: запуски суб-агентов (task и explore) и из них — разведка
+        "task_calls": len(tasks) + explores,
+        "explore_calls": explores + sum(1 for call in tasks if _subagent_type(call) == "explore"),
         "general_calls": sum(
             1 for call in tasks if _subagent_type(call) in ("general", "general-purpose")
         ),
         "task_batches": sum(
             1
             for m in messages
-            if m.role == "assistant" and sum(c.name == "task" for c in m.function_calls) >= 2
+            if m.role == "assistant"
+            and sum(c.name in ("task", "explore") for c in m.function_calls) >= 2
         ),
         "subagent_runs": len(subagents),
         "subagent_tool_calls": sum(1 for kind, _ in user.events if kind == "subagent_tool_call"),
@@ -1341,7 +1343,8 @@ SUMMARY_LEGEND = (
     "вызвала exit_plan_mode; shown — план показан пользователю; rem — план записан, но не "
     "отправлен моделью (напоминание, с этапа 3 — показ harness'ом); chk — самопроверок; "
     "txt — ходов плана, закончившихся текстом без показа плана (в среднем); task/expl — "
-    "вызовов task / из них explore; res — своих поисков и чтений; req — запросов к модели "
+    "запусков суб-агентов (task и explore) / из них разведка; res — своих поисков и "
+    "чтений; req — запросов к модели "
     "(с суб-агентами); tok,k — тысяч токенов; cache — доля токенов запроса из кеша; time — "
     "секунд."
 )

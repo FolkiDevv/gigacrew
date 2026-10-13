@@ -308,6 +308,21 @@ def test_broad_question_delegated_to_explore(shop):
     assert record["research_calls"] == 0 and record["subagent_tool_calls"] == 1
 
 
+def test_broad_question_explored_with_explore_tool(shop):
+    result = _run(
+        "delegate_broad",
+        [
+            tool_turn("explore", {"question": "Где возникают исключения и как становятся HTTP?"}),
+            text_turn("shop/errors.py, shop/api.py:25, shop/storage.py, shop/payments.py"),
+            text_turn("Ошибки: shop/errors.py, shop/api.py, shop/storage.py, shop/payments.py."),
+        ],
+        shop,
+    )
+    record = result.record
+    assert record["ok"] and record["task_calls"] == record["explore_calls"] == 1
+    assert record["general_calls"] == 0 and record["subagent_runs"] == 1
+
+
 def test_pinpoint_question_answered_directly(shop):
     result = _run(
         "delegate_pinpoint",

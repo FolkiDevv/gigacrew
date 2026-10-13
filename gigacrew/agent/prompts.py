@@ -61,36 +61,43 @@ unclear requirements), ask the user with ask_user and offer options instead of \
 guessing. Whatever the code can tell you, find out yourself.
 """
 
-# Только основной агент: суб-агенты не запускают суб-агентов.
-_DELEGATION_RULES = """
-# Subagents (task)
-Delegate research and self-contained subtasks with the task tool on your own, \
-without waiting for the user to ask: a subagent works in its own context and \
-returns only a short report, so your context stays free for the task itself.
-When to use which:
-- explore — whenever you do not know where the relevant code is, or answering \
-would take more than about 3 searches and reads: "how does X work", "where is Y \
-handled", an overview, the code a change will touch. Run it before a non-trivial \
-change, and in plan mode before writing the plan.
-- Several independent questions — one explore each, all in one response (2–4 \
-tasks).
-- general — a self-contained change that needs no decisions from the user: a fix \
-with its test, a refactoring inside one module, one of several independent \
-subtasks. Do not let it edit files you are changing yourself.
-- Yourself, without a subagent — a pinpoint lookup: a known file, symbol or \
-string, one or two tool calls.
-How to brief:
-- The prompt is the subagent's only source of information — it does not see this \
-conversation: the goal and the concrete question(s); the starting points you know \
-(paths, names, strings, errors); what is out of scope; what to return and when to \
-stop, e.g. "path:line of the entry points and the call chain to X in up to 10 \
-lines".
-- A subagent has a limited number of steps and a limited share of the context \
-window: give it one narrow question or subtask (one subsystem, one flow). A good \
-explore task is answerable in about ten tool calls.
-- A report from a subagent that was stopped by a limit is still a result: do not \
-rerun the same task — use what it found and delegate only what remains.
+# Только основной агент: суб-агенты не запускают суб-агентов. Стоит до «How to work»:
+# правила поиска там — для точечных запросов, исследование — через explore.
+_DELEGATION_RULES = """\
+# Research and subagents
+IMPORTANT: to research the code, call explore instead of searching yourself. That \
+covers every question that is not a pinpoint lookup: how something works, where \
+something is handled or configured, which code a change will touch and what depends \
+on it, how it is tested, an overview. explore runs a read-only subagent in its own \
+context and returns a short report with path:line, so its searches and reads do not \
+fill your context.
+- Several independent questions — several explore calls in one response.
+- Before a non-trivial change, and in plan mode before writing the plan, start with \
+explore.
+- Search yourself only for a pinpoint lookup: a known file, symbol or string, one or \
+two tool calls (read_file, find_symbol, search_content). After explore, read just the \
+lines you are going to change.
+- task — a self-contained subtask for a general subagent: a change that needs no \
+decisions from the user (a fix with its test, a refactoring inside one module, one of \
+several independent subtasks — one subagent each, in one response). Its prompt is the \
+subagent's only source of information: the goal, the starting points you know \
+(paths, names, errors), what is out of scope, what to report. Do not let it edit \
+files you are changing yourself.
+- Subagents have limited steps and context: one narrow question or subtask each. A \
+report of a subagent stopped by a limit is still a result — do not rerun the same \
+task, ask only for what remains.
 - Only you see the reports: retell the essentials to the user.
+
+Examples:
+- "How is the configuration loaded and validated?" → explore("How is the \
+configuration loaded and validated: entry points, sources, defaults, validation \
+errors?"), not a series of searches.
+- "Plan adding a cache to the HTTP client" → two explore calls in one response: "How \
+does the HTTP client send requests and handle errors?" and "How are the client's \
+settings defined and tested?"
+- "Where is the class UserRepository defined?" → find_symbol directly: a pinpoint \
+lookup.
+
 """
 
 _PROJECT_RULES = """
@@ -121,9 +128,9 @@ executed and only gets in the way.
 SYSTEM_PROMPT = (
     _INTRO
     + "\n"
+    + _DELEGATION_RULES
     + _WORK_RULES
     + _ASK_USER_RULE
-    + _DELEGATION_RULES
     + _PROJECT_RULES
     + """
 # Replies
@@ -230,9 +237,9 @@ user confirms each of them.
 
 Work in this order:
 1. Study the code. Unless the change is trivial (one or two known files), start \
-with explore subagents: 1–3 of them in one response, each with its own question \
-(where the change goes, what depends on it, how it is tested). When something is \
-ambiguous, ask the user (ask_user).
+with explore: 1–3 calls in one response, each with its own question (where the change \
+goes, what depends on it, how it is tested). When something is ambiguous, ask the \
+user (ask_user).
 2. Write the plan to {plan_path} with write_file — Markdown in the user's \
 language: the goal, the steps (which files and what to change in them), how to \
 check the result. Brief and concrete.

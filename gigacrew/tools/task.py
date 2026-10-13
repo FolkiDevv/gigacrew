@@ -5,8 +5,11 @@
 инструментов и возвращает только итоговый отчёт — контекст основного агента не
 засоряется промежуточными результатами.
 
-Здесь — описания встроенных агентов (данные, общие для инструмента и ядра) и сам
-инструмент. Запускает суб-агента ядро (:mod:`gigacrew.agent.subagents`,
+Исследование кода — отдельный инструмент ``explore``: один вопрос вместо брифа и типа
+агента. Модель охотнее берёт инструмент «ответь на вопрос о коде», чем «поручи подзадачу».
+
+Здесь — описания встроенных агентов (данные, общие для инструментов и ядра) и сами
+инструменты. Запускает суб-агента ядро (:mod:`gigacrew.agent.subagents`,
 ``Agent._run_subagent``) — инструмент получает его через ``ToolContext.run_subagent``.
 """
 
@@ -36,14 +39,14 @@ class SubagentSpec:
 
 # Суб-агенту недоступны: запуск суб-агентов (без вложенности), вопросы пользователю и
 # одобрение плана — пользователь говорит только с основным агентом.
-SUBAGENT_EXCLUDED: frozenset[str] = frozenset({"task", "ask_user", "exit_plan_mode"})
+SUBAGENT_EXCLUDED: frozenset[str] = frozenset({"task", "explore", "ask_user", "exit_plan_mode"})
 
 EXPLORE = SubagentSpec(
     name="explore",
     description=(
-        "codebase research, read-only — use it proactively whenever the answer takes more "
-        "than a few searches: search, code navigation, reading files, git status/diff/log. "
-        "Returns a digest with paths and line numbers"
+        "codebase research, read-only: search, code navigation, reading files, git "
+        "status/diff/log. Returns a digest with paths and line numbers. For a research "
+        "question prefer the explore tool"
     ),
     tools=frozenset(
         {
@@ -103,32 +106,65 @@ class TaskParams(BaseModel):
     )
 
 
+class ExploreParams(BaseModel):
+    question: str = Field(
+        description=(
+            "What to find out about the code, as one full question, e.g. 'How is a "
+            "request authenticated: where are credentials checked and where is the "
+            "session created?'"
+        )
+    )
+    hints: str = Field(
+        "",
+        description=(
+            "Optional: what you already know (paths, names, strings, errors) and what is "
+            "out of scope."
+        ),
+    )
+
+
+class ExploreTool(Tool):
+    name = "explore"
+    description = (
+        "Investigates the codebase to answer a question and returns a short report with "
+        "path:line references. A read-only subagent does the searching and reading in its "
+        "own context, so none of it fills yours. Use it instead of searching yourself for "
+        "any question that is not a pinpoint lookup: how something works, where something "
+        "is handled or configured, which code a change will touch and what depends on it, "
+        "how it is tested, an overview. Several independent questions — several explore "
+        "calls in one response. Not for a known file, symbol or string: use read_file, "
+        "find_symbol or search_content directly."
+    )
+    Params = ExploreParams
+
+    def describe(self, params: ExploreParams) -> str:
+        return " ".join(params.question.split())[:70]
+
+    def run(self, params: ExploreParams, ctx: ToolContext) -> ToolResult:
+        question = params.question.strip()
+        if not question:
+            raise ToolError("Пустой вопрос: опиши в параметре question, что выяснить.")
+        if ctx.run_subagent is None:
+            raise ToolError("суб-агенты здесь недоступны — выясни сам.")
+        hints = params.hints.strip()
+        brief = f"{question}\n\nAlready known / out of scope: {hints}" if hints else question
+        return ctx.run_subagent(EXPLORE.name, task_title("", question), brief)
+
+
 class TaskTool(Tool):
     name = "task"
     description = (
-        "Launches a subagent that works in its own context and returns only its final "
-        "report — its intermediate searches and reads do not fill your context. Use it "
-        "proactively, without being asked: whenever finding the relevant code would take "
-        "more than about 3 searches and reads, before a non-trivial change, and in plan "
-        f"mode before writing the plan. Subagent types: {_agents_list()}. Independent "
-        "questions or subtasks — one subagent each, sent together in one response. A "
-        "subagent has limited steps and context: give it ONE narrow question or subtask "
-        "(one subsystem, one flow) and a complete brief — it does not see this "
-        "conversation.\n"
-        "When NOT to use: a known file, symbol or string (read_file, find_symbol, "
-        "search_content are faster); a question about 1–3 files you already know; "
-        "anything that needs the user's decisions.\n"
-        "A report of a subagent stopped by a limit is partial but useful: do not rerun the "
-        "same task — narrow it to what remains. If the user stopped a subagent, do not run "
-        "the same task again unless asked.\n"
-        "Examples:\n"
-        '- "How does authentication work here?" → subagent_type "explore", prompt: "Find '
-        "where credentials are checked and how a session is created; return path:line of "
-        'each step of the flow, up to 15 lines."\n'
-        '- "Plan adding a cache to the API client" → two explore tasks in one response: '
-        '"where and how the client sends requests" and "how its settings are loaded and '
-        'tested".\n'
-        '- "Where is the class UserRepository defined?" → no subagent: find_symbol.'
+        "Hands a self-contained subtask to a subagent that works in its own context and "
+        "returns only its final report. For research questions use the explore tool; "
+        "task is mainly for a general subagent: a change that needs no decisions from the "
+        "user (a fix with its test, a refactoring inside one module, one of several "
+        f"independent subtasks — one subagent each, in one response). Subagent types: "
+        f"{_agents_list()}. A subagent has limited steps and context: give it ONE narrow "
+        "subtask and a complete brief — it does not see this conversation. Do not delegate "
+        "what needs the user's decisions, and do not let it edit files you are changing "
+        "yourself. A report of a subagent stopped by a limit is partial but useful: do not "
+        "rerun the same task — narrow it to what remains. If the user stopped a subagent, "
+        "do not run the same task again unless asked."
     )
     Params = TaskParams
 

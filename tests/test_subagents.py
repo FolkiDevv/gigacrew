@@ -27,7 +27,13 @@ from gigacrew.llm.model_windows import ModelWindows
 from gigacrew.llm.types import FunctionCall, Usage
 from gigacrew.permissions import PermissionMode
 from gigacrew.tools.base import build_default_registry
-from gigacrew.tools.task import EXPLORE, SUBAGENT_EXCLUDED, SUBAGENTS
+from gigacrew.tools.task import (
+    EXPLORE,
+    SUBAGENT_EXCLUDED,
+    SUBAGENTS,
+    ExploreTool,
+    allows_tool,
+)
 
 
 def _agent(provider, tmp_path: Path, *, events=None, registry=None, **cfg_kw) -> loop.Agent:
@@ -242,25 +248,66 @@ def test_delegation_rules_only_for_main_agent():
     """Как ставить задачи суб-агентам — знает основной агент; суб-агент их не ставит."""
     from gigacrew.agent.prompts import SUBAGENT_PROMPT, SYSTEM_PROMPT
 
-    assert "# Subagents (task)" in SYSTEM_PROMPT
-    assert "# Subagents (task)" not in SUBAGENT_PROMPT
+    assert "# Research and subagents" in SYSTEM_PROMPT
+    assert "# Research and subagents" not in SUBAGENT_PROMPT
 
 
-def test_delegation_is_proactive_with_triggers():
-    """Суб-агенты — без просьбы пользователя: триггеры в промпте, описании task и в
-    порядке работы режима плана; точечный поиск — самому."""
+def test_research_goes_to_explore_first():
+    """Исследование — через explore без просьбы пользователя: правило стоит до «How to
+    work», с примерами; точечный поиск — самому; в режиме плана — explore первым шагом."""
     from gigacrew.agent.prompts import PLAN_MODE_PROMPT, SYSTEM_PROMPT
-    from gigacrew.tools.task import TaskTool
 
-    rules = SYSTEM_PROMPT[SYSTEM_PROMPT.index("# Subagents (task)") :]
-    assert "without waiting for the user to ask" in rules
-    assert "more than about 3 searches and reads" in rules and "pinpoint lookup" in rules
-    description = TaskTool.description
-    assert description.startswith("Launches a subagent") and "proactively" in description
-    assert "When NOT to use" in description and description.count('\n- "') == 3
-    assert "use it proactively" in EXPLORE.description
+    research = SYSTEM_PROMPT.index("# Research and subagents")
+    assert research < SYSTEM_PROMPT.index("# How to work")
+    rules = SYSTEM_PROMPT[research : SYSTEM_PROMPT.index("# How to work")]
+    assert "IMPORTANT: to research the code, call explore instead of searching yourself" in rules
+    assert "pinpoint lookup" in rules and rules.count('\n- "') == 3  # три примера
+    assert "Use it instead of searching yourself" in ExploreTool.description
     step = PLAN_MODE_PROMPT[PLAN_MODE_PROMPT.index("1. ") : PLAN_MODE_PROMPT.index("2. ")]
-    assert "explore subagents: 1–3 of them in one response" in step
+    assert "start with explore: 1–3 calls in one response" in step
+
+
+def test_explore_tool_comes_first_and_is_not_for_subagents():
+    reg = build_default_registry()
+    assert next(iter(reg)).name == "explore"
+    spec = reg.get("explore").spec()
+    assert spec.parameters["required"] == ["question"]
+    assert "explore" in SUBAGENT_EXCLUDED
+    for subagent in SUBAGENTS.values():
+        assert not allows_tool(subagent, "explore")
+
+
+def test_explore_tool_runs_read_only_subagent(tmp_path):
+    (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+    question = "Где определена foo\nи что она возвращает?"
+    provider = ScriptedProvider(
+        [
+            tool_turn("explore", {"question": question, "hints": "смотри a.py"}),
+            tool_turn("write_file", {"path": "b.py", "content": "x"}),  # заблокировано
+            text_turn("foo в a.py:1, возвращает 1"),
+            text_turn("foo возвращает 1"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, auto_approve=True)
+    assert agent.run_turn("что возвращает foo?") == "foo возвращает 1"
+    brief = provider.requests[1]["messages"][1].content
+    assert brief.startswith(question) and "Already known / out of scope: смотри a.py" in brief
+    assert not (tmp_path / "b.py").exists()  # суб-агент только читает
+    info = next(p for k, p in events.events if k == "subagent_start")
+    assert info.name == "explore" and info.description == "Где определена foo"
+    call = next(p for k, p in events.events if k == "tool_call")
+    assert call.summary == "Где определена foo и что она возвращает?"
+    report = _results(agent.conversation.messages)[0]
+    assert "foo в a.py:1" in report
+
+
+def test_explore_tool_rejects_empty_question(tmp_path):
+    provider = ScriptedProvider([tool_turn("explore", {"question": "  "}), text_turn("ок")])
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("x")
+    assert "Пустой вопрос" in _results(agent.conversation.messages)[0]
+    assert provider.calls == 2  # суб-агент не запускался
 
 
 def test_limit_stop_report_tells_not_to_rerun_the_same_task():
