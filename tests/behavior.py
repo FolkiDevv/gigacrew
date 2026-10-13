@@ -9,8 +9,8 @@
   безопасные команды (:func:`is_safe_command`);
 * запись обращений к модели (:class:`RecordingProvider`): размер запросов, кеш, вызовы;
 * прогон сценария и метрики (:func:`run_scenario`), инварианты harness'а
-  (:func:`invariant_errors`), отчёт (:class:`EvalSession`, :func:`summary_table`) и
-  сравнение отчётов (:func:`compare_reports`);
+  (:func:`invariant_errors`), отчёт (:class:`EvalSession`, :func:`summary_table`),
+  выжимка для чата (:func:`digest_report`) и сравнение отчётов (:func:`compare_reports`);
 * разбор ответов шлюза для проб (:func:`reasoning_texts`, :func:`with_reasoning`,
   :func:`describe_probe`).
 
@@ -18,9 +18,10 @@
 проекта), поэтому набор работает и на коде до изменений промпта — первый прогон даёт
 baseline. Поведение модели случайно: сценарий повторяется, в отчёте — доли прогонов.
 
-Просмотр и сравнение сохранённых отчётов::
+Просмотр, выжимка для чата (до ~100 строк) и сравнение сохранённых отчётов::
 
     uv run python tests/behavior.py show .gigacrew/evals/eval-<время>.json
+    uv run python tests/behavior.py digest .gigacrew/evals/eval-<время>.json
     uv run python tests/behavior.py compare <было>.json <стало>.json
 """
 
@@ -35,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -44,7 +46,7 @@ from typing import Any
 from fakes import RecordingEvents
 
 from gigacrew.agent.context_window import CHARS_PER_TOKEN
-from gigacrew.agent.loop import PLAN_BLOCKED_NOTE, REJECTED_NOTE, Agent
+from gigacrew.agent.loop import PLAN_BLOCKED_NOTE, REJECTED_NOTE, SELF_CHECK_NOTE, Agent
 from gigacrew.agent.prompts import SUBAGENT_PROMPT
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMProvider
@@ -67,9 +69,12 @@ EVAL_TIMEOUT_ENV = "GIGACREW_EVAL_TIMEOUT"
 DEFAULT_RUNS = 3
 DEFAULT_TIMEOUT = 1800  # с на один прогон сценария
 
-# Уведомления, которыми harness сообщает о своём вмешательстве в план-режиме (счёт
-# напоминаний). Меняется текст — обновить здесь.
+# Уведомления, которыми harness сообщает, что модель записала план, но не отправила его
+# (до этапа 3 — напоминание модели, теперь — показ плана самим harness'ом): счёт ``rem``
+# сравним между отчётами. Меняется текст — обновить здесь.
 HARNESS_PLAN_NOTICES = ("не отправлен на одобрение",)
+# Первая строка вопроса самопроверки: так её служебное сообщение видно в истории.
+SELF_CHECK_MARK = SELF_CHECK_NOTE.splitlines()[0]
 # Инструменты исследования кода: их вызовы основным агентом — «работа вместо суб-агента».
 RESEARCH_TOOLS = frozenset(
     {
@@ -774,6 +779,10 @@ PROMO_TASK = (
     "Добавь промокоды: скидка в процентах при оформлении заказа, не больше предела скидки "
     "из настроек; неизвестный промокод — ошибка валидации."
 )
+DETAILED_PLAN = (
+    "Нужен подробный план: для каждого шага — полный код изменений (функции и классы "
+    "целиком, не фрагменты) и тесты к нему."
+)
 CLEAR_TASK = "добавь в Cart метод clear(), очищающий корзину, и тест к нему в tests/test_cart.py."
 PLAN_REMARKS = "Добавь в план тесты на промокоды и проверку, что скидка не превышает предел."
 
@@ -783,6 +792,15 @@ SCENARIOS: tuple[Scenario, ...] = (
         goal="план показан пользователю (exit_plan_mode)",
         mode=PermissionMode.PLAN,
         turns=(Turn(PROMO_TASK),),
+        plan_answers=(None,),
+        plan_only=True,
+        check=lambda r: r["plan_shown"] >= 1,
+    ),
+    Scenario(
+        id="plan_detailed",
+        goal="подробный план с кодом (длинный write_file) показан пользователю",
+        mode=PermissionMode.PLAN,
+        turns=(Turn(f"{PROMO_TASK} {DETAILED_PLAN}"),),
         plan_answers=(None,),
         plan_only=True,
         check=lambda r: r["plan_shown"] >= 1,
@@ -1086,6 +1104,10 @@ def _metrics(
         "plan_reminders": sum(
             1 for _, text in user.notices if any(mark in text for mark in HARNESS_PLAN_NOTICES)
         ),
+        # самопроверки и те из них, после которых модель продолжила работу (служебное
+        # сообщение осталось в истории); остальные кончились ответом «OK»
+        "self_checks": sum(s.self_checks for s in user.stats),
+        "self_checks_resumed": sum(1 for m in messages if m.meta and SELF_CHECK_MARK in m.content),
         "plan_turns_ended_in_text": sum(
             1
             for t in turns
@@ -1124,7 +1146,9 @@ def _metrics(
         "completion_tokens": sum(c["completion_tokens"] for c in recorder.calls),
         "cached_tokens": sum(c["cached_tokens"] for c in recorder.calls),
         "text_with_calls": sum(1 for c in main_requests if c["text"] and c["calls"]),
-        "cut_retries": sum(getattr(s, "cut_retries", 0) for s in user.stats),
+        "cut_retries": sum(s.cut_retries for s in user.stats),
+        "max_completion_tokens": max((c["completion_tokens"] for c in recorder.calls), default=0),
+        "max_request_s": max((c["duration_s"] for c in recorder.calls), default=0.0),
         "steps": sum(s.steps for s in user.stats),
         "tool_calls": sum(s.tool_calls for s in user.stats),
         "stop_reasons": [s.stop_reason for s in user.stats if s.stop_reason],
@@ -1311,10 +1335,12 @@ def _table(rows: list[tuple[str, ...]]) -> list[str]:
 
 SUMMARY_LEGEND = (
     "ok — сценарий выполнен (цели ниже); err — сорвавшиеся прогоны; exit — модель сама "
-    "вызвала exit_plan_mode; shown — план показан пользователю; txt — ходов плана, "
-    "закончившихся текстом без показа плана (в среднем); task/expl — вызовов task / из них "
-    "explore; res — своих поисков и чтений; req — запросов к модели (с суб-агентами); "
-    "tok,k — тысяч токенов; cache — доля токенов запроса из кеша; time — секунд."
+    "вызвала exit_plan_mode; shown — план показан пользователю; rem — план записан, но не "
+    "отправлен моделью (напоминание, с этапа 3 — показ harness'ом); chk — самопроверок; "
+    "txt — ходов плана, закончившихся текстом без показа плана (в среднем); task/expl — "
+    "вызовов task / из них explore; res — своих поисков и чтений; req — запросов к модели "
+    "(с суб-агентами); tok,k — тысяч токенов; cache — доля токенов запроса из кеша; time — "
+    "секунд."
 )
 
 
@@ -1329,6 +1355,8 @@ def summary_table(records: Sequence[Mapping[str, Any]]) -> list[str]:
             "err",
             "exit",
             "shown",
+            "rem",
+            "chk",
             "txt",
             "task",
             "expl",
@@ -1349,6 +1377,8 @@ def summary_table(records: Sequence[Mapping[str, Any]]) -> list[str]:
                 str(sum(1 for r in runs if r.get("error"))),
                 _rate(runs, lambda r: r["exit_calls"] > 0),
                 _rate(runs, lambda r: r["plan_shown"] > 0),
+                _mean(runs, "plan_reminders"),
+                _mean(runs, "self_checks"),
                 _mean(runs, "plan_turns_ended_in_text"),
                 _mean(runs, "task_calls"),
                 _mean(runs, "explore_calls"),
@@ -1372,29 +1402,143 @@ def _describe(meta: Mapping[str, Any]) -> str:
     return " · ".join(parts)
 
 
+def _errors(records: Sequence[Mapping[str, Any]]) -> str:
+    return str(sum(1 for r in records if r.get("error")))
+
+
+# Столбцы сравнения: имя и значение по группе прогонов.
+_COMPARED: tuple[tuple[str, Callable[[Sequence[Mapping[str, Any]]], str]], ...] = (
+    ("ok", lambda g: _rate(g, "ok")),
+    ("err", _errors),
+    ("exit", lambda g: _rate(g, lambda r: r["exit_calls"] > 0)),
+    ("shown", lambda g: _rate(g, lambda r: r["plan_shown"] > 0)),
+    ("rem", lambda g: _mean(g, "plan_reminders")),
+    ("chk", lambda g: _mean(g, "self_checks")),
+    ("txt", lambda g: _mean(g, "plan_turns_ended_in_text")),
+    ("expl", lambda g: _mean(g, "explore_calls")),
+    ("task", lambda g: _mean(g, "task_calls")),
+    ("res", lambda g: _mean(g, "research_calls")),
+    ("req", lambda g: _mean(g, "requests")),
+    ("tok,k", lambda g: _mean(g, _tokens)),
+)
+
+
 def compare_reports(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
     """Сравнение двух отчётов по модели и сценарию: «было → стало»."""
     before, after = _groups(old["runs"]), _groups(new["runs"])
-    rows: list[tuple[str, ...]] = [
-        ("model", "scenario", "ok", "exit", "shown", "expl", "task", "req", "tok,k")
-    ]
+    rows: list[tuple[str, ...]] = [("model", "scenario", *(name for name, _ in _COMPARED))]
     for key in _ordered(before.keys() | after.keys()):
         a, b = before.get(key, []), after.get(key, [])
+        rows.append((key[0], key[1], *(f"{value(a)} → {value(b)}" for _, value in _COMPARED)))
+    head = [f"было:  {_describe(old['meta'])}", f"стало: {_describe(new['meta'])}", ""]
+    return head + _table(rows)
+
+
+# --------------------------------------------------------------------------- #
+# Выжимка для чата
+# --------------------------------------------------------------------------- #
+DIGEST_PROBLEMS = 30  # неуспешных прогонов в выжимке, остальные — числом
+DIGEST_ERRORS = 5  # частых ошибок
+_CLIP = 100  # символов текста ошибки или ответа
+
+
+def _clip(text: str, limit: int = _CLIP) -> str:
+    line = " ".join(str(text).split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def _peak(records: Sequence[Mapping[str, Any]], metric: str, scale: float = 1.0) -> str:
+    """Максимум по прогонам («—» — метрики нет: отчёт старой версии)."""
+    values = [r[metric] for r in records if r.get(metric) is not None]
+    return f"{max(values) / scale:.1f}" if values else "—"
+
+
+def _stops(records: Sequence[Mapping[str, Any]]) -> str:
+    counts = Counter(reason for r in records for reason in r.get("stop_reasons") or ())
+    return ",".join(f"{reason}×{n}" if n > 1 else reason for reason, n in counts.most_common())
+
+
+def _problem(record: Mapping[str, Any]) -> str:
+    """Почему прогон не удался — одной строкой."""
+    parts = [f"{record['model']} {record['scenario']} r{record.get('run', '?')}:"]
+    if record.get("error"):
+        parts.append(f"сбой «{_clip(record['error'])}»")
+    if record.get("stop_reasons"):
+        parts.append("стоп " + ",".join(record["stop_reasons"]))
+    parts.append(
+        f"shown={record.get('plan_shown', 0)} exit={record.get('exit_calls', 0)} "
+        f"chk={record.get('self_checks', 0)} task={record.get('task_calls', 0)}"
+    )
+    if record.get("answer"):
+        parts.append(f"ответ «{_clip(record['answer'], 60)}»")
+    return " ".join(parts)
+
+
+def digest_report(report: Mapping[str, Any]) -> list[str]:
+    """Выжимка отчёта, которую можно целиком вставить в чат (до ~100 строк).
+
+    Сводка по модели и сценарию — с пиком вывода и длительности запроса, причинами
+    остановок, — затем неуспешные прогоны по одному в строку (сначала без сбоя) и частые
+    ошибки.
+    """
+    runs = report["runs"]
+    groups = _groups(runs)
+    rows: list[tuple[str, ...]] = [
+        (
+            "model",
+            "scenario",
+            "ok",
+            "err",
+            "rem",
+            "chk",
+            "txt",
+            "res",
+            "req",
+            "cut",
+            "out,k",
+            "max,s",
+            "stops",
+        )
+    ]
+    for key in _ordered(groups):
+        g = groups[key]
         rows.append(
             (
                 key[0],
                 key[1],
-                f"{_rate(a, 'ok')} → {_rate(b, 'ok')}",
-                f"{_rate(a, lambda r: r['exit_calls'] > 0)} → {_rate(b, lambda r: r['exit_calls'] > 0)}",
-                f"{_rate(a, lambda r: r['plan_shown'] > 0)} → {_rate(b, lambda r: r['plan_shown'] > 0)}",
-                f"{_mean(a, 'explore_calls')} → {_mean(b, 'explore_calls')}",
-                f"{_mean(a, 'task_calls')} → {_mean(b, 'task_calls')}",
-                f"{_mean(a, 'requests')} → {_mean(b, 'requests')}",
-                f"{_mean(a, _tokens)} → {_mean(b, _tokens)}",
+                _rate(g, "ok"),
+                _errors(g),
+                _mean(g, "plan_reminders"),
+                _mean(g, "self_checks"),
+                _mean(g, "plan_turns_ended_in_text"),
+                _mean(g, "research_calls", digits=0),
+                _mean(g, "requests", digits=0),
+                str(sum(r.get("cut_retries") or 0 for r in g)),
+                _peak(g, "max_completion_tokens", scale=1000),
+                _peak(g, "max_request_s"),
+                _stops(g),
             )
         )
-    head = [f"было:  {_describe(old['meta'])}", f"стало: {_describe(new['meta'])}", ""]
-    return head + _table(rows)
+    lines = [_describe(report["meta"]), *_table(rows)]
+    # Сначала провалы поведения, потом сбои: сбои ещё и сведены в «Частые ошибки» ниже,
+    # и сотня одинаковых таймаутов не должна вытеснить единичный провал.
+    failed = sorted((r for r in runs if not r.get("ok")), key=lambda r: bool(r.get("error")))
+    if failed:
+        lines += ["", f"Неуспешные прогоны: {len(failed)} из {len(runs)}"]
+        lines += [_problem(r) for r in failed[:DIGEST_PROBLEMS]]
+        if len(failed) > DIGEST_PROBLEMS:
+            lines.append(f"… и ещё {len(failed) - DIGEST_PROBLEMS}")
+    errors = Counter(_clip(r["error"]) for r in runs if r.get("error"))
+    if errors:
+        lines += ["", "Частые ошибки:"]
+        lines += [f"{n}× {text}" for text, n in errors.most_common(DIGEST_ERRORS)]
+    lines += [
+        "",
+        "rem — план не отправлен моделью; chk — самопроверок; txt — ходов плана, кончившихся "
+        "текстом; cut — повторов после оборванного ответа; out,k — пик вывода за запрос, "
+        "тыс. токенов; max,s — самый долгий запрос.",
+    ]
+    return lines
 
 
 # --------------------------------------------------------------------------- #
@@ -1505,6 +1649,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = load_report(Path(args[1]))
         print(_describe(report["meta"]))
         print("\n".join(summary_table(report["runs"])))
+        return 0
+    if len(args) == 2 and args[0] == "digest":
+        print("\n".join(digest_report(load_report(Path(args[1])))))
         return 0
     if len(args) == 3 and args[0] == "compare":
         lines = compare_reports(load_report(Path(args[1])), load_report(Path(args[2])))

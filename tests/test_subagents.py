@@ -292,6 +292,24 @@ def test_parent_mode_change_reaches_running_subagent(tmp_path):
     assert "# Plan mode" in last[0].content and "exit_plan_mode" not in last[0].content
 
 
+def test_subagent_answer_in_plan_mode_gets_no_self_check(tmp_path):
+    provider = ScriptedProvider(
+        [
+            _task("explore", "где foo?"),
+            text_turn("foo — в a.py"),  # ответ суб-агента: самопроверки нет
+            text_turn("foo лежит в a.py"),  # ответ основного агента
+            text_turn("OK"),  # его самопроверка
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, mode=PermissionMode.PLAN)
+    assert agent.run_turn("где foo?") == "foo лежит в a.py"
+    assert provider.calls == 4 and events.stats[-1].self_checks == 1
+    after_subagent = provider.requests[2]["messages"]
+    assert after_subagent[-1].role == "function"  # отчёт суб-агента, не самопроверка
+    assert provider.requests[3]["messages"][-1].meta
+
+
 # ------------------------------ токены, сбои ----------------------------- #
 def test_subagent_tokens_billed_to_parent(tmp_path):
     provider = ScriptedProvider(

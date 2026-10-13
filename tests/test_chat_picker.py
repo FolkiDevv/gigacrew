@@ -181,6 +181,20 @@ def test_chat_resumed_shows_last_exchange(monkeypatch):
     assert "первый ответ" not in out
 
 
+def test_chat_resumed_skips_meta_messages(monkeypatch):
+    ui, buf = _console(monkeypatch)
+    messages = [
+        Message(role="user", content="спланируй промокоды"),
+        Message(role="assistant", content="Вот план"),
+        Message(role="user", content="<system-reminder>план одобрен</system-reminder>", meta=True),
+        Message(role="assistant", content="Промокоды готовы"),
+    ]
+    ui.chat_resumed(_chat(0, "спланируй промокоды"), messages)
+    out = buf.getvalue()
+    assert "› спланируй промокоды" in out and "Промокоды готовы" in out
+    assert "system-reminder" not in out
+
+
 def test_chat_resumed_after_interrupted_turn_shows_no_stale_answer(monkeypatch):
     ui, buf = _console(monkeypatch)
     messages = [

@@ -75,7 +75,7 @@ def _one_line(text: str, limit: int) -> str:
 def chat_title(messages: Iterable[Message]) -> str:
     """Заголовок чата — первый запрос пользователя в одну строку."""
     for m in messages:
-        if m.role == "user" and m.content.strip():
+        if m.is_request and m.content.strip():
             return _one_line(m.content, TITLE_LIMIT)
     return "(без названия)"
 
@@ -129,7 +129,7 @@ class ChatStore:
             created_at=created_at or now,
             updated_at=now,
             model=model,
-            requests=sum(1 for m in messages if m.role == "user"),
+            requests=sum(1 for m in messages if m.is_request),
             preview=_preview(messages),
         )
         data = {
@@ -275,7 +275,7 @@ class ChatRecorder:
 
     def save(self, conversation: Conversation, *, model: str = "") -> str | None:
         """Сохраняет диалог; возвращает предупреждение, если запись не удалась."""
-        if not self.enabled or not any(m.role == "user" for m in conversation.messages):
+        if not self.enabled or not any(m.is_request for m in conversation.messages):
             return None
         try:
             if self._created_at is None:

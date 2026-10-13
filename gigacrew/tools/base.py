@@ -48,11 +48,13 @@ class PlanFile:
 
     Агент пишет его обычными write_file/edit_file — единственный файл в
     ``.gigacrew/``, доступный для записи. ``dirty`` — план менялся после того, как
-    его в последний раз показали пользователю (``exit_plan_mode``).
+    его в последний раз отдали на одобрение (:func:`~gigacrew.tools.plan.review_plan`);
+    ``reviews`` — сколько раз отдавали: по нему агент видит, показан ли план в этом ходе.
     """
 
     path: Path
     dirty: bool = False
+    reviews: int = 0
 
     def is_target(self, path: Path) -> bool:
         """Указывает ли (уже разрешённый) путь на этот файл плана.

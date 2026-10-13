@@ -33,6 +33,10 @@ class Message(BaseModel):
     - assistant с ``function_calls``: модель просит вызвать инструменты (один или
       несколько за раз); на каждый вызов по порядку идёт свой результат.
     - function: результат одного вызова (``name`` + ``content``, ``call_id`` — id вызова).
+
+    ``meta`` — служебное user-сообщение harness'а (одобрение плана, самопроверка): модель
+    получает его как обычное, но это не запрос пользователя — не заголовок чата, не
+    счётчик запросов, не закреплённая задача.
     """
 
     role: Role
@@ -43,6 +47,12 @@ class Message(BaseModel):
     # Непрозрачный идентификатор состояния инструментов из ответа API: возвращается
     # с assistant-сообщением и результатами его вызовов.
     state_id: str | None = None
+    meta: bool = False
+
+    @property
+    def is_request(self) -> bool:
+        """Запрос пользователя (не служебное сообщение harness'а)."""
+        return self.role == "user" and not self.meta
 
     @model_validator(mode="before")
     @classmethod

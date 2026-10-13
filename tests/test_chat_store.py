@@ -170,6 +170,16 @@ def test_title():
     title = chat_title([Message(role="user", content=long)])
     assert title.startswith("сделай что-нибудь полезное") and title.endswith("…")
     assert len(title) == 60
+    meta = Message(role="user", content="<system-reminder>…</system-reminder>", meta=True)
+    assert chat_title([meta, Message(role="user", content="задача")]) == "задача"
+
+
+def test_meta_messages_are_not_counted_as_requests(store):
+    conv = _conv()
+    conv.add_user("<system-reminder>план одобрен</system-reminder>", meta=True)
+    conv.add_assistant(Message(role="assistant", content="сделано"))
+    info = store.save("20260101-120000-abcd", conv)
+    assert info.requests == 1 and info.title == "почини тесты"
 
 
 # ------------------------------ ChatRecorder ------------------------------ #

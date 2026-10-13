@@ -20,19 +20,20 @@ from gigacrew.agent.conversation import INTERRUPTED_NOTE
 from gigacrew.agent.loop import (
     LOOP_STOP_NOTE,
     PLAN_BLOCKED_NOTE,
-    PLAN_NOT_SUBMITTED_NOTE,
     REJECTED_AGAIN_NOTE,
     REJECTED_NOTE,
+    SELF_CHECK_NOTE,
     SKIPPED_NOTE,
     Agent,
 )
 from gigacrew.config import Config
 from gigacrew.errors import ToolError
+from gigacrew.llm.base import LLMError
 from gigacrew.llm.types import Message, Usage
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolRegistry, ToolResult, build_default_registry
 from gigacrew.tools.plan import APPROVE_EDITS
-from gigacrew.tools.questions import Answer
+from gigacrew.tools.questions import Answer, QuestionsUnavailable
 from gigacrew.tools.task import EXPLORE
 
 
@@ -735,13 +736,14 @@ def test_accept_edits_still_asks_for_the_rest(tmp_path, kind):
 
 
 def test_plan_rules_are_sent_only_in_plan_mode(tmp_path):
-    provider = ScriptedProvider([text_turn("план"), text_turn("готово")])
+    # «OK» — ответ на самопроверку: ход в режиме плана кончился текстом
+    provider = ScriptedProvider([text_turn("план"), text_turn("OK"), text_turn("готово")])
     agent = _agent(provider, tmp_path, mode=PermissionMode.PLAN)
     agent.run_turn("спланируй")
     agent.set_mode(PermissionMode.MANUAL)
     agent.run_turn("делай")
-    planning, manual = _system_prompts(provider)
-    assert "# Plan mode" in planning
+    planning, check, manual = _system_prompts(provider)
+    assert "# Plan mode" in planning and "# Plan mode" in check
     assert "# Plan mode" not in manual
 
 
@@ -806,56 +808,253 @@ def test_plan_mode_allows_only_the_plan_file(tmp_path):
     assert not (tmp_path / "a.txt").exists() and events.confirms == []
 
 
-def test_unsubmitted_plan_gets_one_reminder(tmp_path):
+class _PlanAnswers(RecordingEvents):
+    """Ответы на вопросы по очереди: ``None`` — отказ (Esc), исключение — бросается
+    (``QuestionsUnavailable`` — спросить некого)."""
+
+    def __init__(self, *answers):
+        super().__init__(confirm_answer=False)
+        self._queue = list(answers)
+
+    def ask_user(self, questions):
+        self.questions.append(list(questions))
+        answer = self._queue.pop(0) if self._queue else None
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
+def _user_messages(agent) -> list[tuple[str, bool]]:
+    return [(m.content, m.meta) for m in agent.conversation.messages if m.role == "user"]
+
+
+def test_plan_left_in_text_is_shown_and_approved(tmp_path):
     provider = ScriptedProvider(
         [
-            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План\n1. создать a.txt"}),
             text_turn("Вот план: ..."),  # забыла exit_plan_mode
-            text_turn("План готов, см. файл"),  # и после напоминания — ответ принимается
+            tool_turn("write_file", {"path": "a.txt", "content": "x"}),
+            text_turn("готово"),
         ]
     )
-    events = RecordingEvents()
+    events = _PlanAnswers([Answer((APPROVE_EDITS,))])
     agent = _planning_agent(provider, tmp_path, events)
-    assert agent.run_turn("спланируй") == "План готов, см. файл"
-    assert len(provider.requests) == 3
-    reminder = provider.requests[2]["messages"]
-    assert PLAN_NOT_SUBMITTED_NOTE in reminder[-1].content  # в хвосте, рядом с моделью
-    assert PLAN_NOT_SUBMITTED_NOTE not in provider.requests[1]["messages"][-1].content
-    # текст без вызова в историю не попал: запрос не кончается репликой ассистента
-    assert reminder[-1].role == "function"
-    # заметка дописана к копии: в сохранённом диалоге её нет
-    assert all(PLAN_NOT_SUBMITTED_NOTE not in m.content for m in agent.conversation.messages)
-    assert [m.content for m in agent.conversation.messages if m.role == "assistant"][-1] == (
-        "План готов, см. файл"
+    assert agent.run_turn("спланируй и сделай") == "готово"
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
+    (question,) = events.questions[0]
+    assert question.body.startswith("# План\n1. создать a.txt")
+    # ответ модели остался в истории, за ним — служебное сообщение с решением пользователя
+    request = provider.requests[2]["messages"]
+    assert request[-2].role == "assistant" and request[-2].content == "Вот план: ..."
+    decision = request[-1]
+    assert decision.role == "user" and decision.content.startswith("<system-reminder>")
+    assert "Пользователь одобрил план" in decision.content and "создать a.txt" in decision.content
+    assert [meta for _, meta in _user_messages(agent)] == [False, True]
+    assert len(provider.requests) == 4 and events.stats[-1].self_checks == 0
+    notices = [text for _, text in events.notices]
+    assert any("не отправлен на одобрение" in text for text in notices)
+    assert any(text.startswith("план одобрен") for text in notices)
+
+
+def test_plan_left_in_text_with_remarks_is_revised_and_shown_again(tmp_path):
+    fix = {"path": PLAN_REL, "old_string": "1. код", "new_string": "1. код\n2. тесты"}
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План\n1. код"}),
+            text_turn("Вот план"),
+            tool_turn("edit_file", fix),
+            text_turn("Исправил"),  # и снова без exit_plan_mode
+        ]
     )
-    assert any("не отправлен" in text for _, text in events.notices)
+    events = _PlanAnswers([Answer((), custom="добавь тесты")], None)
+    agent = _planning_agent(provider, tmp_path, events)
+    assert agent.run_turn("спланируй") == "Исправил"
+    assert agent.mode is PermissionMode.PLAN and len(events.questions) == 2
+    assert "2. тесты" in events.questions[1][0].body
+    remark = provider.requests[2]["messages"][-1]
+    assert remark.meta and "просит доработать: «добавь тесты»" in remark.content
+    # после отказа (Esc) ход кончился ответом модели, без служебного сообщения
+    assert agent.conversation.messages[-1].content == "Исправил"
+    assert len(provider.requests) == 4 and events.stats[-1].self_checks == 0
 
 
-def test_reminder_leads_to_submission(tmp_path):
+@pytest.mark.parametrize(
+    "answer", [None, QuestionsUnavailable("нет терминала")], ids=["esc", "no_approver"]
+)
+def test_plan_left_in_text_ends_the_turn_when_not_approved(tmp_path, answer):
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
             text_turn("Вот план"),
-            tool_turn("exit_plan_mode", {}),
-            text_turn("жду указаний"),
+            text_turn("лишний запрос"),
         ]
     )
-    events = RecordingEvents(answers=None)
+    events = _PlanAnswers(answer)
     agent = _planning_agent(provider, tmp_path, events)
-    assert agent.run_turn("спланируй") == "жду указаний"
+    assert agent.run_turn("спланируй") == "Вот план"
+    assert len(provider.requests) == 2 and events.stats[-1].self_checks == 0
+    assert agent.conversation.messages[-1].content == "Вот план"
+    assert agent.mode is PermissionMode.PLAN and not agent._plan.dirty
+    if answer is not None:  # одобрить некому — пользователь узнаёт, где план
+        assert any(PLAN_REL in text for _, text in events.notices)
+
+
+def test_empty_plan_file_is_not_shown(tmp_path):
+    provider = ScriptedProvider(
+        [tool_turn("write_file", {"path": PLAN_REL, "content": " "}), text_turn("Вот план")]
+    )
+    events = _PlanAnswers()
+    agent = _planning_agent(provider, tmp_path, events)
+    assert agent.run_turn("спланируй") == "Вот план"
+    assert events.questions == [] and not agent._plan.dirty
+    assert events.notices[-1][0] == "warn"
+
+
+def test_promise_to_write_the_plan_gets_self_check(tmp_path):
+    (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            tool_turn("read_file", {"path": "f.txt"}),
+            text_turn("Сейчас запишу план."),  # пообещала и остановилась
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            tool_turn("exit_plan_mode", {}),
+            text_turn("Жду решения."),
+        ]
+    )
+    events = _PlanAnswers(None)
+    agent = _planning_agent(provider, tmp_path, events)
+    assert agent.run_turn("спланируй") == "Жду решения."
+    check = provider.requests[2]["messages"]
+    assert check[-2].role == "assistant" and check[-2].content == "Сейчас запишу план."
+    assert check[-1].meta and SELF_CHECK_NOTE.format(path=PLAN_REL) in check[-1].content
+    assert check[-1].content.startswith("<system-reminder>")
     assert len(events.questions) == 1  # план показан пользователю
-    assert PLAN_NOT_SUBMITTED_NOTE not in provider.requests[3]["messages"][-1].content
+    assert events.stats[-1].self_checks == 1
+    # модель после самопроверки работала — служебное сообщение осталось в истории
+    assert [meta for _, meta in _user_messages(agent)] == [False, True]
+    _assert_well_formed(agent.conversation.messages)
 
 
-@pytest.mark.parametrize("mode", [PermissionMode.PLAN, PermissionMode.MANUAL])
-def test_no_reminder_without_plan_changes(tmp_path, mode):
+def test_answer_in_plan_mode_survives_self_check(tmp_path):
+    provider = ScriptedProvider(
+        [
+            text_turn("foo считает сумму", Usage(prompt_tokens=7_000, completion_tokens=50)),
+            text_turn("OK", Usage(prompt_tokens=7_100, completion_tokens=2)),
+        ]
+    )
+    events = RecordingEvents()
+    cfg = Config(access_key="x", project_root=tmp_path, stream=True, mode=PermissionMode.PLAN)
+    agent = Agent(provider, build_default_registry(), cfg, events)
+    assert agent.run_turn("что делает foo?") == "foo считает сумму"
+    assert len(provider.requests) == 2
+    # в истории нет ни служебного сообщения, ни «OK»
+    contents = [m.content for m in agent.conversation.messages]
+    assert contents == ["что делает foo?", "foo считает сумму"]
+    shown = [value for kind, value in events.events if kind in ("delta", "text")]
+    assert shown == ["foo считает сумму"]  # ответ на самопроверку не показан
+    stats = events.stats[-1]
+    assert stats.self_checks == 1 and stats.billed_tokens == 14_152
+    assert stats.context_tokens == agent.context_tokens == 7_050  # без служебного обмена
+
+
+def test_self_check_reply_with_calls_is_shown(tmp_path):
+    provider = ScriptedProvider(
+        [
+            text_turn("Сейчас запишу план."),
+            tools_turn([("write_file", {"path": PLAN_REL, "content": "# План"})], text="Пишу."),
+            tool_turn("exit_plan_mode", {}),
+            text_turn("Жду."),
+        ]
+    )
+    events = _PlanAnswers(None)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=True, mode=PermissionMode.PLAN)
+    agent = Agent(provider, build_default_registry(), cfg, events)
+    agent.chat_id = "chat1"
+    assert agent.run_turn("спланируй") == "Жду."
+    shown = [(kind, value) for kind, value in events.events if kind in ("delta", "text")]
+    assert shown == [("delta", "Сейчас запишу план."), ("text", "Пишу."), ("delta", "Жду.")]
+
+
+def test_self_check_happens_once_per_turn(tmp_path):
+    (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            text_turn("Сейчас запишу план."),
+            tool_turn("read_file", {"path": "f.txt"}),
+            text_turn("Теперь точно запишу."),
+            text_turn("лишний запрос"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _planning_agent(provider, tmp_path, events)
+    assert agent.run_turn("спланируй") == "Теперь точно запишу."
+    assert provider.calls == 3 and events.stats[-1].self_checks == 1
+
+
+def test_self_check_follows_answered_question(tmp_path):
+    options = [{"label": "SQLite"}, {"label": "Postgres"}]
+    provider = ScriptedProvider(
+        [
+            tool_turn("ask_user", {"questions": [{"question": "Какая БД?", "options": options}]}),
+            text_turn("Понял, сейчас запишу план."),
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План: SQLite"}),
+            tool_turn("exit_plan_mode", {}),
+            text_turn("Жду."),
+        ]
+    )
+    events = _PlanAnswers([Answer(("SQLite",))], None)
+    agent = _planning_agent(provider, tmp_path, events)
+    assert agent.run_turn("спланируй") == "Жду."
+    assert events.stats[-1].self_checks == 1 and len(events.questions) == 2
+
+
+@pytest.mark.parametrize(
+    "error", [LLMError("сбой сети"), KeyboardInterrupt()], ids=["llm_error", "interrupt"]
+)
+def test_failed_self_check_leaves_the_answer(tmp_path, error):
+    provider = ScriptedProvider([text_turn("ответ"), error])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, mode=PermissionMode.PLAN)
+    if isinstance(error, LLMError):
+        assert agent.run_turn("вопрос") == "ответ"
+        assert events.notices[-1][0] == "warn" and "самопроверка" in events.notices[-1][1]
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            agent.run_turn("вопрос")
+    assert [m.content for m in agent.conversation.messages] == ["вопрос", "ответ"]
+
+
+def test_cut_self_check_reply_is_retried(tmp_path):
+    provider = ScriptedProvider(
+        [
+            text_turn("Сейчас запишу план."),
+            cut_turn(reason="incomplete"),  # длинный write_file оборвался
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            tool_turn("exit_plan_mode", {}),
+            text_turn("Жду."),
+        ]
+    )
+    events = _PlanAnswers(None)
+    agent = _planning_agent(provider, tmp_path, events)
+    assert agent.run_turn("спланируй") == "Жду."
+    retry = provider.requests[2]["messages"][-1]
+    assert retry.meta and "# Turn ended in plan mode" in retry.content
+    assert "# Reply cut off" in retry.content  # заметка — к служебному сообщению в хвосте
+    stats = events.stats[-1]
+    assert stats.self_checks == 1 and stats.cut_retries == 1 and len(events.questions) == 1
+
+
+@pytest.mark.parametrize("mode", [PermissionMode.MANUAL, PermissionMode.ACCEPT_EDITS])
+def test_no_self_check_outside_plan_mode(tmp_path, mode):
     provider = ScriptedProvider([text_turn("ответ на вопрос")])
-    agent = _agent(provider, tmp_path, mode=mode)
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, mode=mode)
     assert agent.run_turn("что делает foo?") == "ответ на вопрос"
-    assert len(provider.requests) == 1
+    assert len(provider.requests) == 1 and events.stats[-1].self_checks == 0
 
 
-def test_submitted_plan_needs_no_reminder(tmp_path):
+def test_no_self_check_after_plan_was_shown(tmp_path):
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),

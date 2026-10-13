@@ -15,6 +15,7 @@ from behavior import (
     ScriptedUser,
     compare_reports,
     describe_probe,
+    digest_report,
     eval_models,
     invariant_errors,
     is_safe_command,
@@ -171,21 +172,37 @@ def test_plan_submitted_by_model(shop):
     assert result.transcript["plans"][0].startswith("# План")
 
 
-def test_plan_left_in_text_is_counted(shop):
+def test_plan_left_in_text_is_shown_by_harness(shop):
     result = _run(
         "plan_exit",
         [
             tool_turn("write_file", {"path": PLAN, "content": "# План"}),
-            text_turn("Вот план: …"),  # без exit_plan_mode — напоминание harness'а
-            text_turn("План в файле."),
+            text_turn("Вот план: …"),  # без exit_plan_mode — harness показывает план сам
+            text_turn("лишний запрос"),
         ],
         shop,
     )
     record = result.record
-    assert not record["ok"]
-    assert record["exit_calls"] == record["plan_shown"] == 0
-    assert record["plan_reminders"] == 1 and record["plan_turns_ended_in_text"] == 1
-    assert record["requests"] == 3
+    assert record["ok"] and record["exit_calls"] == 0 and record["plan_shown"] == 1
+    assert record["plan_reminders"] == 1 and record["self_checks"] == 0
+    assert record["plan_turns_ended_in_text"] == 0 and record["requests"] == 2
+
+
+def test_promise_without_plan_gets_self_check(shop):
+    result = _run(
+        "plan_exit",
+        [
+            text_turn("Сейчас запишу план."),
+            tool_turn("write_file", {"path": PLAN, "content": "# План"}),
+            tool_turn("exit_plan_mode", {}),
+            text_turn("Жду решения."),
+        ],
+        shop,
+    )
+    record = result.record
+    assert record["ok"] and record["exit_calls"] == record["plan_shown"] == 1
+    assert record["self_checks"] == record["self_checks_resumed"] == 1
+    assert record["requests"] == 4 and record["plan_reminders"] == 0
 
 
 def test_plan_revised_after_remarks(shop):
@@ -261,6 +278,9 @@ def test_question_in_plan_mode(shop):
     assert record["ok"] and record["answer_hits"] == 1.0
     assert record["plan_shown"] == 0 and not record["plan_written"]
     assert record["research_calls"] == 1 and record["plan_turns_ended_in_text"] == 1
+    # ответ на вопрос пережил самопроверку: +1 запрос, служебного обмена в истории нет
+    assert record["self_checks"] == 1 and record["self_checks_resumed"] == 0
+    assert record["requests"] == 3
 
 
 def test_broad_question_delegated_to_explore(shop):
@@ -353,8 +373,55 @@ def test_report_is_written_after_each_run_and_compared(shop, tmp_path):
         "meta": {**report["meta"], "label": "после"},
         "runs": [{**report["runs"][0], "ok": False}],
     }
-    assert any("1/1 → 0/1" in line for line in compare_reports(report, newer))
+    compared = compare_reports(report, newer)
+    assert any("1/1 → 0/1" in line for line in compared)
+    assert all(name in compared[3] for name in ("err", "rem", "chk", "txt", "res"))
     assert main(["show", str(session.path)]) == 0
+    assert main(["digest", str(session.path)]) == 0
+
+
+def test_digest_fits_a_chat_message():
+    def run(i: int, scenario: str, **extra) -> dict:
+        return {
+            "model": f"model-{i % 4}",
+            "scenario": scenario,
+            "run": i,
+            "ok": True,
+            "error": None,
+            "plan_shown": 1,
+            "exit_calls": 1,
+            "plan_reminders": 0,
+            "self_checks": 1,
+            "plan_turns_ended_in_text": 0,
+            "research_calls": 9,
+            "requests": 12,
+            "cut_retries": 0,
+            "max_completion_tokens": 6_500,
+            "max_request_s": 205.0,
+            "stop_reasons": [],
+            "task_calls": 0,
+            "answer": "Жду решения.",
+            **extra,
+        }
+
+    runs = [run(i, scenario.id) for i, scenario in enumerate(SCENARIOS * 4)]
+    runs += [
+        run(i, "plan_exit", ok=False, error="LLMError: The read operation timed out")
+        for i in range(40)
+    ]
+    runs.append(run(1, "plan_question", ok=False, stop_reasons=["tool_failures"], answer=""))
+    old = {**runs[0]}
+    for key in ("self_checks", "max_completion_tokens", "max_request_s"):
+        del old[key]  # отчёт до этапа 3
+    report = {"meta": {"created": "20261013-120000", "temperature": 1.0}, "runs": [*runs, old]}
+    lines = digest_report(report)
+    assert len(lines) <= 100
+    text = "\n".join(lines)
+    assert "Неуспешные прогоны: 41 из 82" in text and "… и ещё 11" in text
+    assert "40× LLMError: The read operation timed out" in text
+    assert "стоп tool_failures" in text
+    row = next(line for line in lines if line.startswith("model-1") and "plan_exit" in line)
+    assert "6.5" in row and "205.0" in row
 
 
 def test_eval_models_from_environment():

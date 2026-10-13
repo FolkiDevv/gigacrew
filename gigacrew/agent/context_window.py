@@ -82,7 +82,7 @@ def fit_history(history: Sequence[Message], budget_tokens: int) -> list[Message]
 
     blocks = _blocks(history)
     sizes = [estimate_tokens(b) for b in blocks]
-    pinned_user = max((i for i, b in enumerate(blocks) if b[0].role == "user"), default=None)
+    pinned_user = max((i for i, b in enumerate(blocks) if b[0].is_request), default=None)
     pinned = {len(blocks) - 1}
     if pinned_user is not None:
         pinned.add(pinned_user)
