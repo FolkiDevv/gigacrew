@@ -80,6 +80,8 @@ def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
         {"GIGACREW_SUBAGENT_CONTEXT": "99"},
         {"GIGACREW_SUBAGENT_TIMEOUT": "5"},
         {"GIGACREW_SUBAGENT_TIMEOUT": "long"},
+        {"GIGACREW_READ_TIMEOUT": "0"},
+        {"GIGACREW_READ_TIMEOUT": "long"},
     ],
 )
 def test_bad_values_raise_config_error(tmp_path, env):
@@ -186,6 +188,14 @@ def test_subagent_limits(tmp_path):
         0.6,
         120,
     )
+
+
+def test_read_timeout(tmp_path):
+    def load(env):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+
+    assert (load({}).timeout, load({}).read_timeout) == (120, 600)
+    assert load({"GIGACREW_READ_TIMEOUT": "900"}).read_timeout == 900
 
 
 def test_yes_all_implies_auto_approve(tmp_path):

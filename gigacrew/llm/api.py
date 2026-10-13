@@ -69,6 +69,9 @@ _NOT_SIZE_STATUS = {401, 403, 404, 429}
 _UNAVAILABLE_STATUS = {502, 503}
 # Сколько тела ответа показывать в сообщении об ошибке (HTML-страница прокси и т.п.).
 _ERROR_BODY_CHARS = 500
+# Попыток запроса чата, на который модель молчит дольше read_timeout: ожидание долгое,
+# и обычные пять попыток растянулись бы почти на час.
+_SILENT_ATTEMPTS = 2
 
 
 def _body(resp: httpx.Response) -> str:
@@ -226,6 +229,13 @@ class ApiProvider(LLMProvider):
             timeout=config.timeout,
             transport=transport,
         )
+        # Запросы чата ждут ответа модели дольше (``read_timeout``): вызовы инструментов
+        # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план,
+        # файл), байты не идут. Токен, список моделей и замер окна — по обычному timeout:
+        # долгая проба при замере и означает «не помещается».
+        self._chat_timeout = httpx.Timeout(
+            config.timeout, read=max(config.timeout, config.read_timeout)
+        )
         self._mtls = config.auth_mode == "mtls"
         self._token: str | None = None
         self._token_exp: float = 0.0  # unix-время истечения токена
@@ -248,7 +258,11 @@ class ApiProvider(LLMProvider):
     # Сетевой слой с повторами
     # ------------------------------------------------------------------ #
     def _request_with_retry(
-        self, do_request: Callable[[], httpx.Response], *, attempts: int | None = None
+        self,
+        do_request: Callable[[], httpx.Response],
+        *,
+        attempts: int | None = None,
+        silent_attempts: int | None = None,
     ) -> httpx.Response:
         """Выполняет HTTP-запрос, повторяя транзиентные сбои.
 
@@ -257,16 +271,22 @@ class ApiProvider(LLMProvider):
           * 429 Too Many Requests и 5xx — временная недоступность/лимит.
         Прочие HTTP-ответы (включая 4xx) возвращаем как есть — их разбирает
         вызывающая сторона. Неповторяемые ошибки транспорта → ApiError.
-        ``attempts`` — число попыток вместо ``_max_retries``.
+        ``attempts`` — число попыток вместо ``_max_retries``; ``silent_attempts`` —
+        сколько раз из них ответ может не прийти за время ожидания чтения.
         """
         attempts = attempts or self._max_retries
         delay = 1.0
         last_exc: Exception | None = None
+        silences = 0
         for attempt in range(attempts):
             try:
                 resp = do_request()
             except _RETRYABLE_EXC as e:
                 last_exc = e
+                if isinstance(e, httpx.ReadTimeout) and silent_attempts is not None:
+                    silences += 1
+                    if silences >= silent_attempts:
+                        raise ApiError(self._silence_message()) from e
                 if attempt < attempts - 1:
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)
@@ -479,7 +499,7 @@ class ApiProvider(LLMProvider):
         payload = self._payload(
             messages, tools, model=model, temperature=temperature, tool_choice=tool_choice
         )
-        resp = self._post_chat(payload)
+        resp = self._post_chat(payload, self._send_chat, timeout=self._chat_timeout)
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
@@ -491,22 +511,38 @@ class ApiProvider(LLMProvider):
         self,
         payload: dict[str, Any],
         send: Callable[[Callable[[], httpx.Response]], httpx.Response] | None = None,
+        *,
+        timeout: httpx.Timeout | None = None,
     ) -> httpx.Response:
         """POST на chat/completions; при протухшем токене (401) — обновить и повторить раз.
 
         ``send`` — как отправлять сам запрос (по умолчанию ``_request_with_retry``);
-        получение токена идёт мимо него, его ошибки — обычные ``ApiError``.
+        получение токена идёт мимо него, его ошибки — обычные ``ApiError``. ``timeout`` —
+        таймауты запроса вместо клиентских (None — клиентские; не «без таймаута»).
         """
         url = chat_url(self._cfg.base_url)
         headers = {"Content-Type": "application/json", **self._auth_headers()}
         send = send or self._request_with_retry
+        options = {} if timeout is None else {"timeout": timeout}
 
-        resp = send(lambda: self._client.post(url, json=payload, headers=headers))
+        resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
         if resp.status_code == 401 and not self._mtls:
             # токен протух — обновляем принудительно и повторяем один раз
             headers.update(self._auth_headers(force=True))
-            resp = send(lambda: self._client.post(url, json=payload, headers=headers))
+            resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
         return resp
+
+    def _send_chat(self, do_request: Callable[[], httpx.Response]) -> httpx.Response:
+        """Отправка запроса чата: молчание модели дольше ожидания чтения — не больше
+        :data:`_SILENT_ATTEMPTS` попыток."""
+        return self._request_with_retry(do_request, silent_attempts=_SILENT_ATTEMPTS)
+
+    def _silence_message(self) -> str:
+        seconds = int(self._chat_timeout.read or 0)
+        return (
+            f"Модель не отвечала дольше {seconds} с — ответ оборван. Если она писала длинный "
+            "вызов (план, большой файл), увеличьте GIGACREW_READ_TIMEOUT."
+        )
 
     # ------------------------------------------------------------------ #
     # Замер окна контекста
@@ -582,6 +618,7 @@ class ApiProvider(LLMProvider):
         delay = 1.0
         last_exc: Exception | None = None
         refreshed = False
+        silences = 0  # попыток, на которые модель молчала дольше ожидания чтения
 
         for attempt in range(self._max_retries):
             headers = {
@@ -590,7 +627,9 @@ class ApiProvider(LLMProvider):
                 **self._auth_headers(),
             }
             try:
-                with self._client.stream("POST", url, json=payload, headers=headers) as resp:
+                with self._client.stream(
+                    "POST", url, json=payload, headers=headers, timeout=self._chat_timeout
+                ) as resp:
                     if resp.status_code == 401 and not self._mtls and not refreshed:
                         resp.read()
                         self._ensure_token(force=True)
@@ -607,9 +646,16 @@ class ApiProvider(LLMProvider):
                     return self._consume_sse(resp, emit)
             except _RETRYABLE_EXC as e:
                 last_exc = e
+                silent = isinstance(e, httpx.ReadTimeout)
+                if silent:
+                    silences += 1
                 if state["emitted"]:
                     # часть текста уже отдана пользователю — повтор приведёт к дублю
+                    if silent:
+                        raise ApiError(self._silence_message()) from e
                     raise ApiError(f"Сетевой сбой во время потоковой передачи: {e}") from e
+                if silences >= _SILENT_ATTEMPTS:
+                    raise ApiError(self._silence_message()) from e
                 if attempt < self._max_retries - 1:
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)

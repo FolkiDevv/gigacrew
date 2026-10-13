@@ -85,6 +85,107 @@ def test_stream_broken_after_first_chunk_is_not_retried():
     p.close()
 
 
+class _SilentStream(httpx.SyncByteStream):
+    """Тело ответа: отдаёт кусок, потом модель молчит дольше ожидания чтения."""
+
+    def __init__(self, first: bytes):
+        self._first = first
+
+    def __iter__(self):
+        yield self._first
+        raise httpx.ReadTimeout("The read operation timed out")
+
+
+def _done(text: str) -> bytes:
+    return _event({**_text(text), "finish_reason": "stop"}, "response.message.done").encode()
+
+
+def _timeouts(handler, config: Config) -> list[tuple[str, float]]:
+    """Таймаут чтения каждого запроса: токен, цельный ответ, поток и замер окна."""
+    seen: list[tuple[str, float]] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            kind = "auth"
+        else:
+            kind = "stream" if json.loads(request.content).get("stream") else "chat"
+        seen.append((kind, request.extensions["timeout"]["read"]))
+        return handler(request)
+
+    p = ApiProvider(config, transport=httpx.MockTransport(recording))
+    p.complete(_msgs())
+    p.stream(_msgs())
+    p.measure_prompt("x")
+    p.close()
+    return seen
+
+
+def _answer(request: httpx.Request) -> httpx.Response:
+    if str(request.url) == AUTH_URL:
+        return _auth_response()
+    body = json.loads(request.content)
+    if body.get("stream"):
+        return httpx.Response(200, content=_done("ok"))
+    if body["model_options"].get("max_tokens") == 1:  # замер окна
+        return _chat_reply(10)
+    return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+
+def test_chat_waits_for_the_model_longer_than_other_requests():
+    """Вызовы инструментов приходят в конце ответа: чат ждёт read_timeout, а токен и
+    замер окна — обычный timeout (долгая проба и есть «не помещается»)."""
+    config = Config(access_key="dummy", auth_url=AUTH_URL, base_url=BASE_URL, model="M")
+    assert _timeouts(_answer, config) == [
+        ("auth", 120),
+        ("chat", 600),
+        ("stream", 600),
+        ("chat", 120),  # замер окна
+    ]
+
+
+def test_longer_general_timeout_is_not_shortened_for_chat():
+    config = Config(
+        access_key="dummy", auth_url=AUTH_URL, base_url=BASE_URL, model="M", timeout=900
+    )
+    reads = [read for kind, read in _timeouts(_answer, config) if kind != "auth"]
+    assert reads == [900, 900, 900]
+
+
+def test_model_silent_after_shown_text_names_the_setting():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        return httpx.Response(
+            200, stream=_SilentStream(_event(_text("Сейчас запишу план")).encode())
+        )
+
+    deltas: list[str] = []
+    p = _provider(handler)
+    with pytest.raises(ApiError, match="GIGACREW_READ_TIMEOUT") as e:
+        p.stream(_msgs(), on_delta=deltas.append)
+    assert "дольше 600 с" in str(e.value)
+    assert deltas == ["Сейчас запишу план"]  # текст не продублирован повтором
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_silent_model_is_retried_only_once(streaming):
+    """Молчание дольше ожидания чтения — не обрыв сети: пять попыток по 10 минут не нужны."""
+    chat_calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        chat_calls.append(request)
+        raise httpx.ReadTimeout("The read operation timed out", request=request)
+
+    p = _provider(handler)
+    with pytest.raises(ApiError, match="GIGACREW_READ_TIMEOUT"):
+        (p.stream if streaming else p.complete)(_msgs())
+    assert len(chat_calls) == 2
+    p.close()
+
+
 def test_stream_retries_connect_error_before_output():
     attempts = {"n": 0}
 

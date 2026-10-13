@@ -178,6 +178,10 @@ class Config:
     # по умолчанию.
     ca_bundle: str | None = None
     timeout: int = 120
+    # Ожидание ответа модели в запросах чата, с (не меньше timeout): вызовы инструментов
+    # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план, файл),
+    # байты не идут — обычный timeout оборвал бы такой ответ.
+    read_timeout: int = 600
 
     # --- Агент / окружение ---
     project_root: Path = field(default_factory=Path.cwd)
@@ -257,6 +261,7 @@ class Config:
             verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", ca_bundle is not None),
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             timeout=_env_int(env, "GIGACREW_TIMEOUT", 120),
+            read_timeout=_env_int(env, "GIGACREW_READ_TIMEOUT", 600),
             project_root=root,
             auto_approve=auto_approve or yes_all,
             yes_all=yes_all,
