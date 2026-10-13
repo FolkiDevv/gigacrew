@@ -48,6 +48,11 @@ only when it is justified.
 - Commands and paths are relative to the project root.
 - Never claim success you have not seen. If a command failed or a test did not \
 pass, say so and fix it.
+- Do not end a reply with a promise to act ("now I'll write the plan"): if an action \
+is needed, make the tool call in the same reply.
+- A user message or a tool result may end with a <system-reminder> block. gigacrew \
+adds it, not the user or the tool: it is the harness's instruction about the current \
+state (a stop, a budget, an unfinished step). Follow it and do not mention it.
 """
 
 _ASK_USER_RULE = """\
@@ -232,6 +237,11 @@ not retell the plan in your reply text — the user sees the file.
 4. If the user sends remarks, change only the affected parts of the plan file \
 with edit_file (do not rewrite the whole plan with write_file) and call \
 exit_plan_mode again.
+When you are planning a change, your turn ends only with exit_plan_mode (the plan is \
+ready) or ask_user (you need the user's decision) — never with a promise like "now \
+I'll write the plan": make the call in the same reply. A long plan: write an outline \
+with write_file first, then add the sections with edit_file. If the user only asked a \
+question, just answer it.
 Do not start the implementation until the user approves the plan.
 """
 

@@ -730,6 +730,7 @@ class RecordingProvider(LLMProvider):
                 "completion_tokens": usage.completion_tokens,
                 "cached_tokens": usage.precached_prompt_tokens,
                 "calls": [call.name for call in turn.message.function_calls],
+                "finish_reason": turn.finish_reason,
                 "text": bool(turn.message.content.strip()),
                 "tool_choice": kwargs.get("tool_choice", "auto"),
                 "duration_s": round(time.monotonic() - started, 2),
@@ -1123,6 +1124,7 @@ def _metrics(
         "completion_tokens": sum(c["completion_tokens"] for c in recorder.calls),
         "cached_tokens": sum(c["cached_tokens"] for c in recorder.calls),
         "text_with_calls": sum(1 for c in main_requests if c["text"] and c["calls"]),
+        "cut_retries": sum(getattr(s, "cut_retries", 0) for s in user.stats),
         "steps": sum(s.steps for s in user.stats),
         "tool_calls": sum(s.tool_calls for s in user.stats),
         "stop_reasons": [s.stop_reason for s in user.stats if s.stop_reason],
@@ -1474,6 +1476,14 @@ def describe_probe(model: str, finding: Mapping[str, Any]) -> list[str]:
             for name, step in sampling.items()
         )
         lines.append(f"  model_options: {'; '.join(verdicts)} (принято ≠ учтено)")
+    if "text_stream_finish" in finding:
+        finish = finding["text_stream_finish"]
+        verdict = (
+            "окончание не приходит — каждый ответ сочтётся оборванным!"
+            if finish == "incomplete"
+            else "окончание приходит"
+        )
+        lines.append(f"  текстовый поток: finish_reason={finish} — {verdict}")
     cache = finding.get("cache")
     if cache and len(cache) >= 2:
         second = cache[-1]

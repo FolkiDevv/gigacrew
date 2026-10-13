@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fakes import FakeTool, RecordingEvents, ScriptedProvider, text_turn, tool_turn
+from fakes import FakeTool, RecordingEvents, ScriptedProvider, cut_turn, text_turn, tool_turn
 
 import gigacrew.agent.loop as loop
 from gigacrew.agent.events import Approval, TurnStats
@@ -424,8 +424,9 @@ def test_esc_soft_stop_wraps_up_and_parent_continues(tmp_path):
     holder["agent"] = agent
     assert agent.run_turn("x") == "основной продолжает"
     wrap_request = provider.requests[2]["messages"]
-    # просьба об итоге — в системном сообщении: задача суб-агента остаётся закреплённой
-    assert SUBAGENT_USER_STOP_NOTE in wrap_request[0].content
+    # просьба об итоге — заметкой к последнему сообщению, а не новым сообщением
+    # пользователя: задача суб-агента остаётся закреплённой
+    assert SUBAGENT_USER_STOP_NOTE in wrap_request[-1].content
     assert [m.role for m in wrap_request[1:]] == ["user", "assistant", "function"]
     assert wrap_request[1].content == "долгая задача"
     assert provider.requests[2]["tool_choice"] == "none"
@@ -467,8 +468,9 @@ def test_esc_while_subagent_streams_text_wraps_up_without_partial(tmp_path):
     assert agent.run_turn("x") == "дальше"
 
     wrap_request = provider.requests[2]["messages"]
-    assert SUBAGENT_USER_STOP_NOTE in wrap_request[0].content
-    assert [(m.role, m.content) for m in wrap_request[1:]] == [("user", "найди foo")]
+    assert [m.role for m in wrap_request[1:]] == ["user"]
+    assert wrap_request[-1].content.startswith("найди foo\n\n<system-reminder>")
+    assert SUBAGENT_USER_STOP_NOTE in wrap_request[-1].content
     assert provider.requests[2]["tool_choice"] == "none"
     report = _results(agent.conversation.messages)[0]
     assert "stopped early by the user" in report and "итог: foo в a.py" in report
@@ -522,8 +524,8 @@ def test_subagent_step_limit_wraps_up(tmp_path):
     agent = _agent(provider, tmp_path, events=events, subagent_max_steps=2)
     assert agent.run_turn("x") == "ок"
     wrap_up = provider.requests[3]
-    # просьба об итоге — в системном сообщении, вызовы запрещены
-    assert "STOP: the step limit is reached" in wrap_up["messages"][0].content
+    # просьба об итоге — заметкой в хвосте запроса, вызовы запрещены
+    assert "STOP: the step limit is reached" in wrap_up["messages"][-1].content
     assert wrap_up["tool_choice"] == "none"
     report = _results(agent.conversation.messages)[0]
     assert "the step limit is reached" in report and "частичный итог" in report
@@ -552,7 +554,7 @@ def test_subagent_stops_at_context_share_of_unmeasured_window(tmp_path):
     # окно не замерено — 32k по умолчанию: 80% = 25 600, но бюджет запроса меньше — 21 600
     provider, report = _context_case(tmp_path, 26_000)
     assert "the context is full" in report
-    assert "STOP: the context is full" in provider.requests[2]["messages"][0].content
+    assert "STOP: the context is full" in provider.requests[2]["messages"][-1].content
     assert provider.summary_requests == []  # суб-агент не сжимает историю
 
     _, report = _context_case(tmp_path, 20_000)
@@ -596,8 +598,25 @@ def test_subagent_context_counts_tool_results_after_last_reply(tmp_path):
     wrap_up = provider.requests[2]["messages"]
     assert wrap_up[1].role == "user" and wrap_up[1].content == "найди функцию foo"
     assert "строка с текстом" in wrap_up[-1].content
-    assert "STOP: the context is full" in wrap_up[0].content
+    assert "STOP: the context is full" in wrap_up[-1].content
     assert provider.requests[2]["tool_choice"] == "none"
+
+
+def test_cut_reply_does_not_fill_subagent_context(tmp_path):
+    """Оборванный длинный ответ не идёт в историю — и в счётчик контекста суб-агента тоже:
+    иначе повтор ложно упёрся бы в предел контекста."""
+    provider = ScriptedProvider(
+        [
+            _task(),
+            cut_turn("длинный отчёт…", usage=Usage(prompt_tokens=1_000, completion_tokens=50_000)),
+            text_turn("итог: foo в a.py"),
+            text_turn("ок"),
+        ]
+    )
+    agent = _agent(provider, tmp_path)
+    assert agent.run_turn("x") == "ок"
+    report = _results(agent.conversation.messages)[0]
+    assert "итог: foo в a.py" in report and "the context is full" not in report
 
 
 def test_subagent_time_limit(tmp_path):
@@ -631,9 +650,10 @@ def test_subagent_budget_pressure_note(tmp_path):
     )
     agent = _agent(provider, tmp_path, subagent_max_steps=4)
     agent.run_turn("x")
-    assert "# Budget" not in provider.requests[1]["messages"][0].content
-    assert "# Budget" in provider.requests[3]["messages"][0].content  # шаг 3 из 4
-    assert "# Budget" not in provider.requests[-1]["messages"][0].content  # основной
+    assert "# Budget" not in provider.requests[1]["messages"][-1].content
+    assert "# Budget" in provider.requests[3]["messages"][-1].content  # шаг 3 из 4
+    assert "# Budget" not in provider.requests[3]["messages"][0].content  # не в системном
+    assert "# Budget" not in provider.requests[-1]["messages"][-1].content  # основной
 
 
 def test_subagent_launches_per_turn_limited(tmp_path, monkeypatch):

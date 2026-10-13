@@ -111,6 +111,22 @@ PLAN_NOT_SUBMITTED_NOTE = (
     "it to the user. Call exit_plan_mode now (without arguments); do not repeat the plan "
     "as text. If you need the user's answer first, ask with ask_user."
 )
+OUTPUT_CUT_NOTE = (
+    "# Reply cut off\nYour previous reply was cut off before it finished (finish_reason: "
+    "{reason}), and any tool call in it was lost. Do it again in smaller pieces: write a "
+    "long file as an outline with write_file and add the sections with edit_file; keep a "
+    "text answer shorter."
+)
+OUTPUT_LIMIT_MESSAGE = (
+    "Прервано: ответ модели {count} раза подряд оборвался, не дойдя до конца "
+    "(finish_reason={reason}). Задача может быть не завершена."
+)
+
+# Ответ без вызовов с такой причиной завершения оборван, а не закончен моделью: вызов в нём
+# мог потеряться. Он не считается финальным — запрос повторяется (не больше MAX_CUT_RETRIES
+# раз за ход).
+CUT_REASONS = frozenset({"length", "incomplete"})
+MAX_CUT_RETRIES = 2
 
 
 # Сжатие контекста — доли бюджета истории (бюджет запроса за вычетом системного
@@ -135,6 +151,11 @@ USER_STOP_REASON = "Пользователь остановил суб-аген�
 
 def _with_note(content: str, note: str | None) -> str:
     return f"{content}\n\n{note}" if note else content
+
+
+def _reminder(note: str) -> str:
+    """Заметка harness'а для одного запроса — в теге, который описан в системном промпте."""
+    return f"<system-reminder>\n{note}\n</system-reminder>"
 
 
 class Agent:
@@ -529,6 +550,7 @@ class Agent:
         """Шаги хода до финального ответа модели или остановки ограничителем."""
         compact_failed = False  # не удалось — до конца хода не пытаемся снова
         plan_reminded = False  # напоминание отправить план — не больше одного за ход
+        cuts = 0  # оборванных ответов за ход
         note = ""
         while True:
             context = self._subagent_context(specs, stats)
@@ -542,9 +564,26 @@ class Agent:
                 note = ""
                 msg = turn.message
                 self._account(turn.usage, stats)
+                # Повторы ниже: ответ текстом не идёт в историю — запрос не должен кончаться
+                # репликой ассистента, — а заметка дописывается к хвосту следующего запроса.
+                if not turn.wants_tool and turn.finish_reason in CUT_REASONS:
+                    self._forget_reply(turn, stats)
+                    if cuts >= MAX_CUT_RETRIES:
+                        message = OUTPUT_LIMIT_MESSAGE.format(
+                            count=cuts + 1, reason=turn.finish_reason
+                        )
+                        return self._stopped(specs, StopReason("output_limit", message), stats)
+                    cuts += 1
+                    stats.cut_retries += 1
+                    note = OUTPUT_CUT_NOTE.format(reason=turn.finish_reason)
+                    self._events.on_notice(
+                        f"ответ модели оборван (finish_reason={turn.finish_reason}) — "
+                        f"повторяю запрос ({cuts}/{MAX_CUT_RETRIES})",
+                        level="warn",
+                    )
+                    continue
                 if not turn.wants_tool and not plan_reminded and self._plan_unsubmitted():
-                    # Ответ текстом не идёт в историю: запрос не должен кончаться
-                    # репликой ассистента, а напоминание — системное, как итог остановки.
+                    self._forget_reply(turn, stats)
                     plan_reminded = True
                     note = PLAN_NOT_SUBMITTED_NOTE
                     self._events.on_notice(
@@ -617,6 +656,16 @@ class Agent:
         # Суб-агенту без итога — пустой ответ: отчёт сам назовёт причину остановки.
         return text or ("" if self._parent is not None else stop.message)
 
+    def _forget_reply(self, turn: AssistantTurn, stats: TurnStats) -> None:
+        """Ответ не идёт в историю: его вывод не занимает контекст следующего запроса.
+
+        Иначе оборванный длинный ответ раздул бы счётчик, и суб-агент ложно упёрся бы в
+        предел контекста.
+        """
+        stats.context_tokens = max(stats.context_tokens - turn.usage.completion_tokens, 0)
+        if self._context_model == self._model:
+            self._context = stats.context_tokens
+
     def _account(self, usage: Usage, stats: TurnStats) -> None:
         """Учесть расход обращения: статистика хода, сессия, размер контекста, калибровка.
 
@@ -663,10 +712,10 @@ class Agent:
         пришёл, не выполняется — в историю идёт только текст. Сбой обращения к модели
         не мешает: остаётся сообщение ограничителя.
 
-        Просьба подвести итог — дополнение к системному сообщению, а не сообщение
-        пользователя: окно истории закрепляет последний запрос пользователя, и такая
-        просьба вытеснила бы из обрезанной истории саму задачу. ``user_stop`` — суб-агент
-        остановлен пользователем (Esc). ``reason`` — причина для пользователя,
+        Просьба подвести итог — заметка к последнему сообщению запроса, а не отдельное
+        сообщение пользователя: окно истории закрепляет последний запрос пользователя, и
+        такая просьба вытеснила бы из обрезанной истории саму задачу. ``user_stop`` —
+        суб-агент остановлен пользователем (Esc). ``reason`` — причина для пользователя,
         ``model_reason`` — для модели.
         """
         self._wrapping = True
@@ -748,20 +797,36 @@ class Agent:
         дописывается к системному сообщению (API принимает одно системное
         сообщение — первым); история — сообщения после него, а если и они не
         укладываются в бюджет, старые отбрасываются (:func:`fit_history`).
+
+        ``note`` — заметка только для этого запроса (итог остановки, бюджет, напоминание).
+        Она дописывается в конец последнего сообщения — запроса пользователя или
+        результата вызова, — то есть туда, где модель её видит, а не в начало контекста;
+        дописывается к копии, диалог не меняется. Если хвост истории другой — к
+        системному сообщению.
         """
         system_text = self._system_text()
         summary = self._conversation.summary
         if summary is not None:
             system_text = f"{system_text}\n\n{summary_prompt(summary.text)}"
-        if note:
-            system_text = f"{system_text}\n\n{note}"
-        system = Message(role="system", content=system_text)
-        # Схемы инструментов уходят в каждом запросе и занимают то же окно.
-        used = estimate_tokens([system]) + estimate_specs_tokens(specs)
+        reminder = _reminder(note) if note else ""
+        # Схемы инструментов и заметка уходят в запросе и занимают то же окно.
+        used = (
+            estimate_tokens([Message(role="system", content=system_text)])
+            + estimate_specs_tokens(specs)
+            + (estimate_text_tokens(reminder) if reminder else 0)
+        )
         budget = max(self._estimate_budget() - used, MIN_HISTORY_TOKENS)
         history = fit_history(self._conversation.context_messages(), budget)
         self._last_estimate = used + estimate_tokens(history)
-        return [system, *history]
+        if reminder:
+            if history and history[-1].role in ("user", "function"):
+                last = history[-1]
+                history[-1] = last.model_copy(
+                    update={"content": _with_note(last.content, reminder)}
+                )
+            else:
+                system_text = f"{system_text}\n\n{reminder}"
+        return [Message(role="system", content=system_text), *history]
 
     # ------------------------------------------------------------------ #
     def compact(self, instructions: str = "") -> CompactResult | None:
@@ -864,7 +929,7 @@ class Agent:
     ) -> AssistantTurn:
         """Один проход модели с выводом текста (потоковым или цельным).
 
-        ``note`` — дополнение к системному сообщению только для этого запроса;
+        ``note`` — заметка только для этого запроса (см. :meth:`_build_request`);
         ``tool_choice="none"`` — ответ только текстом (итог после остановки).
         Оборванный поток (Esc, сбой сети) оставляет в истории основного агента уже
         показанный текст с пометкой — модель знает, что её ответ прерван, а следующий

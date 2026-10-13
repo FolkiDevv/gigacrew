@@ -47,6 +47,7 @@ StopKind = Literal[
     "context_limit",
     "time_limit",
     "user_stop",
+    "output_limit",
 ]
 
 # Через сколько похожих вызовов после предупреждения ход останавливается.
@@ -61,6 +62,7 @@ MODEL_STOP_REASONS: dict[str, str] = {
     "context_limit": "the context is full",
     "time_limit": "the time limit is reached",
     "user_stop": "the user stopped the work early",
+    "output_limit": "your replies were cut off before they finished, several times in a row",
 }
 
 # С какой доли любого лимита модель получает напоминание о бюджете.

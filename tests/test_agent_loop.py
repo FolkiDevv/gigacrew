@@ -9,11 +9,13 @@ from fakes import (
     FakeTool,
     RecordingEvents,
     ScriptedProvider,
+    cut_turn,
     text_turn,
     tool_turn,
     tools_turn,
 )
 
+from gigacrew.agent.context_window import estimate_text_tokens
 from gigacrew.agent.conversation import INTERRUPTED_NOTE
 from gigacrew.agent.loop import (
     LOOP_STOP_NOTE,
@@ -26,7 +28,7 @@ from gigacrew.agent.loop import (
 )
 from gigacrew.config import Config
 from gigacrew.errors import ToolError
-from gigacrew.llm.types import Usage
+from gigacrew.llm.types import Message, Usage
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolRegistry, ToolResult, build_default_registry
 from gigacrew.tools.plan import APPROVE_EDITS
@@ -63,7 +65,9 @@ def test_loop_stops_after_repeated_failures(tmp_path):
     assert "Прервано" in final
     # должно остановиться на пороге, а не крутить 50 шагов: 4 шага + запрос итога
     assert provider.calls == 5
-    assert "# Turn stopped" in provider.requests[-1]["messages"][0].content
+    # просьба об итоге — заметкой в хвосте запроса, а не в системном сообщении
+    assert "# Turn stopped" in provider.requests[-1]["messages"][-1].content
+    assert "# Turn stopped" not in provider.requests[-1]["messages"][0].content
     assert provider.requests[-1]["tool_choice"] == "none"  # итог — только текстом
     assert len(_function_results(agent)) == 4  # вызов из запроса итога не выполнялся
     assert events.stats[-1].stop_reason == "tool_failures"
@@ -815,10 +819,12 @@ def test_unsubmitted_plan_gets_one_reminder(tmp_path):
     assert agent.run_turn("спланируй") == "План готов, см. файл"
     assert len(provider.requests) == 3
     reminder = provider.requests[2]["messages"]
-    assert PLAN_NOT_SUBMITTED_NOTE in reminder[0].content
-    assert PLAN_NOT_SUBMITTED_NOTE not in provider.requests[1]["messages"][0].content
+    assert PLAN_NOT_SUBMITTED_NOTE in reminder[-1].content  # в хвосте, рядом с моделью
+    assert PLAN_NOT_SUBMITTED_NOTE not in provider.requests[1]["messages"][-1].content
     # текст без вызова в историю не попал: запрос не кончается репликой ассистента
     assert reminder[-1].role == "function"
+    # заметка дописана к копии: в сохранённом диалоге её нет
+    assert all(PLAN_NOT_SUBMITTED_NOTE not in m.content for m in agent.conversation.messages)
     assert [m.content for m in agent.conversation.messages if m.role == "assistant"][-1] == (
         "План готов, см. файл"
     )
@@ -838,7 +844,7 @@ def test_reminder_leads_to_submission(tmp_path):
     agent = _planning_agent(provider, tmp_path, events)
     assert agent.run_turn("спланируй") == "жду указаний"
     assert len(events.questions) == 1  # план показан пользователю
-    assert PLAN_NOT_SUBMITTED_NOTE not in provider.requests[3]["messages"][0].content
+    assert PLAN_NOT_SUBMITTED_NOTE not in provider.requests[3]["messages"][-1].content
 
 
 @pytest.mark.parametrize("mode", [PermissionMode.PLAN, PermissionMode.MANUAL])
@@ -1315,3 +1321,74 @@ def test_yes_flag_still_asks_for_dangerous_commands(tmp_path):
     events = RecordingEvents(confirm_answer=False)
     _agent(provider, tmp_path, events=events, yes_all=True).run_turn("почисти")
     assert events.confirms == []
+
+
+# ------------------------------ оборванный ответ ---------------------------- #
+@pytest.mark.parametrize("reason", ["length", "incomplete"])
+def test_cut_reply_is_retried_with_note_at_the_tail(tmp_path, reason):
+    """«Сейчас запишу план» с потерянным вызовом — не финальный ответ: повтор с заметкой."""
+    provider = ScriptedProvider(
+        [
+            cut_turn("Сейчас запишу план", reason),
+            tool_turn("write_file", {"path": "a.txt", "content": "x"}),
+            text_turn("готово"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("сделай") == "готово"
+    retry = provider.requests[1]["messages"]
+    assert retry[-1].role == "user" and "# Reply cut off" in retry[-1].content
+    assert f"finish_reason: {reason}" in retry[-1].content
+    assert "# Reply cut off" not in retry[0].content
+    assert "# Reply cut off" not in provider.requests[2]["messages"][-1].content
+    assert all(m.content != "Сейчас запишу план" for m in agent.conversation.messages)
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
+    assert events.stats[-1].cut_retries == 1
+    assert any(level == "warn" and reason in text for level, text in events.notices)
+
+
+def test_replies_cut_again_and_again_stop_the_turn(tmp_path):
+    provider = ScriptedProvider(
+        [cut_turn("a"), cut_turn("b"), cut_turn("c"), text_turn("успел немного")]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("сделай") == "успел немного"  # итог после остановки
+    assert provider.calls == 4
+    wrap_up = provider.requests[-1]
+    assert wrap_up["tool_choice"] == "none"
+    assert "your replies were cut off" in wrap_up["messages"][-1].content
+    stats = events.stats[-1]
+    assert (stats.stop_reason, stats.cut_retries) == ("output_limit", 2)
+    assert any(level == "error" and "оборвался" in text for level, text in events.notices)
+
+
+def test_stop_reply_is_final_even_if_it_announces_action(tmp_path):
+    """Без разбора текста: обычный stop — финальный ответ, сколько бы он ни обещал."""
+    provider = ScriptedProvider([text_turn("Сейчас запишу план")])
+    agent = _agent(provider, tmp_path)
+    assert agent.run_turn("сделай") == "Сейчас запишу план"
+    assert provider.calls == 1
+
+
+def test_note_goes_to_a_copy_of_the_last_message(tmp_path):
+    agent = _agent(ScriptedProvider(), tmp_path)
+    specs = build_default_registry().specs()
+    agent.conversation.add_user("вопрос")
+    agent._build_request(specs)
+    plain = agent._last_estimate
+    messages = agent._build_request(specs, note="# Заметка")
+    reminder = "<system-reminder>\n# Заметка\n</system-reminder>"
+    assert messages[-1].content == f"вопрос\n\n{reminder}"
+    assert "# Заметка" not in messages[0].content
+    assert agent.conversation.messages[-1].content == "вопрос"  # диалог не меняется
+    assert agent._last_estimate - plain == estimate_text_tokens(reminder)  # учтена один раз
+
+
+def test_note_falls_back_to_system_when_history_ends_with_answer(tmp_path):
+    agent = _agent(ScriptedProvider(), tmp_path)
+    agent.conversation.add_user("вопрос")
+    agent.conversation.add_assistant(Message(role="assistant", content="ответ"))
+    messages = agent._build_request(build_default_registry().specs(), note="# Заметка")
+    assert "# Заметка" in messages[0].content and messages[-1].content == "ответ"

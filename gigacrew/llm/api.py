@@ -159,6 +159,11 @@ class _TurnBuilder:
         self._finish_reason: str | None = None
         self._usage: Any = None
 
+    @property
+    def finished(self) -> bool:
+        """Пришло ли окончание ответа: причина завершения или расход токенов."""
+        return self._finish_reason is not None or self._usage is not None
+
     def add(self, data: Mapping[str, Any]) -> str:
         """Учесть ответ или кусок потока; возвращает пришедший в нём текст."""
         pieces: list[str] = []
@@ -188,7 +193,10 @@ class _TurnBuilder:
         self._text.append(text)
         return text
 
-    def turn(self) -> AssistantTurn:
+    def turn(self, *, complete: bool = True) -> AssistantTurn:
+        """Ход ассистента. ``complete=False`` — поток кончился без окончания ответа:
+        без причины завершения ответ без вызовов — ``"incomplete"``, а не ``"stop"``
+        (вызовы приходят только в окончании и могли потеряться)."""
         calls = list(self._calls.values())
         message = Message(
             role="assistant",
@@ -197,7 +205,9 @@ class _TurnBuilder:
             # Состояние нужно только результатам вызовов.
             state_id=self._state_id if calls else None,
         )
-        finish = self._finish_reason or ("function_call" if calls else "stop")
+        finish = self._finish_reason or (
+            "function_call" if calls else "stop" if complete else "incomplete"
+        )
         return AssistantTurn(
             message=message, finish_reason=finish, usage=Usage.from_raw(self._usage)
         )
@@ -669,10 +679,17 @@ class ApiProvider(LLMProvider):
 
     @staticmethod
     def _consume_sse(resp: httpx.Response, emit: Callable[[str], None]) -> AssistantTurn:
-        """Разбирает SSE-поток, отдавая текстовые дельты в ``emit``."""
+        """Разбирает SSE-поток, отдавая текстовые дельты в ``emit``.
+
+        Поток, где не пришло окончание ответа (событие ``response.message.done``, маркер
+        ``[DONE]``, причина завершения или расход токенов), — незавершённый: шлюз закрыл
+        соединение посреди ответа.
+        """
         builder = _TurnBuilder()
+        done = False
         for event, data in _iter_sse_events(resp.iter_lines()):
             if data.strip() == "[DONE]":
+                done = True
                 break
             try:
                 chunk = json.loads(data)
@@ -683,10 +700,11 @@ class ApiProvider(LLMProvider):
             error = _stream_error(event, chunk)
             if error is not None:
                 raise ApiError(f"API вернул ошибку в потоке: {error}")
+            done = done or event == "response.message.done"
             piece = builder.add(chunk)
             if piece:
                 emit(piece)
-        return builder.turn()
+        return builder.turn(complete=done or builder.finished)
 
     def list_models(self) -> list[str]:
         """Чат-модели (``type == "chat"``): эмбеддеры и прочие в выборе не нужны."""

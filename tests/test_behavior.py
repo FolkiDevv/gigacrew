@@ -393,6 +393,7 @@ def test_probe_helpers():
             "without_state+reasoning": {"status": 200, "input_tokens": 480},
         },
         "sampling": {"top_p=0.95": {"status": 200}},
+        "text_stream_finish": "stop",
         "cache": [
             {"input_tokens": 1000, "cached_tokens": 0},
             {"input_tokens": 1000, "cached_tokens": 900},
@@ -402,6 +403,7 @@ def test_probe_helpers():
     assert "да, 300 симв." in text and "ошибка 422" in text and "480 ток. (+80)" in text
     assert "разница +100 ток.: похоже, шлюз сам подставляет" in text
     assert "из кеша 900 (90%)" in text and "top_p=0.95 → принято" in text
+    assert "текстовый поток: finish_reason=stop — окончание приходит" in text
     same = {**finding["step2"], "without_state": {"status": 200, "input_tokens": 498}}
     text = "\n".join(describe_probe("m", {**finding, "step2": same}))
     assert "разница +2 ток.: признаков, что шлюз хранит рассуждения сам, нет" in text

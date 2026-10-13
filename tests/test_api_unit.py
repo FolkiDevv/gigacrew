@@ -343,6 +343,37 @@ def test_consume_sse_text_stream():
     assert not turn.wants_tool
 
 
+_PREAMBLE = (
+    'event: response.message.delta\ndata: {"messages":[{"role":"assistant",'
+    '"content":[{"text":"Сейчас запишу план"}]}]}\n\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("tail", "finish"),
+    [
+        ("", "incomplete"),  # шлюз закрыл поток посреди ответа: вызов мог потеряться
+        ('event: response.message.done\ndata: {"messages":[]}\n\n', "stop"),
+        ("data: [DONE]\n\n", "stop"),
+        ('data: {"messages":[],"usage":{"total_tokens":5}}\n\n', "stop"),
+        (
+            'event: response.message.done\ndata: {"messages":[],"finish_reason":"length"}\n\n',
+            "length",
+        ),
+    ],
+)
+def test_consume_sse_stream_without_end_is_incomplete(tail, finish):
+    turn = ApiProvider._consume_sse(_FakeSSE(_PREAMBLE + tail), lambda _s: None)
+    assert turn.message.content == "Сейчас запишу план"
+    assert turn.finish_reason == finish
+    assert not turn.wants_tool
+
+
+def test_parse_response_without_finish_reason_is_complete():
+    data = {"messages": [{"role": "assistant", "content": [{"text": "ok"}]}]}
+    assert ApiProvider._parse_response(data).finish_reason == "stop"
+
+
 def test_consume_sse_repeated_call_id_is_not_duplicated():
     call = '{"function_call":{"id":"c1","name":"f","arguments":{"a":1}}}'
     text = (

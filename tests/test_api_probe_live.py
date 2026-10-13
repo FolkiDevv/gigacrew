@@ -10,7 +10,9 @@
 3. принимает ли рассуждения в запросе (сообщение ``role: "reasoning"`` перед ответом
    ассистента) и учитывает ли их (рост ``input_tokens``);
 4. принимает ли ``top_p`` в ``model_options`` (принято без ошибки ≠ учтено);
-5. сообщает ли о кешировании префикса (``precached_prompt_tokens`` на повторе запроса).
+5. сообщает ли о кешировании префикса (``precached_prompt_tokens`` на повторе запроса);
+6. доходит ли текстовый поток до окончания ответа: иначе gigacrew считал бы каждый ответ
+   оборванным и повторял запрос.
 
 Модели — как у eval: ``GIGACREW_EVAL_MODELS``, иначе ``GIGACREW_TEST_MODEL``. Запуск —
 ``make probe``; находки — в конце вывода и в ``.gigacrew/evals/probe-<время>.json``.
@@ -173,6 +175,17 @@ def test_sampling_options(api, model):
         outcome[name] = {"status": status, "error": error}
     finding["sampling"] = outcome
     assert any(step["status"] < 400 for step in outcome.values()), outcome
+
+
+@pytest.mark.parametrize("model", MODEL_PARAMS)
+def test_text_stream_reaches_the_end(api, model):
+    """Поток без окончания (``done``, ``finish_reason``, ``usage``) gigacrew считает
+    оборванным. Здесь — что присылает шлюз на обычный короткий ответ."""
+    finding = FINDINGS.setdefault(model, {})
+    prompt = [Message(role="user", content="Ответь одним словом: столица Франции?")]
+    turn = api.stream(prompt, model=model, temperature=1.0)
+    finding["text_stream_finish"] = turn.finish_reason
+    assert turn.finish_reason != "incomplete", "шлюз не присылает окончание текстового потока"
 
 
 @pytest.mark.parametrize("model", MODEL_PARAMS)
