@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 
@@ -41,8 +41,9 @@ SUBAGENT_EXCLUDED: frozenset[str] = frozenset({"task", "ask_user", "exit_plan_mo
 EXPLORE = SubagentSpec(
     name="explore",
     description=(
-        "codebase research, read-only: search, code navigation, reading files, git "
-        "status/diff/log. Returns a digest with paths and line numbers"
+        "codebase research, read-only — use it proactively whenever the answer takes more "
+        "than a few searches: search, code navigation, reading files, git status/diff/log. "
+        "Returns a digest with paths and line numbers"
     ),
     tools=frozenset(
         {
@@ -84,7 +85,11 @@ def _agents_list() -> str:
 
 
 class TaskParams(BaseModel):
-    agent: str = Field(description=f"Subagent type: {', '.join(SUBAGENTS)}.")
+    # Прежнее имя параметра — agent: так его пишут старые чаты и модели по привычке.
+    subagent_type: str = Field(
+        validation_alias=AliasChoices("subagent_type", "agent"),
+        description=f"Subagent type: {' or '.join(SUBAGENTS)}.",
+    )
     prompt: str = Field(
         description=(
             "A complete brief — the subagent does NOT see this conversation: the goal and "
@@ -101,26 +106,42 @@ class TaskParams(BaseModel):
 class TaskTool(Tool):
     name = "task"
     description = (
-        "Runs a subagent with its own context for a self-contained subtask and returns "
-        "its final report; the subagent's intermediate steps do not get into your "
-        f"context. Agents: {_agents_list()}. The subagent has a limited number of steps "
-        "and a limited context: give it ONE narrow question or subtask (one subsystem, "
-        "one flow) and split broad research into several such tasks sent in one "
-        "response. Pinpoint questions (a known file or symbol) are faster to answer "
-        "yourself. A report of a subagent stopped by a limit is partial but useful: do "
-        "not rerun the same task — narrow it to what remains. If the user stopped a "
-        "subagent, do not run the same task again unless asked."
+        "Launches a subagent that works in its own context and returns only its final "
+        "report — its intermediate searches and reads do not fill your context. Use it "
+        "proactively, without being asked: whenever finding the relevant code would take "
+        "more than about 3 searches and reads, before a non-trivial change, and in plan "
+        f"mode before writing the plan. Subagent types: {_agents_list()}. Independent "
+        "questions or subtasks — one subagent each, sent together in one response. A "
+        "subagent has limited steps and context: give it ONE narrow question or subtask "
+        "(one subsystem, one flow) and a complete brief — it does not see this "
+        "conversation.\n"
+        "When NOT to use: a known file, symbol or string (read_file, find_symbol, "
+        "search_content are faster); a question about 1–3 files you already know; "
+        "anything that needs the user's decisions.\n"
+        "A report of a subagent stopped by a limit is partial but useful: do not rerun the "
+        "same task — narrow it to what remains. If the user stopped a subagent, do not run "
+        "the same task again unless asked.\n"
+        "Examples:\n"
+        '- "How does authentication work here?" → subagent_type "explore", prompt: "Find '
+        "where credentials are checked and how a session is created; return path:line of "
+        'each step of the flow, up to 15 lines."\n'
+        '- "Plan adding a cache to the API client" → two explore tasks in one response: '
+        '"where and how the client sends requests" and "how its settings are loaded and '
+        'tested".\n'
+        '- "Where is the class UserRepository defined?" → no subagent: find_symbol.'
     )
     Params = TaskParams
 
     def describe(self, params: TaskParams) -> str:
-        return f"{params.agent.strip()} · {task_title(params.description, params.prompt)}"[:70]
+        kind = params.subagent_type.strip()
+        return f"{kind} · {task_title(params.description, params.prompt)}"[:70]
 
     def run(self, params: TaskParams, ctx: ToolContext) -> ToolResult:
-        agent = params.agent.strip().lower()
+        agent = params.subagent_type.strip().lower()
         if agent not in SUBAGENTS:
             raise ToolError(
-                f"неизвестный суб-агент {params.agent.strip()!r}; доступны: {', '.join(SUBAGENTS)}."
+                f"неизвестный суб-агент {params.subagent_type.strip()!r}; "
+                f"доступны: {', '.join(SUBAGENTS)}."
             )
         prompt = params.prompt.strip()
         if not prompt:

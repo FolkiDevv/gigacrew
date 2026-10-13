@@ -125,7 +125,24 @@ def test_task_schema_and_registry():
     assert set(SUBAGENTS) == set(SUBAGENT_PROMPTS)
     assert SUBAGENT_EXCLUDED <= {tool.name for tool in reg}
     params = reg.get("task").spec().parameters
-    assert params["required"] == ["agent", "prompt"]
+    assert params["required"] == ["subagent_type", "prompt"]
+
+
+@pytest.mark.parametrize("key", ["subagent_type", "agent"])
+def test_task_accepts_old_parameter_name(tmp_path, key):
+    provider = ScriptedProvider(
+        [
+            tool_turn("task", {key: "Explore", "prompt": "где foo?"}),
+            text_turn("в a.py"),
+            text_turn("ок"),
+        ]
+    )
+    events = RecordingEvents()
+    _agent(provider, tmp_path, events=events).run_turn("x")
+    info = next(p for k, p in events.events if k == "subagent_start")
+    assert info.name == "explore"
+    call = next(p for k, p in events.events if k == "tool_call")
+    assert call.summary == "Explore · где foo?"
 
 
 def test_subagent_cannot_spawn_subagents(tmp_path):
@@ -227,6 +244,23 @@ def test_delegation_rules_only_for_main_agent():
 
     assert "# Subagents (task)" in SYSTEM_PROMPT
     assert "# Subagents (task)" not in SUBAGENT_PROMPT
+
+
+def test_delegation_is_proactive_with_triggers():
+    """Суб-агенты — без просьбы пользователя: триггеры в промпте, описании task и в
+    порядке работы режима плана; точечный поиск — самому."""
+    from gigacrew.agent.prompts import PLAN_MODE_PROMPT, SYSTEM_PROMPT
+    from gigacrew.tools.task import TaskTool
+
+    rules = SYSTEM_PROMPT[SYSTEM_PROMPT.index("# Subagents (task)") :]
+    assert "without waiting for the user to ask" in rules
+    assert "more than about 3 searches and reads" in rules and "pinpoint lookup" in rules
+    description = TaskTool.description
+    assert description.startswith("Launches a subagent") and "proactively" in description
+    assert "When NOT to use" in description and description.count('\n- "') == 3
+    assert "use it proactively" in EXPLORE.description
+    step = PLAN_MODE_PROMPT[PLAN_MODE_PROMPT.index("1. ") : PLAN_MODE_PROMPT.index("2. ")]
+    assert "explore subagents: 1–3 of them in one response" in step
 
 
 def test_limit_stop_report_tells_not_to_rerun_the_same_task():

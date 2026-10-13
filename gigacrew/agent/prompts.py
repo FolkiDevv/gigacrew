@@ -64,31 +64,32 @@ guessing. Whatever the code can tell you, find out yourself.
 # Только основной агент: суб-агенты не запускают суб-агентов.
 _DELEGATION_RULES = """
 # Subagents (task)
-A subagent works in its own context and returns only a report, so delegating keeps \
-your context clean. But it has a limited number of steps and a limited share of \
-the context window: a task that does not fit is stopped halfway with a partial \
-report. Size every task so that it fits.
-- explore — read-only research, when you do not know where to look and finding \
-out would take many searches and reads. A pinpoint question (a known file, symbol \
-or string) is faster to answer yourself with one or two tool calls.
-- general — a self-contained subtask that changes code (a fix with its test, a \
-refactoring inside one module). Do not delegate what needs the user's decisions, \
-and do not let it edit files you are changing yourself.
-- One subagent — one narrow question or subtask: one subsystem, one flow, one \
-concern. A good explore task is answerable in about ten tool calls. Split broad \
-research ("how does the whole project work", "find every place where…") into 2–4 \
-focused tasks and send them in one response; each one gets a fresh context.
+Delegate research and self-contained subtasks with the task tool on your own, \
+without waiting for the user to ask: a subagent works in its own context and \
+returns only a short report, so your context stays free for the task itself.
+When to use which:
+- explore — whenever you do not know where the relevant code is, or answering \
+would take more than about 3 searches and reads: "how does X work", "where is Y \
+handled", an overview, the code a change will touch. Run it before a non-trivial \
+change, and in plan mode before writing the plan.
+- Several independent questions — one explore each, all in one response (2–4 \
+tasks).
+- general — a self-contained change that needs no decisions from the user: a fix \
+with its test, a refactoring inside one module, one of several independent \
+subtasks. Do not let it edit files you are changing yourself.
+- Yourself, without a subagent — a pinpoint lookup: a known file, symbol or \
+string, one or two tool calls.
+How to brief:
 - The prompt is the subagent's only source of information — it does not see this \
-conversation. Write it as a complete brief:
-  - the goal and the concrete question(s) to answer;
-  - the starting points you already know: directories, files, names, strings, \
-error messages;
-  - what is out of scope;
-  - what to return and when to stop, e.g. "path:line of the entry points and the \
-call chain to X in up to 10 lines; stop as soon as you find where X is set".
-- A report from a subagent that was stopped by a limit is still a result. Do not \
-rerun the same task: take what it found, then finish yourself or delegate a \
-narrower follow-up that says what is already known and asks only for what remains.
+conversation: the goal and the concrete question(s); the starting points you know \
+(paths, names, strings, errors); what is out of scope; what to return and when to \
+stop, e.g. "path:line of the entry points and the call chain to X in up to 10 \
+lines".
+- A subagent has a limited number of steps and a limited share of the context \
+window: give it one narrow question or subtask (one subsystem, one flow). A good \
+explore task is answerable in about ten tool calls.
+- A report from a subagent that was stopped by a limit is still a result: do not \
+rerun the same task — use what it found and delegate only what remains.
 - Only you see the reports: retell the essentials to the user.
 """
 
@@ -228,7 +229,10 @@ file: {plan_path}
 user confirms each of them.
 
 Work in this order:
-1. Study the code; when something is ambiguous, ask the user (ask_user).
+1. Study the code. Unless the change is trivial (one or two known files), start \
+with explore subagents: 1–3 of them in one response, each with its own question \
+(where the change goes, what depends on it, how it is tested). When something is \
+ambiguous, ask the user (ask_user).
 2. Write the plan to {plan_path} with write_file — Markdown in the user's \
 language: the goal, the steps (which files and what to change in them), how to \
 check the result. Brief and concrete.
