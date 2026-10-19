@@ -65,6 +65,10 @@ _RETRY_STATUS = {429, 500, 502, 503, 504}
 # (``GIGACREW_RATE_LIMIT_WAIT``) и паузы длиннее; Retry-After шлюза — в приоритете.
 _RATE_LIMIT_FIRST_DELAY = 5.0
 _RATE_LIMIT_MAX_DELAY = 30.0
+# Ответ шлюза на запрос, который он не принял по формату. Если в запросе были рассуждения
+# модели (``role: "reasoning"``), он повторяется без них; удалось — модель до конца сессии
+# работает без возврата рассуждений: так их возврат не может сломать модель.
+_REJECTED_STATUS = {400, 422}
 # Закрывающий тег рассуждений, который шлюз оставляет в начале текста ответа: сами
 # рассуждения ушли в ``role: "reasoning"``, а тег — в ответ (MiniMax: ``</mm:think>``).
 _LEAKED_REASONING_TAGS = ("</mm:think>", "</think>")
@@ -153,18 +157,23 @@ def _build_function_call(raw: Any) -> FunctionCall | None:
     )
 
 
+def _has_reasoning(payload: Mapping[str, Any]) -> bool:
+    """Есть ли в теле запроса рассуждения модели."""
+    return any(m.get("role") == "reasoning" for m in payload.get("messages") or ())
+
+
 class _RateLimitWait:
     """Ожидание при 429 в пределах бюджета одного запроса (``budget`` секунд).
 
     Паузы растут от :data:`_RATE_LIMIT_FIRST_DELAY` вдвое до :data:`_RATE_LIMIT_MAX_DELAY`;
     Retry-After шлюза важнее, но не меньше секунды — нулевая пауза крутила бы повторы, не
-    расходуя бюджет. О каждой паузе сообщает ``on_wait``.
+    расходуя бюджет. О каждой паузе сообщает ``on_notice``.
     """
 
-    def __init__(self, budget: float, on_wait: Callable[[str], None] | None):
+    def __init__(self, budget: float, on_notice: Callable[[str], None] | None):
         self._left = float(budget)
         self._delay = _RATE_LIMIT_FIRST_DELAY
-        self._on_wait = on_wait
+        self._on_notice = on_notice
 
     def wait(self, resp: httpx.Response) -> bool:
         """Подождать перед повтором; False — бюджет исчерпан, 429 — ошибка."""
@@ -172,8 +181,8 @@ class _RateLimitWait:
             return False
         pause = max(ApiProvider._retry_after(resp, self._delay), 1.0)
         pause = min(pause, _RATE_LIMIT_MAX_DELAY, self._left)
-        if self._on_wait is not None:
-            self._on_wait(f"лимит запросов шлюза (429) — жду {pause:.0f} с и повторяю")
+        if self._on_notice is not None:
+            self._on_notice(f"лимит запросов шлюза (429) — жду {pause:.0f} с и повторяю")
         time.sleep(pause)
         self._left -= pause
         self._delay = min(self._delay * 2, _RATE_LIMIT_MAX_DELAY)
@@ -325,6 +334,8 @@ class ApiProvider(LLMProvider):
         self._token_exp: float = 0.0  # unix-время истечения токена
         self._max_retries = 5  # повторы при транзиентных сбоях (сеть/5xx)
         self._rate_limit_wait = config.rate_limit_wait  # ожидание при 429, с на запрос
+        # Модели, для которых шлюз не принял рассуждения в запросе: дальше — без них.
+        self._no_reasoning: set[str] = set()
 
     @property
     def model(self) -> str:
@@ -348,7 +359,7 @@ class ApiProvider(LLMProvider):
         *,
         attempts: int | None = None,
         silent_attempts: int | None = None,
-        on_wait: Callable[[str], None] | None = None,
+        on_notice: Callable[[str], None] | None = None,
     ) -> httpx.Response:
         """Выполняет HTTP-запрос, повторяя транзиентные сбои.
 
@@ -356,7 +367,7 @@ class ApiProvider(LLMProvider):
           * сетевые ошибки/таймауты — сеть до API Сбера бывает нестабильна;
           * 5xx — временная недоступность;
           * 429 Too Many Requests — в пределах своего бюджета ожидания (не в счёт
-            попыток), о каждой паузе сообщает ``on_wait``.
+            попыток), о каждой паузе сообщает ``on_notice``.
         Прочие HTTP-ответы (включая 4xx) возвращаем как есть — их разбирает
         вызывающая сторона. Неповторяемые ошибки транспорта → ApiError.
         ``attempts`` — число попыток вместо ``_max_retries``; ``silent_attempts`` —
@@ -366,7 +377,7 @@ class ApiProvider(LLMProvider):
         delay = 1.0
         last_exc: Exception | None = None
         silences = 0
-        limit = _RateLimitWait(self._rate_limit_wait, on_wait)
+        limit = _RateLimitWait(self._rate_limit_wait, on_notice)
         attempt = 0
         while attempt < attempts:
             try:
@@ -507,7 +518,9 @@ class ApiProvider(LLMProvider):
         return out
 
     @classmethod
-    def _messages_payload(cls, messages: Sequence[Message]) -> list[dict[str, Any]]:
+    def _messages_payload(
+        cls, messages: Sequence[Message], *, reasoning: bool = True
+    ) -> list[dict[str, Any]]:
         """История для запроса. Результаты вызовов одного assistant-сообщения (идут
         подряд) склеиваются в одно сообщение ``role: "tool"`` с его ``tools_state_id``.
         Рассуждения ответа — сообщение ``role: "reasoning"`` перед ним, как в ответе API."""
@@ -531,7 +544,7 @@ class ApiProvider(LLMProvider):
                     out.append(tool)
                 continue
             if msg.role == "assistant":
-                if msg.reasoning:
+                if reasoning and msg.reasoning:
                     out.append({"role": "reasoning", "content": [{"text": msg.reasoning}]})
                 out.append(cls._assistant_payload(msg))
                 state_id = msg.state_id if msg.function_calls else None
@@ -568,11 +581,13 @@ class ApiProvider(LLMProvider):
         temperature: float,
         stream: bool = False,
         tool_choice: ToolChoice = "auto",
+        reasoning: bool = True,
     ) -> dict[str, Any]:
+        """Тело запроса чата; ``reasoning=False`` — без рассуждений модели."""
         options: dict[str, Any] = {"temperature": temperature}
         payload: dict[str, Any] = {
             "model": model or self._cfg.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(messages, reasoning=reasoning),
             "model_options": options,
         }
         if stream:
@@ -594,16 +609,35 @@ class ApiProvider(LLMProvider):
         model: str | None = None,
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
-        on_wait: Callable[[str], None] | None = None,
+        on_notice: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
+        name = model or self._cfg.model
         payload = self._payload(
-            messages, tools, model=model, temperature=temperature, tool_choice=tool_choice
+            messages,
+            tools,
+            model=model,
+            temperature=temperature,
+            tool_choice=tool_choice,
+            reasoning=name not in self._no_reasoning,
         )
 
         def send(do_request: Callable[[], httpx.Response]) -> httpx.Response:
-            return self._send_chat(do_request, on_wait=on_wait)
+            return self._send_chat(do_request, on_notice=on_notice)
 
         resp = self._post_chat(payload, send, timeout=self._chat_timeout)
+        if resp.status_code in _REJECTED_STATUS and _has_reasoning(payload):
+            plain = self._payload(
+                messages,
+                tools,
+                model=model,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                reasoning=False,
+            )
+            retry = self._post_chat(plain, send, timeout=self._chat_timeout)
+            if retry.status_code < 400:
+                self._reject_reasoning(name, resp.status_code, on_notice)
+            resp = retry
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
@@ -636,16 +670,26 @@ class ApiProvider(LLMProvider):
             resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
         return resp
 
+    def _reject_reasoning(
+        self, model: str, status: int, on_notice: Callable[[str], None] | None
+    ) -> None:
+        """Шлюз не принял запрос с рассуждениями, а без них принял: дальше — без них."""
+        self._no_reasoning.add(model)
+        if on_notice is not None:
+            on_notice(
+                f"шлюз не принял рассуждения модели {model} в запросе ({status}) — дальше без них"
+            )
+
     def _send_chat(
         self,
         do_request: Callable[[], httpx.Response],
         *,
-        on_wait: Callable[[str], None] | None = None,
+        on_notice: Callable[[str], None] | None = None,
     ) -> httpx.Response:
         """Отправка запроса чата: молчание модели дольше ожидания чтения — не больше
         :data:`_SILENT_ATTEMPTS` попыток."""
         return self._request_with_retry(
-            do_request, silent_attempts=_SILENT_ATTEMPTS, on_wait=on_wait
+            do_request, silent_attempts=_SILENT_ATTEMPTS, on_notice=on_notice
         )
 
     def _silence_message(self) -> str:
@@ -699,7 +743,7 @@ class ApiProvider(LLMProvider):
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
         on_delta: Callable[[str], None] | None = None,
-        on_wait: Callable[[str], None] | None = None,
+        on_notice: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Потоковая генерация. Вызывает on_delta(text) на каждый кусок текста и
         возвращает финальный AssistantTurn (идентичный complete()).
@@ -718,6 +762,7 @@ class ApiProvider(LLMProvider):
             state["emitted"] = True
             sink(piece)
 
+        name = model or self._cfg.model
         payload = self._payload(
             messages,
             tools,
@@ -725,13 +770,15 @@ class ApiProvider(LLMProvider):
             temperature=temperature,
             stream=True,
             tool_choice=tool_choice,
+            reasoning=name not in self._no_reasoning,
         )
         url = chat_url(self._cfg.base_url)
         delay = 1.0
         last_exc: Exception | None = None
         refreshed = False
         silences = 0  # попыток, на которые модель молчала дольше ожидания чтения
-        limit = _RateLimitWait(self._rate_limit_wait, on_wait)
+        limit = _RateLimitWait(self._rate_limit_wait, on_notice)
+        rejected: int | None = None  # статус отказа запросу с рассуждениями
 
         attempt = 0
         while attempt < self._max_retries:
@@ -750,6 +797,20 @@ class ApiProvider(LLMProvider):
                         refreshed = True
                         attempt += 1
                         continue
+                    if resp.status_code in _REJECTED_STATUS and _has_reasoning(payload):
+                        resp.read()
+                        rejected = resp.status_code
+                        payload = self._payload(
+                            messages,
+                            tools,
+                            model=model,
+                            temperature=temperature,
+                            stream=True,
+                            tool_choice=tool_choice,
+                            reasoning=False,
+                        )
+                        attempt += 1
+                        continue
                     if resp.status_code == 429:
                         resp.read()
                         if limit.wait(resp):
@@ -763,6 +824,8 @@ class ApiProvider(LLMProvider):
                     if resp.status_code >= 400:
                         resp.read()
                         raise ApiError(f"API вернул {resp.status_code}: {_body(resp)}")
+                    if rejected is not None:
+                        self._reject_reasoning(name, rejected, on_notice)
                     return self._consume_sse(resp, emit)
             except _RETRYABLE_EXC as e:
                 last_exc = e

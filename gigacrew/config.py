@@ -209,9 +209,10 @@ class Config:
     max_tool_repeats: int = 3
     temperature: float = 0.2
     stream: bool = True  # потоковый (посимвольный) вывод ответа модели
-    # Возвращать ли модели её рассуждения: "off" — нет, "turn" — в пределах хода (до
-    # следующего запроса пользователя), как советуют вендоры моделей с рассуждениями.
-    reasoning: str = "off"
+    # Возвращать ли модели её рассуждения: "turn" — в пределах хода (до следующего
+    # запроса пользователя), как советуют вендоры моделей с рассуждениями; "off" — нет.
+    # Модели без рассуждений это не касается: возвращать нечего, запрос тот же.
+    reasoning: str = "turn"
     # Бюджет контекста (оценка в токенах), в который укладывается история при
     # отправке модели; старые сообщения сверх бюджета отбрасываются. None — от
     # замеренного окна модели (~/.gigacrew/models.json), число — явное переопределение.
@@ -284,7 +285,7 @@ class Config:
             mode=mode or _env_mode(env, "GIGACREW_MODE"),
             stream=stream,
             temperature=_env_float(env, "GIGACREW_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
-            reasoning=_env_choice(env, "GIGACREW_REASONING", ("off", "turn")),
+            reasoning=_env_choice(env, "GIGACREW_REASONING", ("turn", "off")),
             context_budget_tokens=_env_optional_int(env, "GIGACREW_CONTEXT_TOKENS", minimum=4_000),
             auto_compact=_env_bool(env, "GIGACREW_AUTO_COMPACT", True),
             compact_threshold=_env_int(

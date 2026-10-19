@@ -202,8 +202,8 @@ def test_reasoning_mode(tmp_path):
     def load(env):
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
-    assert load({}).reasoning == "off"
-    assert load({"GIGACREW_REASONING": " Turn "}).reasoning == "turn"
+    assert load({}).reasoning == "turn"
+    assert load({"GIGACREW_REASONING": " Off "}).reasoning == "off"
     with pytest.raises(ConfigError, match="GIGACREW_REASONING"):
         load({"GIGACREW_REASONING": "always"})
 

@@ -886,7 +886,9 @@ SCENARIOS: tuple[Scenario, ...] = (
     ),
     Scenario(
         id="delegate_subtasks",
-        goal="две независимые подзадачи — суб-агенты",
+        # Справочный: правки — дело основного агента, суб-агенты — на выбор модели
+        # (столбец task показывает, звала ли она их).
+        goal="две независимые подзадачи выполнены (суб-агенты — на выбор модели)",
         mode=PermissionMode.ACCEPT_EDITS,
         turns=(
             Turn(
@@ -896,7 +898,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         ),
         files_expect={"tests/test_payments.py": "def test", "tests/test_storage.py": "def test"},
         run_tests=True,
-        check=lambda r: r["task_calls"] >= 1 and bool(r["files_ok"]),
+        check=lambda r: bool(r["files_ok"]) and bool(r["tests_pass"]),
     ),
 )
 SCENARIO_BY_ID: dict[str, Scenario] = {scenario.id: scenario for scenario in SCENARIOS}
@@ -1407,7 +1409,7 @@ def _describe(meta: Mapping[str, Any]) -> str:
         if meta.get(key):
             parts.append(str(meta[key]))
     parts.append(f"T={meta.get('temperature')}")
-    if meta.get("reasoning") not in (None, "off"):
+    if meta.get("reasoning"):  # в отчётах до этапа 5 ключа нет
         parts.append(f"reasoning={meta['reasoning']}")
     return " · ".join(parts)
 

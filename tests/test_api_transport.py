@@ -16,7 +16,7 @@ from gigacrew.config import Config
 from gigacrew.llm import api
 from gigacrew.llm.api import ApiError, ApiProvider
 from gigacrew.llm.base import LLMError, PromptTooLong
-from gigacrew.llm.types import Message, Usage
+from gigacrew.llm.types import FunctionCall, Message, Usage
 
 AUTH_URL = "https://auth.test/oauth"
 BASE_URL = "https://api.test/v1"
@@ -502,7 +502,7 @@ def test_rate_limit_waits_longer_than_other_retries(monkeypatch, streaming):
     p = _provider(handler)
     waits: list[str] = []
     call = p.stream if streaming else p.complete
-    assert call(_msgs(), on_wait=waits.append).message.content == "ok"
+    assert call(_msgs(), on_notice=waits.append).message.content == "ok"
     assert calls["chat"] == 7
     assert pauses == [5.0, 10.0, 20.0, 30.0, 30.0, 25.0]  # до бюджета 120 с
     assert len(waits) == 6 and "лимит запросов шлюза (429) — жду 5 с" in waits[0]
@@ -546,3 +546,154 @@ def test_rate_limit_wait_can_be_turned_off(monkeypatch):
         p.complete(_msgs())
     assert pauses == [] and calls["chat"] == 1
     p.close()
+
+
+# ------------------------------ рассуждения модели ------------------------------ #
+def _bodies_of(handler):
+    """Обработчик, запоминающий тела запросов чата."""
+    bodies: list[dict] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        if str(request.url) != AUTH_URL:
+            bodies.append(json.loads(request.content))
+        return handler(request)
+
+    return recording, bodies
+
+
+def _roles(body: dict) -> list[str]:
+    return [m["role"] for m in body["messages"]]
+
+
+def _with_reasoning_history():
+    call = FunctionCall(name="read_file", arguments={"path": "a"}, id="c1")
+    return [
+        Message(role="user", content="что в a?"),
+        Message(role="assistant", function_calls=[call], state_id="S", reasoning="прочитаю a"),
+        Message(role="function", name="read_file", content="x", call_id="c1"),
+    ]
+
+
+def _rejecting(*, always: bool = False):
+    """Шлюз не принимает рассуждения в запросе (422); ``always`` — и без них."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        body = json.loads(request.content)
+        if always or "reasoning" in _roles(body):
+            return httpx.Response(422, json={"message": "unknown role: reasoning"})
+        if body.get("stream"):
+            done = _event({**_text("ok"), "finish_reason": "stop"}, "response.message.done")
+            return httpx.Response(200, content=done.encode())
+        return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+    return handler
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_rejected_reasoning_is_dropped_for_the_model(streaming):
+    handler, bodies = _bodies_of(_rejecting())
+    p = _provider(handler)
+    notices: list[str] = []
+    call = p.stream if streaming else p.complete
+    assert call(_with_reasoning_history(), on_notice=notices.append).message.content == "ok"
+    assert [_roles(b).count("reasoning") for b in bodies] == [1, 0]  # повтор — без них
+    assert len(notices) == 1 and "не принял рассуждения модели M-default" in notices[0]
+    # дальше эта модель — сразу без рассуждений, без лишнего запроса и уведомления
+    call(_with_reasoning_history(), on_notice=notices.append)
+    assert len(bodies) == 3 and "reasoning" not in _roles(bodies[2]) and len(notices) == 1
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_other_rejection_is_not_blamed_on_reasoning(streaming):
+    handler, bodies = _bodies_of(_rejecting(always=True))
+    p = _provider(handler)
+    call = p.stream if streaming else p.complete
+    with pytest.raises(ApiError, match="422"):
+        call(_with_reasoning_history())
+    with pytest.raises(ApiError, match="422"):
+        call(_msgs())  # без рассуждений — и повторять нечего
+    # отказ не из-за рассуждений: модель их не теряет
+    assert [_roles(b).count("reasoning") for b in bodies] == [1, 0, 0]
+    with pytest.raises(ApiError):
+        call(_with_reasoning_history())
+    assert _roles(bodies[3]).count("reasoning") == 1
+    p.close()
+
+
+def _agent_requests(tmp_path, reasoning: str, *, thoughts: bool) -> list[dict]:
+    """Ход агента через настоящий клиент API: чтение файла, затем ответ; тела запросов."""
+    from fakes import RecordingEvents
+
+    from gigacrew.agent.loop import Agent
+    from gigacrew.tools.base import build_default_registry
+
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    replies = iter(
+        [
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tools_state_id": "S",
+                        "content": [
+                            {
+                                "function_call": {
+                                    "id": "c1",
+                                    "name": "read_file",
+                                    "arguments": {"path": "a.txt"},
+                                }
+                            }
+                        ],
+                    }
+                ],
+                "finish_reason": "function_call",
+            },
+            {**_text("там hello"), "finish_reason": "stop"},
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        data = next(replies)
+        if thoughts:
+            data = {**data, "messages": [_reasoning_part(), *data["messages"]]}
+        return httpx.Response(200, json=data)
+
+    recording, bodies = _bodies_of(handler)
+    cfg = Config(
+        access_key="dummy",
+        auth_url=AUTH_URL,
+        base_url=BASE_URL,
+        model="M-default",
+        project_root=tmp_path,
+        stream=False,
+        reasoning=reasoning,
+    )
+    provider = ApiProvider(cfg, transport=httpx.MockTransport(recording))
+    Agent(provider, build_default_registry(), cfg, RecordingEvents()).run_turn("что в a.txt?")
+    provider.close()
+    return bodies
+
+
+def _reasoning_part() -> dict:
+    return {"role": "reasoning", "content": [{"text": "надо прочитать a.txt"}]}
+
+
+def test_model_without_reasoning_gets_the_same_requests_in_turn_mode(tmp_path):
+    """Модели без рассуждений режим turn не касается: запросы те же, что с off."""
+    turn = _agent_requests(tmp_path, "turn", thoughts=False)
+    off = _agent_requests(tmp_path, "off", thoughts=False)
+    assert turn == off and len(turn) == 2
+    assert all("reasoning" not in _roles(body) for body in turn)
+
+
+def test_model_with_reasoning_gets_it_back_within_the_turn(tmp_path):
+    turn = _agent_requests(tmp_path, "turn", thoughts=True)
+    off = _agent_requests(tmp_path, "off", thoughts=True)
+    assert _roles(turn[1]) == ["system", "user", "reasoning", "assistant", "tool"]
+    assert turn[1]["messages"][2] == _reasoning_part()
+    assert "reasoning" not in _roles(off[1])

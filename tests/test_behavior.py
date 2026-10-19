@@ -323,6 +323,55 @@ def test_broad_question_explored_with_explore_tool(shop):
     assert record["general_calls"] == 0 and record["subagent_runs"] == 1
 
 
+PAYMENTS_TESTS = """\
+import pytest
+
+from shop.errors import PaymentError
+from shop.payments import PaymentGateway
+
+
+def test_charge_returns_payment_id():
+    assert PaymentGateway().charge("4111111111111111", 100) == "pay-1"
+
+
+def test_declined_card():
+    with pytest.raises(PaymentError):
+        PaymentGateway().charge("4000000000000002", 100)
+"""
+STORAGE_TESTS = """\
+import pytest
+
+from shop.errors import NotFoundError
+from shop.storage import JsonStorage
+
+
+def test_missing_order(tmp_path):
+    with pytest.raises(NotFoundError):
+        JsonStorage(tmp_path / "orders.json").order_status("nope")
+"""
+
+
+@pytest.mark.parametrize(
+    ("storage", "ok"),
+    [(STORAGE_TESTS, True), (STORAGE_TESTS.replace("NotFoundError):", "KeyError):"), False)],
+    ids=["tests_pass", "tests_fail"],
+)
+def test_subtasks_done_by_main_agent_count(shop, storage, ok):
+    """Справочный сценарий: успех — тесты написаны и проходят, суб-агенты — на выбор модели."""
+    result = _run(
+        "delegate_subtasks",
+        [
+            tool_turn("write_file", {"path": "tests/test_payments.py", "content": PAYMENTS_TESTS}),
+            tool_turn("write_file", {"path": "tests/test_storage.py", "content": storage}),
+            text_turn("Готово."),
+        ],
+        shop,
+    )
+    record = result.record
+    assert record["task_calls"] == 0 and record["files_ok"]
+    assert record["tests_pass"] is ok and record["ok"] is ok
+
+
 def test_pinpoint_question_answered_directly(shop):
     result = _run(
         "delegate_pinpoint",
@@ -393,9 +442,11 @@ def test_report_is_written_after_each_run_and_compared(shop, tmp_path):
     assert all(name in compared[3] for name in ("err", "rem", "chk", "txt", "res"))
     assert main(["show", str(session.path)]) == 0
     assert main(["digest", str(session.path)]) == 0
-    assert report["meta"]["reasoning"] == "off" and "reasoning=" not in compared[0]
-    turn_meta = {**newer["meta"], "reasoning": "turn"}
-    assert "reasoning=turn" in compare_reports(report, {**newer, "meta": turn_meta})[1]
+    assert report["meta"]["reasoning"] == "turn" and "reasoning=turn" in compared[0]
+    off_meta = {**newer["meta"], "reasoning": "off"}
+    assert "reasoning=off" in compare_reports(report, {**newer, "meta": off_meta})[1]
+    old_meta = {k: v for k, v in report["meta"].items() if k != "reasoning"}  # до этапа 5
+    assert "reasoning=" not in compare_reports({**report, "meta": old_meta}, newer)[0]
 
 
 def test_digest_fits_a_chat_message():

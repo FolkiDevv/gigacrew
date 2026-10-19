@@ -395,9 +395,9 @@ class _WaitingProvider(ScriptedProvider):
     """Перед каждым ответом провайдер «ждёт» лимита запросов и сообщает об этом."""
 
     def complete(self, messages, tools=None, **kwargs):
-        on_wait = kwargs.get("on_wait")
-        if on_wait is not None:
-            on_wait("лимит запросов шлюза (429) — жду 5 с и повторяю")
+        on_notice = kwargs.get("on_notice")
+        if on_notice is not None:
+            on_notice("лимит запросов шлюза (429) — жду 5 с и повторяю")
         return super().complete(messages, tools, **kwargs)
 
 

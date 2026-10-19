@@ -1055,7 +1055,7 @@ class Agent:
                     temperature=self._cfg.temperature,
                     tool_choice=tool_choice,
                     on_delta=on_delta,
-                    on_wait=self._notify_wait,
+                    on_notice=self._provider_notice,
                 )
             else:
                 turn = self._provider.complete(
@@ -1064,7 +1064,7 @@ class Agent:
                     model=self._model,
                     temperature=self._cfg.temperature,
                     tool_choice=tool_choice,
-                    on_wait=self._notify_wait,
+                    on_notice=self._provider_notice,
                 )
         except BaseException as e:
             partial = "".join(streamed).rstrip()
@@ -1091,8 +1091,9 @@ class Agent:
             turn = turn.model_copy(update={"message": message})
         return turn
 
-    def _notify_wait(self, text: str) -> None:
-        """Провайдер ждёт перед повтором (лимит запросов шлюза) — сказать пользователю."""
+    def _provider_notice(self, text: str) -> None:
+        """Сообщение провайдера пользователю: пауза при лимите запросов, отказ шлюза
+        принять рассуждения."""
         self._events.on_notice(text, level="warn")
 
     # ------------------------------------------------------------------ #
