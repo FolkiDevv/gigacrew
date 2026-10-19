@@ -146,6 +146,22 @@ def _env_choice(env: Mapping[str, str], name: str, choices: tuple[str, ...]) -> 
     return raw
 
 
+_HEADER_VALUE_RE = re.compile(r"[\x20-\x7e]+")
+
+
+def _env_header(env: Mapping[str, str], name: str) -> str | None:
+    """Значение HTTP-заголовка: печатный ASCII (пробелы по краям обрезаются); пусто — None.
+
+    Иначе запрос не собрать — ошибка при запуске, а не на первом запросе.
+    """
+    value = (env.get(name) or "").strip()
+    if not value:
+        return None
+    if not _HEADER_VALUE_RE.fullmatch(value):
+        raise ConfigError(f"{name}: допустимы только печатные ASCII-символы, получено {value!r}")
+    return value
+
+
 def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, hi: float) -> float:
     raw = env.get(name)
     if raw is None or not raw.strip():
@@ -193,6 +209,8 @@ class Config:
     # Имя клиента, под которым gigacrew входит в бэкенд GigaCode (plugin_name в теле
     # входа). Значения по умолчанию нет: на время демо имя выдаёт команда бэкенда.
     plugin_name: str | None = None
+    # User-Agent всех запросов к бэкенду GigaCode; значения по умолчанию тоже нет.
+    user_agent: str | None = None
     # Каталог официального CLI GigaCode (GIGACODE_HOME, иначе ~/.gigacode): оттуда
     # берётся постоянный id устройства для входа.
     gigacode_home: str | None = None
@@ -287,6 +305,7 @@ class Config:
             verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", ca_bundle is not None),
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             plugin_name=(env.get("GIGACREW_PLUGIN_NAME") or "").strip() or None,
+            user_agent=_env_header(env, "GIGACREW_USER_AGENT"),
             gigacode_home=env.get("GIGACODE_HOME") or None,
             timeout=_env_int(env, "GIGACREW_TIMEOUT", 120),
             read_timeout=_env_int(env, "GIGACREW_READ_TIMEOUT", 600),
@@ -378,6 +397,11 @@ class Config:
             if not self.plugin_name:
                 raise RuntimeError(
                     "Не задано имя клиента для входа в GigaCode. Укажите GIGACREW_PLUGIN_NAME "
+                    "в .env или переменных окружения. См. .env.example."
+                )
+            if not self.user_agent:
+                raise RuntimeError(
+                    "Не задан User-Agent для запросов к GigaCode. Укажите GIGACREW_USER_AGENT "
                     "в .env или переменных окружения. См. .env.example."
                 )
             return

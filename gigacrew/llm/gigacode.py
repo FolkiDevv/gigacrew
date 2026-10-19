@@ -7,8 +7,9 @@
 
 Вход (:mod:`gigacrew.llm.gigacode_auth`) — когда токена нет, он истёк или бэкенд ответил
 401: ссылка на страницу входа показывается пользователю, gigacrew ждёт подтверждения. Имя
-клиента в теле входа — ``GIGACREW_PLUGIN_NAME`` (значения по умолчанию нет). Токен
-хранится в ``~/.gigacrew/gigacode_token.json``.
+клиента в теле входа — ``GIGACREW_PLUGIN_NAME``, User-Agent всех запросов —
+``GIGACREW_USER_AGENT`` (значений по умолчанию нет). Токен хранится в
+``~/.gigacrew/gigacode_token.json``.
 
 Чат — OpenAI Chat Completions (:mod:`gigacrew.llm.openai_chat`); каждый запрос идёт
 потоком (бэкенд рассчитан на поток), кроме моделей с ``ai_api.stream: false``.
@@ -18,9 +19,7 @@
 from __future__ import annotations
 
 import math
-import platform
 import re
-import sys
 import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -31,7 +30,6 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from gigacrew import __version__
 from gigacrew.config import Config
 from gigacrew.llm import openai_chat
 from gigacrew.llm.base import ModelInfo
@@ -183,11 +181,6 @@ def parse_catalogue(data: Mapping[str, Any], config_url: str) -> Catalogue:
     return Catalogue(models=tuple(models), default_model=default, chat_url=url)
 
 
-def _user_agent() -> str:
-    arch = platform.machine().lower() or "unknown"
-    return f"gigacrew/{__version__} ({sys.platform}; {arch})"
-
-
 class GigaCodeProvider(HttpProvider):
     """Бэкенд GigaCode. Конструктор не обращается к сети и файлам.
 
@@ -210,8 +203,10 @@ class GigaCodeProvider(HttpProvider):
             raise RuntimeError(
                 f"GIGACREW_PROVIDER={config.provider}: этот провайдер — для бэкенда GigaCode"
             )
-        config.require_credentials()
-        super().__init__(config, transport=transport, headers={"User-Agent": _user_agent()})
+        config.require_credentials()  # адрес, имя клиента и User-Agent заданы
+        super().__init__(
+            config, transport=transport, headers={"User-Agent": config.user_agent or ""}
+        )
         self._config_url = config_endpoint(config.base_url)
         self._plugin_name = config.plugin_name or ""
         self._home = Path(config.gigacode_home).expanduser() if config.gigacode_home else None

@@ -27,6 +27,7 @@ CONFIG = f"{BASE}/api/v2/config"
 POLL = f"{BASE}/api/v2/auth/poll"
 SIGNIN = "https://gitverse.test/signin"
 CHAT = f"{BASE}/api/v2/chat/completions"
+AGENT = "demo-agent/1.0 (test)"
 
 CATALOGUE = {
     "default_model": "coder",
@@ -148,6 +149,7 @@ def _config(tmp_path, **kw) -> Config:
         "provider": "gigacode",
         "base_url": BASE,
         "plugin_name": "demo",
+        "user_agent": AGENT,
         "gigacode_home": str(tmp_path / "cli-home"),
         "project_root": tmp_path,
     }
@@ -277,6 +279,8 @@ def test_constructor_does_no_io(tmp_path):
 def test_constructor_requires_the_client_name(tmp_path):
     with pytest.raises(RuntimeError, match="GIGACREW_PLUGIN_NAME"):
         _provider(Backend(), tmp_path, plugin_name=None)
+    with pytest.raises(RuntimeError, match="GIGACREW_USER_AGENT"):
+        _provider(Backend(), tmp_path, user_agent=None)
     with pytest.raises(RuntimeError, match="GIGACREW_API_URL"):
         _provider(Backend(), tmp_path, base_url="")
     with pytest.raises(RuntimeError, match="GIGACREW_PROVIDER"):
@@ -447,7 +451,7 @@ def test_chat_request_headers_and_body(tmp_path):
     chat = [r for r in backend.requests if str(r.url) == CHAT]
     assert chat[0].headers["Accept"] == "application/json"
     assert chat[0].headers["Content-Type"] == "application/json"
-    assert chat[0].headers["User-Agent"].startswith("gigacrew/")
+    assert chat[0].headers["User-Agent"] == AGENT
     assert chat[0].headers["X-Session-Id"] == chat[1].headers["X-Session-Id"]
     body = backend.chat_bodies[0]
     assert body["model"] == "coder" and body["temperature"] == 0.4 and body["top_p"] == 0.9
@@ -456,8 +460,9 @@ def test_chat_request_headers_and_body(tmp_path):
     assert "max_tokens" not in body
     assert body["messages"] == [{"role": "user", "content": "привет"}]
     assert deltas == ["ok"]
-    login = [r for r in backend.requests if str(r.url) == POLL][0]
-    assert login.headers["User-Agent"].startswith("gigacrew/")
+    # User-Agent из GIGACREW_USER_AGENT — у всех запросов к бэкенду, и у входа тоже
+    assert {r.headers["User-Agent"] for r in backend.requests} == {AGENT}
+    assert {str(r.url) for r in backend.requests} == {CONFIG, POLL, CHAT}
 
 
 def test_complete_goes_through_the_stream(tmp_path):

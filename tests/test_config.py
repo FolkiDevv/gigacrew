@@ -83,6 +83,8 @@ def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
         {"GIGACREW_READ_TIMEOUT": "0"},
         {"GIGACREW_READ_TIMEOUT": "long"},
         {"GIGACREW_PROVIDER": "openai"},
+        {"GIGACREW_USER_AGENT": "агент/1.0"},
+        {"GIGACREW_USER_AGENT": "agent\x1b[31m"},
     ],
 )
 def test_bad_values_raise_config_error(tmp_path, env):
@@ -160,9 +162,33 @@ def test_gigacode_client_name_has_no_default(tmp_path):
     assert load({**base, "GIGACREW_PLUGIN_NAME": "   "}).plugin_name is None
     cfg = load({**base, "GIGACREW_PLUGIN_NAME": " demo-client ", "GIGACODE_HOME": "/opt/gc"})
     assert (cfg.plugin_name, cfg.gigacode_home) == ("demo-client", "/opt/gc")
-    cfg.require_credentials()  # ключ и сертификат не нужны
     with pytest.raises(RuntimeError, match="GIGACREW_API_URL"):
         load({"GIGACREW_PROVIDER": "gigacode", "GIGACREW_PLUGIN_NAME": "x"}).require_credentials()
+
+
+def test_gigacode_user_agent_has_no_default(tmp_path):
+    """User-Agent запросов к GigaCode тоже задаёт только пользователь."""
+
+    def load(env):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+
+    base = {
+        "GIGACREW_PROVIDER": "gigacode",
+        "GIGACREW_API_URL": "https://code.test",
+        "GIGACREW_PLUGIN_NAME": "demo",
+    }
+    cfg = load(base)
+    assert cfg.user_agent is None
+    with pytest.raises(RuntimeError, match="GIGACREW_USER_AGENT"):
+        cfg.require_credentials()
+    assert load({**base, "GIGACREW_USER_AGENT": "  "}).user_agent is None
+    cfg = load({**base, "GIGACREW_USER_AGENT": " demo-cli/26.10 (darwin; x64) "})
+    assert cfg.user_agent == "demo-cli/26.10 (darwin; x64)"
+    cfg.require_credentials()  # ключ и сертификат не нужны
+    # API v2 без него обходится
+    Config(
+        access_key="k", auth_url="https://a.test", base_url="https://api.test/v1"
+    ).require_credentials()
 
 
 def test_save_chats_flag_and_env(tmp_path):

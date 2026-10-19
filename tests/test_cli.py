@@ -160,6 +160,7 @@ def oneshot(tmp_path, monkeypatch):
         "GIGACREW_AUTO_MEASURE",
         "GIGACREW_PROVIDER",
         "GIGACREW_PLUGIN_NAME",
+        "GIGACREW_USER_AGENT",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -986,7 +987,10 @@ def test_make_provider_follows_the_setting(tmp_path):
         Config(access_key="k", auth_url="https://auth.test", base_url="https://api.test/v1"), ui
     )
     giga = app._make_provider(
-        Config(provider="gigacode", base_url="https://code.test", plugin_name="demo"), ui
+        Config(
+            provider="gigacode", base_url="https://code.test", plugin_name="demo", user_agent="ua"
+        ),
+        ui,
     )
     assert isinstance(api, ApiProvider) and isinstance(giga, GigaCodeProvider)
     api.close()
@@ -1000,6 +1004,12 @@ def test_gigacode_without_client_name_stops_before_any_request(
     monkeypatch.setattr(app, "_make_provider", lambda *_a: pytest.fail("провайдер не нужен"))
     assert _main(tmp_path, "-p", "x") == 1
     assert "GIGACREW_PLUGIN_NAME" in _flat(capsys)
+    monkeypatch.setenv("GIGACREW_PLUGIN_NAME", "demo")  # имя есть, User-Agent — нет
+    assert _main(tmp_path, "-p", "x") == 1
+    assert "GIGACREW_USER_AGENT" in _flat(capsys)
+    monkeypatch.setenv("GIGACREW_USER_AGENT", "агент")  # не ASCII — ошибка конфигурации
+    assert _main(tmp_path, "-p", "x") == 1
+    assert "ошибка конфигурации: GIGACREW_USER_AGENT" in _flat(capsys)
 
 
 def test_catalogue_gives_the_default_model_and_its_window(tmp_path, oneshot, monkeypatch, capsys):
