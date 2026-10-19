@@ -251,24 +251,24 @@ def test_sandbox_escape_blocked(ctx):
 
 
 def test_data_dir_check_ignores_case(ctx):
-    """На macOS/Windows .GIGACREW — та же папка: запрет не обходится регистром."""
-    chats = ctx.root / ".gigacrew" / "chats"
+    """На macOS/Windows .GIGACODE — та же папка: запрет не обходится регистром."""
+    chats = ctx.root / ".gigacode" / "chats"
     chats.mkdir(parents=True)
     (chats / "x.json").write_text("{}", encoding="utf-8")
     w, e = WriteFileTool(), EditFileTool()
-    for path in (".GIGACREW/chats/x.json", ".GigaCrew/a"):
+    for path in (".GIGACODE/chats/x.json", ".GigaCode/a"):
         with pytest.raises(ToolError, match="Служебная папка"):
             w.run(w.parse({"path": path, "content": "x"}), ctx)
     with pytest.raises(ToolError, match="Служебная папка"):
         e.run(
-            e.parse({"path": ".gigacrew/chats/x.json", "old_string": "{}", "new_string": "[]"}),
+            e.parse({"path": ".gigacode/chats/x.json", "old_string": "{}", "new_string": "[]"}),
             ctx,
         )
     assert (chats / "x.json").read_text(encoding="utf-8") == "{}"
     # чтение по-прежнему разрешено, вложенная папка с тем же именем — обычная
     r = ReadFileTool()
-    assert r.run(r.parse({"path": ".gigacrew/chats/x.json"}), ctx).ok
-    assert w.run(w.parse({"path": "docs/.gigacrew/a.md", "content": "x"}), ctx).ok
+    assert r.run(r.parse({"path": ".gigacode/chats/x.json"}), ctx).ok
+    assert w.run(w.parse({"path": "docs/.gigacode/a.md", "content": "x"}), ctx).ok
 
 
 def _plan_ctx(ctx):
@@ -280,29 +280,30 @@ def _plan_ctx(ctx):
 
 
 def test_plan_file_is_writable_without_risk(ctx):
-    """Файл плана чата — единственный файл .gigacrew/, который можно писать."""
+    """Файл плана чата — единственный файл .gigacode/, который можно писать."""
     from gigacrew.security import RiskLevel
 
     pctx = _plan_ctx(ctx)
     w, e = WriteFileTool(), EditFileTool()
-    write = w.parse({"path": ".gigacrew/plans/chat1.md", "content": "# План\n1. a\n"})
+    write = w.parse({"path": ".gigacode/plans/chat1.md", "content": "# План\n1. a\n"})
     assert w.risk(write, pctx) is RiskLevel.SAFE
     res = w.run(write, pctx)
     assert res.ok and res.summary == "создан план" and pctx.plan.dirty
     # папка данных получила .gitignore — план не попадёт в репозиторий
-    assert (ctx.root / ".gigacrew" / ".gitignore").exists()
+    assert (ctx.root / ".gigacode" / ".gitignore").exists()
 
     pctx.plan.dirty = False
-    edit = e.parse({"path": ".gigacrew/plans/chat1.md", "old_string": "1. a", "new_string": "1. b"})
+    edit = e.parse({"path": ".gigacode/plans/chat1.md", "old_string": "1. a", "new_string": "1. b"})
     assert e.risk(edit, pctx) is RiskLevel.SAFE
     assert e.run(edit, pctx).summary == "изменён план" and pctx.plan.dirty
     assert pctx.plan.path.read_text(encoding="utf-8") == "# План\n1. b\n"
 
     # чужой план, чаты и обычный контекст без плана — по-прежнему закрыты
     for c, path in (
-        (pctx, ".gigacrew/plans/other.md"),
-        (pctx, ".gigacrew/chats/x.json"),
-        (ctx, ".gigacrew/plans/chat1.md"),
+        (pctx, ".gigacode/plans/other.md"),
+        (pctx, ".gigacode/chats/x.json"),
+        (pctx, ".gigacode/skills/demo/SKILL.md"),  # скиллы агент не пишет
+        (ctx, ".gigacode/plans/chat1.md"),
     ):
         params = w.parse({"path": path, "content": "x"})
         assert w.risk(params, c) is RiskLevel.WRITE
@@ -310,7 +311,7 @@ def test_plan_file_is_writable_without_risk(ctx):
             w.run(params, c)
 
 
-@pytest.mark.parametrize("target", [".git/config", ".gigacrew/chats/x.json"])
+@pytest.mark.parametrize("target", [".git/config", ".gigacode/chats/x.json"])
 def test_symlinked_plan_file_is_not_a_plan(ctx, target):
     """Ссылка на месте файла плана не уводит запись без вопроса в .git/ или к чатам."""
     import os
@@ -324,7 +325,7 @@ def test_symlinked_plan_file_is_not_a_plan(ctx, target):
     pctx.plan.path.parent.mkdir(parents=True)
     os.symlink(victim, pctx.plan.path)
     w = WriteFileTool()
-    params = w.parse({"path": ".gigacrew/plans/chat1.md", "content": "x"})
+    params = w.parse({"path": ".gigacode/plans/chat1.md", "content": "x"})
     assert w.risk(params, pctx) is RiskLevel.WRITE
     with pytest.raises(ToolError):
         w.preview(params, pctx)
@@ -338,12 +339,12 @@ def test_plan_dir_symlinked_into_git_is_rejected(ctx):
 
     git = ctx.root / ".git"
     git.mkdir()
-    (ctx.root / ".gigacrew").mkdir()
+    (ctx.root / ".gigacode").mkdir()
     os.symlink(git, ctx.workspace.plans_dir)
     pctx = _plan_ctx(ctx)
     w = WriteFileTool()
     with pytest.raises(ToolError, match="Внутренности git"):
-        w.run(w.parse({"path": ".gigacrew/plans/chat1.md", "content": "x"}), pctx)
+        w.run(w.parse({"path": ".gigacode/plans/chat1.md", "content": "x"}), pctx)
     assert list(git.iterdir()) == []
 
 
@@ -363,7 +364,7 @@ def test_data_dir_write_rejected_before_confirmation(tmp_path):
 
     provider = ScriptedProvider(
         [
-            tool_turn("write_file", {"path": ".gigacrew/chats/a.json", "content": "{}"}),
+            tool_turn("write_file", {"path": ".gigacode/chats/a.json", "content": "{}"}),
             text_turn("ок"),
         ]
     )
@@ -371,7 +372,7 @@ def test_data_dir_write_rejected_before_confirmation(tmp_path):
     cfg = Config(access_key="x", project_root=tmp_path, stream=False)
     Agent(provider, build_default_registry(), cfg, events).run_turn("испорти чат")
     assert events.confirms == []
-    assert not (tmp_path / ".gigacrew").exists()
+    assert not (tmp_path / ".gigacode").exists()
     assert "Служебная папка" in provider.requests[-1]["messages"][-1].content
 
 
@@ -412,11 +413,11 @@ def test_list_dir_shows_hidden(ctx):
     assert ".github/" in out and ".gitignore" in out
 
 
-@pytest.mark.parametrize("path", [".gigacrew/index/index.sqlite3", ".gigacrew", "./.gigacrew/x"])
+@pytest.mark.parametrize("path", [".gigacode/index/index.sqlite3", ".gigacode", "./.gigacode/x"])
 def test_data_dir_is_not_writable(ctx, path):
     """Индекс, история и чаты агента — не для правки моделью (отказ ещё в превью)."""
-    (ctx.root / ".gigacrew" / "index").mkdir(parents=True)
-    (ctx.root / ".gigacrew" / "x").write_text("old", encoding="utf-8")
+    (ctx.root / ".gigacode" / "index").mkdir(parents=True)
+    (ctx.root / ".gigacode" / "x").write_text("old", encoding="utf-8")
     w, e = WriteFileTool(), EditFileTool()
     write = w.parse({"path": path, "content": "new"})
     edit = e.parse({"path": path, "old_string": "old", "new_string": "new"})
@@ -425,24 +426,24 @@ def test_data_dir_is_not_writable(ctx, path):
             tool.preview(params, ctx)
         with pytest.raises(ToolError, match="Служебная папка"):
             tool.run(params, ctx)
-    assert (ctx.root / ".gigacrew" / "x").read_text(encoding="utf-8") == "old"
+    assert (ctx.root / ".gigacode" / "x").read_text(encoding="utf-8") == "old"
 
 
 def test_similar_names_outside_data_dir_are_writable(ctx):
     w = WriteFileTool()
-    assert w.run(w.parse({"path": ".gigacrew.md", "content": "ok"}), ctx).ok
+    assert w.run(w.parse({"path": ".gigacode.md", "content": "ok"}), ctx).ok
 
 
 def test_data_dir_symlink_target_is_not_writable(ctx):
-    """.gigacrew — симлинк на каталог проекта: запись по любому из путей запрещена."""
+    """.gigacode — симлинк на каталог проекта: запись по любому из путей запрещена."""
     import os
 
     if os.name == "nt":
         pytest.skip("симлинки")
     (ctx.root / "agent-data").mkdir()
-    (ctx.root / ".gigacrew").symlink_to(ctx.root / "agent-data", target_is_directory=True)
+    (ctx.root / ".gigacode").symlink_to(ctx.root / "agent-data", target_is_directory=True)
     w = WriteFileTool()
-    for path in (".gigacrew/index.sqlite3", "agent-data/index.sqlite3"):
+    for path in (".gigacode/index.sqlite3", "agent-data/index.sqlite3"):
         with pytest.raises(ToolError, match="Служебная папка"):
             w.preview(w.parse({"path": path, "content": "x"}), ctx)
 
@@ -768,12 +769,12 @@ def test_file_with_xattrs_is_edited_in_place(ctx):
     path = ctx.root / "acl.txt"
     path.write_text("x = 1\n", encoding="utf-8")
     try:
-        os.setxattr(path, "user.gigacrew", b"1")
+        os.setxattr(path, "user.gigacode", b"1")
     except OSError:
         pytest.skip("ФС без user xattr")
     inode = path.stat().st_ino
     _edit(ctx, "acl.txt", "x = 1", "x = 2")
-    assert path.stat().st_ino == inode and os.getxattr(path, "user.gigacrew") == b"1"
+    assert path.stat().st_ino == inode and os.getxattr(path, "user.gigacode") == b"1"
 
 
 def _fake_git_dir(directory):

@@ -750,7 +750,7 @@ def test_mode_survives_reset_and_cycles(tmp_path):
     assert [agent.cycle_mode(), agent.cycle_mode()] == [PermissionMode.PLAN, PermissionMode.MANUAL]
 
 
-PLAN_REL = ".gigacrew/plans/chat1.md"
+PLAN_REL = ".gigacode/plans/chat1.md"
 
 
 def _planning_agent(provider, tmp_path, events=None) -> Agent:
@@ -786,7 +786,7 @@ def test_plan_mode_allows_only_the_plan_file(tmp_path):
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": "a.txt", "content": "x"}),
-            tool_turn("write_file", {"path": ".gigacrew/plans/other.md", "content": "x"}),
+            tool_turn("write_file", {"path": ".gigacode/plans/other.md", "content": "x"}),
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
             tool_turn("exit_plan_mode", {}),
             text_turn("жду"),
@@ -865,7 +865,7 @@ def test_submitted_plan_needs_no_reminder(tmp_path):
 def test_chat_id_names_the_plan_file(tmp_path):
     agent = _agent(ScriptedProvider(), tmp_path)
     agent.chat_id = "a1"
-    assert agent.plan_path == tmp_path.resolve() / ".gigacrew" / "plans" / "a1.md"
+    assert agent.plan_path == tmp_path.resolve() / ".gigacode" / "plans" / "a1.md"
     agent.reset(chat_id="b2")
     assert agent.chat_id == "b2" and agent.plan_path.name == "b2.md"
     agent.reset()

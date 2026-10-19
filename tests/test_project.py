@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 
 import pytest
 
@@ -20,17 +22,54 @@ from gigacrew.project.workspace import Workspace
 # ------------------------------ Workspace ------------------------------ #
 def test_workspace_constructor_has_no_side_effects(tmp_path):
     ws = Workspace(tmp_path)
-    assert ws.data_dir == tmp_path.resolve() / ".gigacrew"
+    assert ws.data_dir == tmp_path.resolve() / ".gigacode"
     assert ws.chats_dir == ws.data_dir / "chats"
     assert ws.index_dir == ws.data_dir / "index"
+    assert ws.skills_dir == ws.data_dir / "skills"
     assert not ws.data_dir.exists()
+
+
+def _gitignored(ws: Workspace) -> set[str]:
+    lines = (ws.data_dir / ".gitignore").read_text(encoding="utf-8").splitlines()
+    return {line.strip("/") for line in lines if line and not line.startswith("#")}
+
+
+def test_gitignore_covers_agent_data_but_not_skills(tmp_path):
+    """Рабочие данные агента не коммитятся, а скиллы проекта — коммитятся."""
+    ws = Workspace(tmp_path)
+    ws.ensure_data_dir()
+    ignored = _gitignored(ws)
+    for path in (ws.chats_dir, ws.plans_dir, ws.index_dir, ws.history_file):
+        assert path.relative_to(ws.data_dir).as_posix() in ignored
+    assert not any(p == "*" or p.startswith("skills") for p in ignored)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="нужен git")
+def test_gitignore_keeps_skills_in_git(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    ws = Workspace(tmp_path)
+    ws.ensure_data_dir()
+
+    def ignored(rel: str) -> bool:
+        run = subprocess.run(["git", "-C", str(tmp_path), "check-ignore", "-q", rel])
+        return run.returncode == 0
+
+    for rel in (
+        ".gigacode/chats/a.json",
+        ".gigacode/plans/a.md",
+        ".gigacode/history",
+        ".gigacode/index/index.sqlite3",
+    ):
+        assert ignored(rel), rel
+    for rel in (".gigacode/skills/demo/SKILL.md", ".gigacode/.gitignore"):
+        assert not ignored(rel), rel
 
 
 def test_ensure_data_dir_creates_gitignore_idempotently(tmp_path):
     ws = Workspace(tmp_path)
     assert ws.ensure_data_dir() == ws.data_dir
     gi = ws.data_dir / ".gitignore"
-    assert "*" in gi.read_text(encoding="utf-8").splitlines()
+    assert "/chats/" in gi.read_text(encoding="utf-8").splitlines()
     gi.write_text("# мой\n*\n!keep\n", encoding="utf-8")
     ws.ensure_data_dir()  # повторно — без ошибок и без перезаписи
     assert gi.read_text(encoding="utf-8") == "# мой\n*\n!keep\n"
@@ -90,11 +129,11 @@ def test_file_tree_shows_dotfiles_hides_service_dirs(tmp_path):
     _make(tmp_path, ".github/workflows/ci.yml")
     _make(tmp_path, "node_modules/junk.js")
     _make(tmp_path, ".git/HEAD")
-    _make(tmp_path, ".gigacrew/chats/1.json")
+    _make(tmp_path, ".gigacode/chats/1.json")
     tree = build_file_tree(tmp_path)
     assert "src/" in tree and "main.py" in tree
     assert ".github/" in tree
-    for hidden in ("node_modules", ".git/", ".gigacrew"):
+    for hidden in ("node_modules", ".git/", ".gigacode"):
         assert hidden not in tree
 
 
@@ -227,11 +266,11 @@ def test_nested_instructions_skip_ignored_dirs_and_outside_paths(tmp_path):
     _make(tmp_path, ".gitignore", "build/\nGIGACREW.local.md\n")
     _make(tmp_path, "node_modules/lib/AGENTS.md", "чужое")
     _make(tmp_path, "build/AGENTS.md", "сгенерировано")
-    _make(tmp_path, ".gigacrew/AGENTS.md", "служебное")
+    _make(tmp_path, ".gigacode/AGENTS.md", "служебное")
     _make(tmp_path, "src/GIGACREW.local.md", "моё")  # сам файл в .gitignore — не важно
     nested = NestedInstructions(tmp_path)
     found = nested.add_paths(
-        ["node_modules/lib/x.js", "build/out.js", ".gigacrew/x", "../x", "/etc/passwd", "", "src"]
+        ["node_modules/lib/x.js", "build/out.js", ".gigacode/x", "../x", "/etc/passwd", "", "src"]
     )
     assert [d.name for d in found] == ["src/GIGACREW.local.md"]
     assert nested.add_paths(["README.md", "."]) == []  # корень — уже в системном промпте

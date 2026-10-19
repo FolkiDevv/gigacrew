@@ -9,6 +9,7 @@ from gigacrew.project.files import TREE_TRUNCATED, build_file_tree
 from gigacrew.project.index import INDEX_ERRORS, ProjectIndex
 from gigacrew.project.instructions import InstructionFile, load_instructions
 from gigacrew.project.repomap import DEFAULT_MAP_CHARS, build_repo_map
+from gigacrew.project.skills import Skill, discover_skills
 from gigacrew.project.workspace import Workspace
 
 # Промпты — на английском (модели следуют им точнее); отвечает агент на языке
@@ -294,7 +295,7 @@ def mode_prompt(mode: PermissionMode, *, subagent: bool = False, plan_path: str 
         return ""
     if subagent:
         return SUBAGENT_PLAN_MODE_PROMPT
-    return PLAN_MODE_PROMPT.format(plan_path=plan_path or ".gigacrew/plans/<chat>.md")
+    return PLAN_MODE_PROMPT.format(plan_path=plan_path or ".gigacode/plans/<chat>.md")
 
 
 def _instruction_block(title: str, doc: InstructionFile) -> str:
@@ -310,6 +311,9 @@ def build_project_context(workspace: Workspace) -> str:
     parts = [f"Project root: {root}"]
     for doc in load_instructions(root):
         parts.append(_instruction_block("Project instructions", doc))
+    skills = skills_prompt(discover_skills(workspace))
+    if skills:
+        parts.append(f"\n{skills}")
     tree = build_file_tree(root)
     if tree:
         parts.append(f"\nProject structure:\n{tree}")
@@ -339,6 +343,51 @@ def _repo_map(workspace: Workspace) -> str:
         return ""
     finally:
         index.close()
+
+
+MAX_SKILL_DESCRIPTION = 300  # символов описания скилла в системном промпте
+MAX_SKILLS_LISTED = 100
+
+
+def skills_prompt(skills: Sequence[Skill]) -> str:
+    """Список скиллов для системного промпта ("" — скиллов нет)."""
+    if not skills:
+        return ""
+    lines = [
+        "Skills — ready-made instructions for typical tasks. When the task matches a "
+        "skill's description, load it with the skill tool before starting and follow it:"
+    ]
+    for skill in skills[:MAX_SKILLS_LISTED]:
+        description = skill.description or "(no description)"
+        if len(description) > MAX_SKILL_DESCRIPTION:
+            description = description[: MAX_SKILL_DESCRIPTION - 1].rstrip() + "…"
+        lines.append(f"- {skill.name}: {description}")
+    if len(skills) > MAX_SKILLS_LISTED:
+        lines.append(f"(and {len(skills) - MAX_SKILLS_LISTED} more — the skill tool lists all)")
+    return "\n".join(lines)
+
+
+ARGUMENTS_PLACEHOLDER = "$ARGUMENTS"
+
+
+def skill_invocation_prompt(skill: Skill, body: str, command_line: str, args: str) -> str:
+    """Сообщение пользователя, вызвавшего скилл командой ``/<имя> [аргументы]``.
+
+    Первая строка — сама команда (по ней назван чат). Аргументы подставляются
+    вместо ``$ARGUMENTS`` в теле скилла, а если его там нет — дописываются после.
+    """
+    if ARGUMENTS_PLACEHOLDER in body:
+        body = body.replace(ARGUMENTS_PLACEHOLDER, args)
+        args = ""
+    parts = [
+        command_line,
+        f"The user invoked the skill {skill.name} — follow its instructions "
+        f"(files of the skill are in {skill.directory}):",
+        f'<skill name="{skill.name}">\n{body}\n</skill>',
+    ]
+    if args:
+        parts.append(f"Arguments: {args}")
+    return "\n\n".join(parts)
 
 
 NESTED_HEADER = "# Subdirectory instructions"

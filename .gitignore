@@ -35,8 +35,7 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
-# --- Рабочие данные gigacrew ---
-.gigacrew/
+# --- Рабочие данные gigacrew (.gigacode/ закрыта собственным .gitignore) ---
 GIGACREW.local.md
 
 # --- Редакторы и ОС ---

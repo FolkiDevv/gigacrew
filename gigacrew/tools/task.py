@@ -56,6 +56,7 @@ EXPLORE = SubagentSpec(
             "call_hierarchy",
             "file_outline",
             "repo_map",
+            "skill",
             "git",  # изменяющие подкоманды блокирует read_only
         }
     ),

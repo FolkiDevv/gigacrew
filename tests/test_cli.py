@@ -317,7 +317,7 @@ def test_oneshot_no_save(tmp_path, oneshot, monkeypatch):
     assert _main(tmp_path, "-p", "x", "--no-save") == 0
     monkeypatch.setenv("GIGACREW_SAVE_CHATS", "0")
     assert _main(tmp_path, "-p", "x") == 0
-    assert not (tmp_path / ".gigacrew").exists()
+    assert not (tmp_path / ".gigacode").exists()
 
 
 def test_oneshot_continue_appends_to_latest_chat(tmp_path, oneshot):
@@ -553,7 +553,7 @@ def test_repl_does_not_index_outside_git_repo(cli_env, capsys):
     assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
     out = _out(capsys)
     assert "не в git-репозитории" in out and "индексирую" not in out
-    assert not (agent.workspace.root / ".gigacrew").exists()
+    assert not (agent.workspace.root / ".gigacode").exists()
     commands.dispatch("/index", ctx)  # вручную — строится
     assert "индекс проекта: 1 файл, 1 определение" in _out(capsys)
 
@@ -574,7 +574,7 @@ def test_repl_warns_when_tls_verification_is_off(tmp_path, capsys):
 def test_repl_without_index_on_start(cli_env):
     agent, ui, commands, _, _ = cli_env
     run_repl(agent, ui, commands, read_input=_reader("/exit"), index_on_start=False)
-    assert not (agent.workspace.root / ".gigacrew").exists()
+    assert not (agent.workspace.root / ".gigacode").exists()
 
 
 def test_cancelled_index_build_lets_user_continue(cli_env, capsys, monkeypatch):
@@ -638,7 +638,7 @@ def test_index_command(cli_env, capsys):
 def _models_json(home):
     import json
 
-    path = home / ".gigacrew" / "models.json"
+    path = home / ".gigacode" / "models.json"
     return json.loads(path.read_text(encoding="utf-8"))["models"] if path.exists() else {}
 
 
@@ -933,7 +933,7 @@ def test_oneshot_mode_flag_and_env(tmp_path, oneshot, monkeypatch):
 
 def test_oneshot_plan_without_approver_ends_with_plan(tmp_path, oneshot, capsys, monkeypatch):
     monkeypatch.setattr(ChatStore, "new_id", staticmethod(lambda now=None: "chat1"))
-    plan = ".gigacrew/plans/chat1.md"
+    plan = ".gigacode/plans/chat1.md"
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": plan, "content": "1. поправить a.py"}),

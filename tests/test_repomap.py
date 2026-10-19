@@ -119,7 +119,7 @@ def test_unbuilt_index_gives_no_map_in_prompt(tmp_path):
         _make(tmp_path, f"pkg/m{i:03}.py", "def f():\n    pass\n")
     prompt = build_system_prompt(Workspace(tmp_path))
     assert "the tree is incomplete" in prompt and "Project map" not in prompt
-    assert not (tmp_path / ".gigacrew").exists()  # промпт индекс не строит
+    assert not (tmp_path / ".gigacode").exists()  # промпт индекс не строит
 
 
 # ------------------------------ инструмент ------------------------------ #

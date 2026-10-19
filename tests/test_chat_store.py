@@ -46,7 +46,7 @@ def test_round_trip(store, tmp_path):
     assert saved.info.model == "Alpha-2-Max"
     assert saved.info.created_at == info.created_at
     # служебная папка создана с .gitignore, временных файлов не осталось
-    assert (tmp_path / ".gigacrew" / ".gitignore").read_text().strip().endswith("*")
+    assert "/chats/" in (tmp_path / ".gigacode" / ".gitignore").read_text().splitlines()
     assert [p.name for p in store.directory.iterdir()] == ["20260101-120000-abcd.json"]
 
 
