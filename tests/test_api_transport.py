@@ -288,6 +288,20 @@ def test_usage_from_raw_is_tolerant():
     assert (u.prompt_tokens, u.completion_tokens, u.total_tokens) == (5, 0, 0)
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"input_tokens": 10, "input_tokens_details": {"cached_tokens": 4}},
+        {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 4}},
+        {"prompt_tokens": 10, "cached_tokens": 4},
+        {"prompt_tokens": 10, "precached_prompt_tokens": 4, "cached_tokens": 9},
+    ],
+)
+def test_usage_cached_tokens_in_every_layout(raw):
+    usage = Usage.from_raw(raw)
+    assert (usage.prompt_tokens, usage.precached_prompt_tokens) == (10, 4)
+
+
 # ------------------------------ замер окна ------------------------------ #
 def _chat_reply(prompt_tokens: int) -> httpx.Response:
     return httpx.Response(

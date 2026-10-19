@@ -130,3 +130,22 @@ def test_window_from_another_endpoint_is_ignored(tmp_path):
     assert ModelWindows(entries=entries, base_url="https://internal/v1").get("M") is None
     assert ModelWindows(entries=entries).get("M") == 32_000
     assert ModelWindows(entries=entries, base_url="https://internal/v1").get("Old") == 8_000
+
+
+def test_windows_reported_by_api(tmp_path):
+    """Окно из каталога API — без платного замера; замер этого эндпоинта точнее и важнее."""
+    path = tmp_path / "models.json"
+    entries = {
+        "Here": {"context_window": 100_000, "base_url": "https://b"},
+        "There": {"context_window": 50_000, "base_url": "https://other"},
+        "Old": {"context_window": 8_000},
+    }
+    windows = ModelWindows(path, entries, base_url="https://b")
+    windows.report({"Here": 262_144, "There": 131_072, "Old": 32_768, "New": 65_536, "Bad": 0})
+    assert windows.get("Here") == 100_000  # замер этого эндпоинта
+    assert windows.get("There") == 131_072  # замер другого — не берётся, есть окно API
+    assert windows.get("Old") == 32_768  # окно API важнее замера без эндпоинта
+    assert windows.get("New") == 65_536 and windows.get("Bad") is None
+    assert not path.exists()  # только в памяти
+    windows.report({})
+    assert windows.get("New") is None and windows.get("Old") == 8_000

@@ -107,13 +107,18 @@ class Usage(BaseModel):
     def from_raw(cls, raw: Mapping[str, Any] | None) -> Usage:
         """Терпимый разбор поля ``usage`` ответа API (мусор → нули).
 
-        Понимает обе схемы: ``prompt_tokens``/``completion_tokens`` и
+        Понимает обе схемы: ``prompt_tokens``/``completion_tokens`` (+
+        ``prompt_tokens_details.cached_tokens`` или ``cached_tokens``) и
         ``input_tokens``/``output_tokens`` (+ ``input_tokens_details.cached_tokens``).
         """
         if not isinstance(raw, Mapping):
             return cls()
-        details = raw.get("input_tokens_details")
-        cached = details.get("cached_tokens") if isinstance(details, Mapping) else None
+        cached = raw.get("cached_tokens")
+        for key in ("input_tokens_details", "prompt_tokens_details"):
+            details = raw.get(key)
+            if isinstance(details, Mapping) and details.get("cached_tokens") is not None:
+                cached = details["cached_tokens"]
+                break
         values: dict[str, int] = {}
         for name in cls.model_fields:
             value = raw.get(name)

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,8 @@ class ModelWindows:
         self._entries: dict[str, dict[str, Any]] = dict(entries or {})
         # Текущий эндпоинт: замер с другого эндпоинта (иное окно у той же модели) не берётся.
         self.base_url = base_url
+        # Окна, которые сообщил API (каталог моделей бэкенда): только в памяти.
+        self._reported: dict[str, int] = {}
 
     @classmethod
     def load(
@@ -70,19 +73,32 @@ class ModelWindows:
         return cls(path, entries, base_url=base_url), None
 
     def get(self, model: str) -> int | None:
-        """Замеренное окно модели (токены) или None.
+        """Окно модели (токены) или None.
 
-        Замер другого эндпоинта (поле ``base_url``) не используется: разные
-        эндпоинты могут разворачивать модель с разными окнами.
+        Замер этого эндпоинта важнее окна, которое сообщил API (:meth:`report`), а оно —
+        старого замера без эндпоинта. Замер другого эндпоинта (поле ``base_url``) не
+        используется: разные эндпоинты могут разворачивать модель с разными окнами.
         """
+        legacy: int | None = None  # замер без поля base_url (до его появления)
         entry = self._entries.get(model)
-        if not isinstance(entry, dict):
-            return None
-        measured_at = entry.get("base_url")
-        if self.base_url and measured_at and measured_at != self.base_url:
-            return None
-        value = entry.get("context_window")
-        return value if isinstance(value, int) and value > 0 else None
+        if isinstance(entry, dict):
+            value = entry.get("context_window")
+            measured_at = entry.get("base_url")
+            if isinstance(value, int) and value > 0:
+                if not measured_at:
+                    legacy = value
+                elif not self.base_url or measured_at == self.base_url:
+                    return value
+        return self._reported.get(model, legacy)
+
+    def report(self, windows: Mapping[str, int | None]) -> None:
+        """Окна моделей, которые сообщил API: только в памяти, в файл не пишутся.
+        Заменяют прежние; не положительные числа и None пропускаются."""
+        self._reported = {
+            str(name): window
+            for name, window in windows.items()
+            if isinstance(window, int) and not isinstance(window, bool) and window > 0
+        }
 
     def record(self, result: ProbeResult, *, base_url: str = "") -> None:
         """Запоминает замер и сохраняет файл. Ошибки записи — ``OSError``

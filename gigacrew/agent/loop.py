@@ -326,7 +326,7 @@ class Agent:
 
     @property
     def context_window(self) -> int | None:
-        """Замеренное окно текущей модели (None — не замерено)."""
+        """Окно текущей модели — замеренное или сообщённое API (None — неизвестно)."""
         return self._windows.get(self._model)
 
     @property
