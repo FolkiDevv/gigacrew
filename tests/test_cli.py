@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from fakes import ScriptedProvider, WindowProvider, text_turn, tool_turn
+from fakes import CatalogueProvider, ScriptedProvider, WindowProvider, text_turn, tool_turn
 
 import gigacrew.cli.app as app
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore
@@ -158,11 +158,13 @@ def oneshot(tmp_path, monkeypatch):
         "GIGACREW_AUTO_COMPACT",
         "GIGACREW_COMPACT_THRESHOLD",
         "GIGACREW_AUTO_MEASURE",
+        "GIGACREW_PROVIDER",
+        "GIGACREW_PLUGIN_NAME",
     ):
         monkeypatch.delenv(name, raising=False)
 
     def use(provider):
-        monkeypatch.setattr(app, "_make_provider", lambda _cfg: provider)
+        monkeypatch.setattr(app, "_make_provider", lambda _cfg, _ui: provider)
 
     return use
 
@@ -968,3 +970,187 @@ def test_oneshot_plan_left_in_text_ends_without_extra_requests(
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert "План: 1. поправить a.py" in output and plan in output  # где лежит план
+
+
+# ------------------------ провайдер с каталогом моделей ------------------------ #
+def _flat(capsys) -> str:
+    return " ".join(capsys.readouterr().out.split())  # без переносов по ширине терминала
+
+
+def test_make_provider_follows_the_setting(tmp_path):
+    from gigacrew.llm.api import ApiProvider
+    from gigacrew.llm.gigacode import GigaCodeProvider
+
+    ui = Console(no_color=True)
+    api = app._make_provider(
+        Config(access_key="k", auth_url="https://auth.test", base_url="https://api.test/v1"), ui
+    )
+    giga = app._make_provider(
+        Config(provider="gigacode", base_url="https://code.test", plugin_name="demo"), ui
+    )
+    assert isinstance(api, ApiProvider) and isinstance(giga, GigaCodeProvider)
+    api.close()
+    giga.close()
+
+
+def test_gigacode_without_client_name_stops_before_any_request(
+    tmp_path, oneshot, monkeypatch, capsys
+):
+    monkeypatch.setenv("GIGACREW_PROVIDER", "gigacode")
+    monkeypatch.setattr(app, "_make_provider", lambda *_a: pytest.fail("провайдер не нужен"))
+    assert _main(tmp_path, "-p", "x") == 1
+    assert "GIGACREW_PLUGIN_NAME" in _flat(capsys)
+
+
+def test_catalogue_gives_the_default_model_and_its_window(tmp_path, oneshot, monkeypatch, capsys):
+    monkeypatch.delenv("GIGACREW_MODEL")
+    provider = CatalogueProvider([text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, "-p", "x") == 0
+    assert provider.connects == 1 and provider.requests[-1]["model"] == "cat-a"
+    assert "не замерено" not in _flat(capsys)  # окно — из каталога, замер не нужен
+    assert provider.measured == []
+
+
+def test_model_outside_the_catalogue_is_refused(tmp_path, oneshot, capsys):
+    provider = CatalogueProvider([text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, "-p", "x") == 1  # GIGACREW_MODEL=M-default из фикстуры
+    out = _flat(capsys)
+    assert "модели M-default нет в каталоге бэкенда; доступны: cat-a, cat-b" in out
+    assert "--list-models" in out and provider.requests == []
+    assert _main(tmp_path, "--list-models") == 0  # список работает и с чужой моделью
+    assert "cat-b" in _flat(capsys)
+    assert _main(tmp_path, "-m", "cat-b", "-p", "x") == 0
+    assert provider.requests[-1]["model"] == "cat-b"
+    assert _main(tmp_path, "--test-context", "чужая") == 1
+    assert "модели чужая нет в каталоге" in _flat(capsys)
+
+
+def test_connect_interrupted_or_failed(tmp_path, oneshot, capsys):
+    from gigacrew.llm.base import LLMError
+
+    oneshot(CatalogueProvider(connect_errors=[KeyboardInterrupt()]))
+    assert _main(tmp_path, "-m", "cat-a", "-p", "x") == 130
+    assert "вход прерван" in _flat(capsys)
+    oneshot(CatalogueProvider(connect_errors=[LLMError("бэкенд недоступен")]))
+    assert _main(tmp_path, "-m", "cat-a", "--list-models") == 2
+    assert "не удалось подключиться: бэкенд недоступен" in _flat(capsys)
+
+
+def test_continue_with_a_model_missing_from_the_catalogue(tmp_path, oneshot, monkeypatch, capsys):
+    oneshot(ScriptedProvider([text_turn("a")]))
+    assert _main(tmp_path, "-m", "old-model", "-p", "первый") == 0
+    monkeypatch.delenv("GIGACREW_MODEL")
+    provider = CatalogueProvider([text_turn("b")])
+    oneshot(provider)
+    assert _main(tmp_path, "-c", "-p", "второй") == 0
+    assert "модели чата old-model нет в каталоге бэкенда — модель: cat-a" in _flat(capsys)
+    assert provider.requests[-1]["model"] == "cat-a"
+
+
+def _catalogue_env(tmp_path, provider, **cfg):
+    config = Config(access_key="x", project_root=tmp_path, stream=False, model="cat-a", **cfg)
+    ui = Console(no_color=True)
+    agent = Agent(provider, build_default_registry(), config, ui)
+    ctx = CommandContext(
+        agent=agent,
+        ui=ui,
+        commands=default_commands(),
+        chats=ChatRecorder(ChatStore(agent.workspace)),
+    )
+    return agent, ui, ctx
+
+
+def test_model_command_refuses_models_outside_the_catalogue(tmp_path, capsys):
+    agent, _, ctx = _catalogue_env(tmp_path, CatalogueProvider())
+    ctx.commands.dispatch("/model чужая", ctx)
+    assert agent.model == "cat-a"
+    assert "модели чужая нет в каталоге бэкенда; доступны: cat-a, cat-b" in _flat(capsys)
+    ctx.commands.dispatch("/model CAT-B", ctx)  # регистр исправляется
+    assert agent.model == "cat-b"
+    ctx.commands.dispatch("/model", ctx)
+    out = _flat(capsys)
+    assert "доступные модели" in out and "• cat-a" in out
+
+
+def test_resume_command_keeps_the_model_missing_from_the_catalogue(tmp_path, capsys):
+    agent, _, ctx = _catalogue_env(tmp_path, CatalogueProvider([text_turn("ответ")]))
+    agent.conversation.add_user("старый вопрос")
+    info = ctx.chats.store.save("20260101-000000-abcd", agent.conversation, model="old-model")
+    ctx.commands.dispatch(f"/resume {info.id}", ctx)
+    assert agent.model == "cat-a"
+    assert "модели чата old-model нет в каталоге бэкенда — модель: cat-a" in _flat(capsys)
+
+
+def test_repl_connects_before_each_turn(tmp_path, capsys):
+    from gigacrew.llm.base import LLMError
+
+    provider = CatalogueProvider(
+        [text_turn("ответ")], connect_errors=[LLMError("вход не подтверждён")]
+    )
+    agent, ui, ctx = _catalogue_env(tmp_path, provider, auto_approve=True)
+    read = _reader("раз", "два", "/exit")
+    assert run_repl(agent, ui, ctx.commands, read_input=read, index_on_start=False) == 0
+    assert provider.connects == 2
+    assert "вход не подтверждён" in _flat(capsys)
+    assert len(provider.requests) == 1  # первый запрос не ушёл: вход не удался
+
+
+def test_repl_warns_about_tls_for_the_backend_token(tmp_path, capsys):
+    from dataclasses import replace
+
+    agent, ui, ctx = _catalogue_env(tmp_path, CatalogueProvider(), auto_approve=True)
+    agent._cfg = replace(agent.config, provider="gigacode", access_key=None)
+    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
+    assert "ключ или токен можно перехватить" in _flat(capsys)
+
+
+def test_browser_is_opened_only_with_a_display():
+    from gigacrew.cli.login import can_open_browser
+
+    assert can_open_browser({"DISPLAY": ":0"}, "linux")
+    assert can_open_browser({"WAYLAND_DISPLAY": "wayland-0"}, "linux")
+    assert not can_open_browser({}, "linux")
+    assert not can_open_browser({"DISPLAY": ":0", "SSH_CONNECTION": "1 2 3 4"}, "linux")
+    assert can_open_browser({}, "darwin") and can_open_browser({}, "win32")
+    assert not can_open_browser({"SSH_TTY": "/dev/pts/1"}, "darwin")
+
+
+def test_open_in_browser_runs_xdg_open(monkeypatch):
+    import subprocess
+    import sys
+
+    from gigacrew.cli import login
+
+    calls = []
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(login, "can_open_browser", lambda: True)
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: calls.append((cmd, kw)))
+    assert login.open_in_browser("https://x.test/a") is True
+    ((cmd, kw),) = calls
+    assert cmd == ["xdg-open", "https://x.test/a"]
+    assert kw["start_new_session"] and kw["stdout"] is subprocess.DEVNULL
+
+    def missing(*_a, **_kw):
+        raise OSError("нет xdg-open")
+
+    monkeypatch.setattr(subprocess, "Popen", missing)
+    assert login.open_in_browser("https://x.test/a") is False
+    monkeypatch.setattr(login, "can_open_browser", lambda: False)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: pytest.fail("без GUI не запускаем"))
+    assert login.open_in_browser("https://x.test/a") is False
+
+
+def test_login_notice_prints_the_whole_link(capsys):
+    from gigacrew.cli.login import login_notifier
+
+    ui = Console(no_color=True, width=40)
+    url = "https://gitverse.test/signin?device=" + "a" * 64
+    login_notifier(ui, opener=lambda _u: False)(url)
+    out = capsys.readouterr().out
+    assert f"  {url}\n" in out  # одной строкой, без переносов по ширине терминала
+    text = " ".join(out.split())
+    assert "откройте ссылку" in text and "Ctrl+C — отмена" in text
+    login_notifier(ui, opener=lambda _u: True)(url)
+    assert "открываю страницу входа" in _flat(capsys)

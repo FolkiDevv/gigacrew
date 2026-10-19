@@ -33,6 +33,7 @@ from rich.console import ConsoleOptions, Group, RenderResult
 from rich.live import Live
 from rich.panel import Panel
 from rich.segment import Segment, SegmentLines
+from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -171,9 +172,9 @@ class _LiveArea:
                 if not self._stopped.is_set():
                     self._live.refresh()
 
-    def print(self, renderable) -> None:
+    def print(self, renderable, **options) -> None:
         with self._lock:
-            self._live.console.print(renderable)
+            self._live.console.print(renderable, **options)
 
     def stop(self) -> None:
         self._stopped.set()
@@ -294,6 +295,14 @@ class Console(AgentEvents):
     def success(self, text: str) -> None:
         self._print_above_live(Text(f"{ICON_OK} {text}", style=f"bold {OK}"))
 
+    def link(self, url: str) -> None:
+        """Ссылка отдельной строкой, без переносов: копируется из терминала целиком, а
+        терминал с поддержкой OSC 8 открывает её щелчком."""
+        url = sanitize(url)
+        style = Style(color=ACCENT, underline=True, link=url)
+        # soft_wrap: строку переносит сам терминал, rich её не режет и не разбивает.
+        self._print_above_live(Text(f"  {url}", style=style), soft_wrap=True)
+
     # ------------------------- временная область ------------------------ #
     def _start_live(self, view: _LiveView) -> None:
         self.stop_live()
@@ -303,11 +312,11 @@ class Console(AgentEvents):
         area.start()
         self._live = area
 
-    def _print_above_live(self, renderable) -> None:
+    def _print_above_live(self, renderable, **options) -> None:
         if self._live is not None:
-            self._live.print(renderable)
+            self._live.print(renderable, **options)
         else:
-            self._c.print(renderable)
+            self._c.print(renderable, **options)
 
     def stop_live(self) -> None:
         """Убирает временную область (идемпотентно). Безопасно вызывать всегда."""

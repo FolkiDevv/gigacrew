@@ -8,6 +8,10 @@
     сохраняется в ``~/.gigacrew/models.json``. Окно незамеренной модели
     замеряется и автоматически — при запуске и смене модели.
 
+Провайдер — ``GIGACREW_PROVIDER``: API v2 (по умолчанию) или бэкенд GigaCode
+(``gigacode``): вход через браузер при запуске, модели и их окна — из каталога бэкенда,
+модель по умолчанию — его же.
+
 Чаты сохраняются в ``.gigacrew/chats/`` (``--no-save`` — нет); ``-c`` продолжает
 последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
 
@@ -19,12 +23,14 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from pathlib import Path
 
 from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
 from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, resume_chat
+from gigacrew.cli.login import login_notifier
 from gigacrew.cli.models import (
     describe_result,
     ensure_context_window,
@@ -35,6 +41,7 @@ from gigacrew.cli.repl import autosave, esc_interrupt_for, run_repl
 from gigacrew.config import Config, ConfigError
 from gigacrew.llm.api import ApiProvider
 from gigacrew.llm.base import LLMError, LLMProvider
+from gigacrew.llm.gigacode import GigaCodeProvider
 from gigacrew.llm.model_windows import ModelWindows
 from gigacrew.permissions import PermissionMode
 from gigacrew.tools.base import build_default_registry
@@ -112,8 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _make_provider(config: Config) -> LLMProvider:
+def _make_provider(config: Config, ui: Console) -> LLMProvider:
+    if config.provider == "gigacode":
+        return GigaCodeProvider(config, on_login=login_notifier(ui), on_notice=ui.warn)
     return ApiProvider(config)
+
+
+def _not_in_catalogue(model: str, known: list[str]) -> str:
+    return f"модели {model} нет в каталоге бэкенда; доступны: {', '.join(known)}"
 
 
 def run_oneshot(agent: Agent, ui: Console, prompt: str, chats: ChatRecorder | None = None) -> int:
@@ -206,12 +219,20 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     try:
-        provider = _make_provider(config)
+        provider = _make_provider(config, ui)
     except Exception as e:
         ui.error(f"не удалось инициализировать провайдера: {e}")
         return EXIT_ERROR
 
     try:
+        try:
+            provider.connect()  # вход и каталог моделей (бэкенд GigaCode)
+        except KeyboardInterrupt:
+            ui.system("\n(вход прерван)")
+            return EXIT_INTERRUPTED
+        except LLMError as e:
+            ui.error(f"не удалось подключиться: {e}")
+            return EXIT_LLM_ERROR
         if args.list_models:
             try:
                 models = provider.list_models()
@@ -221,14 +242,26 @@ def main(argv: list[str] | None = None) -> int:
             ui.info("Доступные модели:\n" + "\n".join(f"  • {m}" for m in models))
             return EXIT_OK
 
+        catalogue = provider.known_models()  # None — каталога нет, модель любая
+        known = None if catalogue is None else [m.id for m in catalogue]
         windows, warning = ModelWindows.load(base_url=config.base_url)
         if warning:
             ui.warn(warning)
+        if catalogue is not None:
+            windows.report({m.id: m.context_window for m in catalogue})
         if args.test_context:
-            return run_test_context(
-                provider, windows, args.test_context.strip(), ui, base_url=config.base_url
-            )
+            model = args.test_context.strip()
+            if known is not None and model not in known:
+                ui.error(_not_in_catalogue(model, known))
+                return EXIT_ERROR
+            return run_test_context(provider, windows, model, ui, base_url=config.base_url)
 
+        if known is not None:
+            if not config.model:  # модель по умолчанию — бэкенда
+                config = dataclasses.replace(config, model=provider.model)
+            elif config.model not in known:
+                ui.error(_not_in_catalogue(config.model, known) + " (список — --list-models)")
+                return EXIT_ERROR
         if not config.model:
             ui.error(
                 "не задана модель: укажите GIGACREW_MODEL или --model (список — --list-models)"
@@ -245,7 +278,9 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_ERROR
         if saved is not None:
             # Модель чата, если модель не задана явно через -m.
-            resume_chat(agent, chats, saved, keep_model=args.model is not None)
+            skipped = resume_chat(agent, chats, saved, keep_model=args.model is not None)
+            if skipped:
+                ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {agent.model}")
         if args.prompt:
             ensure_context_window(agent, ui, interactive=False)
             return run_oneshot(agent, ui, args.prompt, chats)

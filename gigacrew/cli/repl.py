@@ -30,8 +30,8 @@ from gigacrew.ui.console import Console
 from gigacrew.ui.format import mode_badge
 
 TLS_OFF_WARNING = (
-    "проверка TLS-сертификата сервера API выключена — ключ можно перехватить подменой "
-    "сервера; задайте GIGACREW_CA_BUNDLE (корневой сертификат сервера, PEM)"
+    "проверка TLS-сертификата сервера API выключена — ключ или токен можно перехватить "
+    "подменой сервера; задайте GIGACREW_CA_BUNDLE (корневой сертификат сервера, PEM)"
 )
 
 
@@ -124,7 +124,7 @@ def run_repl(
         mode=agent.mode,
     )
     cfg = agent.config
-    if cfg.auth_mode == "oauth" and not cfg.verify_ssl:
+    if cfg.auth_mode in ("oauth", "browser") and not cfg.verify_ssl:
         ui.warn(TLS_OFF_WARNING)
     if resumed is not None:
         ui.chat_resumed(resumed, agent.conversation.messages)
@@ -168,6 +168,9 @@ def run_repl(
 
         try:
             ui.print()
+            # Вход, если токен бэкенда истёк, — до индикатора хода: ссылка и ожидание
+            # подтверждения не прячутся за ним (Ctrl+C — отмена, как и хода).
+            agent.provider.connect()
             with esc:
                 agent.run_turn(line)
             ui.print()

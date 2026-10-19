@@ -19,7 +19,7 @@ from gigacrew.agent.loop import Agent
 from gigacrew.cli.indexing import describe_index, run_indexing
 from gigacrew.cli.models import ModelCatalog, describe_model, ensure_context_window
 from gigacrew.cli.prompt import KEY_HELP
-from gigacrew.llm.base import LLMError
+from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.permissions import MODE_CYCLE, PermissionMode, parse_mode
 from gigacrew.project import semantic
 from gigacrew.project.index import ProjectIndex
@@ -110,9 +110,16 @@ def _help(ctx: CommandContext, _arg: str) -> bool:
     return True
 
 
+def catalogue_ids(provider: LLMProvider) -> list[str] | None:
+    """Модели каталога провайдера — выбрать можно только их; None — каталога нет."""
+    models = provider.known_models()
+    return None if models is None else [m.id for m in models]
+
+
 def _model(ctx: CommandContext, arg: str) -> bool:
     agent = ctx.agent
-    known = ctx.models.models if ctx.models is not None else None
+    catalogue = catalogue_ids(agent.provider)
+    known = catalogue if catalogue is not None else ctx.models.models if ctx.models else None
     if not arg:
         lines = [f"текущая модель: {agent.model} ({describe_model(agent.model, agent.windows)})"]
         if known:
@@ -123,6 +130,9 @@ def _model(ctx: CommandContext, arg: str) -> bool:
     if known and arg not in known:
         # имена моделей в API регистрозависимы: «model-large» → «Model-Large»
         arg = next((name for name in known if name.lower() == arg.lower()), arg)
+    if catalogue is not None and arg not in catalogue:
+        ctx.ui.error(f"модели {arg} нет в каталоге бэкенда; доступны: {', '.join(catalogue)}")
+        return True
     agent.set_model(arg)
     if known and arg not in known:
         ctx.ui.warn(f"модели {arg} нет в списке доступных чат-моделей")
@@ -198,17 +208,25 @@ RESUME_LIMIT = 100  # сколько последних чатов показы�
 
 def resume_chat(
     agent: Agent, chats: ChatRecorder, saved: SavedChat, *, keep_model: bool = False
-) -> None:
+) -> str | None:
     """Продолжить сохранённый чат: дальнейшие ходы дописываются в него же.
 
-    Модель чата становится текущей, если не ``keep_model`` (модель задана явно, ``-m``).
-    Файл плана — тоже этого чата.
+    Модель чата становится текущей, если не ``keep_model`` (модель задана явно, ``-m``)
+    и если она есть в каталоге провайдера; иначе модель не меняется, а модель чата
+    возвращается — вызывающий предупреждает. Файл плана — тоже этого чата.
     """
+    skipped = None
     # Сначала модель: сохранённый расход токенов чата посчитан в её токенах.
-    if saved.info.model and not keep_model:
-        agent.set_model(saved.info.model)
+    model = saved.info.model
+    if model and not keep_model:
+        catalogue = catalogue_ids(agent.provider)
+        if catalogue is None or model in catalogue:
+            agent.set_model(model)
+        else:
+            skipped = model
     agent.reset(saved.conversation, chat_id=saved.info.id)
     chats.switch_to(saved.info)
+    return skipped
 
 
 def _resume(ctx: CommandContext, arg: str) -> bool:
@@ -232,8 +250,10 @@ def _resume(ctx: CommandContext, arg: str) -> bool:
         ctx.ui.error(str(e))
         return True
     previous = ctx.agent.model
-    resume_chat(ctx.agent, ctx.chats, saved)
+    skipped = resume_chat(ctx.agent, ctx.chats, saved)
     ctx.ui.chat_resumed(saved.info, saved.conversation.messages)
+    if skipped:
+        ctx.ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {ctx.agent.model}")
     if ctx.agent.model != previous:
         ctx.ui.info(f"модель чата: {ctx.agent.model}")
         ensure_context_window(

@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from gigacrew.agent.events import AgentEvents, ToolCallInfo, TurnStats
-from gigacrew.llm.base import LLMProvider, PromptTooLong
+from gigacrew.llm.base import LLMProvider, ModelInfo, PromptTooLong
 from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, Usage
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, Tool, ToolContext, ToolResult
@@ -110,6 +110,39 @@ class WindowProvider(ScriptedProvider):
             )
             raise PromptTooLong(self.status, detail)
         return tokens
+
+
+class CatalogueProvider(WindowProvider):
+    """Провайдер с каталогом моделей, как бэкенд GigaCode: ``connect()`` (вход и каталог)
+    считается и может бросать заготовленные ошибки, модель по умолчанию — первая в каталоге.
+    """
+
+    def __init__(
+        self,
+        turns: Iterable[AssistantTurn | BaseException] = (),
+        *,
+        models: Iterable[tuple[str, int]] = (("cat-a", 64_000), ("cat-b", 32_000)),
+        connect_errors: Iterable[BaseException] = (),
+    ):
+        super().__init__(16_384, turns)
+        self.catalogue = [ModelInfo(name, window) for name, window in models]
+        self.connect_errors = list(connect_errors)
+        self.connects = 0
+
+    @property
+    def model(self) -> str:
+        return self.catalogue[0].id
+
+    def connect(self) -> None:
+        self.connects += 1
+        if self.connect_errors:
+            raise self.connect_errors.pop(0)
+
+    def list_models(self) -> list[str]:
+        return [m.id for m in self.catalogue]
+
+    def known_models(self) -> list[ModelInfo]:
+        return list(self.catalogue)
 
 
 def text_turn(text: str, usage: Usage | None = None) -> AssistantTurn:
