@@ -3,7 +3,8 @@
 Реализует авторизацию OAuth (Basic access-key -> Bearer access_token) с
 автоматическим обновлением токена по истечении срока (или mTLS), и вызов
 chat/completions с поддержкой function calling. Адреса API и выдачи токена
-берутся только из конфигурации — значений по умолчанию нет.
+берутся только из конфигурации — значений по умолчанию нет. Повторы, лимит
+запросов, поток и замер окна — общие для провайдеров (:mod:`gigacrew.llm.transport`).
 
 Адреса: ``GIGACREW_API_URL`` — база API вида ``…/v1``. Чат идёт на ``…/v2/chat/completions``
 (хвост ``/vN`` заменяется на ``/v2``), список моделей — на ``…/v1/models``.
@@ -29,79 +30,23 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import httpx
 
 from gigacrew.config import Config
-from gigacrew.llm.base import LLMError, LLMProvider, PromptTooLong
+from gigacrew.llm.transport import (
+    ERROR_BODY_CHARS,
+    ApiError,
+    HttpProvider,
+    LeakedTagFilter,
+    error_body,
+    iter_sse_events,
+)
 from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolChoice, ToolSpec, Usage
 
-
-class ApiError(LLMError):
-    """Ошибка взаимодействия с API модели."""
-
-
-# Транзиентные сетевые ошибки, которые имеет смысл повторять. Для потокового
-# запроса повтор допустим, только пока пользователю не отдано ни одного куска.
-# Все прочие httpx.HTTPError (ProxyError, LocalProtocolError, DecodingError...)
-# не повторяются и превращаются в ApiError.
-_RETRYABLE_EXC = (
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
-    httpx.ReadTimeout,
-    httpx.WriteTimeout,
-    httpx.PoolTimeout,
-    httpx.RemoteProtocolError,
-    httpx.ReadError,
-    httpx.WriteError,
-)
-
-# HTTP-статусы, которые имеет смысл повторить (лимит/временная недоступность).
-_RETRY_STATUS = {429, 500, 502, 503, 504}
-# Лимит частоты запросов (429) шлюз считает за минуту, а обычные повторы (5 попыток с
-# паузами 1–8 с) укладываются в ~15 с. На 429 — свой бюджет ожидания на запрос
-# (``GIGACREW_RATE_LIMIT_WAIT``) и паузы длиннее; Retry-After шлюза — в приоритете.
-_RATE_LIMIT_FIRST_DELAY = 5.0
-_RATE_LIMIT_MAX_DELAY = 30.0
-# Ответ шлюза на запрос, который он не принял по формату. Если в запросе были рассуждения
-# модели (``role: "reasoning"``), он повторяется без них; удалось — модель до конца сессии
-# работает без возврата рассуждений: так их возврат не может сломать модель.
-_REJECTED_STATUS = {400, 422}
-# Закрывающий тег рассуждений, который шлюз оставляет в начале текста ответа: сами
-# рассуждения ушли в ``role: "reasoning"``, а тег — в ответ (MiniMax: ``</mm:think>``).
-_LEAKED_REASONING_TAGS = ("</mm:think>", "</think>")
-
-# Замер окна: 4xx с этими статусами — не про размер запроса (авторизация, нет
-# модели, лимит частоты); остальные 4xx и 5xx считаются «запрос не помещается».
-_NOT_SIZE_STATUS = {401, 403, 404, 429}
-# …кроме временной недоступности шлюза: счесть её отказом по размеру — занизить
-# окно, и заниженное значение сохранилось бы в ~/.gigacrew/models.json.
-_UNAVAILABLE_STATUS = {502, 503}
-# Сколько тела ответа показывать в сообщении об ошибке (HTML-страница прокси и т.п.).
-_ERROR_BODY_CHARS = 500
-# Попыток запроса чата, на который модель молчит дольше read_timeout: ожидание долгое,
-# и обычные пять попыток растянулись бы почти на час.
-_SILENT_ATTEMPTS = 2
-
-
-def _body(resp: httpx.Response) -> str:
-    """Тело ответа для сообщения об ошибке — не длиннее :data:`_ERROR_BODY_CHARS`."""
-    text = resp.text.strip()
-    return text if len(text) <= _ERROR_BODY_CHARS else text[:_ERROR_BODY_CHARS] + "…"
-
-
-_PROBE_ATTEMPTS = 2
-# Обрыв или таймаут уже отправляемого запроса — для огромного запроса это тоже
-# «не помещается»; ошибки установки соединения к размеру отношения не имеют.
-_OVERSIZE_EXC = (
-    httpx.ReadTimeout,
-    httpx.WriteTimeout,
-    httpx.RemoteProtocolError,
-    httpx.ReadError,
-    httpx.WriteError,
-)
+__all__ = ["ApiError", "ApiProvider", "chat_url"]
 
 
 _VERSION_SUFFIX = re.compile(r"/v\d+$")
@@ -110,33 +55,6 @@ _VERSION_SUFFIX = re.compile(r"/v\d+$")
 def chat_url(base_url: str) -> str:
     """Адрес чата v2: хвост ``/vN`` базы заменяется на ``/v2`` (без хвоста — база как есть)."""
     return _VERSION_SUFFIX.sub("/v2", base_url.rstrip("/")) + "/chat/completions"
-
-
-def _iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str | None, str]]:
-    """События SSE: (имя из ``event:`` или None, склеенные строки ``data:``)."""
-    event: str | None = None
-    data: list[str] = []
-    for line in lines:
-        if not line:
-            if data:
-                yield event, "\n".join(data)
-            event, data = None, []
-            continue
-        if line.startswith(":"):  # комментарий
-            continue
-        name, sep, value = line.partition(":")
-        if not sep:
-            continue
-        value = value.removeprefix(" ")
-        if name == "event":
-            if data:  # событие без пустой строки-разделителя
-                yield event, "\n".join(data)
-                data = []
-            event = value
-        elif name == "data":
-            data.append(value)
-    if data:
-        yield event, "\n".join(data)
 
 
 def _build_function_call(raw: Any) -> FunctionCall | None:
@@ -162,33 +80,6 @@ def _has_reasoning(payload: Mapping[str, Any]) -> bool:
     return any(m.get("role") == "reasoning" for m in payload.get("messages") or ())
 
 
-class _RateLimitWait:
-    """Ожидание при 429 в пределах бюджета одного запроса (``budget`` секунд).
-
-    Паузы растут от :data:`_RATE_LIMIT_FIRST_DELAY` вдвое до :data:`_RATE_LIMIT_MAX_DELAY`;
-    Retry-After шлюза важнее, но не меньше секунды — нулевая пауза крутила бы повторы, не
-    расходуя бюджет. О каждой паузе сообщает ``on_notice``.
-    """
-
-    def __init__(self, budget: float, on_notice: Callable[[str], None] | None):
-        self._left = float(budget)
-        self._delay = _RATE_LIMIT_FIRST_DELAY
-        self._on_notice = on_notice
-
-    def wait(self, resp: httpx.Response) -> bool:
-        """Подождать перед повтором; False — бюджет исчерпан, 429 — ошибка."""
-        if self._left <= 0:
-            return False
-        pause = max(ApiProvider._retry_after(resp, self._delay), 1.0)
-        pause = min(pause, _RATE_LIMIT_MAX_DELAY, self._left)
-        if self._on_notice is not None:
-            self._on_notice(f"лимит запросов шлюза (429) — жду {pause:.0f} с и повторяю")
-        time.sleep(pause)
-        self._left -= pause
-        self._delay = min(self._delay * 2, _RATE_LIMIT_MAX_DELAY)
-        return True
-
-
 class _TurnBuilder:
     """Собирает ход ассистента из ответа v2 — целого или по кускам потока.
 
@@ -199,10 +90,7 @@ class _TurnBuilder:
     def __init__(self) -> None:
         self._text: list[str] = []
         self._reasoning: list[str] = []
-        # Начало ответа, пока неясно, не утёкший ли это тег рассуждений (None — ясно);
-        # после убранного тега пропускаются пустые строки до самого ответа.
-        self._head: str | None = ""
-        self._after_tag = False
+        self._filter = LeakedTagFilter()
         self._calls: dict[str, FunctionCall] = {}
         self._state_id: str | None = None
         self._finish_reason: str | None = None
@@ -247,33 +135,9 @@ class _TurnBuilder:
             self._finish_reason = str(data["finish_reason"])
         if data.get("usage"):
             self._usage = data["usage"]
-        text = self._clean_head("".join(pieces))
+        text = self._filter.feed("".join(pieces))
         self._text.append(text)
         return text
-
-    def _clean_head(self, text: str) -> str:
-        """Текст без утёкшего закрывающего тега рассуждений в самом начале ответа.
-
-        Пока по началу ответа не ясно, тег ли это, текст копится и не отдаётся.
-        """
-        if self._head is None:
-            if self._after_tag:
-                text = text.lstrip()
-                self._after_tag = not text
-            return text
-        head = self._head + text
-        stripped = head.lstrip()
-        for tag in _LEAKED_REASONING_TAGS:
-            if stripped.startswith(tag):
-                self._head = None
-                rest = stripped[len(tag) :].lstrip()
-                self._after_tag = not rest
-                return rest
-        if any(tag.startswith(stripped) for tag in _LEAKED_REASONING_TAGS):
-            self._head = head  # может оказаться тегом — ждём продолжения
-            return ""
-        self._head = None
-        return head
 
     def turn(self, *, complete: bool = True) -> AssistantTurn:
         """Ход ассистента. ``complete=False`` — поток кончился без окончания ответа:
@@ -282,7 +146,7 @@ class _TurnBuilder:
         calls = list(self._calls.values())
         message = Message(
             role="assistant",
-            content="".join(self._text) + (self._head or ""),  # недособранное начало
+            content="".join(self._text) + self._filter.pending,  # недособранное начало
             function_calls=calls,
             # Состояние нужно только результатам вызовов.
             state_id=self._state_id if calls else None,
@@ -299,139 +163,26 @@ class _TurnBuilder:
 def _stream_error(event: str | None, data: Mapping[str, Any]) -> str | None:
     """Текст ошибки, если событие потока — ошибка API (иначе None)."""
     if event and "error" in event.lower():
-        return json.dumps(data, ensure_ascii=False)[:_ERROR_BODY_CHARS]
+        return json.dumps(data, ensure_ascii=False)[:ERROR_BODY_CHARS]
     if "messages" in data:
         return None
     status = data.get("status")
     if data.get("error") or (isinstance(status, int) and status >= 400):
-        return json.dumps(data, ensure_ascii=False)[:_ERROR_BODY_CHARS]
+        return json.dumps(data, ensure_ascii=False)[:ERROR_BODY_CHARS]
     return None
 
 
-class ApiProvider(LLMProvider):
-    supports_measure = True
-
+class ApiProvider(HttpProvider):
     def __init__(self, config: Config, *, transport: httpx.BaseTransport | None = None):
         """``transport`` — подмена HTTP-транспорта (``httpx.MockTransport`` в тестах)."""
         config.require_credentials()
-        self._cfg = config
-        # В режиме mTLS verify — это SSL-контекст с клиентским сертификатом;
-        # в режиме OAuth — булев флаг проверки серверного сертификата.
-        self._client = httpx.Client(
-            verify=config.build_ssl_verify(),
-            timeout=config.timeout,
-            transport=transport,
-        )
-        # Запросы чата ждут ответа модели дольше (``read_timeout``): вызовы инструментов
-        # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план,
-        # файл), байты не идут. Токен, список моделей и замер окна — по обычному timeout:
-        # долгая проба при замере и означает «не помещается».
-        self._chat_timeout = httpx.Timeout(
-            config.timeout, read=max(config.timeout, config.read_timeout)
-        )
+        super().__init__(config, transport=transport)
         self._mtls = config.auth_mode == "mtls"
         self._token: str | None = None
         self._token_exp: float = 0.0  # unix-время истечения токена
-        self._max_retries = 5  # повторы при транзиентных сбоях (сеть/5xx)
-        self._rate_limit_wait = config.rate_limit_wait  # ожидание при 429, с на запрос
-        # Модели, для которых шлюз не принял рассуждения в запросе: дальше — без них.
-        self._no_reasoning: set[str] = set()
 
-    @property
-    def model(self) -> str:
-        return self._cfg.model
-
-    def close(self) -> None:
-        self._client.close()
-
-    def __enter__(self) -> ApiProvider:
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.close()
-
-    # ------------------------------------------------------------------ #
-    # Сетевой слой с повторами
-    # ------------------------------------------------------------------ #
-    def _request_with_retry(
-        self,
-        do_request: Callable[[], httpx.Response],
-        *,
-        attempts: int | None = None,
-        silent_attempts: int | None = None,
-        on_notice: Callable[[str], None] | None = None,
-    ) -> httpx.Response:
-        """Выполняет HTTP-запрос, повторяя транзиентные сбои.
-
-        Повторяем (с экспоненциальной задержкой):
-          * сетевые ошибки/таймауты — сеть до API Сбера бывает нестабильна;
-          * 5xx — временная недоступность;
-          * 429 Too Many Requests — в пределах своего бюджета ожидания (не в счёт
-            попыток), о каждой паузе сообщает ``on_notice``.
-        Прочие HTTP-ответы (включая 4xx) возвращаем как есть — их разбирает
-        вызывающая сторона. Неповторяемые ошибки транспорта → ApiError.
-        ``attempts`` — число попыток вместо ``_max_retries``; ``silent_attempts`` —
-        сколько раз из них ответ может не прийти за время ожидания чтения.
-        """
-        attempts = attempts or self._max_retries
-        delay = 1.0
-        last_exc: Exception | None = None
-        silences = 0
-        limit = _RateLimitWait(self._rate_limit_wait, on_notice)
-        attempt = 0
-        while attempt < attempts:
-            try:
-                resp = do_request()
-            except _RETRYABLE_EXC as e:
-                last_exc = e
-                if isinstance(e, httpx.ReadTimeout) and silent_attempts is not None:
-                    silences += 1
-                    if silences >= silent_attempts:
-                        raise ApiError(self._silence_message()) from e
-                attempt += 1
-                if attempt < attempts:
-                    time.sleep(delay)
-                    delay = min(delay * 2, 8.0)
-                continue
-            except httpx.HTTPError as e:
-                raise ApiError(f"Ошибка соединения с API: {e}") from e
-
-            if resp.status_code == 429:
-                if limit.wait(resp):
-                    continue
-                return resp
-            if resp.status_code in _RETRY_STATUS and attempt < attempts - 1:
-                time.sleep(self._retry_after(resp, delay))
-                delay = min(delay * 2, 8.0)
-                attempt += 1
-                continue
-            return resp
-
-        raise ApiError(
-            f"Сетевая ошибка при обращении к API (после {attempts} попыток): {last_exc}"
-        ) from last_exc
-
-    @staticmethod
-    def _json(resp: httpx.Response) -> dict[str, Any]:
-        """Тело ответа как JSON-объект; иначе ApiError."""
-        try:
-            data = resp.json()
-        except ValueError as e:
-            raise ApiError(f"API вернул не-JSON ответ ({resp.status_code}): {_body(resp)}") from e
-        if not isinstance(data, dict):
-            raise ApiError(f"Неожиданный формат ответа API: {str(data)[:500]}")
-        return data
-
-    @staticmethod
-    def _retry_after(resp: httpx.Response, default: float) -> float:
-        """Задержка перед повтором: уважает заголовок Retry-After, если он есть."""
-        ra = resp.headers.get("Retry-After")
-        if ra:
-            try:
-                return max(min(float(ra), 30.0), 0.0)  # отрицательное — ValueError в sleep
-            except ValueError:
-                pass
-        return default
+    def _chat_url(self) -> str:
+        return chat_url(self._cfg.base_url)
 
     # ------------------------------------------------------------------ #
     # Авторизация
@@ -458,7 +209,7 @@ class ApiProvider(LLMProvider):
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise ApiError(
-                f"Не удалось получить токен API ({resp.status_code}): {_body(resp)}"
+                f"Не удалось получить токен API ({resp.status_code}): {error_body(resp)}"
             ) from e
 
         data = self._json(resp)
@@ -483,6 +234,11 @@ class ApiProvider(LLMProvider):
         if self._mtls:
             return {}
         return {"Authorization": f"Bearer {self._ensure_token(force=force)}"}
+
+    @property
+    def _refreshable(self) -> bool:
+        """Протухший токен (401) обновляется; клиентский сертификат обновлять нечего."""
+        return not self._mtls
 
     # ------------------------------------------------------------------ #
     # Сериализация / разбор
@@ -561,17 +317,16 @@ class ApiProvider(LLMProvider):
             "parameters": tool.parameters,
         }
 
+    _has_reasoning = staticmethod(_has_reasoning)
+
     @staticmethod
     def _parse_response(data: dict[str, Any]) -> AssistantTurn:
         if not isinstance(data.get("messages"), list):
-            raise ApiError(f"Неожиданный формат ответа API: {str(data)[:_ERROR_BODY_CHARS]}")
+            raise ApiError(f"Неожиданный формат ответа API: {str(data)[:ERROR_BODY_CHARS]}")
         builder = _TurnBuilder()
         builder.add(data)
         return builder.turn()
 
-    # ------------------------------------------------------------------ #
-    # Основной вызов
-    # ------------------------------------------------------------------ #
     def _payload(
         self,
         messages: Sequence[Message],
@@ -586,7 +341,7 @@ class ApiProvider(LLMProvider):
         """Тело запроса чата; ``reasoning=False`` — без рассуждений модели."""
         options: dict[str, Any] = {"temperature": temperature}
         payload: dict[str, Any] = {
-            "model": model or self._cfg.model,
+            "model": model or self.model,
             "messages": self._messages_payload(messages, reasoning=reasoning),
             "model_options": options,
         }
@@ -601,267 +356,29 @@ class ApiProvider(LLMProvider):
                 options["parallel_tool_calls"] = True
         return payload
 
-    def complete(
-        self,
-        messages: Sequence[Message],
-        tools: Sequence[ToolSpec] | None = None,
-        *,
-        model: str | None = None,
-        temperature: float = 0.2,
-        tool_choice: ToolChoice = "auto",
-        on_notice: Callable[[str], None] | None = None,
-    ) -> AssistantTurn:
-        name = model or self._cfg.model
-        payload = self._payload(
-            messages,
-            tools,
-            model=model,
-            temperature=temperature,
-            tool_choice=tool_choice,
-            reasoning=name not in self._no_reasoning,
-        )
-
-        def send(do_request: Callable[[], httpx.Response]) -> httpx.Response:
-            return self._send_chat(do_request, on_notice=on_notice)
-
-        resp = self._post_chat(payload, send, timeout=self._chat_timeout)
-        if resp.status_code in _REJECTED_STATUS and _has_reasoning(payload):
-            plain = self._payload(
-                messages,
-                tools,
-                model=model,
-                temperature=temperature,
-                tool_choice=tool_choice,
-                reasoning=False,
-            )
-            retry = self._post_chat(plain, send, timeout=self._chat_timeout)
-            if retry.status_code < 400:
-                self._reject_reasoning(name, resp.status_code, on_notice)
-            resp = retry
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise ApiError(f"API вернул {resp.status_code}: {_body(resp)}") from e
-
-        return self._parse_response(self._json(resp))
-
-    def _post_chat(
-        self,
-        payload: dict[str, Any],
-        send: Callable[[Callable[[], httpx.Response]], httpx.Response] | None = None,
-        *,
-        timeout: httpx.Timeout | None = None,
-    ) -> httpx.Response:
-        """POST на chat/completions; при протухшем токене (401) — обновить и повторить раз.
-
-        ``send`` — как отправлять сам запрос (по умолчанию ``_request_with_retry``);
-        получение токена идёт мимо него, его ошибки — обычные ``ApiError``. ``timeout`` —
-        таймауты запроса вместо клиентских (None — клиентские; не «без таймаута»).
-        """
-        url = chat_url(self._cfg.base_url)
-        headers = {"Content-Type": "application/json", **self._auth_headers()}
-        send = send or self._request_with_retry
-        options = {} if timeout is None else {"timeout": timeout}
-
-        resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
-        if resp.status_code == 401 and not self._mtls:
-            # токен протух — обновляем принудительно и повторяем один раз
-            headers.update(self._auth_headers(force=True))
-            resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
-        return resp
-
-    def _reject_reasoning(
-        self, model: str, status: int, on_notice: Callable[[str], None] | None
-    ) -> None:
-        """Шлюз не принял запрос с рассуждениями, а без них принял: дальше — без них."""
-        self._no_reasoning.add(model)
-        if on_notice is not None:
-            on_notice(
-                f"шлюз не принял рассуждения модели {model} в запросе ({status}) — дальше без них"
-            )
-
-    def _send_chat(
-        self,
-        do_request: Callable[[], httpx.Response],
-        *,
-        on_notice: Callable[[str], None] | None = None,
-    ) -> httpx.Response:
-        """Отправка запроса чата: молчание модели дольше ожидания чтения — не больше
-        :data:`_SILENT_ATTEMPTS` попыток."""
-        return self._request_with_retry(
-            do_request, silent_attempts=_SILENT_ATTEMPTS, on_notice=on_notice
-        )
-
-    def _silence_message(self) -> str:
-        seconds = int(self._chat_timeout.read or 0)
-        return (
-            f"Модель не отвечала дольше {seconds} с — ответ оборван. Если она писала длинный "
-            "вызов (план, большой файл), увеличьте GIGACREW_READ_TIMEOUT."
-        )
-
-    # ------------------------------------------------------------------ #
-    # Замер окна контекста
-    # ------------------------------------------------------------------ #
-    def _send_probe(self, do_request: Callable[[], httpx.Response]) -> httpx.Response:
-        """Отправка пробы. Огромный запрос может упереться в таймаут шлюза: долгие
-        повторы бессмысленны — обрыв уже отправляемого запроса и есть «не помещается»."""
-        try:
-            return self._request_with_retry(do_request, attempts=_PROBE_ATTEMPTS)
-        except ApiError as e:
-            if isinstance(e.__cause__, _OVERSIZE_EXC):
-                raise PromptTooLong(None, str(e)) from e
-            raise
-
-    def measure_prompt(self, text: str, *, model: str | None = None) -> int:
-        payload = {
-            "model": model or self._cfg.model,
+    def _probe_payload(self, text: str, model: str) -> dict[str, Any]:
+        return {
+            "model": model,
             "messages": [{"role": "user", "content": [{"text": text}]}],
             "model_options": {"max_tokens": 1, "temperature": 0},
         }
-        resp = self._post_chat(payload, self._send_probe)
-        status = resp.status_code
-        if status in _UNAVAILABLE_STATUS:
-            raise ApiError(f"API временно недоступен ({status}): {_body(resp)}")
-        if status >= 500 or (status >= 400 and status not in _NOT_SIZE_STATUS):
-            raise PromptTooLong(status, resp.text)
-        if status >= 400:
-            raise ApiError(f"API вернул {status}: {_body(resp)}")
-        usage = Usage.from_raw(self._json(resp).get("usage"))
-        if usage.prompt_tokens <= 0:
-            raise ApiError("API не вернул usage.prompt_tokens — замер невозможен")
-        return usage.prompt_tokens
 
     # ------------------------------------------------------------------ #
-    # Потоковый вызов (SSE)
+    # Поток (SSE)
     # ------------------------------------------------------------------ #
-    def stream(
-        self,
-        messages: Sequence[Message],
-        tools: Sequence[ToolSpec] | None = None,
-        *,
-        model: str | None = None,
-        temperature: float = 0.2,
-        tool_choice: ToolChoice = "auto",
-        on_delta: Callable[[str], None] | None = None,
-        on_notice: Callable[[str], None] | None = None,
-    ) -> AssistantTurn:
-        """Потоковая генерация. Вызывает on_delta(text) на каждый кусок текста и
-        возвращает финальный AssistantTurn (идентичный complete()).
-
-        Формат SSE: события ``response.message.delta`` — куски текста в тех же
-        ``messages``, что и у обычного ответа; ``response.message.done`` — вызовы
-        функций, ``tool_state_id``, ``finish_reason`` и ``usage``.
-
-        Повтор при сетевом сбое выполняется, только пока пользователю не отдан
-        ни один кусок текста — иначе он увидел бы ответ дважды.
-        """
-        sink = on_delta or (lambda _s: None)
-        state = {"emitted": False}
-
-        def emit(piece: str) -> None:
-            state["emitted"] = True
-            sink(piece)
-
-        name = model or self._cfg.model
-        payload = self._payload(
-            messages,
-            tools,
-            model=model,
-            temperature=temperature,
-            stream=True,
-            tool_choice=tool_choice,
-            reasoning=name not in self._no_reasoning,
-        )
-        url = chat_url(self._cfg.base_url)
-        delay = 1.0
-        last_exc: Exception | None = None
-        refreshed = False
-        silences = 0  # попыток, на которые модель молчала дольше ожидания чтения
-        limit = _RateLimitWait(self._rate_limit_wait, on_notice)
-        rejected: int | None = None  # статус отказа запросу с рассуждениями
-
-        attempt = 0
-        while attempt < self._max_retries:
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-                **self._auth_headers(),
-            }
-            try:
-                with self._client.stream(
-                    "POST", url, json=payload, headers=headers, timeout=self._chat_timeout
-                ) as resp:
-                    if resp.status_code == 401 and not self._mtls and not refreshed:
-                        resp.read()
-                        self._ensure_token(force=True)
-                        refreshed = True
-                        attempt += 1
-                        continue
-                    if resp.status_code in _REJECTED_STATUS and _has_reasoning(payload):
-                        resp.read()
-                        rejected = resp.status_code
-                        payload = self._payload(
-                            messages,
-                            tools,
-                            model=model,
-                            temperature=temperature,
-                            stream=True,
-                            tool_choice=tool_choice,
-                            reasoning=False,
-                        )
-                        attempt += 1
-                        continue
-                    if resp.status_code == 429:
-                        resp.read()
-                        if limit.wait(resp):
-                            continue
-                    elif resp.status_code in _RETRY_STATUS and attempt < self._max_retries - 1:
-                        resp.read()
-                        time.sleep(self._retry_after(resp, delay))
-                        delay = min(delay * 2, 8.0)
-                        attempt += 1
-                        continue
-                    if resp.status_code >= 400:
-                        resp.read()
-                        raise ApiError(f"API вернул {resp.status_code}: {_body(resp)}")
-                    if rejected is not None:
-                        self._reject_reasoning(name, rejected, on_notice)
-                    return self._consume_sse(resp, emit)
-            except _RETRYABLE_EXC as e:
-                last_exc = e
-                silent = isinstance(e, httpx.ReadTimeout)
-                if silent:
-                    silences += 1
-                if state["emitted"]:
-                    # часть текста уже отдана пользователю — повтор приведёт к дублю
-                    if silent:
-                        raise ApiError(self._silence_message()) from e
-                    raise ApiError(f"Сетевой сбой во время потоковой передачи: {e}") from e
-                if silences >= _SILENT_ATTEMPTS:
-                    raise ApiError(self._silence_message()) from e
-                attempt += 1
-                if attempt < self._max_retries:
-                    time.sleep(delay)
-                    delay = min(delay * 2, 8.0)
-            except httpx.HTTPError as e:
-                raise ApiError(f"Ошибка соединения с API: {e}") from e
-
-        raise ApiError(
-            f"Сетевая ошибка при потоковом обращении к API (после "
-            f"{self._max_retries} попыток): {last_exc}"
-        ) from last_exc
-
     @staticmethod
     def _consume_sse(resp: httpx.Response, emit: Callable[[str], None]) -> AssistantTurn:
         """Разбирает SSE-поток, отдавая текстовые дельты в ``emit``.
 
-        Поток, где не пришло окончание ответа (событие ``response.message.done``, маркер
-        ``[DONE]``, причина завершения или расход токенов), — незавершённый: шлюз закрыл
-        соединение посреди ответа.
+        Формат: события ``response.message.delta`` — куски текста в тех же ``messages``,
+        что и у обычного ответа; ``response.message.done`` — вызовы функций,
+        ``tool_state_id``, ``finish_reason`` и ``usage``. Поток, где не пришло окончание
+        ответа (событие ``response.message.done``, маркер ``[DONE]``, причина завершения
+        или расход токенов), — незавершённый: шлюз закрыл соединение посреди ответа.
         """
         builder = _TurnBuilder()
         done = False
-        for event, data in _iter_sse_events(resp.iter_lines()):
+        for event, data in iter_sse_events(resp.iter_lines()):
             if data.strip() == "[DONE]":
                 done = True
                 break
@@ -890,7 +407,7 @@ class ApiProvider(LLMProvider):
         )
         if resp.status_code >= 400:
             raise ApiError(
-                f"Не удалось получить список моделей ({resp.status_code}): {_body(resp)}"
+                f"Не удалось получить список моделей ({resp.status_code}): {error_body(resp)}"
             )
         models = self._json(resp).get("data") or []
         return [
