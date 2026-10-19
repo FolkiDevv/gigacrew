@@ -60,6 +60,18 @@ _RETRYABLE_EXC = (
 
 # HTTP-статусы, которые имеет смысл повторить (лимит/временная недоступность).
 _RETRY_STATUS = {429, 500, 502, 503, 504}
+# Лимит частоты запросов (429) шлюз считает за минуту, а обычные повторы (5 попыток с
+# паузами 1–8 с) укладываются в ~15 с. На 429 — свой бюджет ожидания на запрос
+# (``GIGACREW_RATE_LIMIT_WAIT``) и паузы длиннее; Retry-After шлюза — в приоритете.
+_RATE_LIMIT_FIRST_DELAY = 5.0
+_RATE_LIMIT_MAX_DELAY = 30.0
+# Ответ шлюза на запрос, который он не принял по формату. Если в запросе были рассуждения
+# модели (``role: "reasoning"``), он повторяется без них; удалось — модель до конца сессии
+# работает без возврата рассуждений: так их возврат не может сломать модель.
+_REJECTED_STATUS = {400, 422}
+# Закрывающий тег рассуждений, который шлюз оставляет в начале текста ответа: сами
+# рассуждения ушли в ``role: "reasoning"``, а тег — в ответ (MiniMax: ``</mm:think>``).
+_LEAKED_REASONING_TAGS = ("</mm:think>", "</think>")
 
 # Замер окна: 4xx с этими статусами — не про размер запроса (авторизация, нет
 # модели, лимит частоты); остальные 4xx и 5xx считаются «запрос не помещается».
@@ -69,6 +81,9 @@ _NOT_SIZE_STATUS = {401, 403, 404, 429}
 _UNAVAILABLE_STATUS = {502, 503}
 # Сколько тела ответа показывать в сообщении об ошибке (HTML-страница прокси и т.п.).
 _ERROR_BODY_CHARS = 500
+# Попыток запроса чата, на который модель молчит дольше read_timeout: ожидание долгое,
+# и обычные пять попыток растянулись бы почти на час.
+_SILENT_ATTEMPTS = 2
 
 
 def _body(resp: httpx.Response) -> str:
@@ -142,6 +157,38 @@ def _build_function_call(raw: Any) -> FunctionCall | None:
     )
 
 
+def _has_reasoning(payload: Mapping[str, Any]) -> bool:
+    """Есть ли в теле запроса рассуждения модели."""
+    return any(m.get("role") == "reasoning" for m in payload.get("messages") or ())
+
+
+class _RateLimitWait:
+    """Ожидание при 429 в пределах бюджета одного запроса (``budget`` секунд).
+
+    Паузы растут от :data:`_RATE_LIMIT_FIRST_DELAY` вдвое до :data:`_RATE_LIMIT_MAX_DELAY`;
+    Retry-After шлюза важнее, но не меньше секунды — нулевая пауза крутила бы повторы, не
+    расходуя бюджет. О каждой паузе сообщает ``on_notice``.
+    """
+
+    def __init__(self, budget: float, on_notice: Callable[[str], None] | None):
+        self._left = float(budget)
+        self._delay = _RATE_LIMIT_FIRST_DELAY
+        self._on_notice = on_notice
+
+    def wait(self, resp: httpx.Response) -> bool:
+        """Подождать перед повтором; False — бюджет исчерпан, 429 — ошибка."""
+        if self._left <= 0:
+            return False
+        pause = max(ApiProvider._retry_after(resp, self._delay), 1.0)
+        pause = min(pause, _RATE_LIMIT_MAX_DELAY, self._left)
+        if self._on_notice is not None:
+            self._on_notice(f"лимит запросов шлюза (429) — жду {pause:.0f} с и повторяю")
+        time.sleep(pause)
+        self._left -= pause
+        self._delay = min(self._delay * 2, _RATE_LIMIT_MAX_DELAY)
+        return True
+
+
 class _TurnBuilder:
     """Собирает ход ассистента из ответа v2 — целого или по кускам потока.
 
@@ -151,23 +198,42 @@ class _TurnBuilder:
 
     def __init__(self) -> None:
         self._text: list[str] = []
+        self._reasoning: list[str] = []
+        # Начало ответа, пока неясно, не утёкший ли это тег рассуждений (None — ясно);
+        # после убранного тега пропускаются пустые строки до самого ответа.
+        self._head: str | None = ""
+        self._after_tag = False
         self._calls: dict[str, FunctionCall] = {}
         self._state_id: str | None = None
         self._finish_reason: str | None = None
         self._usage: Any = None
 
+    @property
+    def finished(self) -> bool:
+        """Пришло ли окончание ответа: причина завершения или расход токенов."""
+        return self._finish_reason is not None or self._usage is not None
+
     def add(self, data: Mapping[str, Any]) -> str:
         """Учесть ответ или кусок потока; возвращает пришедший в нём текст."""
         pieces: list[str] = []
         for msg in data.get("messages") or []:
-            if not isinstance(msg, Mapping) or msg.get("role") != "assistant":
+            if not isinstance(msg, Mapping):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                content = [{"text": content}]
+            if msg.get("role") == "reasoning":
+                self._reasoning += [
+                    part["text"]
+                    for part in content or []
+                    if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+                ]
+                continue
+            if msg.get("role") != "assistant":
                 continue
             state_id = msg.get("tools_state_id") or msg.get("tool_state_id")
             if state_id:
                 self._state_id = str(state_id)
-            content = msg.get("content")
-            if isinstance(content, str):
-                content = [{"text": content}]
             for part in content or []:
                 if not isinstance(part, Mapping):
                     continue
@@ -181,20 +247,50 @@ class _TurnBuilder:
             self._finish_reason = str(data["finish_reason"])
         if data.get("usage"):
             self._usage = data["usage"]
-        text = "".join(pieces)
+        text = self._clean_head("".join(pieces))
         self._text.append(text)
         return text
 
-    def turn(self) -> AssistantTurn:
+    def _clean_head(self, text: str) -> str:
+        """Текст без утёкшего закрывающего тега рассуждений в самом начале ответа.
+
+        Пока по началу ответа не ясно, тег ли это, текст копится и не отдаётся.
+        """
+        if self._head is None:
+            if self._after_tag:
+                text = text.lstrip()
+                self._after_tag = not text
+            return text
+        head = self._head + text
+        stripped = head.lstrip()
+        for tag in _LEAKED_REASONING_TAGS:
+            if stripped.startswith(tag):
+                self._head = None
+                rest = stripped[len(tag) :].lstrip()
+                self._after_tag = not rest
+                return rest
+        if any(tag.startswith(stripped) for tag in _LEAKED_REASONING_TAGS):
+            self._head = head  # может оказаться тегом — ждём продолжения
+            return ""
+        self._head = None
+        return head
+
+    def turn(self, *, complete: bool = True) -> AssistantTurn:
+        """Ход ассистента. ``complete=False`` — поток кончился без окончания ответа:
+        без причины завершения ответ без вызовов — ``"incomplete"``, а не ``"stop"``
+        (вызовы приходят только в окончании и могли потеряться)."""
         calls = list(self._calls.values())
         message = Message(
             role="assistant",
-            content="".join(self._text),
+            content="".join(self._text) + (self._head or ""),  # недособранное начало
             function_calls=calls,
             # Состояние нужно только результатам вызовов.
             state_id=self._state_id if calls else None,
+            reasoning="".join(self._reasoning),
         )
-        finish = self._finish_reason or ("function_call" if calls else "stop")
+        finish = self._finish_reason or (
+            "function_call" if calls else "stop" if complete else "incomplete"
+        )
         return AssistantTurn(
             message=message, finish_reason=finish, usage=Usage.from_raw(self._usage)
         )
@@ -226,10 +322,20 @@ class ApiProvider(LLMProvider):
             timeout=config.timeout,
             transport=transport,
         )
+        # Запросы чата ждут ответа модели дольше (``read_timeout``): вызовы инструментов
+        # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план,
+        # файл), байты не идут. Токен, список моделей и замер окна — по обычному timeout:
+        # долгая проба при замере и означает «не помещается».
+        self._chat_timeout = httpx.Timeout(
+            config.timeout, read=max(config.timeout, config.read_timeout)
+        )
         self._mtls = config.auth_mode == "mtls"
         self._token: str | None = None
         self._token_exp: float = 0.0  # unix-время истечения токена
-        self._max_retries = 5  # повторы при транзиентных сбоях (сеть/429/5xx)
+        self._max_retries = 5  # повторы при транзиентных сбоях (сеть/5xx)
+        self._rate_limit_wait = config.rate_limit_wait  # ожидание при 429, с на запрос
+        # Модели, для которых шлюз не принял рассуждения в запросе: дальше — без них.
+        self._no_reasoning: set[str] = set()
 
     @property
     def model(self) -> str:
@@ -248,35 +354,56 @@ class ApiProvider(LLMProvider):
     # Сетевой слой с повторами
     # ------------------------------------------------------------------ #
     def _request_with_retry(
-        self, do_request: Callable[[], httpx.Response], *, attempts: int | None = None
+        self,
+        do_request: Callable[[], httpx.Response],
+        *,
+        attempts: int | None = None,
+        silent_attempts: int | None = None,
+        on_notice: Callable[[str], None] | None = None,
     ) -> httpx.Response:
         """Выполняет HTTP-запрос, повторяя транзиентные сбои.
 
         Повторяем (с экспоненциальной задержкой):
           * сетевые ошибки/таймауты — сеть до API Сбера бывает нестабильна;
-          * 429 Too Many Requests и 5xx — временная недоступность/лимит.
+          * 5xx — временная недоступность;
+          * 429 Too Many Requests — в пределах своего бюджета ожидания (не в счёт
+            попыток), о каждой паузе сообщает ``on_notice``.
         Прочие HTTP-ответы (включая 4xx) возвращаем как есть — их разбирает
         вызывающая сторона. Неповторяемые ошибки транспорта → ApiError.
-        ``attempts`` — число попыток вместо ``_max_retries``.
+        ``attempts`` — число попыток вместо ``_max_retries``; ``silent_attempts`` —
+        сколько раз из них ответ может не прийти за время ожидания чтения.
         """
         attempts = attempts or self._max_retries
         delay = 1.0
         last_exc: Exception | None = None
-        for attempt in range(attempts):
+        silences = 0
+        limit = _RateLimitWait(self._rate_limit_wait, on_notice)
+        attempt = 0
+        while attempt < attempts:
             try:
                 resp = do_request()
             except _RETRYABLE_EXC as e:
                 last_exc = e
-                if attempt < attempts - 1:
+                if isinstance(e, httpx.ReadTimeout) and silent_attempts is not None:
+                    silences += 1
+                    if silences >= silent_attempts:
+                        raise ApiError(self._silence_message()) from e
+                attempt += 1
+                if attempt < attempts:
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)
                 continue
             except httpx.HTTPError as e:
                 raise ApiError(f"Ошибка соединения с API: {e}") from e
 
+            if resp.status_code == 429:
+                if limit.wait(resp):
+                    continue
+                return resp
             if resp.status_code in _RETRY_STATUS and attempt < attempts - 1:
                 time.sleep(self._retry_after(resp, delay))
                 delay = min(delay * 2, 8.0)
+                attempt += 1
                 continue
             return resp
 
@@ -391,9 +518,12 @@ class ApiProvider(LLMProvider):
         return out
 
     @classmethod
-    def _messages_payload(cls, messages: Sequence[Message]) -> list[dict[str, Any]]:
+    def _messages_payload(
+        cls, messages: Sequence[Message], *, reasoning: bool = True
+    ) -> list[dict[str, Any]]:
         """История для запроса. Результаты вызовов одного assistant-сообщения (идут
-        подряд) склеиваются в одно сообщение ``role: "tool"`` с его ``tools_state_id``."""
+        подряд) склеиваются в одно сообщение ``role: "tool"`` с его ``tools_state_id``.
+        Рассуждения ответа — сообщение ``role: "reasoning"`` перед ним, как в ответе API."""
         out: list[dict[str, Any]] = []
         state_id: str | None = None  # состояние assistant-сообщения перед результатами
         for msg in messages:
@@ -414,6 +544,8 @@ class ApiProvider(LLMProvider):
                     out.append(tool)
                 continue
             if msg.role == "assistant":
+                if reasoning and msg.reasoning:
+                    out.append({"role": "reasoning", "content": [{"text": msg.reasoning}]})
                 out.append(cls._assistant_payload(msg))
                 state_id = msg.state_id if msg.function_calls else None
                 continue
@@ -449,11 +581,13 @@ class ApiProvider(LLMProvider):
         temperature: float,
         stream: bool = False,
         tool_choice: ToolChoice = "auto",
+        reasoning: bool = True,
     ) -> dict[str, Any]:
+        """Тело запроса чата; ``reasoning=False`` — без рассуждений модели."""
         options: dict[str, Any] = {"temperature": temperature}
         payload: dict[str, Any] = {
             "model": model or self._cfg.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(messages, reasoning=reasoning),
             "model_options": options,
         }
         if stream:
@@ -475,11 +609,35 @@ class ApiProvider(LLMProvider):
         model: str | None = None,
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
+        on_notice: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
+        name = model or self._cfg.model
         payload = self._payload(
-            messages, tools, model=model, temperature=temperature, tool_choice=tool_choice
+            messages,
+            tools,
+            model=model,
+            temperature=temperature,
+            tool_choice=tool_choice,
+            reasoning=name not in self._no_reasoning,
         )
-        resp = self._post_chat(payload)
+
+        def send(do_request: Callable[[], httpx.Response]) -> httpx.Response:
+            return self._send_chat(do_request, on_notice=on_notice)
+
+        resp = self._post_chat(payload, send, timeout=self._chat_timeout)
+        if resp.status_code in _REJECTED_STATUS and _has_reasoning(payload):
+            plain = self._payload(
+                messages,
+                tools,
+                model=model,
+                temperature=temperature,
+                tool_choice=tool_choice,
+                reasoning=False,
+            )
+            retry = self._post_chat(plain, send, timeout=self._chat_timeout)
+            if retry.status_code < 400:
+                self._reject_reasoning(name, resp.status_code, on_notice)
+            resp = retry
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
@@ -491,22 +649,55 @@ class ApiProvider(LLMProvider):
         self,
         payload: dict[str, Any],
         send: Callable[[Callable[[], httpx.Response]], httpx.Response] | None = None,
+        *,
+        timeout: httpx.Timeout | None = None,
     ) -> httpx.Response:
         """POST на chat/completions; при протухшем токене (401) — обновить и повторить раз.
 
         ``send`` — как отправлять сам запрос (по умолчанию ``_request_with_retry``);
-        получение токена идёт мимо него, его ошибки — обычные ``ApiError``.
+        получение токена идёт мимо него, его ошибки — обычные ``ApiError``. ``timeout`` —
+        таймауты запроса вместо клиентских (None — клиентские; не «без таймаута»).
         """
         url = chat_url(self._cfg.base_url)
         headers = {"Content-Type": "application/json", **self._auth_headers()}
         send = send or self._request_with_retry
+        options = {} if timeout is None else {"timeout": timeout}
 
-        resp = send(lambda: self._client.post(url, json=payload, headers=headers))
+        resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
         if resp.status_code == 401 and not self._mtls:
             # токен протух — обновляем принудительно и повторяем один раз
             headers.update(self._auth_headers(force=True))
-            resp = send(lambda: self._client.post(url, json=payload, headers=headers))
+            resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
         return resp
+
+    def _reject_reasoning(
+        self, model: str, status: int, on_notice: Callable[[str], None] | None
+    ) -> None:
+        """Шлюз не принял запрос с рассуждениями, а без них принял: дальше — без них."""
+        self._no_reasoning.add(model)
+        if on_notice is not None:
+            on_notice(
+                f"шлюз не принял рассуждения модели {model} в запросе ({status}) — дальше без них"
+            )
+
+    def _send_chat(
+        self,
+        do_request: Callable[[], httpx.Response],
+        *,
+        on_notice: Callable[[str], None] | None = None,
+    ) -> httpx.Response:
+        """Отправка запроса чата: молчание модели дольше ожидания чтения — не больше
+        :data:`_SILENT_ATTEMPTS` попыток."""
+        return self._request_with_retry(
+            do_request, silent_attempts=_SILENT_ATTEMPTS, on_notice=on_notice
+        )
+
+    def _silence_message(self) -> str:
+        seconds = int(self._chat_timeout.read or 0)
+        return (
+            f"Модель не отвечала дольше {seconds} с — ответ оборван. Если она писала длинный "
+            "вызов (план, большой файл), увеличьте GIGACREW_READ_TIMEOUT."
+        )
 
     # ------------------------------------------------------------------ #
     # Замер окна контекста
@@ -552,6 +743,7 @@ class ApiProvider(LLMProvider):
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
         on_delta: Callable[[str], None] | None = None,
+        on_notice: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Потоковая генерация. Вызывает on_delta(text) на каждый кусок текста и
         возвращает финальный AssistantTurn (идентичный complete()).
@@ -570,6 +762,7 @@ class ApiProvider(LLMProvider):
             state["emitted"] = True
             sink(piece)
 
+        name = model or self._cfg.model
         payload = self._payload(
             messages,
             tools,
@@ -577,40 +770,77 @@ class ApiProvider(LLMProvider):
             temperature=temperature,
             stream=True,
             tool_choice=tool_choice,
+            reasoning=name not in self._no_reasoning,
         )
         url = chat_url(self._cfg.base_url)
         delay = 1.0
         last_exc: Exception | None = None
         refreshed = False
+        silences = 0  # попыток, на которые модель молчала дольше ожидания чтения
+        limit = _RateLimitWait(self._rate_limit_wait, on_notice)
+        rejected: int | None = None  # статус отказа запросу с рассуждениями
 
-        for attempt in range(self._max_retries):
+        attempt = 0
+        while attempt < self._max_retries:
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
                 **self._auth_headers(),
             }
             try:
-                with self._client.stream("POST", url, json=payload, headers=headers) as resp:
+                with self._client.stream(
+                    "POST", url, json=payload, headers=headers, timeout=self._chat_timeout
+                ) as resp:
                     if resp.status_code == 401 and not self._mtls and not refreshed:
                         resp.read()
                         self._ensure_token(force=True)
                         refreshed = True
+                        attempt += 1
                         continue
-                    if resp.status_code in _RETRY_STATUS and attempt < self._max_retries - 1:
+                    if resp.status_code in _REJECTED_STATUS and _has_reasoning(payload):
+                        resp.read()
+                        rejected = resp.status_code
+                        payload = self._payload(
+                            messages,
+                            tools,
+                            model=model,
+                            temperature=temperature,
+                            stream=True,
+                            tool_choice=tool_choice,
+                            reasoning=False,
+                        )
+                        attempt += 1
+                        continue
+                    if resp.status_code == 429:
+                        resp.read()
+                        if limit.wait(resp):
+                            continue
+                    elif resp.status_code in _RETRY_STATUS and attempt < self._max_retries - 1:
                         resp.read()
                         time.sleep(self._retry_after(resp, delay))
                         delay = min(delay * 2, 8.0)
+                        attempt += 1
                         continue
                     if resp.status_code >= 400:
                         resp.read()
                         raise ApiError(f"API вернул {resp.status_code}: {_body(resp)}")
+                    if rejected is not None:
+                        self._reject_reasoning(name, rejected, on_notice)
                     return self._consume_sse(resp, emit)
             except _RETRYABLE_EXC as e:
                 last_exc = e
+                silent = isinstance(e, httpx.ReadTimeout)
+                if silent:
+                    silences += 1
                 if state["emitted"]:
                     # часть текста уже отдана пользователю — повтор приведёт к дублю
+                    if silent:
+                        raise ApiError(self._silence_message()) from e
                     raise ApiError(f"Сетевой сбой во время потоковой передачи: {e}") from e
-                if attempt < self._max_retries - 1:
+                if silences >= _SILENT_ATTEMPTS:
+                    raise ApiError(self._silence_message()) from e
+                attempt += 1
+                if attempt < self._max_retries:
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)
             except httpx.HTTPError as e:
@@ -623,10 +853,17 @@ class ApiProvider(LLMProvider):
 
     @staticmethod
     def _consume_sse(resp: httpx.Response, emit: Callable[[str], None]) -> AssistantTurn:
-        """Разбирает SSE-поток, отдавая текстовые дельты в ``emit``."""
+        """Разбирает SSE-поток, отдавая текстовые дельты в ``emit``.
+
+        Поток, где не пришло окончание ответа (событие ``response.message.done``, маркер
+        ``[DONE]``, причина завершения или расход токенов), — незавершённый: шлюз закрыл
+        соединение посреди ответа.
+        """
         builder = _TurnBuilder()
+        done = False
         for event, data in _iter_sse_events(resp.iter_lines()):
             if data.strip() == "[DONE]":
+                done = True
                 break
             try:
                 chunk = json.loads(data)
@@ -637,10 +874,11 @@ class ApiProvider(LLMProvider):
             error = _stream_error(event, chunk)
             if error is not None:
                 raise ApiError(f"API вернул ошибку в потоке: {error}")
+            done = done or event == "response.message.done"
             piece = builder.add(chunk)
             if piece:
                 emit(piece)
-        return builder.turn()
+        return builder.turn(complete=done or builder.finished)
 
     def list_models(self) -> list[str]:
         """Чат-модели (``type == "chat"``): эмбеддеры и прочие в выборе не нужны."""

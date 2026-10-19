@@ -89,5 +89,6 @@ select = ["E", "F", "I", "UP", "B", "W"]
 [tool.pytest.ini_options]
 markers = [
     "live: тесты, реально обращающиеся к API (нужны реквизиты, GIGACREW_API_URL и GIGACREW_TEST_MODEL)",
+    "eval: поведенческие сценарии на живых моделях — дорого, запуск через make eval (tests/test_behavior_live.py)",
 ]
 testpaths = ["tests"]

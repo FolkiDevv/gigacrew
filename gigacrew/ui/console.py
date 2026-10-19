@@ -810,7 +810,7 @@ class Console(AgentEvents):
             (
                 k
                 for k in range(len(messages) - 1, -1, -1)
-                if messages[k].role == "user" and messages[k].content.strip()
+                if messages[k].is_request and messages[k].content.strip()
             ),
             None,
         )

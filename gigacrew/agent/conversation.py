@@ -79,10 +79,10 @@ class Conversation:
         if self._summary is None:
             return list(self._messages)
         tail = self._messages[self._summary.upto :]
-        if not tail or any(m.role == "user" for m in tail):
+        if not tail or any(m.is_request for m in tail):
             return tail
         task = next(
-            (m for m in reversed(self._messages[: self._summary.upto]) if m.role == "user"),
+            (m for m in reversed(self._messages[: self._summary.upto]) if m.is_request),
             None,
         )
         return tail if task is None else [task, *tail]
@@ -108,8 +108,9 @@ class Conversation:
             raise ValueError("граница сжатия не может приходиться на результат инструмента")
 
     # ------------------------------------------------------------------ #
-    def add_user(self, text: str) -> None:
-        self._messages.append(Message(role="user", content=text))
+    def add_user(self, text: str, *, meta: bool = False) -> None:
+        """Запрос пользователя; ``meta`` — служебное сообщение harness'а (см. :class:`Message`)."""
+        self._messages.append(Message(role="user", content=text, meta=meta))
 
     def add_assistant(self, message: Message, usage: Usage | None = None) -> None:
         self._messages.append(message)
@@ -150,6 +151,23 @@ class Conversation:
         for call in pending:
             self.add_function_result(call.name, note, call.id)
         return bool(pending)
+
+    def forget_reasoning(self) -> None:
+        """Убрать рассуждения модели из истории: они нужны ей только в пределах хода."""
+        self._messages = [
+            m.model_copy(update={"reasoning": ""}) if m.reasoning else m for m in self._messages
+        ]
+
+    def truncate(self, length: int) -> None:
+        """Убрать сообщения после первых ``length`` (откат служебного обмена репликами).
+
+        Граница сжатия не может оказаться за концом истории.
+        """
+        if not 0 <= length <= len(self._messages):
+            raise ValueError(f"длина вне диалога: {length}")
+        if self._summary is not None and self._summary.upto > length:
+            raise ValueError("нельзя убрать сообщения, свёрнутые в краткое содержание")
+        del self._messages[length:]
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict[str, Any]:

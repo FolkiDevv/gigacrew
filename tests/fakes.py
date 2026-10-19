@@ -128,6 +128,15 @@ def tool_turn(name: str, args: dict, usage: Usage | None = None) -> AssistantTur
     )
 
 
+def cut_turn(text: str = "", reason: str = "length", usage: Usage | None = None) -> AssistantTurn:
+    """Ответ, оборванный до конца (лимит длины, поток без окончания): вызов в нём потерян."""
+    return AssistantTurn(
+        message=Message(role="assistant", content=text),
+        finish_reason=reason,
+        usage=usage or Usage(),
+    )
+
+
 def tools_turn(calls: list[tuple[str, dict]], text: str = "") -> AssistantTurn:
     """Ход с несколькими вызовами сразу (id — c1, c2, …)."""
     return AssistantTurn(

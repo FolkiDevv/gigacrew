@@ -101,7 +101,8 @@ def clip_middle(text: str, limit: int) -> str:
 def render_message(message: Message) -> str:
     """Сообщение диалога плоским текстом (вызовы инструментов — тоже текстом)."""
     if message.role == "user":
-        return f"## User\n{clip_middle(message.content, USER_CLIP)}"
+        title = "gigacrew (harness note)" if message.meta else "User"
+        return f"## {title}\n{clip_middle(message.content, USER_CLIP)}"
     if message.role == "function":
         return f"## Result of {message.name or ''}\n{clip_middle(message.content, RESULT_CLIP)}"
     parts = []
@@ -151,7 +152,7 @@ def _recent_chunks(messages: Sequence[Message], budget_tokens: int) -> list[list
     entries = render_transcript(messages)
     chunks = chunk_entries(entries, budget_tokens)
     kept = chunks[-MAX_INPUT_CHUNKS:]
-    last_user = max((i for i, m in enumerate(messages) if m.role == "user"), default=None)
+    last_user = max((i for i, m in enumerate(messages) if m.is_request), default=None)
     if len(chunks) <= MAX_INPUT_CHUNKS or last_user is None:
         return kept
     first_kept = len(entries) - sum(len(c) for c in kept)

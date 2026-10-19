@@ -948,3 +948,23 @@ def test_oneshot_plan_without_approver_ends_with_plan(tmp_path, oneshot, capsys,
     assert "Одобрить план некому" in function_msgs[-1].content and plan in function_msgs[-1].content
     assert (tmp_path / plan).read_text(encoding="utf-8") == "1. поправить a.py"
     assert "План: 1. поправить a.py" in capsys.readouterr().out
+
+
+def test_oneshot_plan_left_in_text_ends_without_extra_requests(
+    tmp_path, oneshot, capsys, monkeypatch
+):
+    monkeypatch.setattr(ChatStore, "new_id", staticmethod(lambda now=None: "chat1"))
+    plan = ".gigacode/plans/chat1.md"
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": plan, "content": "1. поправить a.py"}),
+            text_turn("План: 1. поправить a.py"),  # без exit_plan_mode
+            text_turn("лишний запрос"),
+        ]
+    )
+    oneshot(provider)
+    assert _main(tmp_path, "--mode", "plan", "-p", "спланируй", "--no-save") == 0
+    assert len(provider.requests) == 2  # ни напоминания, ни самопроверки
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "План: 1. поправить a.py" in output and plan in output  # где лежит план

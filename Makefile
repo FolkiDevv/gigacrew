@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 UV ?= uv
 
-.PHONY: help install dev lock run test test-all lint format check clean
+.PHONY: help install dev lock run test test-all eval probe lint format check clean
 
 help: ## Показать список команд
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -22,8 +22,14 @@ run: ## Запустить gigacrew (REPL) из .venv
 test: ## Быстрые офлайн-тесты (без сети)
 	$(UV) run pytest -m "not live"
 
-test-all: ## Все тесты, включая live (нужны реквизиты API, см. .env.example)
-	$(UV) run pytest
+test-all: ## Все тесты, включая live, кроме eval (нужны реквизиты API, см. .env.example)
+	$(UV) run pytest -m "not eval"
+
+eval: ## Поведенческие сценарии на живых моделях — дорого (ARGS="-k plan_exit" — выборка)
+	$(UV) run pytest -m eval -v $(ARGS)
+
+probe: ## Пробы шлюза: рассуждения, top_p, кеш префикса (live)
+	$(UV) run pytest tests/test_api_probe_live.py -v $(ARGS)
 
 lint: ## Проверить стиль и ошибки (ruff)
 	$(UV) run ruff check .

@@ -80,6 +80,7 @@ from gigacrew.project.instructions import NestedInstructions
 from gigacrew.project.workspace import Workspace
 from gigacrew.security import RiskLevel
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
+from gigacrew.tools.plan import PlanReview, review_plan
 from gigacrew.tools.task import SUBAGENTS, SubagentSpec
 
 # Заметки для модели — на английском, как и промпты (пользователь их не видит).
@@ -106,11 +107,32 @@ PLAN_BLOCKED_NOTE = (
     "describe the needed changes in the plan file and hand it to the user with "
     "exit_plan_mode."
 )
-PLAN_NOT_SUBMITTED_NOTE = (
-    "# Plan not submitted\nYou changed the plan file but ended the turn without handing "
-    "it to the user. Call exit_plan_mode now (without arguments); do not repeat the plan "
-    "as text. If you need the user's answer first, ask with ask_user."
+AUTO_REVIEW_NOTE = (
+    "You ended your reply without calling exit_plan_mode, so gigacrew showed the plan file "
+    "to the user itself. The user's decision:\n\n{result}"
 )
+SELF_CHECK_NOTE = (
+    "# Turn ended in plan mode\nYou ended your turn in plan mode without handing over a "
+    "plan (exit_plan_mode) or asking the user (ask_user). If you meant to continue — for "
+    "example, to write the plan to {path} — do it now with tool calls. If your answer is "
+    "complete and no plan is needed, reply with one word: OK"
+)
+OUTPUT_CUT_NOTE = (
+    "# Reply cut off\nYour previous reply was cut off before it finished (finish_reason: "
+    "{reason}), and any tool call in it was lost. Do it again in smaller pieces: write a "
+    "long file as an outline with write_file and add the sections with edit_file; keep a "
+    "text answer shorter."
+)
+OUTPUT_LIMIT_MESSAGE = (
+    "Прервано: ответ модели {count} раза подряд оборвался, не дойдя до конца "
+    "(finish_reason={reason}). Задача может быть не завершена."
+)
+
+# Ответ без вызовов с такой причиной завершения оборван, а не закончен моделью: вызов в нём
+# мог потеряться. Он не считается финальным — запрос повторяется (не больше MAX_CUT_RETRIES
+# раз за ход).
+CUT_REASONS = frozenset({"length", "incomplete"})
+MAX_CUT_RETRIES = 2
 
 
 # Сжатие контекста — доли бюджета истории (бюджет запроса за вычетом системного
@@ -135,6 +157,11 @@ USER_STOP_REASON = "Пользователь остановил суб-аген�
 
 def _with_note(content: str, note: str | None) -> str:
     return f"{content}\n\n{note}" if note else content
+
+
+def _reminder(note: str) -> str:
+    """Заметка harness'а для одного запроса — в теге, который описан в системном промпте."""
+    return f"<system-reminder>\n{note}\n</system-reminder>"
 
 
 class Agent:
@@ -460,6 +487,8 @@ class Agent:
             raise
 
     def _run_turn(self, user_input: str) -> str:
+        # Рассуждения прошлых ходов модели больше не нужны (GIGACREW_REASONING=turn).
+        self._conversation.forget_reasoning()
         self._conversation.add_user(user_input)
         specs = self._registry.specs()
         guard = self._new_guard()
@@ -526,9 +555,17 @@ class Agent:
         )
 
     def _loop(self, specs: list[ToolSpec], guard: LoopGuard, stats: TurnStats) -> str:
-        """Шаги хода до финального ответа модели или остановки ограничителем."""
+        """Шаги хода до финального ответа модели или остановки ограничителем.
+
+        Ход в режиме плана, закончившийся текстом, harness проверяет по структуре, не по
+        тексту ответа: записанный, но не отправленный план показывает пользователю сам
+        (:meth:`_auto_review`), а если план в ходе не показывался — переспрашивает модель
+        (:meth:`_self_check`).
+        """
         compact_failed = False  # не удалось — до конца хода не пытаемся снова
-        plan_reminded = False  # напоминание отправить план — не больше одного за ход
+        checked = False  # самопроверка — не больше одной за ход
+        reviews = self._plan.reviews if self._plan is not None else 0  # показы плана до хода
+        cuts = 0  # оборванных ответов за ход
         note = ""
         while True:
             context = self._subagent_context(specs, stats)
@@ -540,15 +577,38 @@ class Agent:
                 notes = [guard.pressure(context) or "", note]
                 turn = self._next_turn(specs, note="\n\n".join(n for n in notes if n))
                 note = ""
-                msg = turn.message
                 self._account(turn.usage, stats)
-                if not turn.wants_tool and not plan_reminded and self._plan_unsubmitted():
-                    # Ответ текстом не идёт в историю: запрос не должен кончаться
-                    # репликой ассистента, а напоминание — системное, как итог остановки.
-                    plan_reminded = True
-                    note = PLAN_NOT_SUBMITTED_NOTE
+                if not turn.wants_tool and turn.finish_reason not in CUT_REASONS:
+                    if self._plan_unsubmitted():
+                        self._conversation.add_assistant(turn.message, turn.usage)
+                        review = self._auto_review()
+                        if review is None or not review.continues:
+                            return turn.message.content
+                        result = AUTO_REVIEW_NOTE.format(result=review.content)
+                        self._conversation.add_user(_reminder(result), meta=True)
+                        continue
+                    if not checked and self._self_check_due(reviews):
+                        checked = True
+                        followup = self._self_check(specs, turn, stats)
+                        if followup is None:
+                            return turn.message.content
+                        turn = followup  # с вызовами или оборван — дальше как обычно
+                msg = turn.message
+                # Повтор ниже: ответ текстом не идёт в историю — запрос не должен кончаться
+                # репликой ассистента, — а заметка дописывается к хвосту следующего запроса.
+                if not turn.wants_tool and turn.finish_reason in CUT_REASONS:
+                    self._forget_reply(turn, stats)
+                    if cuts >= MAX_CUT_RETRIES:
+                        message = OUTPUT_LIMIT_MESSAGE.format(
+                            count=cuts + 1, reason=turn.finish_reason
+                        )
+                        return self._stopped(specs, StopReason("output_limit", message), stats)
+                    cuts += 1
+                    stats.cut_retries += 1
+                    note = OUTPUT_CUT_NOTE.format(reason=turn.finish_reason)
                     self._events.on_notice(
-                        "план изменён, но не отправлен на одобрение — напоминаю модели",
+                        f"ответ модели оборван (finish_reason={turn.finish_reason}) — "
+                        f"повторяю запрос ({cuts}/{MAX_CUT_RETRIES})",
                         level="warn",
                     )
                     continue
@@ -568,6 +628,80 @@ class Agent:
             and self._parent is None
             and self.mode is PermissionMode.PLAN
         )
+
+    def _auto_review(self) -> PlanReview | None:
+        """Показать пользователю план, который модель записала, но не отправила.
+
+        Исход — как у ``exit_plan_mode``; None — показать нечего (файл плана пуст или не
+        читается).
+        """
+        plan = self._plan
+        if plan is None:
+            return None
+        try:
+            review = review_plan(
+                self._ctx,
+                plan,
+                on_show=lambda: self._events.on_notice(
+                    "план записан, но не отправлен на одобрение — показываю его"
+                ),
+            )
+        except ToolError:
+            plan.dirty = False
+            self._events.on_notice("план не показан: файл плана пуст или не читается", level="warn")
+            return None
+        summary = review.summary
+        if review.outcome == "no_approver":
+            summary = f"{summary} — план сохранён в {self._plan_display()}"
+        self._events.on_notice(summary)
+        return review
+
+    def _self_check_due(self, reviews: int) -> bool:
+        """Нужна ли самопроверка: основной агент в режиме плана, план не менялся и в этом
+        ходе не показывался (``reviews`` — число показов до хода)."""
+        return (
+            self._plan is not None
+            and self._parent is None
+            and self.mode is PermissionMode.PLAN
+            and not self._plan.dirty
+            and self._plan.reviews == reviews
+        )
+
+    def _self_check(
+        self, specs: list[ToolSpec], turn: AssistantTurn, stats: TurnStats
+    ) -> AssistantTurn | None:
+        """Ход в режиме плана кончился текстом — без плана и без вопроса: переспросить.
+
+        Модель могла пообещать действие («сейчас запишу план») и остановиться, а могла
+        просто ответить на вопрос; по тексту их не отличить — спрашивается сама модель.
+        Ответ ``turn`` остаётся в истории, за ним — служебное сообщение с вопросом, и
+        ответ на него не печатается. С вызовами или оборванный ответ возвращается — ход
+        идёт дальше как обычно. Только текст — служебное сообщение убирается, финальным
+        остаётся ``turn`` (None); так же при сбое запроса.
+        """
+        stats.self_checks += 1
+        conversation = self._conversation
+        conversation.add_assistant(turn.message, turn.usage)
+        mark, context = len(conversation), stats.context_tokens
+        note = SELF_CHECK_NOTE.format(path=self._plan_display())
+        conversation.add_user(_reminder(note), meta=True)
+        try:
+            check = self._next_turn(specs, quiet=True)
+        except LLMError as e:
+            conversation.truncate(mark)
+            self._events.on_notice(f"самопроверка плана не удалась: {e}", level="warn")
+            return None
+        except BaseException:
+            conversation.truncate(mark)
+            raise
+        self._account(check.usage, stats)
+        if check.wants_tool or check.finish_reason in CUT_REASONS:
+            return check
+        conversation.truncate(mark)
+        stats.context_tokens = context
+        if self._context_model == self._model:
+            self._context = context
+        return None
 
     def _run_calls(
         self, calls: list[FunctionCall], guard: LoopGuard, stats: TurnStats
@@ -617,6 +751,16 @@ class Agent:
         # Суб-агенту без итога — пустой ответ: отчёт сам назовёт причину остановки.
         return text or ("" if self._parent is not None else stop.message)
 
+    def _forget_reply(self, turn: AssistantTurn, stats: TurnStats) -> None:
+        """Ответ не идёт в историю: его вывод не занимает контекст следующего запроса.
+
+        Иначе оборванный длинный ответ раздул бы счётчик, и суб-агент ложно упёрся бы в
+        предел контекста.
+        """
+        stats.context_tokens = max(stats.context_tokens - turn.usage.completion_tokens, 0)
+        if self._context_model == self._model:
+            self._context = stats.context_tokens
+
     def _account(self, usage: Usage, stats: TurnStats) -> None:
         """Учесть расход обращения: статистика хода, сессия, размер контекста, калибровка.
 
@@ -663,10 +807,10 @@ class Agent:
         пришёл, не выполняется — в историю идёт только текст. Сбой обращения к модели
         не мешает: остаётся сообщение ограничителя.
 
-        Просьба подвести итог — дополнение к системному сообщению, а не сообщение
-        пользователя: окно истории закрепляет последний запрос пользователя, и такая
-        просьба вытеснила бы из обрезанной истории саму задачу. ``user_stop`` — суб-агент
-        остановлен пользователем (Esc). ``reason`` — причина для пользователя,
+        Просьба подвести итог — заметка к последнему сообщению запроса, а не отдельное
+        сообщение пользователя: окно истории закрепляет последний запрос пользователя, и
+        такая просьба вытеснила бы из обрезанной истории саму задачу. ``user_stop`` —
+        суб-агент остановлен пользователем (Esc). ``reason`` — причина для пользователя,
         ``model_reason`` — для модели.
         """
         self._wrapping = True
@@ -748,20 +892,36 @@ class Agent:
         дописывается к системному сообщению (API принимает одно системное
         сообщение — первым); история — сообщения после него, а если и они не
         укладываются в бюджет, старые отбрасываются (:func:`fit_history`).
+
+        ``note`` — заметка только для этого запроса (итог остановки, бюджет, напоминание).
+        Она дописывается в конец последнего сообщения — запроса пользователя или
+        результата вызова, — то есть туда, где модель её видит, а не в начало контекста;
+        дописывается к копии, диалог не меняется. Если хвост истории другой — к
+        системному сообщению.
         """
         system_text = self._system_text()
         summary = self._conversation.summary
         if summary is not None:
             system_text = f"{system_text}\n\n{summary_prompt(summary.text)}"
-        if note:
-            system_text = f"{system_text}\n\n{note}"
-        system = Message(role="system", content=system_text)
-        # Схемы инструментов уходят в каждом запросе и занимают то же окно.
-        used = estimate_tokens([system]) + estimate_specs_tokens(specs)
+        reminder = _reminder(note) if note else ""
+        # Схемы инструментов и заметка уходят в запросе и занимают то же окно.
+        used = (
+            estimate_tokens([Message(role="system", content=system_text)])
+            + estimate_specs_tokens(specs)
+            + (estimate_text_tokens(reminder) if reminder else 0)
+        )
         budget = max(self._estimate_budget() - used, MIN_HISTORY_TOKENS)
         history = fit_history(self._conversation.context_messages(), budget)
         self._last_estimate = used + estimate_tokens(history)
-        return [system, *history]
+        if reminder:
+            if history and history[-1].role in ("user", "function"):
+                last = history[-1]
+                history[-1] = last.model_copy(
+                    update={"content": _with_note(last.content, reminder)}
+                )
+            else:
+                system_text = f"{system_text}\n\n{reminder}"
+        return [Message(role="system", content=system_text), *history]
 
     # ------------------------------------------------------------------ #
     def compact(self, instructions: str = "") -> CompactResult | None:
@@ -860,47 +1020,58 @@ class Agent:
         return result
 
     def _next_turn(
-        self, specs: list[ToolSpec], note: str = "", *, tool_choice: ToolChoice = "auto"
+        self,
+        specs: list[ToolSpec],
+        note: str = "",
+        *,
+        tool_choice: ToolChoice = "auto",
+        quiet: bool = False,
     ) -> AssistantTurn:
         """Один проход модели с выводом текста (потоковым или цельным).
 
-        ``note`` — дополнение к системному сообщению только для этого запроса;
-        ``tool_choice="none"`` — ответ только текстом (итог после остановки).
-        Оборванный поток (Esc, сбой сети) оставляет в истории основного агента уже
-        показанный текст с пометкой — модель знает, что её ответ прерван, а следующий
-        запрос не идёт двумя репликами пользователя подряд. У суб-агента текст не
-        показывается и не сохраняется.
+        ``note`` — заметка только для этого запроса (см. :meth:`_build_request`);
+        ``tool_choice="none"`` — ответ только текстом (итог после остановки); ``quiet`` —
+        текст показывается, только если в ответе есть вызовы, и целиком после ответа
+        (самопроверка). Оборванный поток (Esc, сбой сети) оставляет в истории основного
+        агента уже показанный текст с пометкой — модель знает, что её ответ прерван, а
+        следующий запрос не идёт двумя репликами пользователя подряд. У суб-агента текст
+        не показывается и не сохраняется.
         """
         messages = self._build_request(specs, note)
         streamed: list[str] = []
 
         def on_delta(text: str) -> None:
             streamed.append(text)
-            self._events.on_stream_delta(text)
+            if not quiet:
+                self._events.on_stream_delta(text)
 
         self._events.on_stream_start()
         try:
             if self._cfg.stream:
-                return self._provider.stream(
+                turn = self._provider.stream(
                     messages,
                     tools=specs,
                     model=self._model,
                     temperature=self._cfg.temperature,
                     tool_choice=tool_choice,
                     on_delta=on_delta,
+                    on_notice=self._provider_notice,
                 )
-            turn = self._provider.complete(
-                messages,
-                tools=specs,
-                model=self._model,
-                temperature=self._cfg.temperature,
-                tool_choice=tool_choice,
-            )
+            else:
+                turn = self._provider.complete(
+                    messages,
+                    tools=specs,
+                    model=self._model,
+                    temperature=self._cfg.temperature,
+                    tool_choice=tool_choice,
+                    on_notice=self._provider_notice,
+                )
         except BaseException as e:
             partial = "".join(streamed).rstrip()
             # Суб-агенту оборванный текст не нужен: пользователь его не видел, а запрос
-            # итога после остановки (Esc) не должен кончаться репликой ассистента.
-            if partial.strip() and self._parent is None:
+            # итога после остановки (Esc) не должен кончаться репликой ассистента. Тихий
+            # ответ пользователь тоже не видел.
+            if partial.strip() and self._parent is None and not quiet:
                 tail = (
                     INTERRUPTED_ANSWER_NOTE
                     if isinstance(e, KeyboardInterrupt)
@@ -911,9 +1082,19 @@ class Agent:
         finally:
             self._events.on_stream_end()
 
-        if turn.message.content.strip():
+        shown = self._cfg.stream and not quiet  # текст уже показан потоком
+        if not shown and turn.message.content.strip() and (turn.wants_tool or not quiet):
             self._events.on_assistant_text(turn.message.content)
+        if self._cfg.reasoning == "off" and turn.message.reasoning:
+            # Не возвращаются модели — и не хранятся: размер истории равен отправляемому.
+            message = turn.message.model_copy(update={"reasoning": ""})
+            turn = turn.model_copy(update={"message": message})
         return turn
+
+    def _provider_notice(self, text: str) -> None:
+        """Сообщение провайдера пользователю: пауза при лимите запросов, отказ шлюза
+        принять рассуждения."""
+        self._events.on_notice(text, level="warn")
 
     # ------------------------------------------------------------------ #
     def _execute_tool_call(self, function_call: FunctionCall, check: CallCheck) -> ToolOutcome:
