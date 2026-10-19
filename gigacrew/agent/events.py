@@ -61,6 +61,11 @@ class TurnStats:
     duration_s: float = 0.0
     # Успешных изменяющих вызовов за ход (правки, изменяющие команды).
     changes: int = 0
+    # Повторов запроса после ответа, оборванного до конца (finish_reason length/incomplete).
+    cut_retries: int = 0
+    # Самопроверок: ход в режиме плана кончился текстом без плана и вопроса — harness
+    # переспросил модель, не собиралась ли она продолжить.
+    self_checks: int = 0
 
     @property
     def billed_tokens(self) -> int:

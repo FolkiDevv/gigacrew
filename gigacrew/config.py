@@ -136,6 +136,16 @@ def _env_mode(env: Mapping[str, str], name: str) -> PermissionMode:
         raise ConfigError(f"{name}: {e}") from e
 
 
+def _env_choice(env: Mapping[str, str], name: str, choices: tuple[str, ...]) -> str:
+    """Значение из списка (первое — по умолчанию)."""
+    raw = (env.get(name) or "").strip().lower()
+    if not raw:
+        return choices[0]
+    if raw not in choices:
+        raise ConfigError(f"{name}: ожидается одно из {', '.join(choices)}, получено {raw!r}")
+    return raw
+
+
 def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, hi: float) -> float:
     raw = env.get(name)
     if raw is None or not raw.strip():
@@ -178,6 +188,12 @@ class Config:
     # по умолчанию.
     ca_bundle: str | None = None
     timeout: int = 120
+    # Ожидание ответа модели в запросах чата, с (не меньше timeout): вызовы инструментов
+    # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план, файл),
+    # байты не идут — обычный timeout оборвал бы такой ответ.
+    read_timeout: int = 600
+    # Сколько ждать при 429 (лимит запросов шлюза) на один запрос, с; 0 — не ждать.
+    rate_limit_wait: int = 120
 
     # --- Агент / окружение ---
     project_root: Path = field(default_factory=Path.cwd)
@@ -193,6 +209,10 @@ class Config:
     max_tool_repeats: int = 3
     temperature: float = 0.2
     stream: bool = True  # потоковый (посимвольный) вывод ответа модели
+    # Возвращать ли модели её рассуждения: "turn" — в пределах хода (до следующего
+    # запроса пользователя), как советуют вендоры моделей с рассуждениями; "off" — нет.
+    # Модели без рассуждений это не касается: возвращать нечего, запрос тот же.
+    reasoning: str = "turn"
     # Бюджет контекста (оценка в токенах), в который укладывается история при
     # отправке модели; старые сообщения сверх бюджета отбрасываются. None — от
     # замеренного окна модели (~/.gigacrew/models.json), число — явное переопределение.
@@ -257,12 +277,15 @@ class Config:
             verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", ca_bundle is not None),
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             timeout=_env_int(env, "GIGACREW_TIMEOUT", 120),
+            read_timeout=_env_int(env, "GIGACREW_READ_TIMEOUT", 600),
+            rate_limit_wait=_env_int(env, "GIGACREW_RATE_LIMIT_WAIT", 120, minimum=0),
             project_root=root,
             auto_approve=auto_approve or yes_all,
             yes_all=yes_all,
             mode=mode or _env_mode(env, "GIGACREW_MODE"),
             stream=stream,
             temperature=_env_float(env, "GIGACREW_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
+            reasoning=_env_choice(env, "GIGACREW_REASONING", ("turn", "off")),
             context_budget_tokens=_env_optional_int(env, "GIGACREW_CONTEXT_TOKENS", minimum=4_000),
             auto_compact=_env_bool(env, "GIGACREW_AUTO_COMPACT", True),
             compact_threshold=_env_int(

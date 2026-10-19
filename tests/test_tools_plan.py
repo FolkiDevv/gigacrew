@@ -13,6 +13,7 @@ from gigacrew.tools.plan import (
     DECLINED_NOTE,
     NO_APPROVER_NOTE,
     ExitPlanModeTool,
+    review_plan,
 )
 from gigacrew.tools.questions import Answer, QuestionsUnavailable
 
@@ -105,6 +106,41 @@ def test_nobody_to_approve(tmp_path, session):
     result = _run(tmp_path, session)
     assert session.mode is PermissionMode.PLAN
     assert result.ok and result.content == NO_APPROVER_NOTE.format(path=PLAN_REL)
+    # отдать план дальше нельзя — он «отправлен»: harness не напоминает о нём снова
+    assert not session.plan.dirty and session.plan.reviews == 1
+
+
+@pytest.mark.parametrize(
+    ("answers", "outcome", "continues"),
+    [
+        ([Answer((APPROVE_EDITS,))], "approved", True),
+        ([Answer(custom="ещё тесты")], "revise", True),
+        (None, "declined", False),
+        (QuestionsUnavailable(), "no_approver", False),
+    ],
+)
+def test_review_outcomes(tmp_path, answers, outcome, continues):
+    _write_plan(tmp_path)
+    session = _Session(answers)
+    shown: list[int] = []
+    review = review_plan(
+        session.context(tmp_path), session.plan, on_show=lambda: shown.append(len(session.asked))
+    )
+    assert review.outcome == outcome and review.continues is continues
+    assert shown == [0]  # перед вопросом пользователю
+    assert session.plan.reviews == 1 and not session.plan.dirty
+
+
+@pytest.mark.parametrize("plan", [None, "  \n "])
+def test_review_of_missing_plan_shows_nothing(tmp_path, plan):
+    if plan is not None:
+        _write_plan(tmp_path, plan)
+    session = _Session([Answer((APPROVE_EDITS,))])
+    shown: list[bool] = []
+    context = session.context(tmp_path)
+    with pytest.raises(ToolError):
+        review_plan(context, session.plan, on_show=lambda: shown.append(True))
+    assert shown == [] and session.asked == [] and session.plan.reviews == 0
 
 
 def test_outside_plan_mode_is_an_error(tmp_path):

@@ -92,6 +92,8 @@ def test_render_message_clips_results_and_shows_calls():
     assert result.startswith("## Result of run_shell\nAAA")
     assert "chars cut" in result and len(result) < 2_200
     assert render_message(Message(role="user", content="привет")) == "## User\nпривет"
+    note = Message(role="user", content="план одобрен", meta=True)
+    assert render_message(note) == "## gigacrew (harness note)\nплан одобрен"
 
 
 def test_clip_middle_keeps_head_and_tail():
@@ -239,7 +241,8 @@ def test_summarize_request_fits_budget_with_huge_instructions_and_old_summary():
         assert estimate_tokens(request["messages"]) <= 4_000
 
 
-def test_summarize_keeps_latest_request_when_old_chunks_dropped():
+@pytest.mark.parametrize("meta", [False, True], ids=["plain", "with_meta_message"])
+def test_summarize_keeps_latest_request_when_old_chunks_dropped(meta):
     # Длинный последний ход: запрос, затем много больших результатов — запрос
     # оказывается старше трёх последних кусков, но на вход суммаризатора попадает.
     messages = _messages(2, 4_000)
@@ -248,6 +251,8 @@ def test_summarize_keeps_latest_request_when_old_chunks_dropped():
         Message(role="function", name="read_file", content=f"файл {i:02} " + "x" * 4_000)
         for i in range(12)  # ~2 результата на кусок (обрезаются до 2000 символов)
     ]
+    if meta:  # служебное сообщение посреди хода — не запрос: закрепляется задача
+        messages.insert(5, Message(role="user", content="план одобрен", meta=True))
     provider = ScriptedProvider(summaries=[text_turn(f"сводка {i}") for i in range(5)])
     summarize(provider, messages, model="M", temperature=0.2, input_budget=2_500, max_chars=600)
     assert len(provider.summary_requests) == MAX_INPUT_CHUNKS

@@ -47,6 +47,8 @@ def estimate_message_tokens(message: Message) -> int:
     for call in message.function_calls:
         args = json.dumps(call.arguments, ensure_ascii=False)
         size += estimate_text_tokens(call.name + args)
+    if message.reasoning:  # уходит отдельным сообщением перед ответом
+        size += estimate_text_tokens(message.reasoning) + MESSAGE_OVERHEAD_TOKENS
     return size + MESSAGE_OVERHEAD_TOKENS
 
 
@@ -82,7 +84,7 @@ def fit_history(history: Sequence[Message], budget_tokens: int) -> list[Message]
 
     blocks = _blocks(history)
     sizes = [estimate_tokens(b) for b in blocks]
-    pinned_user = max((i for i, b in enumerate(blocks) if b[0].role == "user"), default=None)
+    pinned_user = max((i for i, b in enumerate(blocks) if b[0].is_request), default=None)
     pinned = {len(blocks) - 1}
     if pinned_user is not None:
         pinned.add(pinned_user)

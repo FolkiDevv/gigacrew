@@ -5,8 +5,11 @@
 инструментов и возвращает только итоговый отчёт — контекст основного агента не
 засоряется промежуточными результатами.
 
-Здесь — описания встроенных агентов (данные, общие для инструмента и ядра) и сам
-инструмент. Запускает суб-агента ядро (:mod:`gigacrew.agent.subagents`,
+Исследование кода — отдельный инструмент ``explore``: один вопрос вместо брифа и типа
+агента. Модель охотнее берёт инструмент «ответь на вопрос о коде», чем «поручи подзадачу».
+
+Здесь — описания встроенных агентов (данные, общие для инструментов и ядра) и сами
+инструменты. Запускает суб-агента ядро (:mod:`gigacrew.agent.subagents`,
 ``Agent._run_subagent``) — инструмент получает его через ``ToolContext.run_subagent``.
 """
 
@@ -14,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 
@@ -36,13 +39,14 @@ class SubagentSpec:
 
 # Суб-агенту недоступны: запуск суб-агентов (без вложенности), вопросы пользователю и
 # одобрение плана — пользователь говорит только с основным агентом.
-SUBAGENT_EXCLUDED: frozenset[str] = frozenset({"task", "ask_user", "exit_plan_mode"})
+SUBAGENT_EXCLUDED: frozenset[str] = frozenset({"task", "explore", "ask_user", "exit_plan_mode"})
 
 EXPLORE = SubagentSpec(
     name="explore",
     description=(
         "codebase research, read-only: search, code navigation, reading files, git "
-        "status/diff/log. Returns a digest with paths and line numbers"
+        "status/diff/log. Returns a digest with paths and line numbers. For a research "
+        "question prefer the explore tool"
     ),
     tools=frozenset(
         {
@@ -84,7 +88,11 @@ def _agents_list() -> str:
 
 
 class TaskParams(BaseModel):
-    agent: str = Field(description=f"Subagent type: {', '.join(SUBAGENTS)}.")
+    # Прежнее имя параметра — agent: так его пишут старые чаты и модели по привычке.
+    subagent_type: str = Field(
+        validation_alias=AliasChoices("subagent_type", "agent"),
+        description=f"Subagent type: {' or '.join(SUBAGENTS)}.",
+    )
     prompt: str = Field(
         description=(
             "A complete brief — the subagent does NOT see this conversation: the goal and "
@@ -98,29 +106,78 @@ class TaskParams(BaseModel):
     )
 
 
+class ExploreParams(BaseModel):
+    question: str = Field(
+        description=(
+            "What to find out about the code, as one full question, e.g. 'How is a "
+            "request authenticated: where are credentials checked and where is the "
+            "session created?'"
+        )
+    )
+    hints: str = Field(
+        "",
+        description=(
+            "Optional: what you already know (paths, names, strings, errors) and what is "
+            "out of scope."
+        ),
+    )
+
+
+class ExploreTool(Tool):
+    name = "explore"
+    description = (
+        "Investigates the codebase to answer a question and returns a short report with "
+        "path:line references. A read-only subagent does the searching and reading in its "
+        "own context, so none of it fills yours. Use it instead of searching yourself for "
+        "any question that is not a pinpoint lookup: how something works, where something "
+        "is handled or configured, which code a change will touch and what depends on it, "
+        "how it is tested, an overview. Several independent questions — several explore "
+        "calls in one response. Not for a known file, symbol or string: use read_file, "
+        "find_symbol or search_content directly."
+    )
+    Params = ExploreParams
+
+    def describe(self, params: ExploreParams) -> str:
+        return " ".join(params.question.split())[:70]
+
+    def run(self, params: ExploreParams, ctx: ToolContext) -> ToolResult:
+        question = params.question.strip()
+        if not question:
+            raise ToolError("Пустой вопрос: опиши в параметре question, что выяснить.")
+        if ctx.run_subagent is None:
+            raise ToolError("суб-агенты здесь недоступны — выясни сам.")
+        hints = params.hints.strip()
+        brief = f"{question}\n\nAlready known / out of scope: {hints}" if hints else question
+        return ctx.run_subagent(EXPLORE.name, task_title("", question), brief)
+
+
 class TaskTool(Tool):
     name = "task"
     description = (
-        "Runs a subagent with its own context for a self-contained subtask and returns "
-        "its final report; the subagent's intermediate steps do not get into your "
-        f"context. Agents: {_agents_list()}. The subagent has a limited number of steps "
-        "and a limited context: give it ONE narrow question or subtask (one subsystem, "
-        "one flow) and split broad research into several such tasks sent in one "
-        "response. Pinpoint questions (a known file or symbol) are faster to answer "
-        "yourself. A report of a subagent stopped by a limit is partial but useful: do "
-        "not rerun the same task — narrow it to what remains. If the user stopped a "
-        "subagent, do not run the same task again unless asked."
+        "Hands a self-contained subtask to a subagent that works in its own context and "
+        "returns only its final report. For research questions use the explore tool; "
+        "task is mainly for a general subagent: a change that needs no decisions from the "
+        "user (a fix with its test, a refactoring inside one module, one of several "
+        f"independent subtasks — one subagent each, in one response). Subagent types: "
+        f"{_agents_list()}. A subagent has limited steps and context: give it ONE narrow "
+        "subtask and a complete brief — it does not see this conversation. Do not delegate "
+        "what needs the user's decisions, and do not let it edit files you are changing "
+        "yourself. A report of a subagent stopped by a limit is partial but useful: do not "
+        "rerun the same task — narrow it to what remains. If the user stopped a subagent, "
+        "do not run the same task again unless asked."
     )
     Params = TaskParams
 
     def describe(self, params: TaskParams) -> str:
-        return f"{params.agent.strip()} · {task_title(params.description, params.prompt)}"[:70]
+        kind = params.subagent_type.strip()
+        return f"{kind} · {task_title(params.description, params.prompt)}"[:70]
 
     def run(self, params: TaskParams, ctx: ToolContext) -> ToolResult:
-        agent = params.agent.strip().lower()
+        agent = params.subagent_type.strip().lower()
         if agent not in SUBAGENTS:
             raise ToolError(
-                f"неизвестный суб-агент {params.agent.strip()!r}; доступны: {', '.join(SUBAGENTS)}."
+                f"неизвестный суб-агент {params.subagent_type.strip()!r}; "
+                f"доступны: {', '.join(SUBAGENTS)}."
             )
         prompt = params.prompt.strip()
         if not prompt:

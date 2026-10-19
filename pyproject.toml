@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "gigacrew"
-version = "0.6.1"
+version = "0.6.2"
 description = "Консольный помощник для работы с кодом проекта"
 readme = "README.md"
 authors = [
@@ -89,5 +89,6 @@ select = ["E", "F", "I", "UP", "B", "W"]
 [tool.pytest.ini_options]
 markers = [
     "live: тесты, реально обращающиеся к API (нужны реквизиты, GIGACREW_API_URL и GIGACREW_TEST_MODEL)",
+    "eval: поведенческие сценарии на живых моделях — дорого, запуск через make eval (tests/test_behavior_live.py)",
 ]
 testpaths = ["tests"]

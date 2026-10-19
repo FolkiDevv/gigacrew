@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from gigacrew.config import Config
@@ -100,6 +102,21 @@ def test_payload_without_tools_has_no_tool_options():
     assert payload["model_options"] == {"temperature": 0}
     assert p._payload([], None, model="m", temperature=0, stream=True)["stream"] is True
     p.close()
+
+
+def test_reasoning_goes_before_its_answer():
+    """Рассуждения ответа — сообщение role=reasoning перед ним (формат проверен пробой)."""
+    call = FunctionCall(name="read_file", arguments={"path": "a"}, id="c1")
+    history = [
+        Message(role="user", content="?"),
+        Message(role="assistant", function_calls=[call], state_id="S", reasoning="надо прочитать"),
+        Message(role="function", name="read_file", content="x", call_id="c1"),
+        Message(role="assistant", content="готово"),  # без рассуждений
+    ]
+    sent = ApiProvider._messages_payload(history)
+    assert [m["role"] for m in sent] == ["user", "reasoning", "assistant", "tool", "assistant"]
+    assert sent[1] == {"role": "reasoning", "content": [{"text": "надо прочитать"}]}
+    assert sent[3]["tools_state_id"] == "S"
 
 
 def test_several_calls_and_results_serialized_as_one_tool_message():
@@ -239,6 +256,7 @@ def test_parse_response_with_reasoning_text_and_parallel_calls():
     assert turn.wants_tool
     assert turn.finish_reason == "function_call"
     assert turn.message.content == "Вызываю get_weather для обоих городов:"  # без рассуждений
+    assert turn.message.reasoning == "Сделаю оба вызова сразу."  # отдельно от текста
     assert turn.message.function_calls == [
         FunctionCall(name="get_weather", arguments={"city": "Москва"}, id="ba12"),
         FunctionCall(name="get_weather", arguments={"city": "Казань"}, id="4552"),
@@ -317,6 +335,7 @@ def test_consume_sse_parallel_calls():
     turn = ApiProvider._consume_sse(_FakeSSE(PARALLEL_STREAM), deltas.append)
     assert deltas == ["Получаю погоду ", "для обоих городов:"]  # рассуждения не показываются
     assert turn.message.content == "Получаю погоду для обоих городов:"
+    assert turn.message.reasoning == "Оба вызова сразу."
     assert [c.id for c in turn.message.function_calls] == ["8879", "bd7a"]
     assert turn.message.function_calls[1].arguments == {"city": "Казань"}
     assert turn.message.state_id == "01a12ea7"
@@ -341,6 +360,74 @@ def test_consume_sse_text_stream():
     assert turn.finish_reason == "stop"
     assert turn.usage.total_tokens == 5
     assert not turn.wants_tool
+
+
+_PREAMBLE = (
+    'event: response.message.delta\ndata: {"messages":[{"role":"assistant",'
+    '"content":[{"text":"Сейчас запишу план"}]}]}\n\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("tail", "finish"),
+    [
+        ("", "incomplete"),  # шлюз закрыл поток посреди ответа: вызов мог потеряться
+        ('event: response.message.done\ndata: {"messages":[]}\n\n', "stop"),
+        ("data: [DONE]\n\n", "stop"),
+        ('data: {"messages":[],"usage":{"total_tokens":5}}\n\n', "stop"),
+        (
+            'event: response.message.done\ndata: {"messages":[],"finish_reason":"length"}\n\n',
+            "length",
+        ),
+    ],
+)
+def test_consume_sse_stream_without_end_is_incomplete(tail, finish):
+    turn = ApiProvider._consume_sse(_FakeSSE(_PREAMBLE + tail), lambda _s: None)
+    assert turn.message.content == "Сейчас запишу план"
+    assert turn.finish_reason == finish
+    assert not turn.wants_tool
+
+
+def _delta(text: str) -> str:
+    chunk = {"messages": [{"role": "assistant", "content": [{"text": text}]}]}
+    return f"event: response.message.delta\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+_DONE = 'event: response.message.done\ndata: {"messages":[],"finish_reason":"stop"}\n\n'
+
+
+@pytest.mark.parametrize(
+    ("pieces", "shown", "content"),
+    [
+        # шлюз убрал рассуждения, а закрывающий тег оставил в начале ответа (MiniMax)
+        (["</mm:", "think>", "\n\nОтвет"], ["Ответ"], "Ответ"),
+        (["</mm:think>План записан"], ["План записан"], "План записан"),
+        (["\n</think>\n", "Готово"], ["Готово"], "Готово"),
+        # не тег — текст как есть, с исходными пробелами
+        (["  При", "вет"], ["  При", "вет"], "  Привет"),
+        (["<b>жирный</b>"], ["<b>жирный</b>"], "<b>жирный</b>"),
+        (["</", "mm:", "thinking"], ["</mm:thinking"], "</mm:thinking"),
+        (["Ответ </think>"], ["Ответ </think>"], "Ответ </think>"),
+        # ответ кончился, так и не став тегом, — в истории он целиком
+        (["</mm"], [], "</mm"),
+    ],
+)
+def test_leaked_reasoning_tag_is_dropped_from_the_start(pieces, shown, content):
+    stream = "".join(_delta(piece) for piece in pieces) + _DONE
+    deltas: list[str] = []
+    turn = ApiProvider._consume_sse(_FakeSSE(stream), deltas.append)
+    assert deltas == shown
+    assert turn.message.content == content
+
+
+def test_leaked_reasoning_tag_is_dropped_from_whole_response():
+    data = {"messages": [{"role": "assistant", "content": [{"text": "</mm:think>Ответ"}]}]}
+    assert ApiProvider._parse_response(data).message.content == "Ответ"
+
+
+def test_parse_response_without_finish_reason_is_complete():
+    data = {"messages": [{"role": "assistant", "content": [{"text": "ok"}]}]}
+    assert ApiProvider._parse_response(data).finish_reason == "stop"
 
 
 def test_consume_sse_repeated_call_id_is_not_duplicated():

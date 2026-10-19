@@ -108,6 +108,54 @@ def test_context_messages_empty_after_full_compaction():
     assert [m.content for m in conv.context_messages()] == ["дальше"]
 
 
+def test_meta_message_is_saved_and_is_not_a_request():
+    conv = Conversation()
+    conv.add_user("ЗАДАЧА")
+    conv.add_assistant(Message(role="assistant", content="ответ"))
+    conv.add_user("<system-reminder>\nплан одобрен\n</system-reminder>", meta=True)
+    data = json.loads(json.dumps(conv.to_dict(), ensure_ascii=False))
+    assert "meta" not in data["messages"][0]  # по умолчанию поле не пишется
+    restored = Conversation.from_dict(data)
+    assert [m.meta for m in restored.messages] == [False, False, True]
+    assert [m.is_request for m in restored.messages] == [True, False, False]
+
+
+def test_context_messages_pin_the_task_not_a_meta_message():
+    conv = _mid_turn()
+    conv.add_user("<system-reminder>план одобрен</system-reminder>", meta=True)
+    conv.add_assistant(_call(path="3.py"))
+    conv.add_function_result("read_file", "файл 3")
+    conv.set_summary(Summary("сводка", 5))
+    # служебное сообщение после границы — не новый запрос: задача остаётся закреплённой
+    assert conv.context_messages()[0].content == "ЗАДАЧА"
+
+
+def test_truncate_drops_the_tail_but_never_summarized_messages():
+    conv = _mid_turn()
+    size = len(conv)
+    conv.add_user("служебное", meta=True)
+    conv.truncate(size)
+    assert len(conv) == size and conv.messages[-1].role == "function"
+    with pytest.raises(ValueError):
+        conv.truncate(size + 1)
+    conv.set_summary(Summary("сводка", 5))
+    with pytest.raises(ValueError):
+        conv.truncate(4)
+    conv.truncate(5)
+    assert len(conv) == 5
+
+
+def test_reasoning_is_estimated_and_forgotten():
+    plain = Message(role="assistant", content="ответ")
+    thinking = plain.model_copy(update={"reasoning": "р" * 300})
+    assert estimate_tokens([thinking]) > estimate_tokens([plain]) + 100
+    conv = Conversation()
+    conv.add_user("вопрос")
+    conv.add_assistant(thinking)
+    conv.forget_reasoning()
+    assert conv.messages[-1] == plain
+
+
 def test_set_summary_does_not_move_back():
     conv = _mid_turn()
     conv.set_summary(Summary("сводка", 5))
@@ -228,6 +276,17 @@ def test_fit_history_keeps_pinned_even_over_budget():
     history = _history()
     fitted = fit_history(history, 10)
     assert [m.content for m in fitted if m.role == "user"] == ["ТЕКУЩАЯ ЗАДАЧА"]
+    assert fitted[-1].content == "последний результат"
+
+
+def test_fit_history_pins_the_request_not_a_meta_message():
+    history = _history()
+    meta = Message(
+        role="user", content="<system-reminder>план одобрен</system-reminder>", meta=True
+    )
+    history.insert(5, meta)  # после первого вызова текущего хода
+    fitted = fit_history(history, 10)
+    assert [m.content for m in fitted if m.is_request] == ["ТЕКУЩАЯ ЗАДАЧА"]
     assert fitted[-1].content == "последний результат"
 
 
