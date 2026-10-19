@@ -82,6 +82,7 @@ def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
         {"GIGACREW_SUBAGENT_TIMEOUT": "long"},
         {"GIGACREW_READ_TIMEOUT": "0"},
         {"GIGACREW_READ_TIMEOUT": "long"},
+        {"GIGACREW_PROVIDER": "openai"},
     ],
 )
 def test_bad_values_raise_config_error(tmp_path, env):
@@ -99,7 +100,7 @@ def test_main_reports_config_error(tmp_path, monkeypatch, capsys):
 
 def test_main_without_credentials(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    for name in ("GIGACREW_ACCESS_KEY", "GIGACREW_CERT", "GIGACREW_KEY"):
+    for name in ("GIGACREW_ACCESS_KEY", "GIGACREW_CERT", "GIGACREW_KEY", "GIGACREW_PROVIDER"):
         monkeypatch.delenv(name, raising=False)
     assert main(["-C", str(tmp_path), "-p", "x", "--no-color"]) == 1
     assert "реквизиты" in capsys.readouterr().out
@@ -127,8 +128,41 @@ def test_endpoints_and_model_have_no_defaults(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GIGACREW_AUTH_URL", "https://auth.test/oauth")
     monkeypatch.setenv("GIGACREW_API_URL", "https://api.test/v1")
     monkeypatch.delenv("GIGACREW_MODEL", raising=False)
+    monkeypatch.delenv("GIGACREW_PROVIDER", raising=False)
     assert main(["-C", str(tmp_path), "-p", "x", "--no-color"]) == 1
     assert "GIGACREW_MODEL" in capsys.readouterr().out
+
+
+def test_provider_choice(tmp_path):
+    def load(env):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+
+    cfg = load({"GIGACREW_ACCESS_KEY": "k"})
+    assert cfg.provider == "api" and cfg.auth_mode == "oauth"
+    cfg = load({"GIGACREW_PROVIDER": " GigaCode ", "GIGACREW_ACCESS_KEY": "k"})
+    assert cfg.provider == "gigacode" and cfg.auth_mode == "browser"  # ключ не нужен
+    assert cfg.build_ssl_verify() is False  # проверка TLS — как у API v2
+    with pytest.raises(ConfigError, match="GIGACREW_PROVIDER"):
+        load({"GIGACREW_PROVIDER": "openai"})
+
+
+def test_gigacode_client_name_has_no_default(tmp_path):
+    """Имя клиента для входа в GigaCode задаёт только пользователь — без него не стартуем."""
+
+    def load(env):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+
+    base = {"GIGACREW_PROVIDER": "gigacode", "GIGACREW_API_URL": "https://code.test"}
+    cfg = load(base)
+    assert cfg.plugin_name is None and cfg.gigacode_home is None
+    with pytest.raises(RuntimeError, match="GIGACREW_PLUGIN_NAME"):
+        cfg.require_credentials()
+    assert load({**base, "GIGACREW_PLUGIN_NAME": "   "}).plugin_name is None
+    cfg = load({**base, "GIGACREW_PLUGIN_NAME": " demo-client ", "GIGACODE_HOME": "/opt/gc"})
+    assert (cfg.plugin_name, cfg.gigacode_home) == ("demo-client", "/opt/gc")
+    cfg.require_credentials()  # ключ и сертификат не нужны
+    with pytest.raises(RuntimeError, match="GIGACREW_API_URL"):
+        load({"GIGACREW_PROVIDER": "gigacode", "GIGACREW_PLUGIN_NAME": "x"}).require_credentials()
 
 
 def test_save_chats_flag_and_env(tmp_path):

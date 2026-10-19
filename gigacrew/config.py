@@ -170,7 +170,10 @@ class Config:
     """
 
     # --- API ---
-    # Две схемы авторизации (выбирается автоматически по наличию реквизитов):
+    # Провайдер: "api" — API v2 с авторизацией по ключу или сертификату (см. ниже);
+    # "gigacode" — бэкенд GigaCode: вход через браузер, модели из его каталога.
+    provider: str = "api"
+    # Две схемы авторизации API v2 (выбирается автоматически по наличию реквизитов):
     #   * OAuth: задан access_key -> Basic-ключ обменивается на Bearer-токен на
     #     auth_url, запросы идут с заголовком Authorization;
     #   * mTLS: заданы cert+key -> клиентский сертификат предъявляется на
@@ -187,6 +190,12 @@ class Config:
     # Корневой сертификат для проверки сервера; задан — проверка TLS включена
     # по умолчанию.
     ca_bundle: str | None = None
+    # Имя клиента, под которым gigacrew входит в бэкенд GigaCode (plugin_name в теле
+    # входа). Значения по умолчанию нет: на время демо имя выдаёт команда бэкенда.
+    plugin_name: str | None = None
+    # Каталог официального CLI GigaCode (GIGACODE_HOME, иначе ~/.gigacode): оттуда
+    # берётся постоянный id устройства для входа.
+    gigacode_home: str | None = None
     timeout: int = 120
     # Ожидание ответа модели в запросах чата, с (не меньше timeout): вызовы инструментов
     # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план, файл),
@@ -267,6 +276,7 @@ class Config:
             raise ConfigError(f"GIGACREW_CA_BUNDLE: файл не найден: {ca_bundle}")
 
         return cls(
+            provider=_env_choice(env, "GIGACREW_PROVIDER", ("api", "gigacode")),
             access_key=access_key,
             cert=cert,
             key=key,
@@ -276,6 +286,8 @@ class Config:
             base_url=base_url.rstrip("/"),
             verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", ca_bundle is not None),
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
+            plugin_name=(env.get("GIGACREW_PLUGIN_NAME") or "").strip() or None,
+            gigacode_home=env.get("GIGACODE_HOME") or None,
             timeout=_env_int(env, "GIGACREW_TIMEOUT", 120),
             read_timeout=_env_int(env, "GIGACREW_READ_TIMEOUT", 600),
             rate_limit_wait=_env_int(env, "GIGACREW_RATE_LIMIT_WAIT", 120, minimum=0),
@@ -305,11 +317,13 @@ class Config:
 
     @property
     def auth_mode(self) -> str:
-        """Схема авторизации, выбранная по наличию реквизитов.
+        """Схема авторизации, выбранная по провайдеру и наличию реквизитов.
 
-        ``"oauth"`` — есть access_key; ``"mtls"`` — есть cert+key (и нет ключа);
-        ``"none"`` — реквизитов нет.
+        ``"browser"`` — бэкенд GigaCode (вход через браузер); ``"oauth"`` — есть
+        access_key; ``"mtls"`` — есть cert+key (и нет ключа); ``"none"`` — реквизитов нет.
         """
+        if self.provider == "gigacode":
+            return "browser"
         if self.access_key:
             return "oauth"
         if self.cert and self.key:
@@ -321,7 +335,8 @@ class Config:
 
         Для mTLS строит SSL-контекст с клиентским сертификатом (cert+key); файлы
         проверяются на существование и загружаемость. Для OAuth — флаг проверки
-        TLS-сертификата сервера (verify_ssl) или контекст с ``ca_bundle``.
+        TLS-сертификата сервера (verify_ssl) или контекст с ``ca_bundle`` — так же и
+        для бэкенда GigaCode.
         """
         if self.auth_mode != "mtls":
             if self.verify_ssl and self.ca_bundle:
@@ -354,6 +369,18 @@ class Config:
 
     def require_credentials(self) -> None:
         """Проверяет, что заданы реквизиты и адреса API (значений по умолчанию нет)."""
+        if self.provider == "gigacode":
+            if not self.base_url:
+                raise RuntimeError(
+                    "Не задан адрес бэкенда GigaCode. Укажите GIGACREW_API_URL в .env или "
+                    "переменных окружения. См. .env.example."
+                )
+            if not self.plugin_name:
+                raise RuntimeError(
+                    "Не задано имя клиента для входа в GigaCode. Укажите GIGACREW_PLUGIN_NAME "
+                    "в .env или переменных окружения. См. .env.example."
+                )
+            return
         if self.auth_mode == "none":
             raise RuntimeError(
                 "Не заданы реквизиты API. Укажите либо GIGACREW_ACCESS_KEY (OAuth), "

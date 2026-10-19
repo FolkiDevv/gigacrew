@@ -52,6 +52,8 @@ def live_config() -> Config:
     if not model:
         pytest.skip("Не задана GIGACREW_TEST_MODEL — live-тесты пропущены")
     cfg = Config.load(project_root=REPO_ROOT, model=model)
+    if cfg.provider != "api":
+        pytest.skip("live-тесты — для API v2 (GIGACREW_PROVIDER=api)")
     try:
         cfg.require_credentials()
     except RuntimeError as e:

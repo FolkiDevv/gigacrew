@@ -175,6 +175,10 @@ def _stream_error(event: str | None, data: Mapping[str, Any]) -> str | None:
 class ApiProvider(HttpProvider):
     def __init__(self, config: Config, *, transport: httpx.BaseTransport | None = None):
         """``transport`` — подмена HTTP-транспорта (``httpx.MockTransport`` в тестах)."""
+        if config.provider != "api":
+            raise RuntimeError(
+                f"GIGACREW_PROVIDER={config.provider}: этот провайдер работает только с API v2"
+            )
         config.require_credentials()
         super().__init__(config, transport=transport)
         self._mtls = config.auth_mode == "mtls"
