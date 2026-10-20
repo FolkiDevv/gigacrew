@@ -128,6 +128,12 @@ def _chat_endpoint(value: Any, config_url: str) -> str:
     parts = urlsplit(url)
     if parts.scheme not in ("https", "http") or not parts.hostname:
         raise ApiError(f"некорректный адрес чата в конфигурации GigaCode: {value[:200]}")
+    if parts.scheme == "http" and urlsplit(config_url).scheme == "https":
+        # Конфигурация по https, а чат — нет: токен ушёл бы открытым текстом.
+        raise ApiError(
+            "адрес чата в конфигурации GigaCode — http при https-адресе конфигурации, "
+            f"токен ушёл бы открытым текстом: {value[:200]}"
+        )
     return url
 
 

@@ -211,6 +211,11 @@ def test_catalogue_sources_in_order():
         ({"models": [{"id": "a\nb"}]}, "id"),
         ({"models": ["a"]}, "id"),
         ({"models": [{"id": "a"}], "chat": {"url": "ftp://h/chat"}}, "адрес чата"),
+        (  # конфигурация по https, а чат — по http: токен ушёл бы открытым текстом
+            {"models": [{"id": "a"}], "chat": {"url": "http://code.test/api/v2/chat/completions"}},
+            "открытым текстом",
+        ),
+        ({"models": [{"id": "a"}], "chatEndpoint": "http://llm.test/v1/c"}, "открытым текстом"),
     ],
 )
 def test_bad_catalogues(data, message):
@@ -232,6 +237,10 @@ def test_catalogue_default_model_and_chat_url():
     assert relative.chat_url == f"{BASE}/api/v2/chat/completions"
     other = parse_catalogue({"models": models, "chat": {"url": "https://llm.test/v1/c"}}, CONFIG)
     assert other.chat_url == "https://llm.test/v1/c"
+    # конфигурация по http (локальный стенд) — и чат по http можно
+    local = "http://127.0.0.1:8000/api/v2/config"
+    plain = parse_catalogue({"models": models, "chat": {"url": "http://127.0.0.1:8000/c"}}, local)
+    assert plain.chat_url == "http://127.0.0.1:8000/c"
 
 
 def test_catalogue_sampling_keeps_only_finite_numbers():
