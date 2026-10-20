@@ -1,8 +1,9 @@
-"""Безопасный запуск внешних процессов для инструментов (run_shell, git).
+"""Безопасный запуск внешних процессов для инструментов (run_shell, git) и хуков.
 
 Гарантии:
   * stdin — /dev/null: процесс не читает терминал пользователя и не зависает
-    в ожидании ввода (``cat``, интерактивные утилиты, редактор git);
+    в ожидании ввода (``cat``, интерактивные утилиты, редактор git); хуку вместо
+    него подаётся готовый текст (``input``) — из временного файла, не из канала;
   * окружение без настроек и секретов gigacrew (``GIGACREW_*``) и без интерактива git;
   * процесс и его потомки живут в отдельной группе и убиваются целиком — по
     таймауту, по Ctrl+C и если после выхода команды фоновые потомки (``cmd &``)
@@ -17,6 +18,7 @@ import codecs
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -147,24 +149,43 @@ def run_process(
     timeout: float,
     shell: bool = False,
     environ: Mapping[str, str] | None = None,
+    input: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> ProcessResult:
-    """Запускает команду и собирает вывод. FileNotFoundError — если нет программы."""
+    """Запускает команду и собирает вывод. FileNotFoundError — если нет программы.
+
+    ``input`` — текст на stdin (UTF-8). Он пишется во временный файл, а не в канал:
+    без потока-писателя, который мог бы заблокироваться на процессе, не читающем
+    stdin. ``extra_env`` добавляется к окружению после фильтра секретов.
+    """
     kwargs: dict = {}
     if os.name == "posix":
         kwargs["start_new_session"] = True  # своя группа процессов — убиваем целиком
     else:
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
 
-    proc = subprocess.Popen(
-        cmd,
-        shell=shell,
-        cwd=str(cwd),
-        env=subprocess_env(environ),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        **kwargs,
-    )
+    env = subprocess_env(environ)
+    if extra_env:
+        env.update(extra_env)
+    stdin = None
+    if input is not None:
+        stdin = tempfile.TemporaryFile()
+        stdin.write(input.encode("utf-8"))
+        stdin.seek(0)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            shell=shell,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL if stdin is None else stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs,
+        )
+    finally:
+        if stdin is not None:
+            stdin.close()  # у процесса своя копия дескриптора
     out, err = _Capture(), _Capture()
     readers: list[threading.Thread] = []
     timed_out = killed_background = False
