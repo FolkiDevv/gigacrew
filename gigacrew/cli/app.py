@@ -30,7 +30,6 @@ from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
 from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, resume_chat
-from gigacrew.cli.login import login_notifier
 from gigacrew.cli.models import (
     describe_result,
     ensure_context_window,
@@ -121,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _make_provider(config: Config, ui: Console) -> LLMProvider:
     if config.provider == "gigacode":
-        return GigaCodeProvider(config, on_login=login_notifier(ui), on_notice=ui.warn)
+        return GigaCodeProvider(config)
     return ApiProvider(config)
 
 
@@ -226,9 +225,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         try:
-            provider.connect()  # вход и каталог моделей (бэкенд GigaCode)
+            provider.connect()  # токен и каталог моделей (бэкенд GigaCode)
         except KeyboardInterrupt:
-            ui.system("\n(вход прерван)")
+            ui.system("\n(подключение прервано)")
             return EXIT_INTERRUPTED
         except LLMError as e:
             ui.error(f"не удалось подключиться: {e}")

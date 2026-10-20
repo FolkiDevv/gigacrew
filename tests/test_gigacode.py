@@ -1,10 +1,9 @@
 """Офлайн-тесты провайдера бэкенда GigaCode на подменном транспорте (httpx.MockTransport):
-каталог моделей, вход через браузер, токены, запросы чата."""
+каталог моделей, токен из файла официального CLI, запросы чата."""
 
 from __future__ import annotations
 
 import json
-import threading
 import time
 
 import httpx
@@ -18,14 +17,12 @@ from gigacrew.llm.gigacode import (
     config_endpoint,
     parse_catalogue,
 )
-from gigacrew.llm.gigacode_auth import Token, TokenStore
+from gigacrew.llm.gigacode_token import Token, load_token, parse_token
 from gigacrew.llm.transport import ApiError
 from gigacrew.llm.types import FunctionCall, Message, ToolSpec
 
 BASE = "https://code.test"
 CONFIG = f"{BASE}/api/v2/config"
-POLL = f"{BASE}/api/v2/auth/poll"
-SIGNIN = "https://gitverse.test/signin"
 CHAT = f"{BASE}/api/v2/chat/completions"
 AGENT = "demo-agent/1.0 (test)"
 
@@ -91,16 +88,12 @@ def _tool_call(name: str, args: dict, call_id: str = "c1") -> bytes:
 
 
 class Backend:
-    """Бэкенд GigaCode: конфигурация с 401-челленджем, опрос входа, чат."""
+    """Бэкенд GigaCode: конфигурация и чат принимают только токены из ``valid``."""
 
-    def __init__(self, *, pending: int = 1, chat=(), catalogue=None):
-        self.pending = pending  # ответов «ждём подтверждения» на каждый вход
+    def __init__(self, *, chat=(), catalogue=None, valid=("tok-1",)):
         self.catalogue = catalogue or CATALOGUE
-        self.valid: set[str] = set()
+        self.valid: set[str] = set(valid)
         self.chat_rejects: set[str] = set()  # токены, которые не принимает чат
-        self.issued = 0
-        self.polls = 0
-        self.logins: list[dict] = []
         self.requests: list[httpx.Request] = []
         self.chat_bodies: list[dict] = []
         self.chat = list(chat)
@@ -112,24 +105,7 @@ class Backend:
         if url == CONFIG and request.method == "GET":
             if token in self.valid:
                 return httpx.Response(200, json=self.catalogue)
-            return httpx.Response(
-                401,
-                headers={
-                    "X-Authorization-Url": POLL,
-                    "X-Signin-Gitverse": SIGNIN,
-                    "Retry-After": "2",
-                },
-            )
-        if url == POLL:
-            self.logins.append(json.loads(request.content))
-            if self.polls < self.pending:
-                self.polls += 1
-                return httpx.Response(401, json={"error": "authorization_pending"})
-            self.polls = 0
-            self.issued += 1
-            new = f"tok-{self.issued}"
-            self.valid.add(new)
-            return httpx.Response(200, json={"access_token": new, "expires_in": 3600})
+            return httpx.Response(401, json={"error": "unauthorized"})
         if url == CHAT:
             if token not in self.valid or token in self.chat_rejects:
                 return httpx.Response(401, json={"error": "unauthorized"})
@@ -144,11 +120,22 @@ class Backend:
         return sum(str(r.url) == url for r in self.requests)
 
 
+def _write_token(tmp_path, token="tok-1", expires_at=None, **extra):
+    """Файл токена официального CLI в ``<GIGACODE_HOME>/gigacode_token.json``."""
+    home = tmp_path / "cli-home"
+    home.mkdir(exist_ok=True)
+    data = {"access_token": token, **extra}
+    if expires_at is not None:
+        data["expires_at"] = expires_at
+    path = home / "gigacode_token.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
 def _config(tmp_path, **kw) -> Config:
     values = {
         "provider": "gigacode",
         "base_url": BASE,
-        "plugin_name": "demo",
         "user_agent": AGENT,
         "gigacode_home": str(tmp_path / "cli-home"),
         "project_root": tmp_path,
@@ -157,14 +144,10 @@ def _config(tmp_path, **kw) -> Config:
     return Config(**values)
 
 
-def _provider(backend: Backend, tmp_path, *, links=None, notices=None, store=None, **kw):
-    return GigaCodeProvider(
-        _config(tmp_path, **kw),
-        on_login=(links.append if links is not None else lambda _url: None),
-        on_notice=(notices.append if notices is not None else None),
-        transport=httpx.MockTransport(backend.handler),
-        token_store=store if store is not None else TokenStore(tmp_path / "tokens.json"),
-    )
+def _provider(backend: Backend, tmp_path, *, token="tok-1", **kw):
+    if token is not None:
+        _write_token(tmp_path, token)
+    return GigaCodeProvider(_config(tmp_path, **kw), transport=httpx.MockTransport(backend.handler))
 
 
 def _msgs():
@@ -265,20 +248,64 @@ def test_catalogue_sampling_keeps_only_finite_numbers():
     assert dict(parsed.sampling) == {"top_p": 0.5, "top_k": 40, "seed": 7}
 
 
-# ------------------------------ вход ------------------------------ #
+# ------------------------------ токен ------------------------------ #
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ({"access_token": "t"}, Token("t")),
+        ({"accessToken": "t", "expiresAt": 1_900_000_000}, Token("t", 1_900_000_000)),
+        ({"token": "t", "expiry_date": 1_900_000_000_000}, Token("t", 1_900_000_000)),
+        ({"access_token": "t", "expires_at": "1900000000"}, Token("t", 1_900_000_000)),
+        (
+            {"access_token": "t", "expires_at": "2030-03-17T17:46:40Z"},
+            Token("t", 1_900_000_000),
+        ),
+        ({"tokens": {CONFIG: {"access_token": "t", "expires_at": None}}}, Token("t")),
+        ({"tokens": {"https://other.test/api/v2/config": {"access_token": "t"}}}, None),
+        ({"access_token": "t", "expires_at": "скоро"}, None),
+        ({"access_token": "с пробелом"}, None),
+        ({"access_token": ""}, None),
+        ({"access_token": 1}, None),
+        ([], None),
+        ({}, None),
+    ],
+)
+def test_parse_token(data, expected):
+    assert parse_token(data, CONFIG) == expected
+
+
+def test_load_token_errors_ask_to_log_in_to_gigacode(tmp_path):
+    path = tmp_path / "gigacode_token.json"
+    with pytest.raises(ApiError, match="нет токена GigaCode.*авторизацию в GigaCode"):
+        load_token(path, CONFIG)
+    path.write_text("{битый", encoding="utf-8")
+    with pytest.raises(ApiError, match="нет корректного токена.*авторизацию в GigaCode"):
+        load_token(path, CONFIG)
+    path.write_text(json.dumps({"access_token": "t", "expires_at": time.time() + 30}))
+    with pytest.raises(ApiError, match="истёк.*авторизацию в GigaCode"):  # запас — минута
+        load_token(path, CONFIG)
+    path.write_text(json.dumps({"access_token": "t", "expires_at": time.time() + 3600}))
+    assert load_token(path, CONFIG).access_token == "t"
+
+
 def test_constructor_does_no_io(tmp_path):
     backend = Backend()
-    provider = _provider(backend, tmp_path)
-    assert backend.requests == [] and not (tmp_path / "tokens.json").exists()
-    assert not (tmp_path / "cli-home").exists()
+    provider = _provider(backend, tmp_path, token=None)
+    assert backend.requests == [] and not (tmp_path / "cli-home").exists()
+    assert provider.token_file == tmp_path / "cli-home" / "gigacode_token.json"
     assert provider.list_models() == [] and provider.known_models() is None
     assert provider.model == ""
     provider.close()
 
 
-def test_constructor_requires_the_client_name(tmp_path):
-    with pytest.raises(RuntimeError, match="GIGACREW_PLUGIN_NAME"):
-        _provider(Backend(), tmp_path, plugin_name=None)
+def test_token_file_defaults_to_the_cli_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    provider = GigaCodeProvider(_config(tmp_path, gigacode_home=None))
+    assert provider.token_file == tmp_path / ".gigacode" / "gigacode_token.json"
+    provider.close()
+
+
+def test_constructor_requires_settings(tmp_path):
     with pytest.raises(RuntimeError, match="GIGACREW_USER_AGENT"):
         _provider(Backend(), tmp_path, user_agent=None)
     with pytest.raises(RuntimeError, match="GIGACREW_API_URL"):
@@ -287,143 +314,99 @@ def test_constructor_requires_the_client_name(tmp_path):
         _provider(Backend(), tmp_path, provider="api")
 
 
-def test_connect_logs_in_through_the_browser(tmp_path):
-    backend = Backend(pending=2)
-    links: list[str] = []
-    provider = _provider(backend, tmp_path, links=links, plugin_name="demo-a")
+def test_connect_reads_the_token_and_the_catalogue(tmp_path):
+    backend = Backend()
+    provider = _provider(backend, tmp_path)
     provider.connect()
-    assert links == [SIGNIN]
-    assert len(backend.logins) == 3 and {b["plugin_name"] for b in backend.logins} == {"demo-a"}
-    device = (tmp_path / "cli-home" / "device_id").read_text(encoding="utf-8")
-    assert backend.logins[0]["device_code"] == device
+    assert backend.requests[0].headers["Authorization"] == "Bearer tok-1"
     assert provider.model == "coder"
     assert provider.list_models() == ["coder", "fast"]
     assert provider.known_models() == [
         ModelInfo("coder", 131_072),
         ModelInfo("fast", DEFAULT_CONTEXT_WINDOW),
     ]
-    stored = json.loads((tmp_path / "tokens.json").read_text(encoding="utf-8"))
-    assert stored["tokens"][CONFIG]["access_token"] == "tok-1"
-    assert stored["tokens"][CONFIG]["plugin_name"] == "demo-a"
-    provider.connect()  # токен действует, каталог есть — без сети
-    assert backend.count(CONFIG) == 2
+    provider.connect()  # каталог есть — без сети
+    assert backend.count(CONFIG) == 1
     provider.close()
 
 
-def test_next_run_takes_the_token_from_the_file(tmp_path):
+def test_connect_without_a_token_asks_to_log_in(tmp_path):
     backend = Backend()
-    _provider(backend, tmp_path).connect()
-    links: list[str] = []
-    again = _provider(backend, tmp_path, links=links)
-    again.connect()
-    assert links == [] and len(backend.logins) == 2  # второго входа не было
-    assert again.stream(_msgs()).message.content == "ok"
-    assert backend.requests[-1].headers["Authorization"] == "Bearer tok-1"
-
-
-def test_changed_client_name_logs_in_again(tmp_path):
-    backend = Backend()
-    _provider(backend, tmp_path, plugin_name="demo-a").connect()
-    links: list[str] = []
-    renamed = _provider(backend, tmp_path, links=links, plugin_name="demo-b")
-    renamed.connect()
-    assert links == [SIGNIN] and backend.logins[-1]["plugin_name"] == "demo-b"
-    assert TokenStore(tmp_path / "tokens.json").load(CONFIG, "demo-b") == Token(
-        "tok-2", pytest.approx(time.time() + 3600, abs=60)
-    )
-
-
-def test_expired_token_logs_in_again(tmp_path):
-    backend = Backend()
-    backend.valid.add("old")
-    store = TokenStore(tmp_path / "tokens.json")
-    store.save(CONFIG, "demo", Token("old", time.time() + 30))  # истекает через 30 с
-    links: list[str] = []
-    _provider(backend, tmp_path, links=links, store=store).connect()
-    assert links == [SIGNIN] and store.load(CONFIG, "demo").access_token == "tok-1"
-
-
-def test_token_rejected_by_config_is_forgotten(tmp_path):
-    backend = Backend()
-    store = TokenStore(tmp_path / "tokens.json")
-    store.save(CONFIG, "demo", Token("revoked"))
-    links: list[str] = []
-    _provider(backend, tmp_path, links=links, store=store).connect()
-    assert links == [SIGNIN] and store.load(CONFIG, "demo").access_token == "tok-1"
-
-
-def test_token_rejected_right_after_login(tmp_path):
-    backend = Backend()
-
-    def handler(request):
-        resp = backend.handler(request)
-        if str(request.url) == CONFIG and resp.status_code == 200:
-            return httpx.Response(401, text="no")  # и новый токен не принят
-        return resp
-
-    provider = GigaCodeProvider(
-        _config(tmp_path),
-        on_login=lambda _u: None,
-        transport=httpx.MockTransport(handler),
-        token_store=TokenStore(tmp_path / "tokens.json"),
-    )
-    with pytest.raises(ApiError, match="сразу после входа"):
+    provider = _provider(backend, tmp_path, token=None)
+    with pytest.raises(ApiError, match="авторизацию в GigaCode"):
         provider.connect()
-    assert len(backend.logins) == 2  # один вход
-    assert TokenStore(tmp_path / "tokens.json").load(CONFIG, "demo") is None
+    assert backend.requests == []
+    _write_token(tmp_path, "tok-1")  # пользователь вошёл в GigaCode
+    provider.connect()
+    assert provider.model == "coder"
 
 
-def test_rejected_login_names_the_client(tmp_path):
+def test_expired_token_asks_to_log_in_and_a_new_one_is_picked_up(tmp_path):
     backend = Backend()
-
-    def handler(request):
-        if str(request.url) == POLL:
-            return httpx.Response(403, json={"error": "unknown plugin"})
-        return backend.handler(request)
-
-    provider = GigaCodeProvider(
-        _config(tmp_path, plugin_name="demo-x"),
-        on_login=lambda _u: None,
-        transport=httpx.MockTransport(handler),
-        token_store=TokenStore(tmp_path / "tokens.json"),
-    )
-    with pytest.raises(ApiError, match="«demo-x».*GIGACREW_PLUGIN_NAME"):
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    _write_token(tmp_path, "tok-1", expires_at=time.time() - 10)
+    with pytest.raises(ApiError, match="истёк.*авторизацию в GigaCode"):
         provider.connect()
+    backend.valid.add("tok-2")
+    _write_token(tmp_path, "tok-2", expires_at=time.time() + 3600)
+    provider.connect()
+    assert provider.stream(_msgs()).message.content == "ok"
+    assert backend.requests[-1].headers["Authorization"] == "Bearer tok-2"
+
+
+def test_token_expiring_during_a_session_is_reread(tmp_path, monkeypatch):
+    backend = Backend(valid=("tok-1", "tok-2"))
+    _write_token(tmp_path, "tok-1", expires_at=time.time() + 3600)
+    provider = GigaCodeProvider(_config(tmp_path), transport=httpx.MockTransport(backend.handler))
+    provider.connect()
+    _write_token(tmp_path, "tok-2", expires_at=time.time() + 7200)
+    later = time.time() + 3600
+    monkeypatch.setattr(time, "time", lambda: later)
+    assert provider.stream(_msgs()).message.content == "ok"
+    assert backend.requests[-1].headers["Authorization"] == "Bearer tok-2"
+
+
+def test_token_rejected_by_config_asks_to_log_in(tmp_path):
+    backend = Backend(valid=())
+    provider = _provider(backend, tmp_path, token="revoked")
+    with pytest.raises(ApiError, match="не принял токен \\(401\\).*авторизацию в GigaCode"):
+        provider.connect()
+    assert backend.count(CONFIG) == 1  # тот же токен второй раз не отправляется
 
 
 def test_config_errors(tmp_path):
     def handler(_request):
         return httpx.Response(403, text="forbidden")
 
+    _write_token(tmp_path)
     provider = GigaCodeProvider(_config(tmp_path), transport=httpx.MockTransport(handler))
     with pytest.raises(ApiError, match="конфигурацию GigaCode \\(403\\)"):
         provider.connect()
 
 
-def test_chat_401_logs_in_once_more(tmp_path):
+def test_chat_401_rereads_the_token_file(tmp_path):
     backend = Backend()
-    links: list[str] = []
-    provider = _provider(backend, tmp_path, links=links)
+    provider = _provider(backend, tmp_path)
     provider.connect()
-    assert provider.stream(_msgs()).message.content == "ok"  # токен работает с чатом
-    backend.valid.discard("tok-1")  # бэкенд его отозвал
     assert provider.stream(_msgs()).message.content == "ok"
-    assert links == [SIGNIN, SIGNIN]
+    backend.valid = {"tok-2"}  # бэкенд отозвал tok-1, пользователь вошёл заново
+    _write_token(tmp_path, "tok-2")
+    assert provider.stream(_msgs()).message.content == "ok"
     assert backend.requests[-1].headers["Authorization"] == "Bearer tok-2"
-    backend.valid.discard("tok-2")
+    backend.valid = {"tok-3"}
+    _write_token(tmp_path, "tok-3")
     assert provider.complete(_msgs()).message.content == "ok"  # и без потока — так же
-    assert len(links) == 3
 
 
-def test_chat_401_on_a_fresh_token_does_not_log_in_again(tmp_path):
+def test_chat_401_with_the_same_token_asks_to_log_in(tmp_path):
     backend = Backend()
-    links: list[str] = []
-    provider = _provider(backend, tmp_path, links=links)
+    provider = _provider(backend, tmp_path)
     provider.connect()
     backend.chat_rejects.add("tok-1")  # конфигурацию даёт, а чат не пускает
-    with pytest.raises(ApiError, match="повторный вход не поможет.*GIGACREW_PLUGIN_NAME"):
+    with pytest.raises(ApiError, match="не принял токен.*авторизацию в GigaCode"):
         provider.stream(_msgs())
-    assert links == [SIGNIN]
+    assert backend.count(CHAT) == 1
 
 
 def test_chat_errors_and_retries(tmp_path, _no_sleep):
@@ -460,9 +443,9 @@ def test_chat_request_headers_and_body(tmp_path):
     assert "max_tokens" not in body
     assert body["messages"] == [{"role": "user", "content": "привет"}]
     assert deltas == ["ok"]
-    # User-Agent из GIGACREW_USER_AGENT — у всех запросов к бэкенду, и у входа тоже
+    # User-Agent из GIGACREW_USER_AGENT — у всех запросов к бэкенду
     assert {r.headers["User-Agent"] for r in backend.requests} == {AGENT}
-    assert {str(r.url) for r in backend.requests} == {CONFIG, POLL, CHAT}
+    assert {str(r.url) for r in backend.requests} == {CONFIG, CHAT}
 
 
 def test_complete_goes_through_the_stream(tmp_path):
@@ -518,55 +501,6 @@ def test_measure_prompt_reads_usage_from_the_stream(tmp_path):
     assert provider.supports_measure and provider.measure_prompt("текст") == 1234
     body = backend.chat_bodies[0]
     assert body["max_tokens"] == 1 and body["model"] == "coder" and body["stream"] is True
-
-
-def test_cancelled_login_is_not_restarted_until_connect(tmp_path, monkeypatch):
-    backend = Backend(pending=5)
-    provider = _provider(backend, tmp_path)
-
-    def interrupted(_seconds):
-        raise KeyboardInterrupt  # так приходят Ctrl+C и Esc
-
-    monkeypatch.setattr(time, "sleep", interrupted)
-    with pytest.raises(KeyboardInterrupt):
-        provider.connect()
-    polls = len(backend.logins)
-    with pytest.raises(ApiError, match="отменён"):
-        provider.stream(_msgs())  # например, итог суб-агента после Esc
-    assert len(backend.logins) == polls
-    monkeypatch.setattr(time, "sleep", lambda _s: None)
-    provider.connect()  # следующий запрос пользователя — вход снова
-    assert provider.model == "coder"
-
-
-def test_login_from_a_background_thread_is_refused(tmp_path):
-    backend = Backend()
-    provider = _provider(backend, tmp_path)
-    errors: list[BaseException] = []
-
-    def run():
-        try:
-            provider.connect()
-        except BaseException as e:  # noqa: BLE001 — проверяем тип ниже
-            errors.append(e)
-
-    thread = threading.Thread(target=run)
-    thread.start()
-    thread.join(5)
-    assert isinstance(errors[0], ApiError) and backend.logins == []
-
-
-def test_token_save_failure_is_reported_and_work_goes_on(tmp_path):
-    class ReadOnly(TokenStore):
-        def save(self, url, plugin_name, token):
-            raise OSError("только для чтения")
-
-    backend = Backend()
-    notices: list[str] = []
-    provider = _provider(backend, tmp_path, notices=notices, store=ReadOnly(tmp_path / "t.json"))
-    provider.connect()
-    assert "не сохранён" in notices[0] and "только для чтения" in notices[0]
-    assert provider.stream(_msgs()).message.content == "ok"
 
 
 def test_request_without_connect_loads_the_catalogue(tmp_path):

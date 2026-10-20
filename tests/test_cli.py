@@ -159,7 +159,6 @@ def oneshot(tmp_path, monkeypatch):
         "GIGACREW_COMPACT_THRESHOLD",
         "GIGACREW_AUTO_MEASURE",
         "GIGACREW_PROVIDER",
-        "GIGACREW_PLUGIN_NAME",
         "GIGACREW_USER_AGENT",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -987,9 +986,7 @@ def test_make_provider_follows_the_setting(tmp_path):
         Config(access_key="k", auth_url="https://auth.test", base_url="https://api.test/v1"), ui
     )
     giga = app._make_provider(
-        Config(
-            provider="gigacode", base_url="https://code.test", plugin_name="demo", user_agent="ua"
-        ),
+        Config(provider="gigacode", base_url="https://code.test", user_agent="ua"),
         ui,
     )
     assert isinstance(api, ApiProvider) and isinstance(giga, GigaCodeProvider)
@@ -997,14 +994,11 @@ def test_make_provider_follows_the_setting(tmp_path):
     giga.close()
 
 
-def test_gigacode_without_client_name_stops_before_any_request(
+def test_gigacode_without_user_agent_stops_before_any_request(
     tmp_path, oneshot, monkeypatch, capsys
 ):
     monkeypatch.setenv("GIGACREW_PROVIDER", "gigacode")
     monkeypatch.setattr(app, "_make_provider", lambda *_a: pytest.fail("провайдер не нужен"))
-    assert _main(tmp_path, "-p", "x") == 1
-    assert "GIGACREW_PLUGIN_NAME" in _flat(capsys)
-    monkeypatch.setenv("GIGACREW_PLUGIN_NAME", "demo")  # имя есть, User-Agent — нет
     assert _main(tmp_path, "-p", "x") == 1
     assert "GIGACREW_USER_AGENT" in _flat(capsys)
     monkeypatch.setenv("GIGACREW_USER_AGENT", "агент")  # не ASCII — ошибка конфигурации
@@ -1042,7 +1036,7 @@ def test_connect_interrupted_or_failed(tmp_path, oneshot, capsys):
 
     oneshot(CatalogueProvider(connect_errors=[KeyboardInterrupt()]))
     assert _main(tmp_path, "-m", "cat-a", "-p", "x") == 130
-    assert "вход прерван" in _flat(capsys)
+    assert "подключение прервано" in _flat(capsys)
     oneshot(CatalogueProvider(connect_errors=[LLMError("бэкенд недоступен")]))
     assert _main(tmp_path, "-m", "cat-a", "--list-models") == 2
     assert "не удалось подключиться: бэкенд недоступен" in _flat(capsys)
@@ -1114,53 +1108,3 @@ def test_repl_warns_about_tls_for_the_backend_token(tmp_path, capsys):
     agent._cfg = replace(agent.config, provider="gigacode", access_key=None)
     run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
     assert "ключ или токен можно перехватить" in _flat(capsys)
-
-
-def test_browser_is_opened_only_with_a_display():
-    from gigacrew.cli.login import can_open_browser
-
-    assert can_open_browser({"DISPLAY": ":0"}, "linux")
-    assert can_open_browser({"WAYLAND_DISPLAY": "wayland-0"}, "linux")
-    assert not can_open_browser({}, "linux")
-    assert not can_open_browser({"DISPLAY": ":0", "SSH_CONNECTION": "1 2 3 4"}, "linux")
-    assert can_open_browser({}, "darwin") and can_open_browser({}, "win32")
-    assert not can_open_browser({"SSH_TTY": "/dev/pts/1"}, "darwin")
-
-
-def test_open_in_browser_runs_xdg_open(monkeypatch):
-    import subprocess
-    import sys
-
-    from gigacrew.cli import login
-
-    calls = []
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(login, "can_open_browser", lambda: True)
-    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: calls.append((cmd, kw)))
-    assert login.open_in_browser("https://x.test/a") is True
-    ((cmd, kw),) = calls
-    assert cmd == ["xdg-open", "https://x.test/a"]
-    assert kw["start_new_session"] and kw["stdout"] is subprocess.DEVNULL
-
-    def missing(*_a, **_kw):
-        raise OSError("нет xdg-open")
-
-    monkeypatch.setattr(subprocess, "Popen", missing)
-    assert login.open_in_browser("https://x.test/a") is False
-    monkeypatch.setattr(login, "can_open_browser", lambda: False)
-    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: pytest.fail("без GUI не запускаем"))
-    assert login.open_in_browser("https://x.test/a") is False
-
-
-def test_login_notice_prints_the_whole_link(capsys):
-    from gigacrew.cli.login import login_notifier
-
-    ui = Console(no_color=True, width=40)
-    url = "https://gitverse.test/signin?device=" + "a" * 64
-    login_notifier(ui, opener=lambda _u: False)(url)
-    out = capsys.readouterr().out
-    assert f"  {url}\n" in out  # одной строкой, без переносов по ширине терминала
-    text = " ".join(out.split())
-    assert "откройте ссылку" in text and "Ctrl+C — отмена" in text
-    login_notifier(ui, opener=lambda _u: True)(url)
-    assert "открываю страницу входа" in _flat(capsys)

@@ -33,7 +33,6 @@ from rich.console import ConsoleOptions, Group, RenderResult
 from rich.live import Live
 from rich.panel import Panel
 from rich.segment import Segment, SegmentLines
-from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -294,14 +293,6 @@ class Console(AgentEvents):
 
     def success(self, text: str) -> None:
         self._print_above_live(Text(f"{ICON_OK} {text}", style=f"bold {OK}"))
-
-    def link(self, url: str) -> None:
-        """Ссылка отдельной строкой, без переносов: копируется из терминала целиком, а
-        терминал с поддержкой OSC 8 открывает её щелчком."""
-        url = sanitize(url)
-        style = Style(color=ACCENT, underline=True, link=url)
-        # soft_wrap: строку переносит сам терминал, rich её не режет и не разбивает.
-        self._print_above_live(Text(f"  {url}", style=style), soft_wrap=True)
 
     # ------------------------- временная область ------------------------ #
     def _start_live(self, view: _LiveView) -> None:

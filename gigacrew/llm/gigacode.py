@@ -1,15 +1,15 @@
-"""Провайдер бэкенда GigaCode: вход через браузер, каталог моделей, Chat Completions.
+"""Провайдер бэкенда GigaCode: токен официального CLI, каталог моделей, Chat Completions.
 
 Адрес — ``GIGACREW_API_URL``: ``https://host`` → конфигурация ``…/api/v2/config``; адрес,
 который кончается на ``/api/vN``, — ``+ /config``; на ``/config`` — как есть. Конфигурация
 (``GET``) — это и проверка токена, и каталог моделей: id, окно контекста, параметры
 генерации (``ai_api``), модель по умолчанию и адрес чата.
 
-Вход (:mod:`gigacrew.llm.gigacode_auth`) — когда токена нет, он истёк или бэкенд ответил
-401: ссылка на страницу входа показывается пользователю, gigacrew ждёт подтверждения. Имя
-клиента в теле входа — ``GIGACREW_PLUGIN_NAME``, User-Agent всех запросов —
-``GIGACREW_USER_AGENT`` (значений по умолчанию нет). Токен хранится в
-``~/.gigacrew/gigacode_token.json``.
+Токен (:mod:`gigacrew.llm.gigacode_token`) gigacrew не получает сам, а читает из файла
+официального CLI GigaCode: ``$GIGACODE_HOME/gigacode_token.json`` (по умолчанию
+``~/.gigacode/gigacode_token.json``). Токена нет, он истёк или бэкенд ответил 401 — ошибка
+с просьбой пройти авторизацию в GigaCode. User-Agent всех запросов —
+``GIGACREW_USER_AGENT`` (значения по умолчанию нет).
 
 Чат — OpenAI Chat Completions (:mod:`gigacrew.llm.openai_chat`); каждый запрос идёт
 потоком (бэкенд рассчитан на поток), кроме моделей с ``ai_api.stream: false``.
@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import math
 import re
-import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -33,15 +32,7 @@ import httpx
 from gigacrew.config import Config
 from gigacrew.llm import openai_chat
 from gigacrew.llm.base import ModelInfo
-from gigacrew.llm.gigacode_auth import (
-    Challenge,
-    DeviceLogin,
-    Token,
-    TokenStore,
-    default_home,
-    device_id,
-    login_body,
-)
+from gigacrew.llm.gigacode_token import Token, load_token, login_hint, token_path
 from gigacrew.llm.transport import ApiError, HttpProvider, error_body
 from gigacrew.llm.types import AssistantTurn, Message, ToolChoice, ToolSpec, Usage
 
@@ -57,7 +48,6 @@ SAMPLING_KEYS = (
     "repetition_penalty",
     "seed",
 )
-LOGIN_CANCELLED = "вход в GigaCode отменён — повторите запрос"
 
 _API_VERSION = re.compile(r"/api/v\d+$")
 
@@ -184,49 +174,40 @@ def parse_catalogue(data: Mapping[str, Any], config_url: str) -> Catalogue:
 class GigaCodeProvider(HttpProvider):
     """Бэкенд GigaCode. Конструктор не обращается к сети и файлам.
 
-    ``on_login(url)`` — показать пользователю ссылку на страницу входа (и открыть
-    браузер); без него вход невозможен — ошибка со ссылкой. ``on_notice`` — сообщения
-    пользователю вне хода (не удалось сохранить токен). ``token_store`` — подмена
-    хранилища токенов (тесты).
+    Токен — из файла официального CLI (:mod:`gigacrew.llm.gigacode_token`); сам
+    gigacrew не входит: токена нет, он истёк или бэкенд ответил 401 — ошибка с просьбой
+    пройти авторизацию в GigaCode. ``token_file`` — подмена пути к файлу (тесты).
     """
 
     def __init__(
         self,
         config: Config,
         *,
-        on_login: Callable[[str], None] | None = None,
-        on_notice: Callable[[str], None] | None = None,
         transport: httpx.BaseTransport | None = None,
-        token_store: TokenStore | None = None,
+        token_file: Path | None = None,
     ):
         if config.provider != "gigacode":
             raise RuntimeError(
                 f"GIGACREW_PROVIDER={config.provider}: этот провайдер — для бэкенда GigaCode"
             )
-        config.require_credentials()  # адрес, имя клиента и User-Agent заданы
+        config.require_credentials()  # адрес и User-Agent заданы
         super().__init__(
             config, transport=transport, headers={"User-Agent": config.user_agent or ""}
         )
         self._config_url = config_endpoint(config.base_url)
-        self._plugin_name = config.plugin_name or ""
-        self._home = Path(config.gigacode_home).expanduser() if config.gigacode_home else None
-        self._on_login = on_login
-        self._on_notice = on_notice
-        self._tokens = token_store if token_store is not None else TokenStore()
+        home = Path(config.gigacode_home).expanduser() if config.gigacode_home else None
+        self._token_file = token_file if token_file is not None else token_path(home)
         self._session_id = str(uuid.uuid4())
         self._token: Token | None = None
-        self._token_loaded = False  # файл токенов уже прочитан
-        # Токен получен входом, а чат его ещё ни разу не принял: 401 с ним — не повод
-        # входить снова (бэкенд не пускает этого клиента, второй вход не поможет).
-        self._fresh = False
         self._catalogue: Catalogue | None = None
-        # Вход отменён (Ctrl+C/Esc): до следующего connect() — ошибка без нового входа,
-        # иначе остановка суб-агента запускала бы вход снова и снова.
-        self._login_cancelled = False
 
     @property
     def config_url(self) -> str:
         return self._config_url
+
+    @property
+    def token_file(self) -> Path:
+        return self._token_file
 
     @property
     def model(self) -> str:
@@ -235,12 +216,13 @@ class GigaCodeProvider(HttpProvider):
         return self._catalogue.default_model if self._catalogue is not None else ""
 
     # ------------------------------------------------------------------ #
-    # Подключение, каталог, вход
+    # Подключение, каталог, токен
     # ------------------------------------------------------------------ #
     def connect(self) -> None:
-        """Каталог моделей и действующий токен; нет токена или истёк — вход через браузер."""
-        self._login_cancelled = False
-        if self._catalogue is None or self._current_token() is None:
+        """Действующий токен из файла CLI и каталог моделей; токена нет или истёк —
+        :class:`ApiError` с просьбой пройти авторизацию в GigaCode."""
+        self._token = load_token(self._token_file, self._config_url)
+        if self._catalogue is None:
             self._load_config()
 
     def list_models(self) -> list[str]:
@@ -252,42 +234,35 @@ class GigaCodeProvider(HttpProvider):
             return None
         return [ModelInfo(m.id, m.context_window) for m in self._catalogue.models]
 
-    def _current_token(self) -> Token | None:
-        """Действующий токен: в памяти или из файла (один раз); истёкший — None."""
-        if self._token is None and not self._token_loaded:
-            self._token_loaded = True
-            self._token = self._tokens.load(self._config_url, self._plugin_name)
-        token = self._token
-        return token if token is not None and not token.expired() else None
+    def _current_token(self) -> Token:
+        """Действующий токен: в памяти, а истёк или его нет — заново из файла."""
+        if self._token is None or self._token.expired():
+            self._token = load_token(self._token_file, self._config_url)
+        return self._token
 
-    def _drop_token(self) -> None:
-        """Забыть токен — и в файле, чтобы следующий запуск не взял его снова."""
-        self._token, self._token_loaded, self._fresh = None, True, False
-        try:
-            self._tokens.forget(self._config_url)
-        except OSError:
-            pass  # не записали — следующий запуск получит тот же 401 и войдёт заново
+    def _reload_rejected(self, rejected: Token) -> Token:
+        """Бэкенд ответил 401 на ``rejected``: файл мог обновиться — перечитать. Там тот
+        же токен — :class:`ApiError` с просьбой пройти авторизацию заново."""
+        self._token = None
+        token = load_token(self._token_file, self._config_url)
+        if token.access_token == rejected.access_token:
+            raise ApiError(f"GigaCode не принял токен (401): {login_hint(self._token_file)}")
+        self._token = token
+        return token
 
-    def _get_config(self, token: Token | None) -> httpx.Response:
-        headers = {"Accept": "*/*"}
-        if token is not None:
-            headers["Authorization"] = f"Bearer {token.access_token}"
+    def _get_config(self, token: Token) -> httpx.Response:
+        headers = {"Accept": "*/*", "Authorization": f"Bearer {token.access_token}"}
         return self._request_with_retry(lambda: self._client.get(self._config_url, headers=headers))
 
     def _load_config(self) -> None:
-        """``GET`` конфигурации: каталог моделей; 401 — вход и повтор с новым токеном."""
+        """``GET`` конфигурации: каталог моделей; 401 — перечитать токен и повторить раз."""
         token = self._current_token()
         resp = self._get_config(token)
         if resp.status_code == 401:
-            if token is not None:
-                self._drop_token()  # бэкенд его больше не принимает
-            token = self._login(Challenge.from_response(resp, self._config_url))
-            resp = self._get_config(token)
+            resp = self._get_config(self._reload_rejected(token))
             if resp.status_code == 401:
-                self._drop_token()
-                raise ApiError(
-                    f"GigaCode не принял токен сразу после входа (401): {error_body(resp)}"
-                )
+                self._token = None
+                raise ApiError(f"GigaCode не принял токен (401): {login_hint(self._token_file)}")
         if not resp.is_success:
             raise ApiError(
                 f"Не удалось получить конфигурацию GigaCode ({resp.status_code}): "
@@ -295,40 +270,9 @@ class GigaCodeProvider(HttpProvider):
             )
         self._catalogue = parse_catalogue(self._json(resp), self._config_url)
 
-    def _login(self, challenge: Challenge) -> Token:
-        if self._login_cancelled:
-            raise ApiError(LOGIN_CANCELLED)
-        if threading.current_thread() is not threading.main_thread():
-            # Фоновый поток не может ни показать ссылку, ни получить Ctrl+C.
-            raise ApiError("нужен вход в GigaCode — он выполнится перед следующим запросом")
-        home = self._home if self._home is not None else default_home()
-        body = login_body(device_code=device_id(home), plugin_name=self._plugin_name)
-        try:
-            token = DeviceLogin(self._post_login, on_link=self._on_login).run(challenge, body)
-        except KeyboardInterrupt:
-            self._login_cancelled = True
-            raise
-        self._token, self._token_loaded, self._fresh = token, True, True
-        try:
-            self._tokens.save(self._config_url, self._plugin_name, token)
-        except OSError as e:
-            if self._on_notice is not None:
-                self._on_notice(
-                    f"токен GigaCode не сохранён в {self._tokens.path}: {e} — "
-                    "при следующем запуске снова понадобится вход"
-                )
-        return token
-
-    def _post_login(self, url: str, body: dict[str, str]) -> httpx.Response:
-        return self._request_with_retry(
-            lambda: self._client.post(url, json=body, headers={"Accept": "*/*"})
-        )
-
     def _ensure_catalogue(self) -> Catalogue:
         """Каталог для запроса; не загружен (запрос без :meth:`connect`) — загрузить."""
         if self._catalogue is None:
-            if self._login_cancelled:
-                raise ApiError(LOGIN_CANCELLED)
             self._load_config()
         assert self._catalogue is not None
         return self._catalogue
@@ -340,24 +284,12 @@ class GigaCodeProvider(HttpProvider):
         return self._ensure_catalogue().chat_url
 
     def _auth_headers(self, *, force: bool = False) -> dict[str, str]:
-        """``Authorization`` с действующим токеном; нет его — вход. ``force`` (чат ответил
-        401) — забыть токен и войти заново, кроме токена, который чат ещё не принимал."""
-        if self._login_cancelled:
-            raise ApiError(LOGIN_CANCELLED)
+        """``Authorization`` с действующим токеном. ``force`` (чат ответил 401) —
+        перечитать файл: там тот же токен — ошибка с просьбой пройти авторизацию."""
         token = self._current_token()
         if force:
-            if self._fresh:
-                raise ApiError(
-                    "GigaCode не принял токен, полученный при входе (401) — повторный вход не "
-                    f"поможет; проверьте, пускает ли бэкенд клиента «{self._plugin_name}» "
-                    "(GIGACREW_PLUGIN_NAME)"
-                )
-            self._drop_token()
-            token = None
-        if token is None:
-            self._load_config()
-            token = self._current_token()
-        return {} if token is None else {"Authorization": f"Bearer {token.access_token}"}
+            token = self._reload_rejected(token)
+        return {"Authorization": f"Bearer {token.access_token}"}
 
     @property
     def _refreshable(self) -> bool:
@@ -399,11 +331,9 @@ class GigaCodeProvider(HttpProvider):
         return openai_chat.has_reasoning(payload)
 
     def _parse_response(self, data: dict[str, Any]) -> AssistantTurn:
-        self._fresh = False  # ответ пришёл — токен принят
         return openai_chat.parse_response(data)
 
     def _consume_sse(self, resp: httpx.Response, emit: Callable[[str], None]) -> AssistantTurn:
-        self._fresh = False
         content_type = resp.headers.get("content-type", "")
         return openai_chat.consume_stream(resp.iter_lines(), emit, content_type=content_type)
 
@@ -412,7 +342,6 @@ class GigaCodeProvider(HttpProvider):
         return openai_chat.probe_payload(text, model, stream=info is None or info.streams)
 
     def _probe_usage(self, resp: httpx.Response) -> Usage:
-        self._fresh = False
         content_type = resp.headers.get("content-type", "")
         turn = openai_chat.consume_stream(
             resp.text.splitlines(), lambda _s: None, content_type=content_type

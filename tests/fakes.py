@@ -113,7 +113,7 @@ class WindowProvider(ScriptedProvider):
 
 
 class CatalogueProvider(WindowProvider):
-    """Провайдер с каталогом моделей, как бэкенд GigaCode: ``connect()`` (вход и каталог)
+    """Провайдер с каталогом моделей, как бэкенд GigaCode: ``connect()`` (токен и каталог)
     считается и может бросать заготовленные ошибки, модель по умолчанию — первая в каталоге.
     """
 

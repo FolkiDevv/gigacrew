@@ -148,22 +148,17 @@ def test_provider_choice(tmp_path):
         load({"GIGACREW_PROVIDER": "openai"})
 
 
-def test_gigacode_client_name_has_no_default(tmp_path):
-    """Имя клиента для входа в GigaCode задаёт только пользователь — без него не стартуем."""
+def test_gigacode_settings(tmp_path):
+    """Для GigaCode нужен адрес; каталог CLI с токеном — GIGACODE_HOME, по умолчанию нет."""
 
     def load(env):
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     base = {"GIGACREW_PROVIDER": "gigacode", "GIGACREW_API_URL": "https://code.test"}
-    cfg = load(base)
-    assert cfg.plugin_name is None and cfg.gigacode_home is None
-    with pytest.raises(RuntimeError, match="GIGACREW_PLUGIN_NAME"):
-        cfg.require_credentials()
-    assert load({**base, "GIGACREW_PLUGIN_NAME": "   "}).plugin_name is None
-    cfg = load({**base, "GIGACREW_PLUGIN_NAME": " demo-client ", "GIGACODE_HOME": "/opt/gc"})
-    assert (cfg.plugin_name, cfg.gigacode_home) == ("demo-client", "/opt/gc")
+    assert load(base).gigacode_home is None
+    assert load({**base, "GIGACODE_HOME": "/opt/gc"}).gigacode_home == "/opt/gc"
     with pytest.raises(RuntimeError, match="GIGACREW_API_URL"):
-        load({"GIGACREW_PROVIDER": "gigacode", "GIGACREW_PLUGIN_NAME": "x"}).require_credentials()
+        load({"GIGACREW_PROVIDER": "gigacode", "GIGACREW_USER_AGENT": "x"}).require_credentials()
 
 
 def test_gigacode_user_agent_has_no_default(tmp_path):
@@ -175,7 +170,6 @@ def test_gigacode_user_agent_has_no_default(tmp_path):
     base = {
         "GIGACREW_PROVIDER": "gigacode",
         "GIGACREW_API_URL": "https://code.test",
-        "GIGACREW_PLUGIN_NAME": "demo",
     }
     cfg = load(base)
     assert cfg.user_agent is None
