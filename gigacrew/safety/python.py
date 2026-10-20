@@ -147,6 +147,17 @@ DANGER_MODULES = frozenset(
         "sh",
         "plumbum",
         "psutil",
+        # загрузка и выполнение кода в обход разбора
+        "pickle",
+        "marshal",
+        "shelve",
+        "dill",
+        "cloudpickle",
+        "builtins",
+        "gc",
+        "runpy",
+        "code",
+        "codeop",
         "docker",
         "boto3",
         "pycurl",
@@ -644,13 +655,28 @@ def _check_imports(tree: ast.AST, ctx: _Ctx) -> None:
                 ctx.modules[alias.asname or alias.name] = full
 
 
+# Безобидные встроенные из списка динамических: только «не знаю», без тревоги.
+_HARMLESS_DYNAMIC = frozenset({"input", "help", "memoryview"})
+
+
+def _dynamic(name: str, ctx: _Ctx) -> None:
+    """Динамический код (eval, getattr…) — разбор его не видит: опасно, пусть человек
+    посмотрит внимательно."""
+    if name in _HARMLESS_DYNAMIC:
+        ctx.flag(None, f"{name}()")
+    else:
+        ctx.flag(Level.DANGER, f"{name} — динамический код, разбор его не видит")
+
+
 def _check_module_attr(module: str, attr: str, ctx: _Ctx) -> None:
     allowed = _MODULE_ATTRS.get(module)
     if allowed is None:
         return
-    if attr in _DANGER_METHODS or (module == "os" and attr in ("system", "popen", "environ")):
-        level = None if attr == "environ" else Level.DANGER
-        ctx.flag(level, f"{module}.{attr}")
+    if attr in _DANGER_METHODS or (
+        module == "os" and attr in ("system", "popen", "environ", "getenv", "environb")
+    ):
+        reason = "окружение процесса (там ключи и токены)" if "env" in attr else "процессы"
+        ctx.flag(Level.DANGER, f"{module}.{attr}: {reason}")
     elif attr not in allowed:
         ctx.flag(None, f"{module}.{attr} не проверен классификатором")
 
@@ -715,7 +741,7 @@ def _path_of(node: ast.AST, ctx: _Ctx, depth: int = 0) -> _Path:
     text = _const_str(node)
     if text is not None:
         if text.startswith("~"):
-            return _UNKNOWN_PATH
+            return _Path(static=Path(os.path.expanduser(text)))
         p = Path(text)
         return _Path(static=Path(os.path.normpath(p if p.is_absolute() else ctx.cwd / p)))
     if isinstance(node, ast.Name):
@@ -750,6 +776,22 @@ def _path_of(node: ast.AST, ctx: _Ctx, depth: int = 0) -> _Path:
             rest = [_const_str(a) or _path_of(a, ctx, depth + 1) for a in node.args[1:]]
             return _join(first, rest) if rest else first
         name = _resolve_module(func, ctx)
+        # Домашний каталог — вне проекта: запись туда должна быть видна как запись наружу.
+        if name in ("pathlib.Path.home",) or (
+            isinstance(func, ast.Attribute)
+            and func.attr == "home"
+            and _is_path_ctor(func.value, ctx)
+        ):
+            return _Path(static=Path.home())
+        if name in ("os.path.expanduser",) and node.args:
+            text = _const_str(node.args[0])
+            return _Path(static=Path(os.path.expanduser(text))) if text else _UNKNOWN_PATH
+        if isinstance(func, ast.Attribute) and func.attr == "expanduser":
+            base = func.value
+            text = _const_str(base.args[0]) if isinstance(base, ast.Call) and base.args else None
+            if text is not None and _is_path_ctor(base.func, ctx):
+                return _Path(static=Path(os.path.expanduser(text)))
+            return _UNKNOWN_PATH
         if name in ("os.getcwd", "pathlib.Path.cwd") or (
             isinstance(func, ast.Attribute)
             and func.attr == "cwd"
@@ -973,12 +1015,12 @@ def _check_call(node: ast.Call, ctx: _Ctx) -> None:
             _check_module_function(bound, node, ctx)
             return
         if name in _DYNAMIC_BUILTINS:
-            ctx.flag(None, f"{name}() — динамический код")
+            _dynamic(name, ctx)
         elif name == "open":
             target = _path_of(node.args[0], ctx) if node.args else _UNKNOWN_PATH
             _check_open(node, target, 1, ctx, "open()")
         elif name == "type" and len(node.args) > 1:
-            ctx.flag(None, "type() с тремя аргументами")
+            ctx.flag(Level.DANGER, "type() с тремя аргументами — класс собирается при выполнении")
         elif name in _SAFE_BUILTINS:
             pass
         elif name in ctx.bindings or name in ctx.iterations or _defined(name, ctx):
@@ -1013,8 +1055,10 @@ def _check_call(node: ast.Call, ctx: _Ctx) -> None:
             # Поля шаблона ({0.__class__}, {0[key]}) обходят атрибуты при выполнении — ast их
             # не видит. Литерал проверяем, шаблон из переменной — «не знаю».
             text = func.value.value if isinstance(func.value, ast.Constant) else None
-            if not isinstance(text, str) or _format_traverses(text):
-                ctx.flag(None, "str.format с доступом к атрибутам или шаблон не литерал")
+            if isinstance(text, str) and _format_traverses(text):
+                ctx.flag(Level.DANGER, "str.format обходит атрибуты объектов ({0.x}, {0[k]})")
+            elif not isinstance(text, str):
+                ctx.flag(None, "str.format: шаблон не литерал")
         return
     ctx.flag(None, "вызов результата выражения")
 
@@ -1032,7 +1076,7 @@ def _looks_like_path(node: ast.AST, ctx: _Ctx, depth: int = 0) -> bool:
         if _is_path_ctor(func, ctx):
             return True
         if isinstance(func, ast.Attribute):
-            if func.attr in _PATH_SAME or func.attr == "cwd":
+            if func.attr in _PATH_SAME or func.attr in ("cwd", "home"):
                 return _looks_like_path(func.value, ctx, depth + 1) or _is_path_ctor(
                     func.value, ctx
                 )
@@ -1132,27 +1176,30 @@ def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
         if isinstance(node, ast.Attribute):
             attr = node.attr
             if attr.startswith("__") and attr.endswith("__") and attr not in _SAFE_DUNDERS:
-                ctx.flag(None, f"доступ к {attr}")
+                ctx.flag(Level.DANGER, f"доступ к {attr} — внутренности интерпретатора")
             elif attr in _INTERNALS:
-                ctx.flag(None, f"доступ к {attr}")
+                ctx.flag(Level.DANGER, f"доступ к {attr} — внутренности интерпретатора")
             module = _resolve_module(node.value, ctx)
             if module is not None:
                 _check_module_attr(module, attr, ctx)
                 if module in ctx.partial and attr not in ctx.partial[module]:
-                    ctx.flag(None, f"{module}.{attr} не проверен классификатором")
+                    if attr in ("import_module", "__import__", "reload", "util", "machinery"):
+                        ctx.flag(Level.DANGER, f"{module}.{attr} — импорт при выполнении")
+                    else:
+                        ctx.flag(None, f"{module}.{attr} не проверен классификатором")
             if (
                 isinstance(node.value, ast.Attribute)
                 and node.value.attr == "path"
                 and _resolve_module(node.value.value, ctx) == "sys"
             ):
-                ctx.flag(None, "изменение sys.path")
+                ctx.flag(Level.DANGER, "изменение sys.path — подмена модулей")
         elif isinstance(node, ast.Name):
             if node.id in _DYNAMIC_BUILTINS:
-                ctx.flag(None, f"{node.id} — динамический код")
+                _dynamic(node.id, ctx)
             elif (
                 node.id.startswith("__") and node.id.endswith("__") and node.id not in _SAFE_DUNDERS
             ):
-                ctx.flag(None, f"доступ к {node.id}")
+                ctx.flag(Level.DANGER, f"доступ к {node.id} — внутренности интерпретатора")
         elif isinstance(node, ast.Call):
             _check_call(node, ctx)
         elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
@@ -1164,10 +1211,10 @@ def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
                         base = base.value
                     mod = _resolve_module(base, ctx) if isinstance(base, ast.Name) else None
                     if mod is not None:
-                        ctx.flag(None, f"изменение модуля {mod}")
+                        ctx.flag(Level.DANGER, f"изменение модуля {mod}")
         elif isinstance(node, ast.Subscript):
             if isinstance(node.value, ast.Attribute) and node.value.attr == "environ":
-                ctx.flag(None, "os.environ")
+                ctx.flag(Level.DANGER, "os.environ: окружение процесса (там ключи и токены)")
 
 
 def shadowed_stdlib(directory: Path) -> str | None:

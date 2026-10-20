@@ -1249,6 +1249,7 @@ class Agent:
                     reason=assessment.reason,
                     remember="" if dangerous else self._remember_label(kind, verdict),
                     history=self._history_hint(verdict),
+                    purpose=assessment.purpose,
                 )
                 answer = _confirm_result(self._events.confirm(asked, preview, dangerous=dangerous))
                 if verdict is not None:

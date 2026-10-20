@@ -479,3 +479,45 @@ def test_subagent_hint_names_stop_keys():
     assert "Esc — оборвать суб-агента" in ui._subagent_hint()
     assert ui._subagent_label() == "explore · подвожу итог"
     ui.on_subagent_end(info, None)
+
+
+# ------------------- подтверждение: команда целиком ------------------- #
+def test_confirm_shows_long_command_entirely_and_offers_pager(monkeypatch):
+    from gigacrew.agent.events import Approval
+    from gigacrew.permissions import ToolKind
+
+    buf = io.StringIO()
+    ui = Console(no_color=True, file=buf, width=80)
+    from rich.console import ConsoleDimensions
+
+    monkeypatch.setattr(type(ui._c), "size", property(lambda self: ConsoleDimensions(80, 24)))
+    body = "\n".join(f"print('line {i:03d}')" for i in range(200))
+    command = f"python3 - <<'EOF'\n{body}\nEOF"
+    pages = []
+    monkeypatch.setattr(ui, "_page", lambda preview: pages.append(preview.text))
+    answers = iter(["v", "y"])
+    monkeypatch.setattr(ui._c, "input", lambda prompt: (ui._c.print(prompt), next(answers))[1])
+    call = ToolCallInfo("run_shell", command[:70], ToolKind.COMMAND, purpose="печать строк")
+    result = ui.confirm(call, Display(f"$ {command}", title="команда"), dangerous=False)
+    assert result.approval is Approval.YES
+    out = buf.getvalue()
+    assert all(f"line {i:03d}" in out for i in range(200))  # ничего не обрезано
+    assert "202 │ EOF" in out and "202 строки" in out  # номера строк и размер
+    assert "v — открыть целиком" in out and "[y/N/a/v]" in out
+    assert "Выполнить run_shell (python3 - <<'EOF' …)?" in out  # вопрос — одной строкой
+    assert "зачем (со слов модели): печать строк" in out
+    assert pages == [f"$ {command}"]  # просмотрщик открыт, потом вопрос задан снова
+
+
+def test_confirm_makes_invisible_characters_visible():
+    from gigacrew.permissions import ToolKind
+
+    ui, buf = _console()
+    ui._c.input = lambda prompt: "n"
+    command = "ls ‮txt.exe\x1b[2K"
+    ui.confirm(
+        ToolCallInfo("run_shell", "ls", ToolKind.COMMAND), Display(f"$ {command}"), dangerous=True
+    )
+    out = buf.getvalue()
+    assert "⟨U+202E⟩" in out and "⟨U+001B⟩" in out and "‮" not in out
+    assert "v — открыть" not in out  # короткая команда помещается на экран

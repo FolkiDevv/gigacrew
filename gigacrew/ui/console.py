@@ -102,6 +102,37 @@ def sanitize(text: str) -> str:
     return _CONTROL_RE.sub("", text.replace("\r\n", "\n"))
 
 
+# Невидимые символы: управляющие, смена направления текста, нулевой ширины. В команде,
+# которую подтверждает пользователь, их нельзя убирать молча — она выполнится с ними.
+_INVISIBLE_RE = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
+)
+# Многострочная команда длиннее — с номерами строк.
+_NUMBER_LINES_FROM = 4
+
+
+def visible_text(text: str, *, numbered: bool | None = None) -> Text:
+    """Текст как есть, но с видимыми невидимыми символами (``⟨U+202E⟩``) и, у длинного
+    многострочного, номерами строк. Ничего не обрезается: длинные строки переносятся."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    if numbered is None:
+        numbered = len(lines) >= _NUMBER_LINES_FROM
+    width = len(str(len(lines)))
+    out = Text(overflow="fold")
+    for i, line in enumerate(lines, 1):
+        if numbered:
+            out.append(f"{i:>{width}} │ ", style=MUTED)
+        pos = 0
+        for m in _INVISIBLE_RE.finditer(line):
+            out.append(line[pos : m.start()])
+            out.append(f"⟨U+{ord(m.group()):04X}⟩", style=f"bold {DANGER}")
+            pos = m.end()
+        out.append(line[pos:])
+        if i < len(lines):
+            out.append("\n")
+    return out
+
+
 class _LiveView:
     """Содержимое временной области: хвост ответа (если есть) + строка индикатора.
 
@@ -512,6 +543,39 @@ class Console(AgentEvents):
             )
         )
 
+    def _exact_block(self, preview: Display) -> bool:
+        """Превью того, что выполнится: целиком, без обрезки и молча удалённых символов.
+
+        Возвращает True, если оно не помещается на экран (тогда предлагается просмотрщик).
+        """
+        text = preview.text.rstrip("\n")
+        lines = text.split("\n")
+        title = preview.title or "превью"
+        if len(lines) >= _NUMBER_LINES_FROM:
+            n = len(lines)
+            title += f" · {n} {plural(n, 'строка', 'строки', 'строк')}"
+        self._print_above_live(
+            Panel(
+                visible_text(text),
+                title=Text(title, style=MUTED),
+                title_align="left",
+                box=ROUNDED,
+                border_style=MUTED,
+                padding=(0, 1),
+                expand=False,
+            )
+        )
+        width = max(self._c.size.width - 4, 20)
+        height = sum(max(1, -(-len(line) // width)) for line in lines)
+        return height > max(self._c.size.height - 8, 10)
+
+    def _page(self, preview: Display) -> None:
+        """Показать превью в просмотрщике (less и т.п.) — длинную команду целиком."""
+        body = visible_text(preview.text.rstrip("\n"), numbered=True)
+        with self._input_guard(), self._c.pager(styles=True):
+            self._c.print(Text(preview.title or "превью", style=MUTED))
+            self._c.print(body)
+
     def output_block(self, text: str, *, title: str = "вывод") -> None:
         if not text.strip():
             return
@@ -622,18 +686,24 @@ class Console(AgentEvents):
         self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
     ) -> ConfirmResult:
         self.stop_live()  # превью печатается до вопроса — область уже не нужна
+        long_preview = False
         if preview and preview.text.strip():
             if preview.kind == "diff":
                 self.diff(preview.text, title=preview.title or None)
             else:
-                self.output_block(preview.text, title=preview.title or "превью")
+                long_preview = self._exact_block(preview)
+        if call.purpose:
+            self._c.print(Text(f"  зачем (со слов модели): {sanitize(call.purpose)}", style=MUTED))
         if call.reason:
             self._c.print(Text(f"  почему спрашиваю: {sanitize(call.reason)}", style=MUTED))
         if call.history:
             self._c.print(Text(f"  {sanitize(call.history)}", style=MUTED))
         edit = call.kind is ToolKind.EDIT
         action = "Применить" if edit else "Выполнить"
-        target = f" ({sanitize(call.summary)})" if call.summary else ""
+        summary = sanitize(call.summary).strip()
+        if "\n" in summary:  # многострочная команда целиком — в превью выше
+            summary = summary.split("\n", 1)[0].rstrip() + " …"
+        target = f" ({summary})" if summary else ""
         always = None
         if not dangerous:  # опасное «навсегда» не разрешается
             if call.remember:
@@ -642,12 +712,18 @@ class Console(AgentEvents):
                 always = "правки файлов без вопросов до конца сессии (режим «авто-правки»)"
             else:
                 always = "не спрашивать этот вызов до конца сессии"
-        raw = self._question_raw(
-            f"{action} {call.name}{target}?", dangerous=dangerous, always=always, feedback=True
-        )
-        if raw is None:
-            return ConfirmResult(Approval.NO, answered=False)
-        answer = raw.strip().lower()
+        question = f"{action} {call.name}{target}?"
+        while True:
+            raw = self._question_raw(
+                question, dangerous=dangerous, always=always, feedback=True, view=long_preview
+            )
+            if raw is None:
+                return ConfirmResult(Approval.NO, answered=False)
+            answer = raw.strip().lower()
+            if preview is not None and answer in _VIEW:
+                self._page(preview)  # и спросить снова
+                continue
+            break
         if answer in _YES:
             return ConfirmResult(Approval.YES)
         if always is not None and answer in _ALWAYS:
@@ -667,19 +743,28 @@ class Console(AgentEvents):
         return "" if raw is None else raw.strip().lower()
 
     def _question_raw(
-        self, question: str, *, dangerous: bool, always: str | None = None, feedback: bool = False
+        self,
+        question: str,
+        *,
+        dangerous: bool,
+        always: str | None = None,
+        feedback: bool = False,
+        view: bool = False,
     ) -> str | None:
         """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода)."""
         self.stop_live()
         color = DANGER if dangerous else WARN
         if always is not None:
             self._c.print(Text(f"  a — {always}", style=MUTED))
+        if view:
+            self._c.print(Text("  v — открыть целиком в просмотрщике", style=MUTED))
         if feedback:
             self._c.print(Text("  или напишите, что сделать вместо этого", style=MUTED))
         prompt = Text("  ")
         prompt.append("⚠ ОПАСНО: " if dangerous else "? ", style=f"bold {color}")
         prompt.append(question, style="bold")
-        prompt.append(" [y/N/a] " if always is not None else " [y/N] ", style=MUTED)
+        keys = "y/N" + ("/a" if always is not None else "") + ("/v" if view else "")
+        prompt.append(f" [{keys}] ", style=MUTED)
         try:
             with self._input_guard():
                 answer = self._c.input(prompt)
@@ -861,6 +946,7 @@ class Console(AgentEvents):
 _YES = ("y", "yes", "д", "да")
 _NO = ("n", "no", "н", "нет", "т")  # н, т — клавиши y и n в русской раскладке: не «да»
 _ALWAYS = ("a", "always", "в", "всегда", "ф")  # ф — клавиша a в русской раскладке
+_VIEW = ("v", "view", "м", "показать")  # м — клавиша v в русской раскладке
 
 
 def _stdin_is_terminal() -> bool:

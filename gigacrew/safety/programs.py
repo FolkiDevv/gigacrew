@@ -3665,7 +3665,7 @@ def classify_simple(cmd: Command, env: Env) -> Part:
         return _read("присваивание переменных")
     name_word = cmd.argv[0]
     if not name_word.static:
-        return _unknown("имя программы известно только при выполнении")
+        return _danger("имя программы получается при выполнении — разбор не видит, что запустится")
     prog, special = _program(env, name_word)
     if "/" in name_word.value and special is None:
         env = replace(env, program_path=str(Path(os.path.normpath(env.dir / name_word.value))))
@@ -3780,8 +3780,9 @@ def _dispatch(
         return _unknown("set с аргументами")
     if prog in ("source", "."):
         return _source(env, args)
+    if prog == "eval":
+        return _danger("eval: команда собирается при выполнении — разбор её не видит")
     if prog in (
-        "eval",
         "trap",
         "alias",
         "unalias",

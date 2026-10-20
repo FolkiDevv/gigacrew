@@ -126,6 +126,7 @@ class Assessment:
     reason: str = ""
     kind: ToolKind | None = None
     verdict: Verdict | None = None
+    purpose: str = ""  # зачем вызов, со слов модели
 
 
 @dataclass

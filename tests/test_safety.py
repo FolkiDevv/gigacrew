@@ -431,3 +431,23 @@ def test_child_environment_drops_shell_hooks_and_adds_git_safety(monkeypatch):
     assert env["GIT_CONFIG_KEY_1"] == "safe.bareRepository"
     assert env["GIT_CONFIG_VALUE_2"] == "false"
     assert os.environ.get("CDPATH") is None or True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        '"$(echo rm)" -rf build',
+        "$CMD a.txt",
+        "eval ls",
+        "ls\u202e txt.exe",  # смена направления текста
+        "cat a.txt\u200b",  # символ нулевой ширины
+        "echo ok\x1b[2K",  # управляющая последовательность терминала
+        "python3 -c 'print(eval(\"1\"))'",
+        "python3 -c 'import os; print(os.environ)'",
+        "python3 -c 'x = ().__class__'",
+    ],
+)
+def test_hidden_or_dynamic_code_is_marked_dangerous(root, command):
+    """Спросить И пометить опасным: человек должен посмотреть внимательно."""
+    verdict = classify(command, root=root)
+    assert verdict.level is DANGER, verdict.reason

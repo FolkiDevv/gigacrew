@@ -18,13 +18,14 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
 from gigacrew.safety.levels import RULES_VERSION, CommandLevel, Part, Verdict, worst
 
-__all__ = ["RULES_VERSION", "CommandLevel", "Part", "Verdict", "classify"]
+__all__ = ["RULES_VERSION", "CommandLevel", "Part", "Verdict", "classify", "invisible_chars"]
 
 # Длиннее — не разбираем (так делают и другие агенты: длинная команда — повод спросить).
 MAX_COMMAND = 10_000
@@ -48,8 +49,34 @@ def classify(
         return Verdict(None, "классификатор работает только с /bin/sh", cwd, command.strip())
     if len(command) > MAX_COMMAND:
         return Verdict(None, "слишком длинная команда", cwd, command.strip())
+    hidden = invisible_chars(command)
+    if hidden:
+        return Verdict(
+            CommandLevel.DANGER,
+            f"в команде невидимые или управляющие символы ({', '.join(hidden)}): "
+            "на экране она выглядит не так, как выполнится",
+            cwd,
+            command.strip(),
+        )
     env = environ if environ is not None else os.environ
     return _classify(command, root=root, cwd=cwd, environ=env, depth=0)
+
+
+# Управляющие символы (кроме табуляции и перевода строки), смена направления текста,
+# символы нулевой ширины: с ними команда на экране выглядит не так, как выполнится.
+_INVISIBLE = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
+)
+
+
+def invisible_chars(text: str) -> list[str]:
+    """Невидимые символы текста в виде ``U+202E`` (без повторов, по порядку)."""
+    found: list[str] = []
+    for ch in _INVISIBLE.findall(text):
+        code = f"U+{ord(ch):04X}"
+        if code not in found:
+            found.append(code)
+    return found
 
 
 def _is_posix() -> bool:

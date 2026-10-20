@@ -88,7 +88,9 @@ class RunShellTool(Tool):
         if verdict.level is None:
             reason = f"не удалось проверить: {verdict.reason}" if verdict.reason else ""
         kind = ToolKind.EDIT if verdict.edits_only else None
-        return Assessment(risk, reason=reason, kind=kind, verdict=verdict)
+        return Assessment(
+            risk, reason=reason, kind=kind, verdict=verdict, purpose=params.description.strip()
+        )
 
     def risk(self, params: RunShellParams, ctx: ToolContext) -> RiskLevel:
         return self.assess(params, ctx).risk
@@ -104,8 +106,6 @@ class RunShellTool(Tool):
     def preview(self, params: RunShellParams, ctx: ToolContext) -> Display:
         cwd = _relative_cwd(params, ctx)
         title = "команда" + (f" · {cwd}" if cwd != "." else "")
-        if params.description.strip():
-            title += f" — {params.description.strip()}"
         return Display(f"$ {params.command}", title=title)
 
     def run(self, params: RunShellParams, ctx: ToolContext) -> ToolResult:
