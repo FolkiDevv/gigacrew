@@ -99,6 +99,8 @@ def test_timeout_default_and_clamp(tmp_path):
                             {"type": "command", "command": "b", "timeout": 5},
                             {"type": "command", "command": "c", "timeout": 10_000},
                             {"type": "command", "command": "d", "timeout": "soon"},
+                            {"type": "command", "command": "e", "timeout": float("inf")},
+                            {"type": "command", "command": "f", "timeout": float("nan")},
                         ]
                     }
                 ]
@@ -107,8 +109,8 @@ def test_timeout_default_and_clamp(tmp_path):
     )
     settings, warnings = load_settings(ws)
     timeouts = [h.timeout for h in settings.commands(HookEvent.STOP)]
-    assert timeouts == [DEFAULT_HOOK_TIMEOUT, 5, MAX_HOOK_TIMEOUT, DEFAULT_HOOK_TIMEOUT]
-    assert len(warnings) == 2
+    assert timeouts == [DEFAULT_HOOK_TIMEOUT, 5, MAX_HOOK_TIMEOUT] + [DEFAULT_HOOK_TIMEOUT] * 3
+    assert len(warnings) == 4
 
 
 @pytest.mark.parametrize(

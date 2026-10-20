@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -219,7 +220,12 @@ def _parse_command(raw: Any, where: str, warnings: list[str]) -> HookCommand | N
         warnings.append(f"{where}: command — ожидается непустая строка")
         return None
     timeout = raw.get("timeout", DEFAULT_HOOK_TIMEOUT)
-    if isinstance(timeout, bool) or not isinstance(timeout, int | float):
+    # json.loads пропускает NaN, Infinity и 1e400 — int() на них упал бы.
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int | float)
+        or not math.isfinite(timeout)
+    ):
         warnings.append(f"{where}: timeout — ожидается число секунд, взято {DEFAULT_HOOK_TIMEOUT}")
         timeout = DEFAULT_HOOK_TIMEOUT
     clamped = min(max(int(timeout), MIN_HOOK_TIMEOUT), MAX_HOOK_TIMEOUT)
