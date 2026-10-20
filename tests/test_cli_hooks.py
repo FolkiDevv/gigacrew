@@ -1,4 +1,4 @@
-"""Хуки в CLI: подтверждение хуков, PreConnect, хуки сессии в REPL и -p, /hooks."""
+"""Хуки в CLI: подтверждение хуков, PreRequest, хуки сессии в REPL и -p, /hooks."""
 
 from __future__ import annotations
 
@@ -8,8 +8,10 @@ import shlex
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
-from fakes import CatalogueProvider, ScriptedProvider, text_turn
+from fakes import ScriptedProvider, text_turn
+from test_gigacode import BASE, CHAT, CONFIG, Backend, _token_file, _write_token
 
 import gigacrew.cli.app as app
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore
@@ -18,6 +20,7 @@ from gigacrew.cli.commands import CommandContext, default_commands
 from gigacrew.cli.hooks import load_hooks
 from gigacrew.cli.repl import run_repl
 from gigacrew.config import Config
+from gigacrew.llm.gigacode import GigaCodeProvider
 from gigacrew.project.settings import HookEvent, TrustStore, load_settings, user_fingerprint
 from gigacrew.project.workspace import Workspace, user_settings_file
 from gigacrew.tools.base import build_default_registry
@@ -25,12 +28,10 @@ from gigacrew.ui.console import Console
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="команды хуков — через /bin/sh")
 
-EVENTS = ("PreConnect", "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop")
+EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop")
 
 
-def _logging_hooks(
-    tmp_path: Path, *, block_prompt: bool = False, block_connect: bool = False, matcher: str = ""
-) -> dict:
+def _logging_hooks(tmp_path: Path, *, block_prompt: bool = False) -> dict:
     """Настройки: каждое событие пишет «событие:источник/причина» в events.log."""
     script = tmp_path / "hook.py"
     script.write_text(
@@ -43,20 +44,12 @@ def _logging_hooks(
             "    print('секреты нельзя', file=sys.stderr); sys.exit(2)\n"
             if block_prompt
             else ""
-        )
-        + (
-            "if d['hook_event_name'] == 'PreConnect':\n"
-            "    print('нет токена', file=sys.stderr); sys.exit(2)\n"
-            if block_connect
-            else ""
         ),
         encoding="utf-8",
     )
     cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
     group = [{"hooks": [{"type": "command", "command": cmd}]}]
-    hooks = {event: group for event in EVENTS}
-    hooks["PreConnect"] = [{"matcher": matcher, "hooks": [{"type": "command", "command": cmd}]}]
-    return {"hooks": hooks}
+    return {"hooks": {event: group for event in EVENTS}}
 
 
 def _trust_user_hooks(tmp_path: Path) -> None:
@@ -110,7 +103,6 @@ def test_oneshot_trust_hooks_flag(tmp_path, oneshot):
     oneshot(ScriptedProvider([text_turn("ок")]))
     assert _main(tmp_path, "--trust-hooks") == 0
     assert _log(tmp_path) == [
-        "PreConnect:",
         "SessionStart:startup",
         "UserPromptSubmit:",
         "Stop:",
@@ -133,7 +125,7 @@ def test_oneshot_trusted_user_hooks_run(tmp_path, oneshot):
     _trust_user_hooks(tmp_path)
     oneshot(ScriptedProvider([text_turn("ок")]))
     assert _main(tmp_path) == 0
-    assert _log(tmp_path)[:2] == ["PreConnect:", "SessionStart:startup"]
+    assert _log(tmp_path)[0] == "SessionStart:startup"
 
 
 def test_oneshot_prompt_blocked(tmp_path, oneshot, capsys):
@@ -147,51 +139,76 @@ def test_oneshot_prompt_blocked(tmp_path, oneshot, capsys):
     assert _log(tmp_path)[-1] == "SessionEnd:other"
 
 
-# ---------------------------- PreConnect ---------------------------- #
-class ConnectProvider(CatalogueProvider):
-    """Провайдер, который при подключении запоминает, что уже записано в лог хуков."""
+# ---------------------------- PreRequest ---------------------------- #
+def _request_hooks(tmp_path: Path, *, block: bool = False, token: str = "") -> dict:
+    """PreRequest пишет «вид:причина» в requests.log; ``token`` — записать новый токен."""
+    script = tmp_path / "request_hook.py"
+    script.write_text(
+        "import json, sys\n"
+        "d = json.load(sys.stdin)\n"
+        f"open({str(tmp_path / 'requests.log')!r}, 'a').write(f\"{{d['request']}}:{{d['reason']}}\\n\")\n"
+        + (
+            f"open(d['token_file'], 'w').write(json.dumps({_token_file(token)!r}))\n"
+            if token
+            else ""
+        )
+        + ("print('VPN не подключён', file=sys.stderr); sys.exit(2)\n" if block else ""),
+        encoding="utf-8",
+    )
+    cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+    return {"hooks": {"PreRequest": [{"hooks": [{"type": "command", "command": cmd}]}]}}
 
-    def __init__(self, log: Path):
-        super().__init__([text_turn("ок")], models=[("M-default", 64_000)])
-        self.log = log
-        self.seen_at_connect: list[str] | None = None
 
-    def connect(self) -> None:
-        self.seen_at_connect = self.log.read_text().split() if self.log.exists() else []
-        super().connect()
+@pytest.fixture
+def gigacode(tmp_path, oneshot, monkeypatch):
+    """-p против бэкенда GigaCode на подменном транспорте; возвращает бэкенд."""
+    oneshot(None)
+    monkeypatch.setenv("GIGACREW_PROVIDER", "gigacode")
+    monkeypatch.setenv("GIGACREW_API_URL", BASE)
+    monkeypatch.setenv("GIGACREW_USER_AGENT", "test-agent/1.0")
+    monkeypatch.setenv("GIGACREW_MODEL", "coder")
+    monkeypatch.setenv("GIGACODE_HOME", str(tmp_path / "cli-home"))
+    _write_token(tmp_path, "tok-1")
+    backend = Backend(valid=("tok-1", "tok-2"))
+    monkeypatch.setattr(
+        app,
+        "_make_provider",
+        lambda cfg: GigaCodeProvider(cfg, transport=httpx.MockTransport(backend.handler)),
+    )
+    return backend
 
 
-def test_pre_connect_runs_before_connect(tmp_path, oneshot):
-    _write(Workspace(tmp_path).settings_file, _logging_hooks(tmp_path))
-    provider = ConnectProvider(tmp_path / "events.log")
-    oneshot(provider)
+def _requests_log(tmp_path: Path) -> list[str]:
+    path = tmp_path / "requests.log"
+    return path.read_text().split() if path.exists() else []
+
+
+def test_pre_request_before_every_gigacode_request(tmp_path, gigacode):
+    _write(Workspace(tmp_path).settings_file, _request_hooks(tmp_path))
     assert _main(tmp_path, "--trust-hooks") == 0
-    assert provider.seen_at_connect == ["PreConnect:"]
+    assert _requests_log(tmp_path) == ["config:request", "chat:request"]
+    assert gigacode.count(CONFIG) == 1 and gigacode.count(CHAT) == 1
 
 
-def test_pre_connect_block_stops_startup(tmp_path, oneshot, capsys):
-    _write(Workspace(tmp_path).settings_file, _logging_hooks(tmp_path, block_connect=True))
-    provider = ConnectProvider(tmp_path / "events.log")
-    oneshot(provider)
-    assert _main(tmp_path, "--trust-hooks") == app.EXIT_ERROR
-    assert "запуск остановлен хуком PreConnect: нет токена" in _text(capsys.readouterr().out)
-    assert provider.connects == 0
-    assert _log(tmp_path) == ["PreConnect:"]  # ни SessionStart, ни хода
-
-
-def test_pre_connect_matcher_is_provider(tmp_path, oneshot):
-    _write(Workspace(tmp_path).settings_file, _logging_hooks(tmp_path, matcher="gigacode"))
-    oneshot(ScriptedProvider([text_turn("ок")]))  # провайдер по умолчанию — api
+def test_pre_request_refreshes_token(tmp_path, gigacode):
+    gigacode.valid = {"tok-2"}  # tok-1 из файла бэкенд уже не принимает
+    _write(Workspace(tmp_path).settings_file, _request_hooks(tmp_path, token="tok-2"))
     assert _main(tmp_path, "--trust-hooks") == 0
-    assert "PreConnect:" not in _log(tmp_path)
+    assert gigacode.requests[-1].headers["Authorization"] == "Bearer tok-2"
 
 
-def test_pre_connect_on_list_models(tmp_path, oneshot):
-    _write(Workspace(tmp_path).settings_file, _logging_hooks(tmp_path))
-    oneshot(ConnectProvider(tmp_path / "events.log"))
-    code = app.main(["-C", str(tmp_path), "--list-models", "--no-color", "--trust-hooks"])
-    assert code == 0
-    assert _log(tmp_path) == ["PreConnect:"]
+def test_pre_request_block_stops_request(tmp_path, gigacode, capsys):
+    _write(Workspace(tmp_path).settings_file, _request_hooks(tmp_path, block=True))
+    assert _main(tmp_path, "--trust-hooks") == app.EXIT_LLM_ERROR
+    assert "остановлен хуком PreRequest: VPN не подключён" in _text(capsys.readouterr().out)
+    assert gigacode.requests == []
+
+
+def test_pre_request_not_installed_for_api_provider(tmp_path, oneshot):
+    _write(Workspace(tmp_path).settings_file, _request_hooks(tmp_path))
+    oneshot(ScriptedProvider([text_turn("ок")]))
+    assert _main(tmp_path, "--trust-hooks") == 0
+    assert _requests_log(tmp_path) == []
 
 
 # ----------------------------- доверие ----------------------------- #

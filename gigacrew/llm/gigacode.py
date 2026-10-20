@@ -208,6 +208,7 @@ class GigaCodeProvider(HttpProvider):
         self._token_file = token_file if token_file is not None else token_path(config.gigacode_dir)
         self._session_id = str(uuid.uuid4())
         self._token: Token | None = None
+        self._sent_token: Token | None = None  # токен последнего запроса (для 401)
         self._catalogue: Catalogue | None = None
 
     @property
@@ -217,6 +218,11 @@ class GigaCodeProvider(HttpProvider):
     @property
     def token_file(self) -> Path:
         return self._token_file
+
+    @property
+    def chat_endpoint(self) -> str:
+        """Адрес чата из каталога ("" — каталог ещё не загружен)."""
+        return self._catalogue.chat_url if self._catalogue is not None else ""
 
     @property
     def model(self) -> str:
@@ -229,10 +235,15 @@ class GigaCodeProvider(HttpProvider):
     # ------------------------------------------------------------------ #
     def connect(self) -> None:
         """Действующий токен из файла CLI и каталог моделей; токена нет или истёк —
-        :class:`ApiError` с просьбой пройти авторизацию в GigaCode."""
-        self._token = load_token(self._token_file, self._config_url)
+        :class:`ApiError` с просьбой пройти авторизацию в GigaCode.
+
+        С ``request_hook`` токен проверяется только вместе с запросом: хук перед ним может
+        обновить файл токена, и ранняя проверка отвергла бы ещё не обновлённый токен.
+        """
         if self._catalogue is None:
             self._load_config()
+        elif self.request_hook is None:
+            self._token = load_token(self._token_file, self._config_url)
 
     def list_models(self) -> list[str]:
         """Модели каталога (без сети; до :meth:`connect` — пусто)."""
@@ -259,15 +270,24 @@ class GigaCodeProvider(HttpProvider):
         self._token = token
         return token
 
+    def _before_request(self, kind: str, reason: str = "request") -> bool:
+        """После хука токен перечитывается: хук мог обновить файл."""
+        ran = super()._before_request(kind, reason)
+        if ran:
+            self._token = None
+        return ran
+
     def _get_config(self, token: Token) -> httpx.Response:
         headers = {"Accept": "*/*", "Authorization": f"Bearer {token.access_token}"}
         return self._request_with_retry(lambda: self._client.get(self._config_url, headers=headers))
 
     def _load_config(self) -> None:
         """``GET`` конфигурации: каталог моделей; 401 — перечитать токен и повторить раз."""
+        self._before_request("config")
         token = self._current_token()
         resp = self._get_config(token)
         if resp.status_code == 401:
+            self._before_request("config", "unauthorized")
             resp = self._get_config(self._reload_rejected(token))
             if resp.status_code == 401:
                 self._token = None
@@ -295,9 +315,13 @@ class GigaCodeProvider(HttpProvider):
     def _auth_headers(self, *, force: bool = False) -> dict[str, str]:
         """``Authorization`` с действующим токеном. ``force`` (чат ответил 401) —
         перечитать файл: там тот же токен — ошибка с просьбой пройти авторизацию."""
-        token = self._current_token()
         if force:
-            token = self._reload_rejected(token)
+            # Отвергнут токен, ушедший в прошлом запросе, а не текущий: хук перед повтором
+            # мог уже положить в файл новый.
+            token = self._reload_rejected(self._sent_token or self._current_token())
+        else:
+            token = self._current_token()
+        self._sent_token = token
         return {"Authorization": f"Bearer {token.access_token}"}
 
     @property

@@ -33,7 +33,14 @@ HOOK_OUTPUT_LIMIT = 10_000
 # «1 file reformatted» уходил бы модели после каждой правки.
 CONTEXT_EVENTS = frozenset({HookEvent.USER_PROMPT_SUBMIT, HookEvent.SESSION_START})
 # Эти хуки идут на каждом вызове инструмента — без индикатора, иначе он мигал бы.
-QUIET_EVENTS = frozenset({HookEvent.PRE_TOOL_USE, HookEvent.POST_TOOL_USE, HookEvent.NOTIFICATION})
+QUIET_EVENTS = frozenset(
+    {
+        HookEvent.PRE_TOOL_USE,
+        HookEvent.POST_TOOL_USE,
+        HookEvent.NOTIFICATION,
+        HookEvent.PRE_REQUEST,
+    }
+)
 NO_REASON = "хук не пояснил причину"
 
 

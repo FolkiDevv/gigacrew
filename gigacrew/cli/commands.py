@@ -21,7 +21,12 @@ from dataclasses import dataclass, field
 from gigacrew.agent.chat_store import ChatRecorder, ChatStoreError, SavedChat
 from gigacrew.agent.loop import Agent
 from gigacrew.agent.prompts import skill_invocation_prompt
-from gigacrew.cli.hooks import describe_hooks, load_hooks, restart_session
+from gigacrew.cli.hooks import (
+    describe_hooks,
+    install_request_hook,
+    load_hooks,
+    restart_session,
+)
 from gigacrew.cli.indexing import describe_index, run_indexing
 from gigacrew.cli.models import ModelCatalog, describe_model, ensure_context_window
 from gigacrew.cli.prompt import KEY_HELP
@@ -329,9 +334,11 @@ def _hooks(ctx: CommandContext, arg: str) -> bool:
         ctx.ui.error("использование: /hooks [reload]")
         return True
     if arg == "reload":
-        ctx.agent.hooks = load_hooks(
-            ctx.agent.workspace, ctx.ui, interactive=ctx.ui.interactive(), trust=ctx.trust_hooks
+        agent = ctx.agent
+        agent.hooks = load_hooks(
+            agent.workspace, ctx.ui, interactive=ctx.ui.interactive(), trust=ctx.trust_hooks
         )
+        install_request_hook(agent.provider, agent.hooks, ctx.ui, agent.config)
         ctx.ui.info("настройки хуков перечитаны")
     ctx.ui.info(describe_hooks(ctx.agent.hooks.settings))
     return True

@@ -17,7 +17,7 @@
 
 Хуки пользователя — из ``~/.gigacode/settings.json`` и ``.gigacode/settings*.json``
 проекта (:mod:`gigacrew.cli.hooks`), после подтверждения или с ``--trust-hooks``; хук
-PreConnect срабатывает до подключения к бэкенду.
+PreRequest срабатывает перед каждым запросом к бэкенду GigaCode.
 
 Коды возврата: 0 — успех, 1 — ошибка конфигурации/внутренняя, 2 — ошибка LLM,
 3 — ход остановлен ограничителем (лимит шагов, серия ошибок, зацикливание) или запрос
@@ -35,7 +35,7 @@ from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, S
 from gigacrew.agent.hooks import PromptBlocked
 from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
-from gigacrew.cli.hooks import hook_session, load_hooks, run_pre_connect
+from gigacrew.cli.hooks import hook_session, install_request_hook, load_hooks
 from gigacrew.cli.models import (
     describe_result,
     ensure_context_window,
@@ -254,18 +254,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # Хуки — до подключения: подтверждение спрашивается до начала работы, а хук
-        # PreConnect может подготовить подключение (например, обновить токен).
+        # PreRequest идёт уже перед запросом конфигурации (может обновить токен).
         hooks = load_hooks(
             Workspace(config.project_root),
             ui,
             interactive=not args.prompt and ui.interactive(),
             trust=args.trust_hooks,
         )
+        install_request_hook(provider, hooks, ui, config)
         try:
-            blocked = run_pre_connect(hooks, ui, config)
-            if blocked is not None:
-                ui.error(f"запуск остановлен хуком PreConnect: {blocked}")
-                return EXIT_ERROR
             provider.connect()  # токен и каталог моделей (бэкенд GigaCode)
         except KeyboardInterrupt:
             ui.system("\n(подключение прервано)")

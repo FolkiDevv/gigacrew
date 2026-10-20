@@ -1,4 +1,4 @@
-"""Хуки пользователя в CLI: загрузка настроек, подтверждение хуков, хук PreConnect,
+"""Хуки пользователя в CLI: загрузка настроек, подтверждение хуков, хук PreRequest,
 хуки сессии (SessionStart/SessionEnd) и описание для ``/hooks``.
 
 Хуки — запуск команд без вопросов: хуки проекта (``.gigacode/settings.json`` и
@@ -19,6 +19,8 @@ from pathlib import Path
 from gigacrew.agent.hooks import HookRunner
 from gigacrew.agent.loop import Agent
 from gigacrew.config import Config
+from gigacrew.llm.base import LLMProvider
+from gigacrew.llm.gigacode import GigaCodeProvider
 from gigacrew.project.settings import (
     PROJECT_SOURCES,
     HookEvent,
@@ -113,22 +115,41 @@ def load_hooks(
     return HookRunner(settings)
 
 
-def run_pre_connect(runner: HookRunner, ui: Console, config: Config) -> str | None:
-    """Хуки PreConnect — до подключения к бэкенду: причина остановить запуск или None.
+def install_request_hook(
+    provider: LLMProvider, runner: HookRunner, ui: Console, config: Config
+) -> None:
+    """Хуки PreRequest — перед каждым запросом к бэкенду GigaCode и перед повтором после
+    401 (у других провайдеров их нет). Нет таких хуков — провайдер работает без них.
 
-    Агента и чата ещё нет: в stdin — провайдер, адрес и модель из настроек. Ctrl+C
-    пробрасывается (вызывающий прерывает запуск, как при подключении).
+    В stdin — вид запроса (``config``, ``chat``, ``probe``; он же matcher), причина
+    (``request`` или ``unauthorized``), адрес и путь к файлу токена: хук может обновить
+    токен, провайдер перечитает файл после него. Ctrl+C пробрасывается — запрос
+    прерывается, как и сам HTTP-запрос.
     """
+    if not isinstance(provider, GigaCodeProvider):
+        return
+    settings = runner.settings
+    if settings.disabled or not any(g.event is HookEvent.PRE_REQUEST for g in settings.groups):
+        provider.request_hook = None
+        return
     root = Path(config.project_root).resolve()
-    payload = {
-        "hook_event_name": HookEvent.PRE_CONNECT.value,
-        "cwd": str(root),
-        "provider": config.provider,
-        "api_url": config.base_url,
-        "model": config.model,
-    }
-    result = runner.run(HookEvent.PRE_CONNECT, payload, cwd=root, events=ui, target=config.provider)
-    return result.reason if result.blocked else None
+
+    def hook(kind: str, reason: str) -> str | None:
+        if not runner.has(HookEvent.PRE_REQUEST, kind):
+            return None
+        url = provider.config_url if kind == "config" else provider.chat_endpoint
+        payload = {
+            "hook_event_name": HookEvent.PRE_REQUEST.value,
+            "cwd": str(root),
+            "request": kind,
+            "reason": reason,
+            "url": url,
+            "token_file": str(provider.token_file),
+        }
+        result = runner.run(HookEvent.PRE_REQUEST, payload, cwd=root, events=ui, target=kind)
+        return result.reason if result.blocked else None
+
+    provider.request_hook = hook
 
 
 def describe_groups(groups: tuple[HookGroup, ...]) -> str:

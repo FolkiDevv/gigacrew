@@ -585,3 +585,99 @@ def test_agent_turn_with_a_tool_call(tmp_path):
     assert second[-1]["role"] == "tool" and second[-1]["tool_call_id"] == "c1"
     assert "hello" in second[-1]["content"]
     provider.close()
+
+
+# --------------------------------------------------------------------------- #
+# request_hook (хуки пользователя PreRequest)
+
+
+class RecordingHook:
+    """request_hook: запоминает (вид, причина), может обновить токен или отказать."""
+
+    def __init__(self, tmp_path, *, tokens=(), block=None):
+        self.tmp_path = tmp_path
+        self.calls: list[tuple[str, str]] = []
+        self.tokens = list(tokens)  # какой токен записать в файл на очередном вызове
+        self.block = block
+
+    def __call__(self, kind: str, reason: str) -> str | None:
+        self.calls.append((kind, reason))
+        if self.tokens:
+            _write_token(self.tmp_path, self.tokens.pop(0))
+        return self.block
+
+
+def test_hook_runs_before_config_chat_and_probe(tmp_path):
+    backend = Backend()
+    provider = _provider(backend, tmp_path)
+    hook = provider.request_hook = RecordingHook(tmp_path)
+    provider.connect()
+    provider.stream(_msgs())
+    provider.complete(_msgs())
+    provider.measure_prompt("проба")
+    assert hook.calls == [
+        ("config", "request"),
+        ("chat", "request"),
+        ("chat", "request"),
+        ("probe", "request"),
+    ]
+
+
+def test_hook_refreshed_token_is_sent_although_cached_one_is_valid(tmp_path):
+    backend = Backend(valid=("tok-1", "tok-2"))
+    provider = _provider(backend, tmp_path)
+    provider.connect()  # tok-1 в памяти, не истёк
+    provider.request_hook = RecordingHook(tmp_path, tokens=["tok-2"])
+    provider.stream(_msgs())
+    assert backend.requests[-1].headers["Authorization"] == "Bearer tok-2"
+
+
+def test_hook_runs_again_before_retry_after_401(tmp_path):
+    backend = Backend(valid=("tok-1", "tok-2"))
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    backend.chat_rejects.add("tok-1")
+    # первый вызов файл не меняет, второй (перед повтором после 401) кладёт новый токен
+    hook = provider.request_hook = RecordingHook(tmp_path, tokens=["tok-1", "tok-2"])
+    assert provider.stream(_msgs()).message.content == "ok"
+    assert hook.calls == [("chat", "request"), ("chat", "unauthorized")]
+    assert backend.requests[-1].headers["Authorization"] == "Bearer tok-2"
+
+
+def test_hook_on_config_401(tmp_path):
+    backend = Backend(valid=("tok-2",))
+    provider = _provider(backend, tmp_path)  # в файле tok-1, бэкенд его не принимает
+    hook = provider.request_hook = RecordingHook(tmp_path, tokens=["tok-1", "tok-2"])
+    provider.connect()
+    assert hook.calls == [("config", "request"), ("config", "unauthorized")]
+    assert provider.list_models() == ["coder", "fast"]
+
+
+def test_hook_block_sends_nothing(tmp_path):
+    backend = Backend()
+    provider = _provider(backend, tmp_path)
+    provider.request_hook = RecordingHook(tmp_path, block="VPN не подключён")
+    with pytest.raises(ApiError, match="остановлен хуком PreRequest: VPN не подключён"):
+        provider.connect()
+    assert backend.requests == []
+
+
+def test_hook_not_called_on_transient_retries(tmp_path, _no_sleep):
+    backend = Backend(chat=[httpx.Response(503, json={"error": "busy"}), _text("ok")])
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    hook = provider.request_hook = RecordingHook(tmp_path)
+    assert provider.stream(_msgs()).message.content == "ok"
+    assert hook.calls == [("chat", "request")]
+    assert backend.count(CHAT) == 2
+
+
+def test_connect_with_hook_leaves_expired_token_to_the_request(tmp_path):
+    backend = Backend(valid=("tok-1", "tok-2"))
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    _write_token(tmp_path, "tok-1", expires_at=int(time.time()) - 3600)  # истёк
+    provider.request_hook = RecordingHook(tmp_path, tokens=["tok-2"])
+    provider.connect()  # перед ходом в REPL: без хука упало бы «токен истёк»
+    assert provider.stream(_msgs()).message.content == "ok"
+    assert backend.requests[-1].headers["Authorization"] == "Bearer tok-2"

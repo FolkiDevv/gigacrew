@@ -211,13 +211,13 @@ def test_trust_store_user_and_projects_coexist(tmp_path):
     assert not TrustStore(store.path).is_user_trusted("")
 
 
-def test_pre_connect_event_matches_provider(tmp_path):
+def test_pre_request_event_matches_request_kind(tmp_path):
     ws = Workspace(tmp_path)
-    _write(ws.settings_file, _hooks("PreConnect", "echo", "gigacode"))
+    _write(ws.settings_file, _hooks("PreRequest", "echo", "chat|probe"))
     settings, warnings = load_settings(ws)
     assert warnings == []
-    assert settings.has(HookEvent.PRE_CONNECT, "gigacode")
-    assert not settings.has(HookEvent.PRE_CONNECT, "api")
+    assert settings.has(HookEvent.PRE_REQUEST, "chat")
+    assert not settings.has(HookEvent.PRE_REQUEST, "config")
 
 
 def test_trust_store_roundtrip(tmp_path):

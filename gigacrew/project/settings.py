@@ -45,7 +45,7 @@ TRUST_FORMAT_VERSION = 1
 
 
 class HookEvent(StrEnum):
-    PRE_CONNECT = "PreConnect"  # при запуске, до подключения к бэкенду (matcher — провайдер)
+    PRE_REQUEST = "PreRequest"  # перед каждым запросом к GigaCode (matcher — вид запроса)
     PRE_TOOL_USE = "PreToolUse"
     POST_TOOL_USE = "PostToolUse"
     USER_PROMPT_SUBMIT = "UserPromptSubmit"

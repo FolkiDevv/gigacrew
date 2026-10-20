@@ -61,7 +61,7 @@ Claude Code, настройки — JSON (хуки из всех файлов о
 
 | Событие | Когда | matcher | Что может хук |
 |---|---|---|---|
-| `PreConnect` | запуск gigacrew, до подключения к бэкенду | провайдер: `api`, `gigacode` | подготовить подключение (обновить токен); код 2 — не запускаться |
+| `PreRequest` | перед каждым запросом к бэкенду GigaCode и перед повтором после 401 | вид запроса: `config`, `chat`, `probe` | обновить токен; код 2 — не отправлять запрос |
 | `PreToolUse` | перед вызовом инструмента | имя инструмента | запретить вызов; решить, спрашивать ли подтверждение |
 | `PostToolUse` | после вызова | имя инструмента | передать модели замечания (вывод линтера) |
 | `UserPromptSubmit` | запрос отправлен | — | отклонить запрос; добавить к нему контекст |
@@ -76,10 +76,13 @@ Claude Code, настройки — JSON (хуки из всех файлов о
 после хода, при `--no-save` его нет), `cwd`, `hook_event_name`, `permission_mode` и поля события: `tool_name`,
 `tool_input`, `tool_use_id`, `tool_response` (`{ok, content}`), `prompt`, `stop_hook_active`,
 `last_assistant_message`, `agent_type`, `source`, `reason`, `trigger`, `custom_instructions`, `message`,
-`notification_type`. У `PreConnect` чата ещё нет: вместо `session_id`, `transcript_path` и `permission_mode` —
-`provider`, `api_url` и `model` (из настроек, может быть пустой). Имена инструментов и параметров — gigacrew, а не Claude Code: `read_file`, `write_file` и
-`edit_file` принимают `path` (не `file_path`), `run_shell` — `command`; параметры остальных — в
-`gigacrew/tools/`. В окружении хука — `GIGACREW_PROJECT_DIR` и `CLAUDE_PROJECT_DIR` (корень проекта; в
+`notification_type`. `PreRequest` срабатывает только с провайдером `gigacode`, вне чата: в stdin — `cwd`,
+`hook_event_name`, `request` (вид запроса), `reason` (`request` или `unauthorized` — повтор после 401), `url` и
+`token_file` (файл токена официального CLI; после хука gigacrew перечитывает его, так что обновлённый токен
+уходит в этом же запросе). Автоматические повторы того же запроса (сеть, 5xx, 429) хук не вызывают.
+Имена инструментов и параметров — gigacrew, а не Claude Code: `read_file`, `write_file` и `edit_file`
+принимают `path` (не `file_path`), `run_shell` — `command`; параметры остальных — в `gigacrew/tools/`.
+В окружении хука — `GIGACREW_PROJECT_DIR` и `CLAUDE_PROJECT_DIR` (корень проекта; в
 `cmd.exe` — `%GIGACREW_PROJECT_DIR%`).
 
 Ответ хука — код выхода: `0` — успех, `2` — блокировка (причина — stderr; у `PostToolUse` она уходит модели

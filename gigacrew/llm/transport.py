@@ -213,7 +213,16 @@ class HttpProvider(LLMProvider):
     Хуки формата: :meth:`_chat_url`, :meth:`_payload`, :meth:`_has_reasoning`,
     :meth:`_parse_response`, :meth:`_consume_sse`, :meth:`_probe_payload`; авторизации —
     :meth:`_auth_headers` и :attr:`_refreshable` (401 на чате — обновить и повторить раз).
+
+    ``request_hook`` — функция ``(вид, причина)``, которую провайдер вызывает перед каждым
+    запросом (``chat``, ``probe``; у потомков — свои виды) и перед повтором после 401
+    (причина ``unauthorized``, иначе ``request``); автоматические повторы того же запроса
+    (сеть, 5xx, 429) её не вызывают. Вернула строку — запрос не отправляется, ``ApiError``
+    с этой причиной. Её ставит CLI (хуки пользователя PreRequest); слой ``llm`` о хуках не
+    знает.
     """
+
+    request_hook: Callable[[str, str], str | None] | None = None
 
     supports_measure = True
 
@@ -263,6 +272,17 @@ class HttpProvider(LLMProvider):
     # ------------------------------------------------------------------ #
     # Хуки формата и авторизации
     # ------------------------------------------------------------------ #
+    def _before_request(self, kind: str, reason: str = "request") -> bool:
+        """Вызвать ``request_hook`` перед запросом. True — он вызывался (провайдер может
+        перечитать авторизацию); отказ — :class:`ApiError`."""
+        hook = self.request_hook
+        if hook is None:
+            return False
+        blocked = hook(kind, reason)
+        if blocked is not None:
+            raise ApiError(f"запрос остановлен хуком PreRequest: {blocked}")
+        return True
+
     @abstractmethod
     def _chat_url(self) -> str:
         """Адрес chat/completions."""
@@ -447,15 +467,17 @@ class HttpProvider(LLMProvider):
         send: Callable[[Callable[[], httpx.Response]], httpx.Response] | None = None,
         *,
         timeout: httpx.Timeout | None = None,
+        kind: str = "chat",
     ) -> httpx.Response:
         """POST на chat/completions; при протухшей авторизации (401) — обновить и повторить раз.
 
         ``send`` — как отправлять сам запрос (по умолчанию ``_request_with_retry``);
         обновление авторизации идёт мимо него, его ошибки — обычные ``ApiError``.
         ``timeout`` — таймауты запроса вместо клиентских (None — клиентские; не «без
-        таймаута»).
+        таймаута»). ``kind`` — вид запроса для ``request_hook`` (``chat``, ``probe``).
         """
         url = self._chat_url()
+        self._before_request(kind)
         headers = {**self._chat_headers(stream=False), **self._auth_headers()}
         send = send or self._request_with_retry
         options = {} if timeout is None else {"timeout": timeout}
@@ -463,6 +485,7 @@ class HttpProvider(LLMProvider):
         resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
         if resp.status_code == 401 and self._refreshable:
             # авторизация протухла — обновляем принудительно и повторяем один раз
+            self._before_request(kind, "unauthorized")
             headers.update(self._auth_headers(force=True))
             resp = send(lambda: self._client.post(url, json=payload, headers=headers, **options))
         return resp
@@ -511,7 +534,7 @@ class HttpProvider(LLMProvider):
 
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
         payload = self._probe_payload(text, model or self.model)
-        resp = self._post_chat(payload, self._send_probe)
+        resp = self._post_chat(payload, self._send_probe, kind="probe")
         status = resp.status_code
         if status in UNAVAILABLE_STATUS:
             raise ApiError(f"API временно недоступен ({status}): {error_body(resp)}")
@@ -571,8 +594,11 @@ class HttpProvider(LLMProvider):
         limit = RateLimitWait(self._rate_limit_wait, on_notice)
         rejected: int | None = None  # статус отказа запросу с рассуждениями
 
+        self._before_request("chat")
         attempt = 0
         while attempt < self._max_retries:
+            if refresh:
+                self._before_request("chat", "unauthorized")
             headers = {**self._chat_headers(stream=True), **self._auth_headers(force=refresh)}
             refresh = False
             try:
