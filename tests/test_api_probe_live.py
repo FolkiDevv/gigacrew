@@ -15,7 +15,7 @@
    оборванным и повторял запрос.
 
 Модели — как у eval: ``GIGACREW_EVAL_MODELS``, иначе ``GIGACREW_TEST_MODEL``. Запуск —
-``make probe``; находки — в конце вывода и в ``.gigacrew/evals/probe-<время>.json``.
+``make probe``; находки — в конце вывода и в ``.gigacode/evals/probe-<время>.json``.
 """
 
 from __future__ import annotations

@@ -391,7 +391,8 @@ class Console(AgentEvents):
         table.add_column(style=ACCENT, no_wrap=True)
         table.add_column(style=MUTED)
         for name, desc in commands:
-            table.add_row(name, desc)
+            # Text, а не строка: «/resume [id]» и описания скиллов — не разметка Rich.
+            table.add_row(Text(name), Text(desc))
         if keys:
             table.add_row("", "")
             for key, desc in keys:

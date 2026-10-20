@@ -215,13 +215,13 @@ class Config:
     reasoning: str = "turn"
     # Бюджет контекста (оценка в токенах), в который укладывается история при
     # отправке модели; старые сообщения сверх бюджета отбрасываются. None — от
-    # замеренного окна модели (~/.gigacrew/models.json), число — явное переопределение.
+    # замеренного окна модели (~/.gigacode/models.json), число — явное переопределение.
     context_budget_tokens: int | None = None
     # Сжимать историю в краткое содержание, когда она занимает compact_threshold
     # бюджета истории (бюджет за вычетом системного промпта и схем инструментов).
     auto_compact: bool = True
     compact_threshold: float = 0.8
-    # Сохранять чаты в .gigacrew/chats/ (продолжение — /resume, --continue).
+    # Сохранять чаты в .gigacode/chats/ (продолжение — /resume, --continue).
     save_chats: bool = True
     # Предлагать замер окна незамеренной модели (пробы оплачиваются); False — только
     # по --test-context.

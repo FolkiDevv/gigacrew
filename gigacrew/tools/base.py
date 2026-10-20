@@ -44,10 +44,10 @@ __all__ = [
 
 @dataclass
 class PlanFile:
-    """Файл плана текущего чата (режим планирования): ``.gigacrew/plans/<id>.md``.
+    """Файл плана текущего чата (режим планирования): ``.gigacode/plans/<id>.md``.
 
     Агент пишет его обычными write_file/edit_file — единственный файл в
-    ``.gigacrew/``, доступный для записи. ``dirty`` — план менялся после того, как
+    ``.gigacode/``, доступный для записи. ``dirty`` — план менялся после того, как
     его в последний раз отдали на одобрение (:func:`~gigacrew.tools.plan.review_plan`);
     ``reviews`` — сколько раз отдавали: по нему агент видит, показан ли план в этом ходе.
     """
@@ -290,6 +290,7 @@ def build_default_registry() -> ToolRegistry:
     from gigacrew.tools.plan import ExitPlanModeTool
     from gigacrew.tools.search import SearchContentTool
     from gigacrew.tools.shell import RunShellTool
+    from gigacrew.tools.skill import SkillTool
     from gigacrew.tools.task import ExploreTool, TaskTool
 
     reg = ToolRegistry()
@@ -310,6 +311,7 @@ def build_default_registry() -> ToolRegistry:
         RepoMapTool(),
         RunShellTool(),
         GitTool(),
+        SkillTool(),
         AskUserTool(),
         ExitPlanModeTool(),
         TaskTool(),

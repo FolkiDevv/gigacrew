@@ -9,12 +9,12 @@
 * ``GIGACREW_EVAL_MODELS`` — модели через запятую (по умолчанию ``GIGACREW_TEST_MODEL``);
 * ``GIGACREW_EVAL_RUNS`` — повторов каждого сценария (по умолчанию 3);
 * ``GIGACREW_EVAL_LABEL`` — метка отчёта (``baseline-t02``…);
-* ``GIGACREW_EVAL_DIR`` — папка отчётов (по умолчанию ``.gigacrew/evals``);
+* ``GIGACREW_EVAL_DIR`` — папка отчётов (по умолчанию ``.gigacode/evals``);
 * ``GIGACREW_EVAL_TIMEOUT`` — предел одного прогона, с (по умолчанию 1800);
 * ``GIGACREW_TEMPERATURE`` и прочие настройки агента — как у ``gigacrew``.
 
 Отдельные сценарии — ``-k``: ``make eval ARGS="-k plan_exit"``. Окна моделей берутся из
-замеров ``~/.gigacrew/models.json`` (незамеренная модель работает с окном 32K — замерьте
+замеров ``~/.gigacode/models.json`` (незамеренная модель работает с окном 32K — замерьте
 заранее: ``gigacrew --test-context <модель>``).
 
 Тест падает, только если нарушен инвариант harness'а (история вызовов, запрет правок в

@@ -256,9 +256,9 @@ def _plan_written(ctx: ToolContext, p: Path) -> bool:
 
 
 def _writable_path(ctx: ToolContext, path: str) -> Path:
-    """Путь для записи: внутри корня, не в ``.gigacrew/`` и не во внутренностях git.
+    """Путь для записи: внутри корня, не в ``.gigacode/`` и не во внутренностях git.
 
-    В ``.gigacrew/`` лежат индекс, история ввода и чаты агента — модель не должна
+    В ``.gigacode/`` лежат индекс, история ввода и чаты агента — модель не должна
     их править. Исключение — файл плана текущего чата (``ctx.plan``). Запись в
     ``.git/`` (``config``, хуки) превратила бы правку файла в выполнение команды:
     ``core.fsmonitor`` и ``diff.external`` запускаются уже на ``git status``/``git
@@ -273,11 +273,11 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
         )
     if ctx.plan is not None and ctx.plan.is_target(p):
         return p
-    data_dir = ctx.workspace.data_dir.resolve()  # .gigacrew может быть симлинком
-    # is_data_path — ещё и без учёта регистра: на macOS/Windows .GIGACREW — та же папка.
+    data_dir = ctx.workspace.data_dir.resolve()  # .gigacode может быть симлинком
+    # is_data_path — ещё и без учёта регистра: на macOS/Windows .GIGACODE — та же папка.
     if p == data_dir or data_dir in p.parents or ctx.workspace.is_data_path(p):
         raise ToolError(
-            f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента) "
+            f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента, скиллы) "
             f"недоступна для записи: {path}"
             + (
                 f". Файл плана этого чата: {_rel(ctx, ctx.plan.path)}"

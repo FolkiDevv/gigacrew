@@ -1,4 +1,4 @@
-"""Строка ввода: автодополнение, история в .gigacrew/, клавиши, статус-строка."""
+"""Строка ввода: автодополнение, история в .gigacode/, клавиши, статус-строка."""
 
 from __future__ import annotations
 
@@ -139,7 +139,7 @@ def test_alt_enter_inserts_newline(tmp_path):
 
 def test_plain_enter_submits(tmp_path):
     assert _prompt(tmp_path, "привет\r") == "привет"
-    assert (tmp_path / ".gigacrew" / "history").is_file()
+    assert (tmp_path / ".gigacode" / "history").is_file()
 
 
 def _styles(status: StatusInfo) -> dict[str, str]:
@@ -199,6 +199,23 @@ def test_default_text_is_prefilled(tmp_path):
         )
         pipe.send_text(" ещё\r")
         assert session.prompt(default="набрано") == "набрано ещё"
+
+
+def test_completes_skills_after_commands():
+    skills = [("/deploy", "выкатка на стенд"), ("/help", "скилл-тёзка"), ("/notes", "")]
+    completer = SlashCommandCompleter(default_commands(), skills=lambda: skills)
+
+    def complete(text: str) -> list[tuple[str, str]]:
+        return [
+            (c.text, c.display_meta_text)
+            for c in completer.get_completions(Document(text), CompleteEvent())
+        ]
+
+    assert complete("/de") == [("/deploy", "скилл · выкатка на стенд")]
+    assert complete("/no") == [("/notes", "скилл")]
+    assert complete("/he") == [("/help", "справка")]  # встроенная команда не перекрывается
+    assert complete("/")[-2:] == [("/deploy", "скилл · выкатка на стенд"), ("/notes", "скилл")]
+    assert complete("/deploy ") == []
 
 
 def test_completes_mode_argument():

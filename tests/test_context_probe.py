@@ -1,4 +1,4 @@
-"""Замер окна контекста пробными запросами и хранилище ~/.gigacrew/models.json."""
+"""Замер окна контекста пробными запросами и хранилище ~/.gigacode/models.json."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ def test_calibration_failure_aborts():
 
 # ------------------------------ хранилище ------------------------------ #
 def test_store_round_trip_and_merge(tmp_path):
-    path = tmp_path / ".gigacrew" / "models.json"
+    path = tmp_path / ".gigacode" / "models.json"
     windows, warning = ModelWindows.load(path)
     assert warning is None and windows.get("A") is None and not path.exists()
 
@@ -115,8 +115,8 @@ def test_store_in_memory_and_default_path(_isolated_home):
     windows = ModelWindows()
     windows.record(probe_context_window(WindowProvider(8_192), "A"))
     assert windows.get("A") is not None
-    assert not (_isolated_home / ".gigacrew").exists()
-    assert default_path() == _isolated_home / ".gigacrew" / "models.json"
+    assert not (_isolated_home / ".gigacode").exists()
+    assert default_path() == _isolated_home / ".gigacode" / "models.json"
 
 
 def test_window_from_another_endpoint_is_ignored(tmp_path):

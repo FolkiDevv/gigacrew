@@ -1,4 +1,4 @@
-"""Замеренные окна контекста моделей: ``~/.gigacrew/models.json``.
+"""Замеренные окна контекста моделей: ``~/.gigacode/models.json``.
 
 Файл общий для всех проектов пользователя (окно — свойство модели, а не проекта),
 ключ — имя модели. Пишется атомарно (временный файл + ``os.replace``) и перед
@@ -23,7 +23,7 @@ from typing import Any
 from gigacrew.llm.context_probe import ProbeResult
 
 FORMAT_VERSION = 1
-USER_DIR_NAME = ".gigacrew"
+USER_DIR_NAME = ".gigacode"
 FILE_NAME = "models.json"
 
 
