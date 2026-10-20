@@ -18,7 +18,7 @@ from gigacrew.tools.plan import (
 from gigacrew.tools.questions import Answer, QuestionsUnavailable
 
 PLAN = "## План\n1. Поправить `a.py`\n2. Прогнать тесты"
-PLAN_REL = ".gigacrew/plans/chat1.md"
+PLAN_REL = ".gigacode/plans/chat1.md"
 
 
 class _Session:

@@ -2,17 +2,17 @@
 
 Режимы:
   * интерактивный REPL (по умолчанию);
-  * одноразовый запрос: ``gigacrew -p "сделай X"``;
+  * одноразовый запрос: ``gigacrew -p "сделай X"`` (или ``-p "/скилл аргументы"``);
   * диагностика: ``gigacrew --list-models`` (чат-модели);
   * замер окна контекста: ``gigacrew --test-context МОДЕЛЬ`` — результат
-    сохраняется в ``~/.gigacrew/models.json``. Окно незамеренной модели
+    сохраняется в ``~/.gigacode/models.json``. Окно незамеренной модели
     замеряется и автоматически — при запуске и смене модели.
 
 Провайдер — ``GIGACREW_PROVIDER``: API v2 (по умолчанию) или бэкенд GigaCode
-(``gigacode``): вход через браузер при запуске, модели и их окна — из каталога бэкенда,
-модель по умолчанию — его же.
+(``gigacode``): токен — из файла официального CLI GigaCode, модели и их окна — из
+каталога бэкенда, модель по умолчанию — его же.
 
-Чаты сохраняются в ``.gigacrew/chats/`` (``--no-save`` — нет); ``-c`` продолжает
+Чаты сохраняются в ``.gigacode/chats/`` (``--no-save`` — нет); ``-c`` продолжает
 последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
 
 Коды возврата: 0 — успех, 1 — ошибка конфигурации/внутренняя, 2 — ошибка LLM,
@@ -29,7 +29,7 @@ from pathlib import Path
 from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
 from gigacrew.agent.loop import Agent
-from gigacrew.cli.commands import RESUME_LIMIT, default_commands, resume_chat
+from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
 from gigacrew.cli.models import (
     describe_result,
     ensure_context_window,
@@ -43,6 +43,7 @@ from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.llm.gigacode import GigaCodeProvider
 from gigacrew.llm.model_windows import ModelWindows
 from gigacrew.permissions import PermissionMode
+from gigacrew.project.skills import SkillCatalog
 from gigacrew.tools.base import build_default_registry
 from gigacrew.ui.console import Console
 
@@ -97,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-save",
         action="store_true",
-        help="Не сохранять чат в .gigacrew/chats/",
+        help="Не сохранять чат в .gigacode/chats/",
     )
     p.add_argument("--no-color", action="store_true", help="Отключить цвет")
     p.add_argument(
@@ -112,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--test-context",
         metavar="MODEL",
         help="Замерить окно контекста модели (пробные запросы), сохранить "
-        "в ~/.gigacrew/models.json и выйти",
+        "в ~/.gigacode/models.json и выйти",
     )
     p.add_argument("--version", action="version", version=f"gigacrew {__version__}")
     return p
@@ -280,10 +281,18 @@ def main(argv: list[str] | None = None) -> int:
             skipped = resume_chat(agent, chats, saved, keep_model=args.model is not None)
             if skipped:
                 ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {agent.model}")
+        commands = default_commands()
         if args.prompt:
+            skills = SkillCatalog(agent.workspace)
+            skills.refresh()
+            try:  # -p "/скилл аргументы" — как в REPL
+                prompt = expand_skill(args.prompt, commands, skills) or args.prompt
+            except OSError as e:
+                ui.error(str(e))
+                return EXIT_ERROR
             ensure_context_window(agent, ui, interactive=False)
-            return run_oneshot(agent, ui, args.prompt, chats)
+            return run_oneshot(agent, ui, prompt, chats)
         resumed = saved.info if saved is not None else None
-        return run_repl(agent, ui, default_commands(), chats=chats, resumed=resumed)
+        return run_repl(agent, ui, commands, chats=chats, resumed=resumed)
     finally:
         provider.close()

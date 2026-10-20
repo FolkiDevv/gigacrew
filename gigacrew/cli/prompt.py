@@ -1,9 +1,9 @@
 """Строка ввода REPL на prompt_toolkit.
 
 * автодополнение слеш-команд из :class:`~gigacrew.cli.commands.CommandRegistry`
-  (имя + краткое описание), меню появляется при вводе ``/``; аргументы команд —
-  из ``arg_choices`` (``/model`` — список моделей);
-* история ввода в ``.gigacrew/history`` (папка создаётся при первом сохранённом
+  и скиллов (имя + краткое описание), меню появляется при вводе ``/``; аргументы
+  команд — из ``arg_choices`` (``/model`` — список моделей);
+* история ввода в ``.gigacode/history`` (папка создаётся при первом сохранённом
   вводе) и подсказки из истории;
 * многострочный ввод: ``\\`` в конце строки + Enter или Alt+Enter — новая строка;
   Esc Esc — очистить ввод (черновик сохраняется в истории);
@@ -48,8 +48,9 @@ if TYPE_CHECKING:  # commands импортирует KEY_HELP отсюда
 InputReader = Callable[..., str]
 # Варианты аргумента команды: пары (значение, пояснение); вызывается при каждом дополнении.
 ArgChoices = Callable[[], Iterable[tuple[str, str]]]
+# Скиллы для дополнения: пары (команда «/имя», описание).
+SkillChoices = Callable[[], Iterable[tuple[str, str]]]
 
-HISTORY_FILE = "history"
 PROMPT = "❯ "
 PLAIN_PROMPT = "gigacrew> "
 PLACEHOLDER = "сообщение…  / — команды · \\ и Enter — новая строка"
@@ -58,7 +59,7 @@ PLACEHOLDER = "сообщение…  / — команды · \\ и Enter — н
 KEY_HELP: tuple[tuple[str, str], ...] = (
     ("Enter", "отправить"),
     ("\\ + Enter, Alt+Enter", "новая строка (вставка многострочного текста не отправляет)"),
-    ("Tab, ↑ ↓", "автодополнение команд, история ввода"),
+    ("Tab, ↑ ↓", "автодополнение команд и скиллов, история ввода"),
     ("→", "принять подсказку из истории"),
     ("Shift+Tab", "сменить режим: ручной → авто-правки → план (и во время ответа)"),
     ("Esc", "во время ответа — прервать ход"),
@@ -111,13 +112,20 @@ def toolbar_fragments(status: StatusInfo) -> list[tuple[str, str]]:
 
 # ------------------------------ автодополнение ----------------------------- #
 class SlashCommandCompleter(Completer):
-    """Дополняет первое слово, если это начало слеш-команды (не путь ``/home/...``),
-    и аргумент команды, для которой есть источник вариантов в ``arg_choices``
-    (ключ — имя команды): сначала совпадения по началу, затем по подстроке."""
+    """Дополняет первое слово, если это начало слеш-команды или скилла (не путь
+    ``/home/...``), и аргумент команды, для которой есть источник вариантов в
+    ``arg_choices`` (ключ — имя команды): сначала совпадения по началу, затем по
+    подстроке. Скилл с именем встроенной команды не предлагается — её не перекрыть."""
 
-    def __init__(self, commands: CommandRegistry, arg_choices: Mapping[str, ArgChoices] = {}):
+    def __init__(
+        self,
+        commands: CommandRegistry,
+        arg_choices: Mapping[str, ArgChoices] = {},
+        skills: SkillChoices | None = None,
+    ):
         self._commands = commands
         self._arg_choices = {name.lower(): source for name, source in arg_choices.items()}
+        self._skills = skills
 
     def get_completions(
         self, document: Document, complete_event: CompleteEvent
@@ -149,11 +157,17 @@ class SlashCommandCompleter(Completer):
                 if name.lower().startswith(prefix):
                     yield Completion(name, start_position=-len(text), display_meta=cmd.summary)
                     break
+        if self._skills is None:
+            return
+        for name, description in self._skills():
+            if name.lower().startswith(prefix) and self._commands.get(name) is None:
+                meta = f"скилл · {description}" if description else "скилл"
+                yield Completion(name, start_position=-len(text), display_meta=meta)
 
 
 # --------------------------------- история --------------------------------- #
 class LazyFileHistory(FileHistory):
-    """История в ``.gigacrew/history``; папка создаётся при первом сохранении.
+    """История в ``.gigacode/history``; папка создаётся при первом сохранении.
 
     Если записать не удалось (проект только для чтения), история остаётся в памяти
     до конца сессии — ошибка не должна закрывать REPL.
@@ -162,7 +176,7 @@ class LazyFileHistory(FileHistory):
     def __init__(self, workspace: Workspace):
         self._workspace = workspace
         self._persist = True
-        super().__init__(workspace.data_dir / HISTORY_FILE)
+        super().__init__(workspace.history_file)
 
     def store_string(self, string: str) -> None:
         if not self._persist:
@@ -227,11 +241,13 @@ def create_prompt_session(
     no_color: bool = False,
     arg_choices: Mapping[str, ArgChoices] = {},
     on_cycle_mode: Callable[[], object] | None = None,
+    skills: SkillChoices | None = None,
     **kwargs: Any,
 ) -> PromptSession[str]:
     """Сессия ввода. ``kwargs`` (``input``/``output``) подменяются в тестах.
 
-    ``on_cycle_mode`` — что сделать по Shift+Tab (сменить режим агента).
+    ``on_cycle_mode`` — что сделать по Shift+Tab (сменить режим агента);
+    ``skills`` — скиллы для автодополнения.
     """
 
     @Condition
@@ -242,7 +258,7 @@ def create_prompt_session(
         message=[("class:prompt", PROMPT)],
         history=LazyFileHistory(workspace),
         auto_suggest=AutoSuggestFromHistory(),
-        completer=SlashCommandCompleter(commands, arg_choices),
+        completer=SlashCommandCompleter(commands, arg_choices, skills),
         complete_while_typing=_typing_command,
         reserve_space_for_menu=min(8, len(list(commands)) + 1),
         key_bindings=_key_bindings(on_cycle_mode),
@@ -269,6 +285,7 @@ def make_input_reader(
     no_color: bool = False,
     arg_choices: Mapping[str, ArgChoices] = {},
     on_cycle_mode: Callable[[], object] | None = None,
+    skills: SkillChoices | None = None,
 ) -> InputReader:
     """Функция чтения строки: prompt_toolkit в терминале, иначе ``input()``."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -281,6 +298,7 @@ def make_input_reader(
             no_color=no_color,
             arg_choices=arg_choices,
             on_cycle_mode=on_cycle_mode,
+            skills=skills,
         )
     except Exception:  # терминал не поддерживается (например, mintty без консоли)
         return _read_plain

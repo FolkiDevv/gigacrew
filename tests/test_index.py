@@ -1,4 +1,4 @@
-"""Тесты индекса проекта (SQLite в .gigacrew/index)."""
+"""Тесты индекса проекта (SQLite в .gigacode/index)."""
 
 from __future__ import annotations
 
@@ -50,16 +50,16 @@ def _paths(ix):
 # ------------------------------ построение ------------------------------ #
 def test_constructor_has_no_side_effects(project):
     ix = ProjectIndex(Workspace(project))
-    assert not (project / ".gigacrew").exists()
+    assert not (project / ".gigacode").exists()
     assert ix.is_complete() is False
-    assert not (project / ".gigacrew").exists()
+    assert not (project / ".gigacode").exists()
 
 
 def test_build_creates_data_dir_and_marks_complete(index, project):
     stats = index.refresh()
     assert (stats.scanned, stats.added, stats.updated, stats.removed) == (4, 4, 0, 0)
-    assert (project / ".gigacrew" / ".gitignore").is_file()
-    assert (project / ".gigacrew" / "index" / INDEX_FILE_NAME).is_file()
+    assert (project / ".gigacode" / ".gitignore").is_file()
+    assert (project / ".gigacode" / "index" / INDEX_FILE_NAME).is_file()
     assert index.is_complete()
     info = index.stats()
     assert info.files == 4 and info.symbols == 8 and info.complete

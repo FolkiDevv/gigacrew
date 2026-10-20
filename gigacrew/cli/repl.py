@@ -18,6 +18,7 @@ from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import (
     CommandContext,
     CommandRegistry,
+    expand_skill,
     is_repl_command,
     mode_choices,
 )
@@ -26,6 +27,7 @@ from gigacrew.cli.interrupt import EscInterrupt
 from gigacrew.cli.models import ModelCatalog, ensure_context_window
 from gigacrew.cli.prompt import ArgChoices, InputReader, StatusInfo, make_input_reader
 from gigacrew.llm.base import LLMError
+from gigacrew.project.skills import SkillCatalog
 from gigacrew.ui.console import Console
 from gigacrew.ui.format import mode_badge
 
@@ -86,6 +88,7 @@ def run_repl(
     resumed: ChatInfo | None = None,
     index_on_start: bool = True,
     models: ModelCatalog | None = None,
+    skills: SkillCatalog | None = None,
 ) -> int:
     """``interrupt`` подменяется в тестах; по умолчанию Esc слушается только вместе с
     настоящей строкой ввода (``read_input is None``). ``index_on_start`` — до первого
@@ -97,13 +100,17 @@ def run_repl(
 
     ``models`` — каталог моделей для ``/model``; по умолчанию с настоящей строкой
     ввода список загружается в фоне. Замер окна незамеренной модели предлагается
-    до первого ввода (:func:`~gigacrew.cli.models.ensure_context_window`)."""
+    до первого ввода (:func:`~gigacrew.cli.models.ensure_context_window`).
+
+    ``skills`` — скиллы (``/<имя> [аргументы]``); по умолчанию — из ``.gigacode/skills``
+    проекта и ``~/.gigacode/skills``, перечитываются перед каждым вводом."""
     if interrupt is None:
         interrupt = EscInterrupt(enabled=None if read_input is None else False)
     esc = esc_interrupt_for(ui, interrupt, agent)
     if models is None and read_input is None:
         models = ModelCatalog(agent.provider)
     catalog = models
+    skills = SkillCatalog(agent.workspace) if skills is None else skills
     arg_choices: dict[str, ArgChoices] = {"/mode": lambda: mode_choices(agent.mode)}
     if catalog is not None:
         arg_choices["/model"] = lambda: catalog.choices(agent.windows, agent.model)
@@ -114,6 +121,7 @@ def run_repl(
         no_color=ui.no_color,
         arg_choices=arg_choices,
         on_cycle_mode=agent.cycle_mode,
+        skills=lambda: [(skill.command, skill.description) for skill in skills],
     )
     ui.banner(
         version=__version__,
@@ -143,10 +151,12 @@ def run_repl(
         interrupt=esc,
         models=models,
         declined_windows=declined,
+        skills=skills,
     )
     typeahead = esc.take_typeahead()  # набранное во время хода — в следующую строку ввода
 
     while True:
+        skills.refresh()  # для автодополнения: скиллы могли поменяться за ход
         try:
             # Набранное во время хода подставляется один раз: Ctrl+C его сбрасывает.
             default, typeahead = typeahead, ""
@@ -161,6 +171,15 @@ def run_repl(
             continue
 
         if is_repl_command(line):
+            skills.refresh()  # скилл могли установить, пока открыто приглашение
+        try:
+            request = expand_skill(line, commands, skills)
+        except OSError as e:
+            ui.error(str(e))
+            continue
+        if request is not None:
+            line = request
+        elif is_repl_command(line):
             if not commands.dispatch(line, ctx):
                 return 0
             typeahead = esc.take_typeahead()

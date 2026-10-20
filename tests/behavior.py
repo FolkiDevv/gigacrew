@@ -20,8 +20,8 @@ baseline. Поведение модели случайно: сценарий п�
 
 Просмотр, выжимка для чата (до ~100 строк) и сравнение сохранённых отчётов::
 
-    uv run python tests/behavior.py show .gigacrew/evals/eval-<время>.json
-    uv run python tests/behavior.py digest .gigacrew/evals/eval-<время>.json
+    uv run python tests/behavior.py show .gigacode/evals/eval-<время>.json
+    uv run python tests/behavior.py digest .gigacode/evals/eval-<время>.json
     uv run python tests/behavior.py compare <было>.json <стало>.json
 """
 
@@ -116,16 +116,16 @@ def env_int(env: Mapping[str, str], name: str, default: int) -> int:
 
 
 def report_dir(env: Mapping[str, str]) -> Path:
-    """Папка отчётов: ``GIGACREW_EVAL_DIR``, по умолчанию ``.gigacrew/evals`` репозитория."""
+    """Папка отчётов: ``GIGACREW_EVAL_DIR``, по умолчанию ``.gigacode/evals`` репозитория."""
     raw = (env.get(EVAL_DIR_ENV) or "").strip()
-    return Path(raw).expanduser() if raw else REPO_ROOT / ".gigacrew" / "evals"
+    return Path(raw).expanduser() if raw else REPO_ROOT / ".gigacode" / "evals"
 
 
 # --------------------------------------------------------------------------- #
 # Учебный проект
 # --------------------------------------------------------------------------- #
 FIXTURE_FILES: dict[str, str] = {
-    ".gitignore": "__pycache__/\n.pytest_cache/\n.gigacrew/\ndata/\n",
+    ".gitignore": "__pycache__/\n.pytest_cache/\n.gigacode/\ndata/\n",
     "README.md": """\
 # shop
 
@@ -553,7 +553,7 @@ def run_fixture_tests(root: Path, timeout: int = 300) -> bool:
     return done.returncode == 0
 
 
-_SNAPSHOT_SKIP = frozenset({".git", ".gigacrew", "__pycache__", ".pytest_cache"})
+_SNAPSHOT_SKIP = frozenset({".git", ".gigacode", "__pycache__", ".pytest_cache"})
 
 
 def snapshot(root: Path) -> dict[str, str]:

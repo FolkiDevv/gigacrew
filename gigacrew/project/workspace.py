@@ -1,10 +1,12 @@
-"""Рабочее пространство проекта и служебная папка ``.gigacrew/``.
+"""Рабочее пространство проекта и служебная папка ``.gigacode/``.
 
-``.gigacrew/`` в корне проекта — место для данных агента (индекс проекта, чаты,
-планы).
+``.gigacode/`` в корне проекта — место для данных агента (индекс проекта, чаты,
+планы, история ввода) и скиллов (``skills/``, см. :mod:`gigacrew.project.skills`).
 Папка создаётся лениво, первым компонентом, которому нужно туда писать
-(:meth:`Workspace.ensure_data_dir`), и сразу получает собственный ``.gitignore``
-со звёздочкой, чтобы её содержимое никогда не попадало в репозиторий.
+(:meth:`Workspace.ensure_data_dir`), и сразу получает собственный ``.gitignore``:
+рабочие данные агента в репозиторий не попадают, а скиллы — коммитятся.
+Пользовательская папка ``~/.gigacode`` (:func:`user_data_dir`) — замеры окон
+моделей и скиллы, общие для всех проектов.
 """
 
 from __future__ import annotations
@@ -12,8 +14,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-DATA_DIR_NAME = ".gigacrew"
-_GITIGNORE_BODY = "# Создано gigacrew: рабочие данные агента не коммитятся.\n*\n"
+DATA_DIR_NAME = ".gigacode"
+SKILLS_DIR_NAME = "skills"
+HISTORY_FILE_NAME = "history"
+# Игнорируются только рабочие данные агента — не вся папка: skills/ коммитятся.
+GITIGNORED_DATA: tuple[str, ...] = ("/chats/", "/plans/", "/index/", f"/{HISTORY_FILE_NAME}")
+_GITIGNORE_BODY = (
+    "# Создано gigacrew: рабочие данные агента не коммитятся, скиллы (skills/) — коммитятся.\n"
+    + "".join(f"{pattern}\n" for pattern in GITIGNORED_DATA)
+)
+
+
+def user_data_dir() -> Path:
+    """``~/.gigacode`` — данные пользователя, общие для всех проектов."""
+    return Path.home() / DATA_DIR_NAME
 
 
 @dataclass(frozen=True)
@@ -27,7 +41,7 @@ class Workspace:
 
     @property
     def data_dir(self) -> Path:
-        """``<root>/.gigacrew`` (может ещё не существовать)."""
+        """``<root>/.gigacode`` (может ещё не существовать)."""
         return self.root / DATA_DIR_NAME
 
     @property
@@ -45,10 +59,20 @@ class Workspace:
         """Каталог индекса проекта."""
         return self.data_dir / "index"
 
-    def is_data_path(self, path: Path) -> bool:
-        """Лежит ли (уже разрешённый) путь внутри ``.gigacrew/``.
+    @property
+    def history_file(self) -> Path:
+        """История ввода REPL."""
+        return self.data_dir / HISTORY_FILE_NAME
 
-        Сравнение без учёта регистра: на macOS/Windows ``.GIGACREW`` — та же папка.
+    @property
+    def skills_dir(self) -> Path:
+        """Скиллы проекта: ``<имя>/SKILL.md``."""
+        return self.data_dir / SKILLS_DIR_NAME
+
+    def is_data_path(self, path: Path) -> bool:
+        """Лежит ли (уже разрешённый) путь внутри ``.gigacode/``.
+
+        Сравнение без учёта регистра: на macOS/Windows ``.GIGACODE`` — та же папка.
         """
         try:
             parts = Path(path).relative_to(self.root).parts
@@ -62,7 +86,7 @@ class Workspace:
         return any((d / ".git").exists() for d in (self.root, *self.root.parents))
 
     def ensure_data_dir(self) -> Path:
-        """Создаёт ``.gigacrew/`` с ``.gitignore`` (идемпотентно) и возвращает путь.
+        """Создаёт ``.gigacode/`` с ``.gitignore`` (идемпотентно) и возвращает путь.
 
         Существующий ``.gitignore`` не перезаписывается — пользователь мог его изменить.
         """

@@ -41,7 +41,7 @@ from gigacrew.tools.base import Display
 from gigacrew.tools.plan import APPROVE_EDITS, PLAN_QUESTION
 from gigacrew.tools.questions import Answer, Question, QuestionOption
 
-PLAN = ".gigacrew/plans/chat1.md"
+PLAN = ".gigacode/plans/chat1.md"
 CLEAR_METHOD = "\n    def clear(self) -> None:\n        self._items.clear()\n"
 
 

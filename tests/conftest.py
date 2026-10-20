@@ -18,7 +18,7 @@ from gigacrew.tools.base import ToolContext  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _isolated_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch):
-    """~/.gigacrew (замеры окон моделей) — во временной папке, не у пользователя."""
+    """~/.gigacode (замеры окон моделей) — во временной папке, не у пользователя."""
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))

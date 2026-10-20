@@ -3,6 +3,10 @@
 Команды регистрируются в :class:`CommandRegistry`; из него же строятся справка,
 подсказки в баннере и автодополнение ввода (:mod:`gigacrew.cli.prompt`). Новая команда
 — это один :class:`SlashCommand`.
+
+Скиллы (:mod:`gigacrew.project.skills`) тоже вызываются как команды — ``/<имя>
+[аргументы]``, но не выполняются здесь: :func:`expand_skill` превращает строку в
+запрос агенту. Встроенная команда важнее скилла с тем же именем.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from dataclasses import dataclass, field
 
 from gigacrew.agent.chat_store import ChatRecorder, ChatStoreError, SavedChat
 from gigacrew.agent.loop import Agent
+from gigacrew.agent.prompts import skill_invocation_prompt
 from gigacrew.cli.indexing import describe_index, run_indexing
 from gigacrew.cli.models import ModelCatalog, describe_model, ensure_context_window
 from gigacrew.cli.prompt import KEY_HELP
@@ -23,6 +28,7 @@ from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.permissions import MODE_CYCLE, PermissionMode, parse_mode
 from gigacrew.project import semantic
 from gigacrew.project.index import ProjectIndex
+from gigacrew.project.skills import COMMAND_NAME_PATTERN, SkillCatalog
 from gigacrew.ui.console import Console
 
 
@@ -37,6 +43,7 @@ class CommandContext:
     models: ModelCatalog | None = None  # список моделей для /model (None — не загружался)
     # Модели, замер окна которых пользователь отклонил в этой сессии (не спрашивать снова).
     declined_windows: set[str] = field(default_factory=set)
+    skills: SkillCatalog | None = None  # для /help и подсказок (None — без скиллов)
 
 
 # Обработчик получает контекст и аргумент (текст после имени команды).
@@ -80,6 +87,8 @@ class CommandRegistry:
         command = self.get(name)
         if command is None:
             names = [n for cmd in self for n in (cmd.name, *cmd.aliases)]
+            if ctx.skills is not None:
+                names += [skill.command for skill in ctx.skills]
             close = difflib.get_close_matches(name.lower(), names, n=1, cutoff=0.6)
             hint = f" — возможно, {close[0]}?" if close else ""
             ctx.ui.error(f"неизвестная команда: {name}{hint} (список — /help)")
@@ -90,7 +99,7 @@ class CommandRegistry:
 # Команда REPL — это слеш + слово (/help, /model ...). Чистый путь
 # (/home/...) или начало регэкспа содержит дополнительные слеши и НЕ считается
 # командой, а уходит обычным запросом агенту.
-_REPL_COMMAND_RE = re.compile(r"^/[a-zA-Zа-яА-Я][\w-]*$")
+_REPL_COMMAND_RE = re.compile(rf"^/{COMMAND_NAME_PATTERN}$")
 
 
 def is_repl_command(line: str) -> bool:
@@ -100,12 +109,40 @@ def is_repl_command(line: str) -> bool:
     return bool(_REPL_COMMAND_RE.match(first))
 
 
+def expand_skill(line: str, commands: CommandRegistry, skills: SkillCatalog) -> str | None:
+    """Запрос агенту для строки ``/<скилл> [аргументы]``.
+
+    None — это не скилл (обычный текст, встроенная команда или неизвестное имя).
+    Скилл, который не удалось прочитать, — :class:`OSError` (текст для пользователя).
+    """
+    if not is_repl_command(line):
+        return None
+    parts = line.strip().split(maxsplit=1)
+    if commands.get(parts[0]) is not None:
+        return None
+    skill = skills.get(parts[0])
+    if skill is None:
+        return None
+    try:
+        body = skill.body()
+    except (OSError, UnicodeDecodeError) as e:
+        raise OSError(f"не удалось прочитать скилл {skill.name} ({skill.path}): {e}") from None
+    args = parts[1].strip() if len(parts) > 1 else ""
+    return skill_invocation_prompt(skill, body, line.strip(), args)
+
+
 # ------------------------------- команды ------------------------------- #
 def _help(ctx: CommandContext, _arg: str) -> bool:
     rows = []
     for cmd in ctx.commands:
         alias = f" (также {', '.join(cmd.aliases)})" if cmd.aliases else ""
         rows.append((cmd.usage or cmd.name, f"{cmd.summary}{alias}"))
+    if ctx.skills is not None:
+        rows += [
+            (f"{skill.command} [аргументы]", f"скилл · {skill.description or skill.path}")
+            for skill in ctx.skills
+            if ctx.commands.get(skill.command) is None
+        ]
     ctx.ui.help(rows, KEY_HELP)
     return True
 

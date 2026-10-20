@@ -756,7 +756,7 @@ def test_mode_survives_reset_and_cycles(tmp_path):
     assert [agent.cycle_mode(), agent.cycle_mode()] == [PermissionMode.PLAN, PermissionMode.MANUAL]
 
 
-PLAN_REL = ".gigacrew/plans/chat1.md"
+PLAN_REL = ".gigacode/plans/chat1.md"
 
 
 def _planning_agent(provider, tmp_path, events=None) -> Agent:
@@ -792,7 +792,7 @@ def test_plan_mode_allows_only_the_plan_file(tmp_path):
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": "a.txt", "content": "x"}),
-            tool_turn("write_file", {"path": ".gigacrew/plans/other.md", "content": "x"}),
+            tool_turn("write_file", {"path": ".gigacode/plans/other.md", "content": "x"}),
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
             tool_turn("exit_plan_mode", {}),
             text_turn("жду"),
@@ -1070,7 +1070,7 @@ def test_no_self_check_after_plan_was_shown(tmp_path):
 def test_chat_id_names_the_plan_file(tmp_path):
     agent = _agent(ScriptedProvider(), tmp_path)
     agent.chat_id = "a1"
-    assert agent.plan_path == tmp_path.resolve() / ".gigacrew" / "plans" / "a1.md"
+    assert agent.plan_path == tmp_path.resolve() / ".gigacode" / "plans" / "a1.md"
     agent.reset(chat_id="b2")
     assert agent.chat_id == "b2" and agent.plan_path.name == "b2.md"
     agent.reset()
@@ -1422,13 +1422,16 @@ def test_resumed_chat_usage_belongs_to_its_model(tmp_path):
 
     saved = Conversation()
     saved.add_user("вопрос")
-    saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=7_000, completion_tokens=5))
+    # usage заметно больше оценки (системный промпт + схемы инструментов, ~7k)
+    saved.add_assistant(
+        text_turn("ответ").message, Usage(prompt_tokens=10_000, completion_tokens=5)
+    )
     agent = _agent(ScriptedProvider(), tmp_path, model="A")
     agent.set_model("B")  # resume_chat: модель чата — до reset()
     agent.reset(saved)
-    assert agent.context_tokens == 7_005
+    assert agent.context_tokens == 10_005
     agent.set_model("A")
-    assert agent.context_tokens < 7_000  # оценка в токенах модели A
+    assert agent.context_tokens < 10_000  # оценка в токенах модели A
 
 
 def test_resumed_chat_with_implausible_usage_is_estimated(tmp_path):
