@@ -40,6 +40,7 @@ def test_completes_commands_with_descriptions():
         "/help",
         "/model",
         "/mode",
+        "/permissions",
         "/clear",
         "/compact",
         "/resume",

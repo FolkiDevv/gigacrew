@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -33,10 +33,12 @@ from gigacrew.agent.context_window import (
     fit_history,
 )
 from gigacrew.agent.conversation import Conversation, Summary
+from gigacrew.agent.decisions import DecisionMemory, history_key
 from gigacrew.agent.events import (
     AgentEvents,
     Approval,
     CompactResult,
+    ConfirmResult,
     SubagentInfo,
     ToolCallInfo,
     TurnStats,
@@ -61,6 +63,7 @@ from gigacrew.agent.prompts import (
 from gigacrew.agent.subagents import (
     MAX_SUBAGENTS_PER_TURN,
     READ_ONLY_BLOCKED_NOTE,
+    READ_ONLY_SHELL_NOTE,
     SUBAGENT_PLAN_BLOCKED_NOTE,
     SUBAGENT_STOP_NOTE,
     SUBAGENT_USER_STOP_NOTE,
@@ -78,6 +81,7 @@ from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolChoice,
 from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide, next_mode
 from gigacrew.project.instructions import NestedInstructions
 from gigacrew.project.workspace import Workspace
+from gigacrew.safety import CommandLevel, Verdict
 from gigacrew.security import RiskLevel
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 from gigacrew.tools.plan import PlanReview, review_plan
@@ -88,6 +92,7 @@ REJECTED_NOTE = (
     "The user REJECTED this operation. Do not repeat it; suggest an alternative or "
     "clarify the plan."
 )
+FEEDBACK_NOTE = "\nThe user said instead: {feedback}"
 REJECTED_AGAIN_NOTE = (
     "The user already REJECTED this operation in this turn, so it was not offered again. "
     "Do not repeat it; suggest an alternative or clarify the plan."
@@ -164,6 +169,34 @@ def _reminder(note: str) -> str:
     return f"<system-reminder>\n{note}\n</system-reminder>"
 
 
+@dataclass(frozen=True)
+class _Journal:
+    id: str
+
+
+def _confirm_result(answer: bool | Approval | ConfirmResult) -> ConfirmResult:
+    if isinstance(answer, ConfirmResult):
+        return answer
+    if isinstance(answer, bool):
+        return ConfirmResult(Approval.YES if answer else Approval.NO)
+    return ConfirmResult(answer)
+
+
+def _decision_name(answer: ConfirmResult) -> str:
+    if not answer.answered:
+        return "no_answer"
+    return {Approval.YES: "yes", Approval.ALWAYS: "always", Approval.NO: "no"}[answer.approval]
+
+
+def _auto_source(risk: RiskLevel, auto_approve: bool, kind: ToolKind, mode: PermissionMode) -> str:
+    """Почему вызов выполняется без вопроса (для журнала)."""
+    if risk < RiskLevel.WRITE:
+        return "read"
+    if kind is ToolKind.EDIT and mode is PermissionMode.ACCEPT_EDITS:
+        return "edits_mode"
+    return "yes_flag" if auto_approve else "auto"
+
+
 class Agent:
     def __init__(
         self,
@@ -178,6 +211,7 @@ class Agent:
         parent: Agent | None = None,
         subagent: SubagentSpec | None = None,
         chat_id: str | None = None,
+        decisions: DecisionMemory | None = None,
     ):
         """Конструктор не обращается к файловой системе и сети.
 
@@ -190,6 +224,9 @@ class Agent:
         и задавать вопросы пользователю суб-агент не может.
 
         ``chat_id`` — id чата: по нему назван файл плана (по умолчанию — новый id).
+
+        ``decisions`` — память решений о командах: разрешения «всегда» и журнал (по
+        умолчанию — только в памяти, до конца сессии); у суб-агента — общая с основным.
         """
         self._provider = provider
         self._registry = registry
@@ -210,6 +247,7 @@ class Agent:
             semantic=config.ty,
             run_subagent=None if parent is not None else self._run_subagent,
             plan=self._plan,
+            classify_commands=config.safe_commands,
         )
         self._conversation = Conversation() if conversation is None else conversation
         self._model = config.model if parent is None else parent.model
@@ -239,6 +277,9 @@ class Agent:
         # Вызовы, которые пользователь разрешил «всегда» (до конца сессии; reset() не
         # сбрасывает — как и режим).
         self._session_allowed: set[str] = set() if parent is None else parent._session_allowed
+        if parent is not None:
+            decisions = parent._decisions
+        self._decisions = DecisionMemory() if decisions is None else decisions
         self._last_estimate = 0  # оценка последнего отправленного запроса
         self._turn_stats: TurnStats | None = None  # статистика идущего хода
         # Суб-агенты: запущенный сейчас (для остановки из потока клавиш) и число
@@ -263,6 +304,11 @@ class Agent:
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def decisions(self) -> DecisionMemory:
+        """Память решений о командах (разрешения «всегда», журнал)."""
+        return self._decisions
 
     @property
     def config(self) -> Config:
@@ -1127,20 +1173,52 @@ class Agent:
         # 2) Разрешение по режиму: выполнить, спросить или заблокировать
         previewed = False
         risk = RiskLevel.SAFE
+        verdict: Verdict | None = None
+        journal: _Journal | None = None
         try:
-            risk = tool.risk(params, self._ctx)
+            assessment = tool.assess(params, self._ctx)
+            risk, verdict = assessment.risk, assessment.verdict
+            kind = assessment.kind or tool.kind
             read_only = self._subagent is not None and self._subagent.read_only
             decision = decide(
                 self.mode,
                 risk,
-                tool.kind,
+                kind,
                 auto_approve=self._cfg.auto_approve,
                 yes_all=self._cfg.yes_all,
                 read_only=read_only,
             )
+            source = _auto_source(risk, self._cfg.auto_approve, kind, self.mode)
+            if (
+                decision is Decision.ASK
+                and self.mode is PermissionMode.PLAN
+                and verdict is not None
+                and verdict.level is not None
+                and verdict.level >= CommandLevel.WRITE
+            ):
+                decision = Decision.BLOCK  # план: изменяющая команда, а не проверка
+            if decision is Decision.ASK and verdict is not None:
+                rule = self._decisions.match(verdict, plan=self.mode is PermissionMode.PLAN)
+                if rule is not None:
+                    decision, source = Decision.ALLOW, f"rule:{rule.id}"
+                    self._events.on_notice(f"разрешено сохранённым правилом: {rule.describe()}")
             if decision is Decision.ASK and key in self._session_allowed:
-                decision = Decision.ALLOW  # пользователь разрешил этот вызов «всегда»
+                decision, source = Decision.ALLOW, "session"  # «всегда» до конца сессии
             if decision is Decision.BLOCK:
+                if verdict is not None:
+                    journal = self._journal_start(call, params, verdict, risk, "blocked", "")
+                    self._journal_end(journal, blocked=True)
+                if read_only and verdict is not None:
+                    # Непроверенная команда у исследователя — не ошибка, а «нельзя здесь».
+                    self._fail(
+                        call,
+                        "заблокировано: агент только читает",
+                        model_text=READ_ONLY_SHELL_NOTE.format(
+                            reason=assessment.reason or verdict.reason
+                        ),
+                        note=note,
+                    )
+                    return ToolOutcome(ok=False, soft=True)
                 if read_only:
                     error, model_text = "заблокировано: агент только читает", READ_ONLY_BLOCKED_NOTE
                 elif self._parent is not None:
@@ -1165,15 +1243,37 @@ class Agent:
                 # не запускается и подтверждение не запрашивается.
                 preview = tool.preview(params, self._ctx)
                 dangerous = risk >= RiskLevel.DANGEROUS
-                answer = self._events.confirm(call, preview, dangerous=dangerous)
-                if isinstance(answer, bool):
-                    answer = Approval.YES if answer else Approval.NO
-                if answer is Approval.ALWAYS and not dangerous:
-                    self._allow_always(call, key)
-                elif answer is not Approval.YES:
-                    self._fail(call, "отклонено пользователем", model_text=REJECTED_NOTE, note=note)
+                asked = replace(
+                    call,
+                    kind=kind,
+                    reason=assessment.reason,
+                    remember="" if dangerous else self._remember_label(kind, verdict),
+                    history=self._history_hint(verdict),
+                )
+                answer = _confirm_result(self._events.confirm(asked, preview, dangerous=dangerous))
+                if verdict is not None:
+                    journal = self._journal_start(
+                        call,
+                        params,
+                        verdict,
+                        risk,
+                        _decision_name(answer),
+                        answer.feedback,
+                        source="user",
+                    )
+                if answer.approval is Approval.ALWAYS and not dangerous:
+                    self._allow_always(asked, key, verdict)
+                elif answer.approval is not Approval.YES:
+                    model_text = REJECTED_NOTE
+                    if answer.feedback:
+                        model_text += FEEDBACK_NOTE.format(feedback=answer.feedback)
+                    self._fail(call, "отклонено пользователем", model_text=model_text, note=note)
                     return ToolOutcome(ok=False, rejected=True)
                 previewed = preview is not None
+            elif verdict is not None:
+                journal = self._journal_start(
+                    call, params, verdict, risk, "auto", "", source=source
+                )
         except ToolError as e:
             return self._fail(call, str(e), note=note)
         except Exception as e:  # неожиданная ошибка — не роняем агента
@@ -1182,6 +1282,7 @@ class Agent:
         # 3) Выполнение
         result: ToolResult | None = None
         error = ""
+        started = time.monotonic()
         self._events.on_tool_start(call)
         try:
             result = tool.run(params, self._ctx)
@@ -1189,8 +1290,12 @@ class Agent:
             error = str(e)
         except Exception as e:  # неожиданная ошибка — не роняем агента
             error = f"внутренняя ошибка выполнения: {e}"
+        except BaseException:  # Ctrl+C: исход в журнале — «прервано»
+            self._journal_end(journal, interrupted=True, duration=time.monotonic() - started)
+            raise
         finally:
             self._events.on_tool_end(call)
+        self._journal_end(journal, result=result, error=error, duration=time.monotonic() - started)
         if result is None:
             return self._fail(call, error or "инструмент не вернул результат", note=note)
 
@@ -1251,8 +1356,9 @@ class Agent:
             self._events.on_subagent_end(info, child.last_turn)
         return subagent_report(spec, text, child.last_turn, events.trail)
 
-    def _allow_always(self, call: ToolCallInfo, key: str) -> None:
-        """«Да, и не спрашивать»: правки — режим авто-правок, прочее — этот вызов."""
+    def _allow_always(self, call: ToolCallInfo, key: str, verdict: Verdict | None = None) -> None:
+        """«Да, и не спрашивать»: правки — режим авто-правок, команды — сохранённые
+        разрешения (части команды, которые спрашивались), прочее — этот вызов."""
         if call.kind is ToolKind.EDIT:
             if self.mode is PermissionMode.MANUAL:
                 self.set_mode(PermissionMode.ACCEPT_EDITS)
@@ -1261,10 +1367,112 @@ class Agent:
                     "(Shift+Tab — сменить)"
                 )
             return
+        if verdict is not None:
+            try:
+                added = self._decisions.approve(verdict)
+            except OSError as e:
+                added = []
+                self._events.on_notice(f"не удалось сохранить разрешение: {e}", level="warn")
+            if added:
+                where = (
+                    "сохранено для проекта"
+                    if self._decisions.directory is not None and self._decisions.remember
+                    else "до конца сессии"
+                )
+                rules = "; ".join(r.describe() for r in added)
+                self._events.on_notice(f"разрешено без вопросов ({where}): {rules}")
+                return
         self._session_allowed.add(key)
         self._events.on_notice(
             f"{call.name} с этими аргументами больше не требует подтверждения до конца сессии"
         )
+
+    def _remember_label(self, kind: ToolKind, verdict: Verdict | None) -> str:
+        """Что запомнит ответ «всегда» (пусто — формулировка интерфейса по умолчанию)."""
+        if kind is ToolKind.EDIT or verdict is None:
+            return ""
+        return self._decisions.offer(verdict)
+
+    def _history_hint(self, verdict: Verdict | None) -> str:
+        if verdict is None:
+            return ""
+        allowed, rejected = self._decisions.history(history_key(verdict))
+        if not allowed and not rejected:
+            return ""
+        parts = []
+        if allowed:
+            parts.append(f"разрешали {allowed}")
+        if rejected:
+            parts.append(f"отклоняли {rejected}")
+        hint = "раньше: " + ", ".join(parts)
+        if allowed >= 2 and not rejected:
+            hint += " — «a» запомнит выбор"
+        return hint
+
+    def _journal_start(
+        self,
+        call: ToolCallInfo,
+        params: BaseModel,
+        verdict: Verdict,
+        risk: RiskLevel,
+        decision: str,
+        feedback: str,
+        *,
+        source: str = "",
+    ) -> _Journal | None:
+        """Записать решение о команде в журнал (что, где, почему, кто решил)."""
+        try:
+            entry_id = self._decisions.record(
+                {
+                    "tool": call.name,
+                    "command": getattr(params, "command", call.summary),
+                    "description": getattr(params, "description", ""),
+                    "cwd": verdict.cwd,
+                    "key": history_key(verdict)[1],
+                    "verdict": {
+                        "level": verdict.level.name if verdict.level is not None else None,
+                        "reason": verdict.reason,
+                        "signatures": list(verdict.signatures),
+                    },
+                    "risk": risk.name,
+                    "mode": self.mode.value,
+                    "agent": self._subagent.name if self._subagent is not None else "main",
+                    "chat": self._chat_id,
+                    "model": self._model,
+                    "decision": decision,
+                    "source": source or "auto",
+                    "feedback": feedback,
+                }
+            )
+        except Exception:  # журнал — не повод прерывать работу
+            return None
+        return _Journal(entry_id)
+
+    def _journal_end(
+        self,
+        journal: _Journal | None,
+        *,
+        result: ToolResult | None = None,
+        error: str = "",
+        duration: float = 0.0,
+        interrupted: bool = False,
+        blocked: bool = False,
+    ) -> None:
+        if journal is None:
+            return
+        fields: dict[str, object] = {"duration_s": round(duration, 2)}
+        if blocked:
+            fields["blocked"] = True
+        elif interrupted:
+            fields["interrupted"] = True
+        elif result is not None:
+            fields.update(ok=result.ok, soft=result.soft, exit_code=result.exit_code)
+        else:
+            fields.update(ok=False, error=error[:200])
+        try:
+            self._decisions.outcome(journal.id, **fields)
+        except Exception:
+            pass
 
     def _attach_instructions(self, tool: Tool, params: BaseModel) -> None:
         """Подключить инструкции подкаталогов, которых коснулся вызов.

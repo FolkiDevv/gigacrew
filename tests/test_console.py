@@ -200,16 +200,49 @@ def test_confirm_question_includes_summary(monkeypatch):
     answers = iter(["д", "", "a", "a"])
     monkeypatch.setattr(ui._c, "input", lambda prompt: (ui._c.print(prompt), next(answers))[1])
     edit = ToolCallInfo("edit_file", "a.py", ToolKind.EDIT)
-    assert ui.confirm(edit, None, dangerous=False) is Approval.YES
+    assert ui.confirm(edit, None, dangerous=False).approval is Approval.YES
     out = buf.getvalue()
     assert "Применить edit_file (a.py)? [y/N/a]" in out and "режим «авто-правки»" in out
     danger = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND)
-    assert ui.confirm(danger, None, dangerous=True) is Approval.NO
+    assert ui.confirm(danger, None, dangerous=True).approval is Approval.NO
     assert "ОПАСНО: Выполнить run_shell (rm -rf x)? [y/N] " in buf.getvalue()
-    command = ToolCallInfo("run_shell", "pytest -q", ToolKind.COMMAND)
-    assert ui.confirm(command, None, dangerous=False) is Approval.ALWAYS
-    assert "Выполнить run_shell (pytest -q)?" in buf.getvalue()
-    assert ui.confirm(danger, None, dangerous=True) is Approval.NO  # «a» для опасного — нет
+    command = ToolCallInfo(
+        "run_shell",
+        "pytest -q",
+        ToolKind.COMMAND,
+        reason="выполняет код проекта",
+        remember="всегда разрешать «pytest»",
+        history="раньше: разрешали 2",
+    )
+    assert ui.confirm(command, None, dangerous=False).approval is Approval.ALWAYS
+    out = buf.getvalue()
+    assert "Выполнить run_shell (pytest -q)?" in out
+    assert "почему спрашиваю: выполняет код проекта" in out and "раньше: разрешали 2" in out
+    assert "a — всегда разрешать «pytest»" in out
+    assert (
+        ui.confirm(danger, None, dangerous=True).approval is Approval.NO
+    )  # «a» для опасного — нет
+
+
+def test_confirm_free_text_is_feedback_and_no_answer_is_marked(monkeypatch):
+    from gigacrew.agent.events import Approval
+    from gigacrew.permissions import ToolKind
+
+    ui, _ = _console()
+    answers = iter(["Используй uv run pytest", "ф", "нет"])
+    monkeypatch.setattr(ui._c, "input", lambda prompt: next(answers))
+    command = ToolCallInfo("run_shell", "pytest", ToolKind.COMMAND)
+    result = ui.confirm(command, None, dangerous=False)
+    assert result.approval is Approval.NO and result.feedback == "Используй uv run pytest"
+    assert ui.confirm(command, None, dangerous=False).approval is Approval.ALWAYS  # «ф» = «a»
+    assert ui.confirm(command, None, dangerous=False).feedback == ""
+
+    def eof(prompt):
+        raise EOFError
+
+    monkeypatch.setattr(ui._c, "input", eof)
+    result = ui.confirm(command, None, dangerous=False)
+    assert result.approval is Approval.NO and not result.answered
 
 
 def test_format_helpers():
@@ -421,7 +454,7 @@ def test_subagent_live_area_survives_confirm():
         seen["live"] = ui._live
         return "y"
 
-    ui._question = question
+    ui._question_raw = question
     ui.confirm(ToolCallInfo("edit_file", "a.py"), Display("+x", "diff", "a.py"), dangerous=False)
     assert seen["live"] is None  # вопрос — без временной области
     ui.on_subagent_activity(info, "edit_file")

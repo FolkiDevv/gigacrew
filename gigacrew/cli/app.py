@@ -23,6 +23,7 @@ from pathlib import Path
 
 from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
+from gigacrew.agent.decisions import DecisionMemory
 from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
 from gigacrew.cli.models import (
@@ -60,7 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-y",
         "--yes",
         action="store_true",
-        help="Авто-подтверждение операций, кроме опасных (rm -rf, git reset --hard…)",
+        help="Авто-подтверждение операций, кроме опасных (rm -rf, git reset --hard, "
+        "секреты, файлы вне проекта…)",
     )
     p.add_argument(
         "--yes-all",
@@ -70,8 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--mode",
         choices=[mode.value for mode in PermissionMode],
-        help="Начальный режим: manual — всё с подтверждением, edits — правки файлов "
-        "без вопросов, plan — только исследование и план (Shift+Tab — сменить)",
+        help="Начальный режим: manual — правки и изменяющие команды с подтверждением, "
+        "edits — правки файлов без вопросов, plan — только исследование и план "
+        "(Shift+Tab — сменить). Команды, которые только читают, — без вопросов",
     )
     chat = p.add_mutually_exclusive_group()
     chat.add_argument(
@@ -92,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-save",
         action="store_true",
-        help="Не сохранять чат в .gigacode/chats/",
+        help="Не сохранять чат в .gigacode/chats/ и журнал решений о командах",
     )
     p.add_argument("--no-color", action="store_true", help="Отключить цвет")
     p.add_argument(
@@ -235,7 +238,14 @@ def main(argv: list[str] | None = None) -> int:
                 "не задана модель: укажите GIGACREW_MODEL или --model (список — --list-models)"
             )
             return EXIT_ERROR
-        agent = Agent(provider, build_default_registry(), config, ui, windows=windows)
+        decisions, warning = DecisionMemory.load(
+            config.project_root, remember=config.remember_approvals, log=config.save_chats
+        )
+        if warning:
+            ui.warn(warning)
+        agent = Agent(
+            provider, build_default_registry(), config, ui, windows=windows, decisions=decisions
+        )
         store = ChatStore(agent.workspace)
         chats = ChatRecorder(store, enabled=config.save_chats)
         agent.chat_id = chats.chat_id  # файл плана назван по id чата

@@ -43,6 +43,7 @@ from gigacrew.agent.events import (
     AgentEvents,
     Approval,
     CompactResult,
+    ConfirmResult,
     NoticeLevel,
     SubagentInfo,
     ToolCallInfo,
@@ -617,31 +618,44 @@ class Console(AgentEvents):
         self._c.print(Text("  " + "  ·  ".join(parts), style=MUTED))
 
     # -------------------------- подтверждения --------------------------- #
-    def confirm(self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool) -> Approval:
+    def confirm(
+        self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
+    ) -> ConfirmResult:
         self.stop_live()  # превью печатается до вопроса — область уже не нужна
         if preview and preview.text.strip():
             if preview.kind == "diff":
                 self.diff(preview.text, title=preview.title or None)
             else:
                 self.output_block(preview.text, title=preview.title or "превью")
+        if call.reason:
+            self._c.print(Text(f"  почему спрашиваю: {sanitize(call.reason)}", style=MUTED))
+        if call.history:
+            self._c.print(Text(f"  {sanitize(call.history)}", style=MUTED))
         edit = call.kind is ToolKind.EDIT
         action = "Применить" if edit else "Выполнить"
         target = f" ({sanitize(call.summary)})" if call.summary else ""
         always = None
         if not dangerous:  # опасное «навсегда» не разрешается
-            always = (
-                "правки файлов без вопросов до конца сессии (режим «авто-правки»)"
-                if edit
-                else "не спрашивать этот вызов до конца сессии"
-            )
-        answer = self._question(
-            f"{action} {call.name}{target}?", dangerous=dangerous, always=always
+            if call.remember:
+                always = sanitize(call.remember)
+            elif edit:
+                always = "правки файлов без вопросов до конца сессии (режим «авто-правки»)"
+            else:
+                always = "не спрашивать этот вызов до конца сессии"
+        raw = self._question_raw(
+            f"{action} {call.name}{target}?", dangerous=dangerous, always=always, feedback=True
         )
+        if raw is None:
+            return ConfirmResult(Approval.NO, answered=False)
+        answer = raw.strip().lower()
         if answer in _YES:
-            return Approval.YES
+            return ConfirmResult(Approval.YES)
         if always is not None and answer in _ALWAYS:
-            return Approval.ALWAYS
-        return Approval.NO
+            return ConfirmResult(Approval.ALWAYS)
+        if not answer or answer in _NO:
+            return ConfirmResult(Approval.NO)
+        # Свой ответ вместо y/n — отказ с объяснением: его получит модель.
+        return ConfirmResult(Approval.NO, feedback=raw.strip())
 
     def ask(self, question: str, *, dangerous: bool = False) -> bool:
         """Вопрос да/нет. Ctrl+C/Ctrl+D — «нет»."""
@@ -649,10 +663,19 @@ class Console(AgentEvents):
 
     def _question(self, question: str, *, dangerous: bool, always: str | None = None) -> str:
         """Ответ на вопрос (в нижнем регистре); Ctrl+C/Ctrl+D — пустой."""
+        raw = self._question_raw(question, dangerous=dangerous, always=always)
+        return "" if raw is None else raw.strip().lower()
+
+    def _question_raw(
+        self, question: str, *, dangerous: bool, always: str | None = None, feedback: bool = False
+    ) -> str | None:
+        """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода)."""
         self.stop_live()
         color = DANGER if dangerous else WARN
         if always is not None:
             self._c.print(Text(f"  a — {always}", style=MUTED))
+        if feedback:
+            self._c.print(Text("  или напишите, что сделать вместо этого", style=MUTED))
         prompt = Text("  ")
         prompt.append("⚠ ОПАСНО: " if dangerous else "? ", style=f"bold {color}")
         prompt.append(question, style="bold")
@@ -662,8 +685,8 @@ class Console(AgentEvents):
                 answer = self._c.input(prompt)
         except (EOFError, KeyboardInterrupt):
             self._c.print()
-            return ""
-        return answer.strip().lower()
+            return None
+        return answer
 
     # ---------------------------- вопросы агента ---------------------------- #
     def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
@@ -836,7 +859,8 @@ class Console(AgentEvents):
 
 
 _YES = ("y", "yes", "д", "да")
-_ALWAYS = ("a", "always", "в", "всегда")
+_NO = ("n", "no", "н", "нет", "т")  # н, т — клавиши y и n в русской раскладке: не «да»
+_ALWAYS = ("a", "always", "в", "всегда", "ф")  # ф — клавиша a в русской раскладке
 
 
 def _stdin_is_terminal() -> bool:

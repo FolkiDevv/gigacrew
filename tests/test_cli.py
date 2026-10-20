@@ -108,6 +108,42 @@ def test_model_and_clear_commands(cli_env, capsys):
     assert len(agent.conversation) == 0
 
 
+def test_permissions_command_lists_forgets_and_shows_log(tmp_path, capsys):
+    from gigacrew.agent.decisions import DecisionMemory
+    from gigacrew.safety import classify
+
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    ui = Console(no_color=True)
+    agent = Agent(ScriptedProvider(), build_default_registry(), cfg, ui, decisions=memory)
+    commands = default_commands()
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands)
+    commands.dispatch("/permissions", ctx)
+    assert "сохранённых разрешений нет" in _out(capsys)
+    memory.approve(classify("pytest -q", root=tmp_path))
+    memory.record(
+        {
+            "command": "pip install x",
+            "cwd": ".",
+            "key": "pip install x",
+            "decision": "no",
+            "source": "user",
+            "feedback": "не надо",
+        }
+    )
+    commands.dispatch("/permissions", ctx)
+    out = _out(capsys)
+    assert "1. «pytest» с проверенными аргументами" in out and "approvals.json" in out
+    commands.dispatch("/permissions log", ctx)
+    assert "нет: pip install x — «не надо»" in _out(capsys)
+    commands.dispatch("/permissions forget 1", ctx)
+    assert "разрешение удалено" in _out(capsys) and memory.rules == []
+    commands.dispatch("/permissions forget 5", ctx)
+    assert "нет разрешения №5" in _out(capsys)
+    commands.dispatch("/permissions bogus", ctx)
+    assert "использование" in _out(capsys)
+
+
 # ------------------------------- REPL ------------------------------- #
 def _reader(*items):
     queue = list(items)

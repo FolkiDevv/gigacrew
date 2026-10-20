@@ -47,7 +47,9 @@ dependencies = [
     "tree-sitter-php>=0.25",
     "tree-sitter-c>=0.24",
     "tree-sitter-cpp>=0.23.4",
-    "tree-sitter-bash>=0.25",
+    # bash — ещё и для классификатора команд (gigacrew/safety): правила опираются на имена
+    # узлов грамматики, поэтому верхняя граница — до сверки с новой версией
+    "tree-sitter-bash>=0.25,<0.26",
     "tree-sitter-scala>=0.26",
     "tree-sitter-swift>=0.7",
 ]

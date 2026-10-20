@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from pydantic import BaseModel, Field
 
 from gigacrew.permissions import ToolKind
-from gigacrew.project.files import glob_match, walk_files
+from gigacrew.project.files import GIT_DIR_NAME, glob_match, is_git_internal, walk_files
 from gigacrew.project.workspace import DATA_DIR_NAME
 from gigacrew.security import RiskLevel, resolve_in_root
 from gigacrew.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
@@ -26,7 +26,6 @@ MAX_READ_LINES = 1000
 MAX_LINE_CHARS = 1000
 MAX_READ_CHARS = 60_000
 _BINARY_PROBE = 8192
-GIT_DIR_NAME = ".git"
 
 
 def _rel(ctx: ToolContext, path: Path) -> str:
@@ -184,59 +183,6 @@ def _lines(text: str) -> list[str]:
     return lines
 
 
-def _git_dirs(root: Path) -> list[Path]:
-    """Каталоги git проекта: ``<root>/.git`` (раскрытый) или цель ``gitdir:`` из
-    ``.git``-файла (рабочие деревья, сабмодули, раскладка с ``.bare``)."""
-    dot_git = root / GIT_DIR_NAME
-    try:
-        if dot_git.is_dir():
-            return [dot_git.resolve()]
-        if not dot_git.is_file():
-            return []
-        for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("gitdir:"):
-                target = Path(line[len("gitdir:") :].strip())
-                return [(target if target.is_absolute() else root / target).resolve()]
-    except OSError:
-        pass
-    return []
-
-
-def _looks_like_git_dir(directory: Path) -> bool:
-    """Каталог устроен как каталог git (обычный ``.git``, bare-репозиторий или цель
-    ``gitdir:``/симлинка вложенного репозитория): ``HEAD``, ``objects/``, ``refs/``."""
-    try:
-        return (
-            (directory / "HEAD").is_file()
-            and (directory / "objects").is_dir()
-            and (directory / "refs").is_dir()
-        )
-    except OSError:
-        return False
-
-
-def _is_git_internal(root: Path, path: Path, raw: str = "") -> bool:
-    """Путь внутри корня — сам ``.git`` или лежит в каталоге git.
-
-    Проверяются и путь как его прислали (``raw``: ``nested/.git/config``, даже если
-    ``nested/.git`` — симлинк, который раскрытие уберёт), и раскрытый: компонент
-    ``.git`` без учёта регистра (``.GIT`` на macOS/Windows) на любой глубине; каталоги
-    по пути от корня, устроенные как каталог git (цель симлинка или ``gitdir:``
-    вложенного репозитория); каталог git корня. ``.github``, ``.gitignore`` — обычные.
-    """
-    try:
-        parts = path.relative_to(root).parts
-    except ValueError:
-        return False
-    raw_parts = Path(raw).parts if raw else ()
-    if any(part.casefold() == GIT_DIR_NAME for part in (*parts, *raw_parts)):
-        return True
-    if any(path == d or d in path.parents for d in _git_dirs(root)):
-        return True
-    candidates = [path, *path.parents] if path.is_dir() else list(path.parents)
-    return any(_looks_like_git_dir(d) for d in candidates if d != root and root in d.parents)
-
-
 def _is_plan_file(ctx: ToolContext, path: str) -> bool:
     """Путь ведёт к файлу плана текущего чата (его можно писать без вопроса)."""
     if ctx.plan is None:
@@ -266,7 +212,7 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
     то есть до вопроса о подтверждении.
     """
     p = resolve_in_root(ctx.root, path)
-    if _is_git_internal(ctx.root, p, path):
+    if is_git_internal(ctx.root, p, path):
         raise ToolError(
             f"Внутренности git ({GIT_DIR_NAME}/) недоступны для записи: {path}. "
             "Для операций с репозиторием используйте инструмент git."

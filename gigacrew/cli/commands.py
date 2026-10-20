@@ -198,6 +198,71 @@ def _mode(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+PERMISSIONS_USAGE = "/permissions [forget N | clear | log]"
+
+
+def _permissions(ctx: CommandContext, arg: str) -> bool:
+    """Сохранённые разрешения «всегда» для команд и последние решения."""
+    memory = ctx.agent.decisions
+    words = arg.split()
+    action = words[0].lower() if words else ""
+    if action in ("forget", "rm", "удалить"):
+        if len(words) != 2 or not words[1].isdigit():
+            ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
+            return True
+        try:
+            rule = memory.forget(int(words[1]))
+        except IndexError:
+            ctx.ui.error(f"нет разрешения №{words[1]} (список — /permissions)")
+        except OSError as e:
+            ctx.ui.error(f"не удалось сохранить: {e}")
+        else:
+            ctx.ui.info(f"разрешение удалено: {rule.describe()}")
+        return True
+    if action in ("clear", "очистить"):
+        try:
+            n = memory.clear()
+        except OSError as e:
+            ctx.ui.error(f"не удалось сохранить: {e}")
+        else:
+            ctx.ui.info(f"удалено разрешений: {n}")
+        return True
+    if action in ("log", "журнал"):
+        items = memory.recent()
+        if not items:
+            ctx.ui.info("журнал решений пуст" + ("" if memory.log else " (не ведётся: --no-save)"))
+            return True
+        lines = []
+        for item in items:
+            mark = {"yes": "да", "always": "всегда", "no": "нет", "no_answer": "без ответа"}.get(
+                str(item.get("decision")), str(item.get("decision"))
+            )
+            where = "" if item.get("cwd") in (None, ".") else f" [{item.get('cwd')}]"
+            text = f"  • {mark}{where}: {item.get('command', '')}"
+            if item.get("feedback"):
+                text += f" — «{item['feedback']}»"
+            lines.append(text)
+        ctx.ui.info("последние решения:\n" + "\n".join(lines))
+        return True
+    if action:
+        ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
+        return True
+    if not memory.rules:
+        lines = ["сохранённых разрешений нет: ответ «a» на вопрос о команде запомнит её"]
+    else:
+        lines = ["разрешено без вопросов:"]
+        for i, rule in enumerate(memory.rules, 1):
+            used = f", применялось {rule.hits}" if rule.hits else ""
+            lines.append(f"  {i}. {rule.describe()}{used}")
+        lines.append("удалить — /permissions forget N, все — /permissions clear")
+    if memory.approvals_path is not None and memory.remember:
+        lines.append(f"файл: {memory.approvals_path}")
+    elif memory.directory is None or not memory.remember:
+        lines.append("разрешения хранятся до конца сессии (GIGACREW_REMEMBER_APPROVALS=0)")
+    ctx.ui.info("\n".join(lines))
+    return True
+
+
 def _clear(ctx: CommandContext, _arg: str) -> bool:
     if ctx.chats is None:
         ctx.agent.reset()
@@ -304,6 +369,14 @@ def default_commands() -> CommandRegistry:
     registry.register(
         SlashCommand(
             "/mode", "режим: ручной, авто-правки, план", _mode, usage="/mode [manual|edits|plan]"
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "/permissions",
+            "разрешённые без вопросов команды и журнал решений",
+            _permissions,
+            usage=PERMISSIONS_USAGE,
         )
     )
     registry.register(SlashCommand("/clear", "новый чат", _clear))

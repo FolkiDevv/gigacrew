@@ -38,6 +38,7 @@ IGNORE_DIRS: frozenset[str] = frozenset(
 
 
 TREE_TRUNCATED = "... (tree truncated)"
+GIT_DIR_NAME = ".git"
 
 
 def is_ignored_dir(name: str) -> bool:
@@ -47,6 +48,7 @@ def is_ignored_dir(name: str) -> bool:
 
 def is_secret_file(name: str) -> bool:
     """Файл с секретами (``.env``, ``.env.local``…), кроме шаблона ``.env.example``."""
+    name = name.casefold()  # .ENV на macOS/Windows — тот же файл
     return name == ".env" or (name.startswith(".env.") and name != ".env.example")
 
 
@@ -60,6 +62,59 @@ def is_secret_path(path: Path) -> bool:
         except OSError:
             return True
     return False
+
+
+def git_dirs(root: Path) -> list[Path]:
+    """Каталоги git проекта: ``<root>/.git`` (раскрытый) или цель ``gitdir:`` из
+    ``.git``-файла (рабочие деревья, сабмодули, раскладка с ``.bare``)."""
+    dot_git = root / GIT_DIR_NAME
+    try:
+        if dot_git.is_dir():
+            return [dot_git.resolve()]
+        if not dot_git.is_file():
+            return []
+        for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("gitdir:"):
+                target = Path(line[len("gitdir:") :].strip())
+                return [(target if target.is_absolute() else root / target).resolve()]
+    except OSError:
+        pass
+    return []
+
+
+def looks_like_git_dir(directory: Path) -> bool:
+    """Каталог устроен как каталог git (обычный ``.git``, bare-репозиторий или цель
+    ``gitdir:``/симлинка вложенного репозитория): ``HEAD``, ``objects/``, ``refs/``."""
+    try:
+        return (
+            (directory / "HEAD").is_file()
+            and (directory / "objects").is_dir()
+            and (directory / "refs").is_dir()
+        )
+    except OSError:
+        return False
+
+
+def is_git_internal(root: Path, path: Path, raw: str = "") -> bool:
+    """Путь внутри корня — сам ``.git`` или лежит в каталоге git.
+
+    Проверяются и путь как его прислали (``raw``: ``nested/.git/config``, даже если
+    ``nested/.git`` — симлинк, который раскрытие уберёт), и раскрытый: компонент
+    ``.git`` без учёта регистра (``.GIT`` на macOS/Windows) на любой глубине; каталоги
+    по пути от корня, устроенные как каталог git (цель симлинка или ``gitdir:``
+    вложенного репозитория); каталог git корня. ``.github``, ``.gitignore`` — обычные.
+    """
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    raw_parts = Path(raw).parts if raw else ()
+    if any(part.casefold() == GIT_DIR_NAME for part in (*parts, *raw_parts)):
+        return True
+    if any(path == d or d in path.parents for d in git_dirs(root)):
+        return True
+    candidates = [path, *path.parents] if path.is_dir() else list(path.parents)
+    return any(looks_like_git_dir(d) for d in candidates if d != root and root in d.parents)
 
 
 def is_within(root: Path, path: Path) -> bool:

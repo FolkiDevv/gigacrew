@@ -140,6 +140,18 @@ def test_save_chats_flag_and_env(tmp_path):
     assert load({"GIGACREW_SAVE_CHATS": "1"}, save_chats=False) is False  # --no-save сильнее
 
 
+def test_command_safety_settings(tmp_path):
+    def load(env):
+        cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+        return cfg.safe_commands, cfg.remember_approvals
+
+    assert load({}) == (True, True)
+    assert load({"GIGACREW_SAFE_COMMANDS": "0", "GIGACREW_REMEMBER_APPROVALS": "0"}) == (
+        False,
+        False,
+    )
+
+
 def test_mode_flag_and_env(tmp_path):
     from gigacrew.permissions import PermissionMode
 

@@ -199,6 +199,12 @@ class Config:
     project_root: Path = field(default_factory=Path.cwd)
     auto_approve: bool = False  # пропускать подтверждения, кроме опасных операций (-y)
     yes_all: bool = False  # пропускать и подтверждения опасных операций (--yes-all)
+    # Команды, которые классификатор признал «только чтение» (ls, grep, git log, python
+    # без записи), — без вопроса в любом режиме; False — каждая команда с подтверждением.
+    safe_commands: bool = True
+    # Ответ «всегда» на вопрос о команде сохраняется для проекта в ~/.gigacode/projects/
+    # (переживает сессии); False — только до конца сессии.
+    remember_approvals: bool = True
     # Начальный режим разрешений (ручной / авто-правки / план); в работе режим
     # меняется в агенте (Shift+Tab, /mode).
     mode: PermissionMode = PermissionMode.MANUAL
@@ -295,6 +301,8 @@ class Config:
             save_chats=save_chats and _env_bool(env, "GIGACREW_SAVE_CHATS", True),
             auto_measure=_env_bool(env, "GIGACREW_AUTO_MEASURE", True),
             ty=_env_bool(env, "GIGACREW_TY", True),
+            safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", True),
+            remember_approvals=_env_bool(env, "GIGACREW_REMEMBER_APPROVALS", True),
             subagent_max_steps=_env_int(env, "GIGACREW_SUBAGENT_MAX_STEPS", 25),
             subagent_context_share=_env_int(
                 env, "GIGACREW_SUBAGENT_CONTEXT", 80, minimum=10, maximum=95

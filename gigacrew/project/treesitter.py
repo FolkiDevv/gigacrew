@@ -4,7 +4,8 @@
 Для каждого языка — таблица «тип узла → вид определения» и «тип узла-вызова →
 поле с вызываемым»; обход дерева учитывает вложенность (метод — внутри класса).
 Из API tree-sitter используются только узлы (тип, поля, позиции, текст): этот
-модуль — единственное место, где tree-sitter встречается в коде.
+модуль — единственное место, где tree-sitter загружается и импортируется. Ещё один
+потребитель узлов — разбор команд оболочки (:func:`parse_tree`, :mod:`gigacrew.safety.bash`).
 
 Грамматики — отдельные колёса ``tree-sitter-<язык>`` (офлайн). Не загрузилась —
 :func:`extract` возвращает None, и вызывающий откатывается на регэкспы.
@@ -283,6 +284,18 @@ def _parser(language: str) -> Any:
 
 def supports(language: str | None) -> bool:
     return language in SPECS
+
+
+def parse_tree(language: str, source: str) -> Node | None:
+    """Синтаксическое дерево ``source`` (корневой узел); None — грамматика не загрузилась.
+
+    Для разбора команд оболочки (:mod:`gigacrew.safety.bash`): ему нужны узлы целиком, а
+    не определения и вызовы, которые извлекает :func:`extract`.
+    """
+    parser = _parser(language)
+    if parser is None:
+        return None
+    return parser.parse(source.encode("utf-8", errors="surrogateescape")).root_node
 
 
 # --------------------------------------------------------------------------- #

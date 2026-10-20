@@ -106,7 +106,8 @@ def test_explore_runs_in_own_context(tmp_path):
     assert [(m.role, m.content) for m in history] == [("user", "найди функцию foo")]
     names = {spec.name for spec in child["tools"]}
     assert names == set(EXPLORE.tools)
-    assert not names & {"task", "ask_user", "exit_plan_mode", "write_file", "run_shell"}
+    assert not names & {"task", "ask_user", "exit_plan_mode", "write_file"}
+    assert "run_shell" in names  # только команды, признанные «только чтение»
 
     # у основного агента — только отчёт, без шагов суб-агента
     messages = agent.conversation.messages
