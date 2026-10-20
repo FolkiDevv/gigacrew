@@ -220,11 +220,12 @@ def _parse_command(raw: Any, where: str, warnings: list[str]) -> HookCommand | N
         warnings.append(f"{where}: command — ожидается непустая строка")
         return None
     timeout = raw.get("timeout", DEFAULT_HOOK_TIMEOUT)
-    # json.loads пропускает NaN, Infinity и 1e400 — int() на них упал бы.
+    # json.loads пропускает NaN, Infinity и 1e400 — int() на них упал бы. Огромное целое
+    # (10**400) isfinite не переводит во float — оно доходит до ограничения сверху.
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, int | float)
-        or not math.isfinite(timeout)
+        or (isinstance(timeout, float) and not math.isfinite(timeout))
     ):
         warnings.append(f"{where}: timeout — ожидается число секунд, взято {DEFAULT_HOOK_TIMEOUT}")
         timeout = DEFAULT_HOOK_TIMEOUT
