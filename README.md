@@ -31,6 +31,70 @@ description: Как выпустить новую версию пакета
 и может загрузить подходящий сама. Каталог `.gigacode/skills/` коммитится вместе с проектом — чаты,
 история и индекс в той же папке закрыты её собственным `.gitignore`.
 
+## Хуки
+
+Хук — команда оболочки, которую gigacrew запускает сам на событиях агента: отформатировать файл после правки,
+запретить команду по своим правилам, прогнать тесты перед концом ответа, получить уведомление. Формат — как у
+Claude Code, настройки — JSON (хуки из всех файлов объединяются):
+
+* `~/.gigacode/settings.json` — общие для всех проектов;
+* `.gigacode/settings.json` — проекта, коммитится;
+* `.gigacode/settings.local.json` — личные, закрыты `.gitignore` папки (в проекте, где `.gigacode/.gitignore`
+  создан раньше, добавьте строку `/settings.local.json` сами).
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "write_file|edit_file",
+        "hooks": [{"type": "command", "command": "ruff format \"$GIGACREW_PROJECT_DIR\"", "timeout": 30}]
+      }
+    ],
+    "Stop": [{"hooks": [{"type": "command", "command": "make test >&2 || exit 2"}]}]
+  }
+}
+```
+
+`matcher` — регулярное выражение на всё значение (пусто или `*` — любое), `timeout` — секунды (1…600, по
+умолчанию 60). `"disableAllHooks": true` выключает все хуки.
+
+| Событие | Когда | matcher | Что может хук |
+|---|---|---|---|
+| `PreToolUse` | перед вызовом инструмента | имя инструмента | запретить вызов; решить, спрашивать ли подтверждение |
+| `PostToolUse` | после вызова | имя инструмента | передать модели замечания (вывод линтера) |
+| `UserPromptSubmit` | запрос отправлен | — | отклонить запрос; добавить к нему контекст |
+| `Stop` | модель закончила ответ | — | вернуть её к работе с причиной |
+| `SubagentStop` | суб-агент закончил | имя суб-агента | то же для суб-агента |
+| `SessionStart` | старт, `/clear`, `/resume` | `startup`, `clear`, `resume` | добавить контекст в системный промпт |
+| `SessionEnd` | выход, `/clear`, `/resume` | `prompt_input_exit`, `other`, `clear`, `resume` | — |
+| `PreCompact` | перед сжатием истории | `manual`, `auto` | — |
+| `Notification` | gigacrew ждёт подтверждения или ответа | `permission_prompt`, `question` | — |
+
+Хук получает JSON в stdin: `session_id` (id чата), `transcript_path` (файл чата в формате gigacrew; пишется
+после хода, при `--no-save` его нет), `cwd`, `hook_event_name`, `permission_mode` и поля события: `tool_name`,
+`tool_input`, `tool_use_id`, `tool_response` (`{ok, content}`), `prompt`, `stop_hook_active`,
+`last_assistant_message`, `agent_type`, `source`, `reason`, `trigger`, `custom_instructions`, `message`,
+`notification_type`. Имена инструментов и параметров — gigacrew, а не Claude Code: `read_file`, `write_file` и
+`edit_file` принимают `path` (не `file_path`), `run_shell` — `command`; параметры остальных — в
+`gigacrew/tools/`. В окружении хука — `GIGACREW_PROJECT_DIR` и `CLAUDE_PROJECT_DIR` (корень проекта; в
+`cmd.exe` — `%GIGACREW_PROJECT_DIR%`).
+
+Ответ хука — код выхода: `0` — успех, `2` — блокировка (причина — stderr; у `PostToolUse` она уходит модели
+как замечание, у `Stop` — возвращает модель к работе, не больше 5 раз за ход), прочие коды и таймаут —
+предупреждение, работа идёт дальше. Простой текст в stdout становится контекстом у `UserPromptSubmit` и
+`SessionStart`. Вместо него можно вывести JSON: `decision: "block"` и `reason`, `systemMessage` (показать
+пользователю), `hookSpecificOutput.additionalContext`, а у `PreToolUse` —
+`hookSpecificOutput.permissionDecision`: `deny` (с `permissionDecisionReason`), `ask` (спросить всегда) или
+`allow` (без вопроса; опасные команды и запрет режима плана хук не снимает). `updatedInput` не
+поддерживается. Фоновые процессы хука останавливаются через секунду после его выхода.
+
+Хуки проекта приходят вместе с репозиторием, поэтому gigacrew показывает их команды и спрашивает разрешение —
+при первом запуске и после каждого изменения (ответ запоминается в `~/.gigacode/trusted_hooks.json`). Без
+терминала и в `-p` неподтверждённые хуки проекта пропускаются; `--trust-hooks` разрешает их на один запуск
+(например, в CI). Настройки читаются при старте: `/hooks` показывает действующие хуки, `/hooks reload`
+перечитывает файлы.
+
 ## Лицензия
 
 MIT, см. [LICENSE](LICENSE).

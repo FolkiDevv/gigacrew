@@ -59,3 +59,33 @@ def live_config() -> Config:
     except RuntimeError as e:
         pytest.skip(f"{e} — live-тесты пропущены")
     return cfg
+
+
+@pytest.fixture
+def oneshot(tmp_path, monkeypatch):
+    """Окружение для ``app.main(["-p", ...])``; вызов ``oneshot(provider)`` подменяет провайдера."""
+    import gigacrew.cli.app as cli_app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GIGACREW_ACCESS_KEY", "dummy")
+    monkeypatch.setenv("GIGACREW_AUTH_URL", "https://auth.test/oauth")
+    monkeypatch.setenv("GIGACREW_API_URL", "https://api.test/v1")
+    monkeypatch.setenv("GIGACREW_MODEL", "M-default")
+    for name in (
+        "GIGACREW_TIMEOUT",
+        "GIGACREW_TEMPERATURE",
+        "GIGACREW_CONTEXT_TOKENS",
+        "GIGACREW_SAVE_CHATS",
+        "GIGACREW_MODE",
+        "GIGACREW_AUTO_COMPACT",
+        "GIGACREW_COMPACT_THRESHOLD",
+        "GIGACREW_AUTO_MEASURE",
+        "GIGACREW_PROVIDER",
+        "GIGACREW_USER_AGENT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    def use(provider):
+        monkeypatch.setattr(cli_app, "_make_provider", lambda _cfg: provider)
+
+    return use

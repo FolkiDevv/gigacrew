@@ -44,6 +44,7 @@ def test_completes_commands_with_descriptions():
         "/compact",
         "/resume",
         "/index",
+        "/hooks",
         "/exit",
     }
     assert _complete("/q") == [("/quit", "выход")]  # по алиасу

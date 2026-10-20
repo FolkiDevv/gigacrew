@@ -15,9 +15,13 @@
 Чаты сохраняются в ``.gigacode/chats/`` (``--no-save`` — нет); ``-c`` продолжает
 последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
 
+Хуки пользователя — из ``~/.gigacode/settings.json`` и ``.gigacode/settings*.json``
+проекта (:mod:`gigacrew.cli.hooks`); хуки проекта — после подтверждения или с
+``--trust-hooks``.
+
 Коды возврата: 0 — успех, 1 — ошибка конфигурации/внутренняя, 2 — ошибка LLM,
-3 — ход остановлен ограничителем (лимит шагов, серия ошибок, зацикливание),
-130 — прервано пользователем (Ctrl+C).
+3 — ход остановлен ограничителем (лимит шагов, серия ошибок, зацикливание) или запрос
+отклонён хуком, 130 — прервано пользователем (Ctrl+C).
 """
 
 from __future__ import annotations
@@ -28,8 +32,10 @@ from pathlib import Path
 
 from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
+from gigacrew.agent.hooks import PromptBlocked
 from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
+from gigacrew.cli.hooks import hook_session, load_hooks
 from gigacrew.cli.models import (
     describe_result,
     ensure_context_window,
@@ -44,6 +50,7 @@ from gigacrew.llm.gigacode import GigaCodeProvider
 from gigacrew.llm.model_windows import ModelWindows
 from gigacrew.permissions import PermissionMode
 from gigacrew.project.skills import SkillCatalog
+from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import build_default_registry
 from gigacrew.ui.console import Console
 
@@ -100,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Не сохранять чат в .gigacode/chats/",
     )
+    p.add_argument(
+        "--trust-hooks",
+        action="store_true",
+        help="Запускать хуки проекта (.gigacode/settings*.json) без подтверждения — "
+        "для -p в CI; подтверждение не запоминается",
+    )
     p.add_argument("--no-color", action="store_true", help="Отключить цвет")
     p.add_argument(
         "--no-stream",
@@ -129,25 +142,40 @@ def _not_in_catalogue(model: str, known: list[str]) -> str:
     return f"модели {model} нет в каталоге бэкенда; доступны: {', '.join(known)}"
 
 
-def run_oneshot(agent: Agent, ui: Console, prompt: str, chats: ChatRecorder | None = None) -> int:
+def run_oneshot(
+    agent: Agent,
+    ui: Console,
+    prompt: str,
+    chats: ChatRecorder | None = None,
+    *,
+    resumed: bool = False,
+) -> int:
+    """Один ход; хуки SessionStart/SessionEnd — вокруг него (SessionEnd — после
+    сохранения чата). ``resumed`` — чат продолжен (``-c``/``-r``)."""
     esc = esc_interrupt_for(ui, agent=agent)
-    try:
-        with esc:
-            agent.run_turn(prompt)
-    except LLMError as e:
-        ui.stop_live()
-        ui.error(str(e))
-        return EXIT_LLM_ERROR
-    except KeyboardInterrupt:
-        ui.stop_live()
-        ui.system("\n(прервано)")
-        return EXIT_INTERRUPTED
-    except Exception as e:  # как в REPL: сообщение вместо traceback
-        ui.stop_live()
-        ui.error(f"внутренняя ошибка: {type(e).__name__}: {e}")
-        return EXIT_ERROR
-    finally:
-        autosave(chats, agent, ui)
+    source = "resume" if resumed else "startup"
+    with hook_session(agent, ui, source=source, end_reason="other"):
+        try:
+            with esc:
+                agent.run_turn(prompt)
+        except PromptBlocked as e:
+            ui.stop_live()
+            ui.warn(f"запрос отклонён хуком UserPromptSubmit: {e.reason}")
+            return EXIT_STOPPED
+        except LLMError as e:
+            ui.stop_live()
+            ui.error(str(e))
+            return EXIT_LLM_ERROR
+        except KeyboardInterrupt:
+            ui.stop_live()
+            ui.system("\n(прервано)")
+            return EXIT_INTERRUPTED
+        except Exception as e:  # как в REPL: сообщение вместо traceback
+            ui.stop_live()
+            ui.error(f"внутренняя ошибка: {type(e).__name__}: {e}")
+            return EXIT_ERROR
+        finally:
+            autosave(chats, agent, ui)
     stats = agent.last_turn
     return EXIT_STOPPED if stats is not None and stats.stop_reason else EXIT_OK
 
@@ -267,7 +295,14 @@ def main(argv: list[str] | None = None) -> int:
                 "не задана модель: укажите GIGACREW_MODEL или --model (список — --list-models)"
             )
             return EXIT_ERROR
-        agent = Agent(provider, build_default_registry(), config, ui, windows=windows)
+        # Хуки — до агента: подтверждение хуков проекта спрашивается до начала работы.
+        hooks = load_hooks(
+            Workspace(config.project_root),
+            ui,
+            interactive=not args.prompt and ui.interactive(),
+            trust=args.trust_hooks,
+        )
+        agent = Agent(provider, build_default_registry(), config, ui, windows=windows, hooks=hooks)
         store = ChatStore(agent.workspace)
         chats = ChatRecorder(store, enabled=config.save_chats)
         agent.chat_id = chats.chat_id  # файл плана назван по id чата
@@ -291,8 +326,10 @@ def main(argv: list[str] | None = None) -> int:
                 ui.error(str(e))
                 return EXIT_ERROR
             ensure_context_window(agent, ui, interactive=False)
-            return run_oneshot(agent, ui, prompt, chats)
+            return run_oneshot(agent, ui, prompt, chats, resumed=saved is not None)
         resumed = saved.info if saved is not None else None
-        return run_repl(agent, ui, commands, chats=chats, resumed=resumed)
+        return run_repl(
+            agent, ui, commands, chats=chats, resumed=resumed, trust_hooks=args.trust_hooks
+        )
     finally:
         provider.close()

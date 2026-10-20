@@ -142,33 +142,7 @@ def test_repl_survives_errors_in_turn(cli_env, capsys, monkeypatch):
 
 
 # ---------------------------- one-shot e2e ---------------------------- #
-@pytest.fixture
-def oneshot(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("GIGACREW_ACCESS_KEY", "dummy")
-    monkeypatch.setenv("GIGACREW_AUTH_URL", "https://auth.test/oauth")
-    monkeypatch.setenv("GIGACREW_API_URL", "https://api.test/v1")
-    monkeypatch.setenv("GIGACREW_MODEL", "M-default")
-    for name in (
-        "GIGACREW_TIMEOUT",
-        "GIGACREW_TEMPERATURE",
-        "GIGACREW_CONTEXT_TOKENS",
-        "GIGACREW_SAVE_CHATS",
-        "GIGACREW_MODE",
-        "GIGACREW_AUTO_COMPACT",
-        "GIGACREW_COMPACT_THRESHOLD",
-        "GIGACREW_AUTO_MEASURE",
-        "GIGACREW_PROVIDER",
-        "GIGACREW_USER_AGENT",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-    def use(provider):
-        monkeypatch.setattr(app, "_make_provider", lambda _cfg: provider)
-
-    return use
-
-
+# Фикстура oneshot — в conftest.py (нужна и тестам хуков).
 def test_oneshot_end_to_end(tmp_path, oneshot, capsys):
     (tmp_path / "hello.txt").write_text("привет из файла", encoding="utf-8")
     provider = ScriptedProvider(

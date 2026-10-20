@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatInfo, ChatRecorder
+from gigacrew.agent.hooks import PromptBlocked
 from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import (
     CommandContext,
@@ -22,6 +23,7 @@ from gigacrew.cli.commands import (
     is_repl_command,
     mode_choices,
 )
+from gigacrew.cli.hooks import hook_session
 from gigacrew.cli.indexing import ensure_index
 from gigacrew.cli.interrupt import EscInterrupt
 from gigacrew.cli.models import ModelCatalog, ensure_context_window
@@ -89,6 +91,7 @@ def run_repl(
     index_on_start: bool = True,
     models: ModelCatalog | None = None,
     skills: SkillCatalog | None = None,
+    trust_hooks: bool = False,
 ) -> int:
     """``interrupt`` подменяется в тестах; по умолчанию Esc слушается только вместе с
     настоящей строкой ввода (``read_input is None``). ``index_on_start`` — до первого
@@ -103,7 +106,10 @@ def run_repl(
     до первого ввода (:func:`~gigacrew.cli.models.ensure_context_window`).
 
     ``skills`` — скиллы (``/<имя> [аргументы]``); по умолчанию — из ``.gigacode/skills``
-    проекта и ``~/.gigacode/skills``, перечитываются перед каждым вводом."""
+    проекта и ``~/.gigacode/skills``, перечитываются перед каждым вводом.
+
+    Хуки SessionStart — перед первым вводом, SessionEnd — при выходе (Ctrl+D, ``/exit``);
+    ``trust_hooks`` (``--trust-hooks``) — для ``/hooks reload``."""
     if interrupt is None:
         interrupt = EscInterrupt(enabled=None if read_input is None else False)
     esc = esc_interrupt_for(ui, interrupt, agent)
@@ -152,7 +158,24 @@ def run_repl(
         models=models,
         declined_windows=declined,
         skills=skills,
+        trust_hooks=trust_hooks,
     )
+    source = "resume" if resumed is not None else "startup"
+    with hook_session(agent, ui, source=source, end_reason="prompt_input_exit"):
+        return _loop(agent, ui, commands, ctx, read, esc, skills, chats)
+
+
+def _loop(
+    agent: Agent,
+    ui: Console,
+    commands: CommandRegistry,
+    ctx: CommandContext,
+    read: InputReader,
+    esc: EscInterrupt,
+    skills: SkillCatalog,
+    chats: ChatRecorder | None,
+) -> int:
+    """Цикл ввода REPL до выхода."""
     typeahead = esc.take_typeahead()  # набранное во время хода — в следующую строку ввода
 
     while True:
@@ -193,6 +216,9 @@ def run_repl(
             with esc:
                 agent.run_turn(line)
             ui.print()
+        except PromptBlocked as e:
+            ui.stop_live()
+            ui.warn(f"запрос отклонён хуком UserPromptSubmit: {e.reason}")
         except LLMError as e:
             ui.stop_live()
             ui.error(str(e))
