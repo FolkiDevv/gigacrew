@@ -120,15 +120,21 @@ class Backend:
         return sum(str(r.url) == url for r in self.requests)
 
 
-def _write_token(tmp_path, token="tok-1", expires_at=None, **extra):
+def _token_file(token="tok-1", expires_ms=None, endpoint=CONFIG) -> dict:
+    """Содержимое файла токена официального CLI."""
+    entry = {"accessToken": token, "authBundle": {"x": 1}, "configEndpoint": endpoint}
+    if expires_ms is not None:
+        entry["expiresAtUnixMs"] = expires_ms
+    return {"version": 1, "token": entry}
+
+
+def _write_token(tmp_path, token="tok-1", expires_at=None, **kw):
     """Файл токена официального CLI в ``<GIGACODE_HOME>/gigacode_token.json``."""
     home = tmp_path / "cli-home"
     home.mkdir(exist_ok=True)
-    data = {"access_token": token, **extra}
-    if expires_at is not None:
-        data["expires_at"] = expires_at
+    expires_ms = None if expires_at is None else expires_at * 1000
     path = home / "gigacode_token.json"
-    path.write_text(json.dumps(data), encoding="utf-8")
+    path.write_text(json.dumps(_token_file(token, expires_ms, **kw)), encoding="utf-8")
     return path
 
 
@@ -249,29 +255,32 @@ def test_catalogue_sampling_keeps_only_finite_numbers():
 
 
 # ------------------------------ токен ------------------------------ #
+def test_parse_token_of_the_cli_format():
+    data = _token_file(expires_ms=1_900_000_000_000)
+    data["token"]["resourceUrl"] = "https://res.test"
+    assert parse_token(data) == Token("tok-1", 1_900_000_000, CONFIG)
+    del data["token"]["expiresAtUnixMs"], data["token"]["configEndpoint"]
+    assert parse_token(data) == Token("tok-1")  # срока нет — до 401
+
+
 @pytest.mark.parametrize(
-    ("data", "expected"),
+    ("data", "reason"),
     [
-        ({"access_token": "t"}, Token("t")),
-        ({"accessToken": "t", "expiresAt": 1_900_000_000}, Token("t", 1_900_000_000)),
-        ({"token": "t", "expiry_date": 1_900_000_000_000}, Token("t", 1_900_000_000)),
-        ({"access_token": "t", "expires_at": "1900000000"}, Token("t", 1_900_000_000)),
-        (
-            {"access_token": "t", "expires_at": "2030-03-17T17:46:40Z"},
-            Token("t", 1_900_000_000),
-        ),
-        ({"tokens": {CONFIG: {"access_token": "t", "expires_at": None}}}, Token("t")),
-        ({"tokens": {"https://other.test/api/v2/config": {"access_token": "t"}}}, None),
-        ({"access_token": "t", "expires_at": "скоро"}, None),
-        ({"access_token": "с пробелом"}, None),
-        ({"access_token": ""}, None),
-        ({"access_token": 1}, None),
-        ([], None),
-        ({}, None),
+        ([], "не JSON-объект"),
+        ({"token": {"accessToken": "t"}}, "версия"),
+        ({"version": 2, "token": {"accessToken": "t"}}, "версия"),
+        ({"version": 1}, "нет записи token"),
+        ({"version": 1, "token": {"access_token": "t"}}, "accessToken"),
+        ({"version": 1, "token": {"accessToken": "с пробелом"}}, "accessToken"),
+        ({"version": 1, "token": {"accessToken": 1}}, "accessToken"),
+        ({"version": 1, "token": {"accessToken": "t", "expiresAtUnixMs": "1"}}, "expires"),
+        ({"version": 1, "token": {"accessToken": "t", "expiresAtUnixMs": True}}, "expires"),
+        ({"version": 1, "token": {"accessToken": "t", "configEndpoint": ""}}, "configEndpoint"),
     ],
 )
-def test_parse_token(data, expected):
-    assert parse_token(data, CONFIG) == expected
+def test_parse_token_rejects(data, reason):
+    with pytest.raises(ValueError, match=reason):
+        parse_token(data)
 
 
 def test_load_token_errors_ask_to_log_in_to_gigacode(tmp_path):
@@ -279,13 +288,23 @@ def test_load_token_errors_ask_to_log_in_to_gigacode(tmp_path):
     with pytest.raises(ApiError, match="нет токена GigaCode.*авторизацию в GigaCode"):
         load_token(path, CONFIG)
     path.write_text("{битый", encoding="utf-8")
-    with pytest.raises(ApiError, match="нет корректного токена.*авторизацию в GigaCode"):
+    with pytest.raises(ApiError, match="авторизацию в GigaCode"):
         load_token(path, CONFIG)
-    path.write_text(json.dumps({"access_token": "t", "expires_at": time.time() + 30}))
+    path.write_text(json.dumps(_token_file("t", (time.time() + 30) * 1000)))
     with pytest.raises(ApiError, match="истёк.*авторизацию в GigaCode"):  # запас — минута
         load_token(path, CONFIG)
-    path.write_text(json.dumps({"access_token": "t", "expires_at": time.time() + 3600}))
+    path.write_text(json.dumps(_token_file("t", (time.time() + 3600) * 1000)))
     assert load_token(path, CONFIG).access_token == "t"
+    assert load_token(path, CONFIG + "/").access_token == "t"
+
+
+def test_token_of_another_backend_is_not_sent(tmp_path):
+    backend = Backend()
+    _write_token(tmp_path, endpoint="https://other.test/api/v2/config")
+    provider = GigaCodeProvider(_config(tmp_path), transport=httpx.MockTransport(backend.handler))
+    with pytest.raises(ApiError, match="выдан для https://other.test.*GIGACREW_API_URL"):
+        provider.connect()
+    assert backend.requests == []
 
 
 def test_constructor_does_no_io(tmp_path):

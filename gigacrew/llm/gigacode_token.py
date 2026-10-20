@@ -7,10 +7,15 @@ gigacrew сам не входит в бэкенд: токен выдаёт оф�
 перезапуска. Нет файла, токен истёк или бэкенд его не принял — :class:`ApiError` с
 просьбой пройти авторизацию в GigaCode.
 
-Формат читается терпимо: токен — ``access_token`` (или ``accessToken``/``token``) на
-верхнем уровне либо в записи ``tokens[<адрес конфигурации>]``; срок — ``expires_at``
-(``expiresAt``, ``expiry_date``, ``expiry``): unix-время в секундах или миллисекундах
-либо дата ISO 8601. Срока нет — токен действует, пока бэкенд не ответит 401.
+Формат файла::
+
+    {"version": 1, "token": {"accessToken": "…", "expiresAtUnixMs": 1.7e12,
+        "configEndpoint": "https://…/api/v2/config", "authBundle": …, "resourceUrl": …}}
+
+Нужны ``accessToken`` и срок ``expiresAtUnixMs`` (unix-время в миллисекундах; нет —
+токен действует, пока бэкенд не ответит 401). ``configEndpoint`` — адрес конфигурации
+бэкенда, для которого выдан токен: не совпадает с адресом из ``GIGACREW_API_URL`` —
+ошибка, токен на чужой бэкенд не уходит. ``authBundle`` и ``resourceUrl`` не нужны.
 """
 
 from __future__ import annotations
@@ -21,17 +26,14 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from gigacrew.llm.transport import ApiError
 
 TOKEN_FILE = "gigacode_token.json"
+FORMAT_VERSION = 1
 EXPIRY_MARGIN = 60.0  # с: токен считается истёкшим заранее
-_TOKEN_KEYS = ("access_token", "accessToken", "token")
-_EXPIRY_KEYS = ("expires_at", "expiresAt", "expiry_date", "expiry")
-_MS_THRESHOLD = 1e11  # больше — это миллисекунды (1e11 с — 5138 год)
 _TOKEN = re.compile(r"[\x21-\x7e]+")  # печатный ASCII без пробелов
 
 
@@ -41,6 +43,7 @@ class Token:
 
     access_token: str
     expires_at: float | None = None
+    config_endpoint: str | None = None  # для какого бэкенда выдан (None — не указано)
 
     def expired(self, now: float | None = None) -> bool:
         """Истёк ли (за :data:`EXPIRY_MARGIN` до срока — уже да)."""
@@ -63,52 +66,38 @@ def login_hint(path: Path) -> str:
     return f"пройдите авторизацию в GigaCode — gigacrew возьмёт новый токен из {path}"
 
 
-def _expiry(value: Any) -> float | None:
-    """Unix-время в секундах из числа (секунды или миллисекунды) или даты ISO 8601."""
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, str):
-        text = value.strip()
-        try:
-            value = float(text)
-        except ValueError:
-            try:
-                moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
-            except ValueError:
-                return None
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=UTC)
-            return moment.timestamp()
-    if not isinstance(value, int | float) or not math.isfinite(value):
-        return None
-    return value / 1000 if value > _MS_THRESHOLD else float(value)
-
-
-def _entry(data: Mapping[str, Any], config_url: str) -> Mapping[str, Any] | None:
-    if any(key in data for key in _TOKEN_KEYS):
-        return data
-    tokens = data.get("tokens")
-    entry = tokens.get(config_url) if isinstance(tokens, Mapping) else None
-    return entry if isinstance(entry, Mapping) else None
-
-
-def parse_token(data: Any, config_url: str) -> Token | None:
-    """Токен из содержимого файла; не нашёлся или некорректен — None."""
-    entry = _entry(data, config_url) if isinstance(data, Mapping) else None
-    if entry is None:
-        return None
-    token = next((entry[k] for k in _TOKEN_KEYS if k in entry), None)
-    if not isinstance(token, str) or not _TOKEN.fullmatch(token.strip()):
-        return None
-    raw = next((entry[k] for k in _EXPIRY_KEYS if entry.get(k) is not None), None)
-    expires_at = _expiry(raw)
-    if raw is not None and expires_at is None:
-        return None  # срок есть, но не разобран — не рискуем просроченным токеном
-    return Token(token.strip(), expires_at)
+def parse_token(data: Any) -> Token:
+    """Токен из содержимого файла; некорректный — ``ValueError`` с причиной."""
+    if not isinstance(data, Mapping):
+        raise ValueError("не JSON-объект")
+    if data.get("version") != FORMAT_VERSION:
+        raise ValueError(f"неизвестная версия формата: {data.get('version')!r}")
+    entry = data.get("token")
+    if not isinstance(entry, Mapping):
+        raise ValueError("нет записи token")
+    token = entry.get("accessToken")
+    if not isinstance(token, str) or not _TOKEN.fullmatch(token):
+        raise ValueError("нет корректного accessToken")
+    expires_ms = entry.get("expiresAtUnixMs")
+    if expires_ms is not None and (
+        isinstance(expires_ms, bool)
+        or not isinstance(expires_ms, int | float)
+        or not math.isfinite(expires_ms)
+    ):
+        raise ValueError(f"некорректный expiresAtUnixMs: {expires_ms!r}")
+    endpoint = entry.get("configEndpoint")
+    if endpoint is not None and (not isinstance(endpoint, str) or not endpoint.strip()):
+        raise ValueError(f"некорректный configEndpoint: {endpoint!r}")
+    return Token(
+        token,
+        None if expires_ms is None else expires_ms / 1000,
+        endpoint.strip() if endpoint is not None else None,
+    )
 
 
 def load_token(path: Path, config_url: str) -> Token:
-    """Действующий токен из файла CLI; нет, не читается или истёк — :class:`ApiError`."""
+    """Действующий токен из файла CLI для бэкенда ``config_url``; нет, не читается,
+    истёк или выдан другому бэкенду — :class:`ApiError`."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -116,12 +105,17 @@ def load_token(path: Path, config_url: str) -> Token:
     except OSError as e:
         raise ApiError(f"не удалось прочитать {path}: {e}") from e
     try:
-        data = json.loads(text)
-    except ValueError:
-        data = None
-    token = parse_token(data, config_url)
-    if token is None:
-        raise ApiError(f"в {path} нет корректного токена GigaCode: {login_hint(path)}")
+        token = parse_token(json.loads(text))
+    except ValueError as e:
+        raise ApiError(f"{path}: {e} — {login_hint(path)}") from None
+    if token.config_endpoint is not None and (
+        token.config_endpoint.rstrip("/") != config_url.rstrip("/")
+    ):
+        raise ApiError(
+            f"токен GigaCode в {path} выдан для {token.config_endpoint}, а GIGACREW_API_URL "
+            f"указывает на {config_url} — исправьте GIGACREW_API_URL или пройдите авторизацию "
+            "в GigaCode на нужном бэкенде"
+        )
     if token.expired():
         raise ApiError(f"токен GigaCode истёк: {login_hint(path)}")
     return token
