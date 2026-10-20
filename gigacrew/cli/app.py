@@ -16,8 +16,8 @@
 последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
 
 Хуки пользователя — из ``~/.gigacode/settings.json`` и ``.gigacode/settings*.json``
-проекта (:mod:`gigacrew.cli.hooks`); хуки проекта — после подтверждения или с
-``--trust-hooks``.
+проекта (:mod:`gigacrew.cli.hooks`), после подтверждения или с ``--trust-hooks``; хук
+PreConnect срабатывает до подключения к бэкенду.
 
 Коды возврата: 0 — успех, 1 — ошибка конфигурации/внутренняя, 2 — ошибка LLM,
 3 — ход остановлен ограничителем (лимит шагов, серия ошибок, зацикливание) или запрос
@@ -35,7 +35,7 @@ from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, S
 from gigacrew.agent.hooks import PromptBlocked
 from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
-from gigacrew.cli.hooks import hook_session, load_hooks
+from gigacrew.cli.hooks import hook_session, load_hooks, run_pre_connect
 from gigacrew.cli.models import (
     describe_result,
     ensure_context_window,
@@ -110,8 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--trust-hooks",
         action="store_true",
-        help="Запускать хуки проекта (.gigacode/settings*.json) без подтверждения — "
-        "для -p в CI; подтверждение не запоминается",
+        help="Запускать хуки (~/.gigacode/settings.json, .gigacode/settings*.json) без "
+        "подтверждения — для -p в CI; подтверждение не запоминается",
     )
     p.add_argument("--no-color", action="store_true", help="Отключить цвет")
     p.add_argument(
@@ -253,7 +253,19 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     try:
+        # Хуки — до подключения: подтверждение спрашивается до начала работы, а хук
+        # PreConnect может подготовить подключение (например, обновить токен).
+        hooks = load_hooks(
+            Workspace(config.project_root),
+            ui,
+            interactive=not args.prompt and ui.interactive(),
+            trust=args.trust_hooks,
+        )
         try:
+            blocked = run_pre_connect(hooks, ui, config)
+            if blocked is not None:
+                ui.error(f"запуск остановлен хуком PreConnect: {blocked}")
+                return EXIT_ERROR
             provider.connect()  # токен и каталог моделей (бэкенд GigaCode)
         except KeyboardInterrupt:
             ui.system("\n(подключение прервано)")
@@ -295,13 +307,6 @@ def main(argv: list[str] | None = None) -> int:
                 "не задана модель: укажите GIGACREW_MODEL или --model (список — --list-models)"
             )
             return EXIT_ERROR
-        # Хуки — до агента: подтверждение хуков проекта спрашивается до начала работы.
-        hooks = load_hooks(
-            Workspace(config.project_root),
-            ui,
-            interactive=not args.prompt and ui.interactive(),
-            trust=args.trust_hooks,
-        )
         agent = Agent(provider, build_default_registry(), config, ui, windows=windows, hooks=hooks)
         store = ChatStore(agent.workspace)
         chats = ChatRecorder(store, enabled=config.save_chats)

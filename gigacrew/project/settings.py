@@ -12,9 +12,10 @@
         "hooks": [{"type": "command", "command": "make fmt", "timeout": 30}]}]}}
 
 Ошибки в файлах не мешают запуску: запись с ошибкой пропускается, вызывающий получает
-текст предупреждения. Хуки проекта приходят вместе с репозиторием — это запуск чужих
-команд, поэтому они работают только после подтверждения пользователя; подтверждённые
-отпечатки хранит :class:`TrustStore`.
+текст предупреждения. Хуки — запуск команд без вопросов, поэтому они работают только после
+подтверждения пользователя: хуки проекта приходят вместе с репозиторием, а в файл
+пользователя команду может дописать и сама модель (через ``run_shell``). Подтверждённые
+отпечатки хранит :class:`TrustStore`: изменились хуки — нужно подтверждение снова.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ TRUST_FORMAT_VERSION = 1
 
 
 class HookEvent(StrEnum):
+    PRE_CONNECT = "PreConnect"  # при запуске, до подключения к бэкенду (matcher — провайдер)
     PRE_TOOL_USE = "PreToolUse"
     POST_TOOL_USE = "PostToolUse"
     USER_PROMPT_SUBMIT = "UserPromptSubmit"
@@ -108,16 +110,22 @@ class HookSettings:
     def has(self, event: HookEvent, target: str = "") -> bool:
         return bool(self.commands(event, target))
 
+    def from_sources(self, *sources: SettingsSource) -> tuple[HookGroup, ...]:
+        return tuple(g for g in self.groups if g.source in sources)
+
     @property
     def project_groups(self) -> tuple[HookGroup, ...]:
-        """Хуки из файлов проекта — им нужно подтверждение."""
-        return tuple(g for g in self.groups if g.source in PROJECT_SOURCES)
+        """Хуки из файлов проекта."""
+        return self.from_sources(*PROJECT_SOURCES)
 
-    def without_project(self) -> HookSettings:
-        """Только хуки пользователя (хуки проекта не подтверждены)."""
-        return replace(
-            self, groups=tuple(g for g in self.groups if g.source not in PROJECT_SOURCES)
-        )
+    @property
+    def user_groups(self) -> tuple[HookGroup, ...]:
+        """Хуки из ``~/.gigacode/settings.json``."""
+        return self.from_sources("user")
+
+    def without(self, *sources: SettingsSource) -> HookSettings:
+        """Без хуков из ``sources`` (не подтверждены)."""
+        return replace(self, groups=tuple(g for g in self.groups if g.source not in sources))
 
 
 def settings_files(workspace: Workspace) -> list[tuple[Path, SettingsSource]]:
@@ -239,16 +247,25 @@ def _parse_command(raw: Any, where: str, warnings: list[str]) -> HookCommand | N
 
 
 # ---------------------------------------------------------------------------- #
-# Доверие к хукам проекта
+# Доверие к хукам
 
 
 def project_fingerprint(settings: HookSettings) -> str:
-    """Отпечаток хуков проекта (sha256); пустая строка — хуков проекта нет.
+    """Отпечаток хуков проекта (sha256); пустая строка — хуков проекта нет."""
+    return hooks_fingerprint(settings.project_groups)
+
+
+def user_fingerprint(settings: HookSettings) -> str:
+    """Отпечаток хуков пользователя (sha256); пустая строка — их нет."""
+    return hooks_fingerprint(settings.user_groups)
+
+
+def hooks_fingerprint(groups: tuple[HookGroup, ...]) -> str:
+    """Отпечаток групп хуков (sha256); пустая строка — групп нет.
 
     Любое изменение команд, matcher, таймаутов или файла, где они записаны, меняет
     отпечаток — и хуки снова требуют подтверждения.
     """
-    groups = settings.project_groups
     if not groups:
         return ""
     canonical = [
@@ -260,24 +277,40 @@ def project_fingerprint(settings: HookSettings) -> str:
 
 
 class TrustStore:
-    """Подтверждённые хуки проектов: ``~/.gigacode/trusted_hooks.json``.
+    """Подтверждённые хуки: ``~/.gigacode/trusted_hooks.json``.
 
-    Формат: ``{"version": 1, "projects": {"<корень проекта>": "<отпечаток>"}}``. Битый
-    файл читается как пустой (хуки просто спросят подтверждение снова).
+    Формат: ``{"version": 1, "user": "<отпечаток>", "projects": {"<корень проекта>":
+    "<отпечаток>"}}``; хуки пользователя подтверждаются одним отпечатком на все проекты.
+    Битый файл читается как пустой (хуки просто спросят подтверждение снова).
     """
 
     def __init__(self, path: Path | None = None):
         self.path = user_data_dir() / TRUST_FILE_NAME if path is None else path
 
     def is_trusted(self, root: Path, fingerprint: str) -> bool:
-        return bool(fingerprint) and self._read().get(_project_key(root)) == fingerprint
+        """Подтверждены ли хуки проекта ``root`` с этим отпечатком."""
+        return bool(fingerprint) and self._read()[1].get(_project_key(root)) == fingerprint
+
+    def is_user_trusted(self, fingerprint: str) -> bool:
+        """Подтверждены ли хуки пользователя с этим отпечатком."""
+        return bool(fingerprint) and self._read()[0] == fingerprint
 
     def trust(self, root: Path, fingerprint: str) -> None:
         """Запомнить отпечаток проекта. Ошибка записи — ``OSError``."""
-        projects = self._read()
+        user, projects = self._read()
         projects[_project_key(root)] = fingerprint
+        self._write(user, projects)
+
+    def trust_user(self, fingerprint: str) -> None:
+        """Запомнить отпечаток хуков пользователя. Ошибка записи — ``OSError``."""
+        self._write(fingerprint, self._read()[1])
+
+    def _write(self, user: str, projects: dict[str, str]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"version": TRUST_FORMAT_VERSION, "projects": dict(sorted(projects.items()))}
+        data: dict[str, object] = {"version": TRUST_FORMAT_VERSION}
+        if user:
+            data["user"] = user
+        data["projects"] = dict(sorted(projects.items()))
         fd, tmp = tempfile.mkstemp(
             prefix=f".{self.path.stem}.", suffix=".tmp", dir=self.path.parent
         )
@@ -289,17 +322,22 @@ class TrustStore:
             Path(tmp).unlink(missing_ok=True)
             raise
 
-    def _read(self) -> dict[str, str]:
+    def _read(self) -> tuple[str, dict[str, str]]:
+        """(отпечаток хуков пользователя, отпечатки проектов)."""
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, ValueError):
-            return {}
+            return "", {}
         if not isinstance(data, dict) or data.get("version") != TRUST_FORMAT_VERSION:
-            return {}
+            return "", {}
+        user = data.get("user")
         projects = data.get("projects")
         if not isinstance(projects, dict):
-            return {}
-        return {str(k): v for k, v in projects.items() if isinstance(v, str)}
+            projects = {}
+        return (
+            user if isinstance(user, str) else "",
+            {str(k): v for k, v in projects.items() if isinstance(v, str)},
+        )
 
 
 def _project_key(root: Path) -> str:

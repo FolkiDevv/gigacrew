@@ -1,21 +1,26 @@
-"""Хуки пользователя в CLI: загрузка настроек, подтверждение хуков проекта, хуки
-сессии (SessionStart/SessionEnd) и описание для ``/hooks``.
+"""Хуки пользователя в CLI: загрузка настроек, подтверждение хуков, хук PreConnect,
+хуки сессии (SessionStart/SessionEnd) и описание для ``/hooks``.
 
-Хуки проекта (``.gigacode/settings.json`` и ``settings.local.json``) приходят вместе с
-репозиторием — это запуск чужих команд. Они работают, только если пользователь их
-подтвердил (отпечаток запоминается в ``~/.gigacode/trusted_hooks.json``; изменились —
-спросим снова) или передал ``--trust-hooks``. Без терминала и в ``-p`` спросить некого:
-хуки проекта пропускаются с предупреждением.
+Хуки — запуск команд без вопросов: хуки проекта (``.gigacode/settings.json`` и
+``settings.local.json``) приходят вместе с репозиторием, а в ``~/.gigacode/settings.json``
+команду может дописать и сама модель (через ``run_shell``). Поэтому любые хуки работают,
+только если пользователь подтвердил их (отпечатки — в ``~/.gigacode/trusted_hooks.json``;
+изменились — спросим снова) или передал ``--trust-hooks``. Без терминала и в ``-p``
+спросить некого: неподтверждённые хуки пропускаются с предупреждением.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 
 from gigacrew.agent.hooks import HookRunner
 from gigacrew.agent.loop import Agent
+from gigacrew.config import Config
 from gigacrew.project.settings import (
+    PROJECT_SOURCES,
     HookEvent,
     HookGroup,
     HookSettings,
@@ -23,6 +28,7 @@ from gigacrew.project.settings import (
     TrustStore,
     load_settings,
     project_fingerprint,
+    user_fingerprint,
 )
 from gigacrew.project.workspace import Workspace
 from gigacrew.ui.console import Console, sanitize
@@ -32,10 +38,16 @@ SOURCE_LABELS: dict[SettingsSource, str] = {
     "project": ".gigacode/settings.json",
     "local": ".gigacode/settings.local.json",
 }
-UNTRUSTED_WARNING = (
-    "хуки проекта (.gigacode/settings*.json) не подтверждены и пропущены: запустите gigacrew "
-    "интерактивно, чтобы подтвердить их, или передайте --trust-hooks"
-)
+
+
+@dataclass(frozen=True)
+class _Pending:
+    """Неподтверждённые хуки одного владельца (пользователь или проект)."""
+
+    owner: str  # «пользователя», «проекта»
+    sources: tuple[SettingsSource, ...]
+    groups: tuple[HookGroup, ...]
+    remember: Callable[[], None]  # записать отпечаток в TrustStore (OSError)
 
 
 def load_hooks(
@@ -46,33 +58,77 @@ def load_hooks(
     trust: bool = False,
     store: TrustStore | None = None,
 ) -> HookRunner:
-    """Хуки из файлов настроек; хуки проекта — только подтверждённые.
+    """Хуки из файлов настроек — только подтверждённые.
 
-    ``interactive`` — можно спросить пользователя; ``trust`` (``--trust-hooks``) —
-    хуки проекта доверены на этот запуск, без вопроса и без записи отпечатка.
+    Новые или изменённые хуки пользователя и проекта подтверждаются одним вопросом.
+    ``interactive`` — можно спросить пользователя; ``trust`` (``--trust-hooks``) — все хуки
+    доверены на этот запуск, без вопроса и без записи отпечатков.
     """
     settings, warnings = load_settings(workspace)
     for warning in warnings:
         ui.warn(warning)
-    fingerprint = project_fingerprint(settings)
-    if settings.disabled or not fingerprint or trust:
+    if settings.disabled or trust:
         return HookRunner(settings)
     store = TrustStore() if store is None else store
-    if store.is_trusted(workspace.root, fingerprint):
+    pending: list[_Pending] = []
+    user = user_fingerprint(settings)
+    if user and not store.is_user_trusted(user):
+        pending.append(
+            _Pending(
+                "пользователя", ("user",), settings.user_groups, lambda: store.trust_user(user)
+            )
+        )
+    project = project_fingerprint(settings)
+    if project and not store.is_trusted(workspace.root, project):
+        pending.append(
+            _Pending(
+                "проекта",
+                PROJECT_SOURCES,
+                settings.project_groups,
+                lambda: store.trust(workspace.root, project),
+            )
+        )
+    if not pending:
         return HookRunner(settings)
+    owners = " и ".join(p.owner for p in pending)
+    sources = tuple(source for p in pending for source in p.sources)
     if not interactive:
-        ui.warn(UNTRUSTED_WARNING)
-        return HookRunner(settings.without_project())
-    ui.warn("в проекте настроены хуки — gigacrew будет сам запускать эти команды:")
-    ui.print(describe_groups(settings.project_groups), markup=False, highlight=False)
-    if not ui.ask("Разрешить хуки проекта?", dangerous=True):
-        ui.info("хуки проекта выключены до конца сессии (/hooks reload — спросить снова)")
-        return HookRunner(settings.without_project())
+        files = ", ".join(SOURCE_LABELS[source] for source in sources)
+        ui.warn(
+            f"хуки {owners} ({files}) не подтверждены и пропущены: запустите gigacrew "
+            "интерактивно, чтобы подтвердить их, или передайте --trust-hooks"
+        )
+        return HookRunner(settings.without(*sources))
+    ui.warn(f"новые или изменённые хуки {owners} — gigacrew будет сам запускать эти команды:")
+    groups = tuple(group for p in pending for group in p.groups)
+    ui.print(describe_groups(groups), markup=False, highlight=False)
+    if not ui.ask(f"Разрешить хуки {owners}?", dangerous=True):
+        ui.info(f"хуки {owners} выключены до конца сессии (/hooks reload — спросить снова)")
+        return HookRunner(settings.without(*sources))
     try:
-        store.trust(workspace.root, fingerprint)
+        for p in pending:
+            p.remember()
     except OSError as e:
         ui.warn(f"подтверждение не сохранено ({e}) — при следующем запуске спрошу снова")
     return HookRunner(settings)
+
+
+def run_pre_connect(runner: HookRunner, ui: Console, config: Config) -> str | None:
+    """Хуки PreConnect — до подключения к бэкенду: причина остановить запуск или None.
+
+    Агента и чата ещё нет: в stdin — провайдер, адрес и модель из настроек. Ctrl+C
+    пробрасывается (вызывающий прерывает запуск, как при подключении).
+    """
+    root = Path(config.project_root).resolve()
+    payload = {
+        "hook_event_name": HookEvent.PRE_CONNECT.value,
+        "cwd": str(root),
+        "provider": config.provider,
+        "api_url": config.base_url,
+        "model": config.model,
+    }
+    result = runner.run(HookEvent.PRE_CONNECT, payload, cwd=root, events=ui, target=config.provider)
+    return result.reason if result.blocked else None
 
 
 def describe_groups(groups: tuple[HookGroup, ...]) -> str:

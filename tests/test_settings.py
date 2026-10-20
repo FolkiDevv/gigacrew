@@ -17,6 +17,7 @@ from gigacrew.project.settings import (
     TrustStore,
     load_settings,
     project_fingerprint,
+    user_fingerprint,
 )
 from gigacrew.project.workspace import Workspace, user_settings_file
 
@@ -158,7 +159,9 @@ def test_without_project_keeps_user_hooks(tmp_path):
     _write(user_settings_file(), _hooks("Stop", "echo user"))
     _write(ws.settings_file, _hooks("Stop", "echo project"))
     settings, _ = load_settings(ws)
-    assert [h.command for h in settings.without_project().commands(HookEvent.STOP)] == ["echo user"]
+    assert [h.command for h in settings.without("project", "local").commands(HookEvent.STOP)] == [
+        "echo user"
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -183,6 +186,38 @@ def test_fingerprint_ignores_user_hooks(tmp_path):
     before = project_fingerprint(load_settings(ws)[0])
     _write(user_settings_file(), _hooks("Stop", "echo user"))
     assert project_fingerprint(load_settings(ws)[0]) == before
+
+
+def test_user_fingerprint_ignores_project_hooks(tmp_path):
+    ws = Workspace(tmp_path)
+    assert user_fingerprint(load_settings(ws)[0]) == ""
+    _write(user_settings_file(), _hooks("Stop", "echo user"))
+    first = user_fingerprint(load_settings(ws)[0])
+    assert len(first) == 64
+    _write(ws.settings_file, _hooks("Stop", "echo project"))
+    assert user_fingerprint(load_settings(ws)[0]) == first
+    _write(user_settings_file(), _hooks("Stop", "echo planted"))
+    assert user_fingerprint(load_settings(ws)[0]) != first
+
+
+def test_trust_store_user_and_projects_coexist(tmp_path):
+    store = TrustStore(tmp_path / "trusted_hooks.json")
+    store.trust(tmp_path, "proj")
+    store.trust_user("usr")
+    assert store.is_user_trusted("usr") and not store.is_user_trusted("other")
+    assert store.is_trusted(tmp_path, "proj")  # trust_user не затёр проекты
+    store.trust(tmp_path, "proj2")
+    assert store.is_user_trusted("usr")  # и наоборот
+    assert not TrustStore(store.path).is_user_trusted("")
+
+
+def test_pre_connect_event_matches_provider(tmp_path):
+    ws = Workspace(tmp_path)
+    _write(ws.settings_file, _hooks("PreConnect", "echo", "gigacode"))
+    settings, warnings = load_settings(ws)
+    assert warnings == []
+    assert settings.has(HookEvent.PRE_CONNECT, "gigacode")
+    assert not settings.has(HookEvent.PRE_CONNECT, "api")
 
 
 def test_trust_store_roundtrip(tmp_path):
