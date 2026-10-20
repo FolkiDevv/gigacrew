@@ -201,8 +201,7 @@ class GigaCodeProvider(HttpProvider):
             config, transport=transport, headers={"User-Agent": config.user_agent or ""}
         )
         self._config_url = config_endpoint(config.base_url)
-        home = Path(config.gigacode_home).expanduser() if config.gigacode_home else None
-        self._token_file = token_file if token_file is not None else token_path(home)
+        self._token_file = token_file if token_file is not None else token_path(config.gigacode_dir)
         self._session_id = str(uuid.uuid4())
         self._token: Token | None = None
         self._catalogue: Catalogue | None = None

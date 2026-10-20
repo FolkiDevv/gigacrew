@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import ssl
 import time
 from abc import abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -83,6 +84,23 @@ def error_body(resp: httpx.Response) -> str:
     """Тело ответа для сообщения об ошибке — не длиннее :data:`ERROR_BODY_CHARS`."""
     text = resp.text.strip()
     return text if len(text) <= ERROR_BODY_CHARS else text[:ERROR_BODY_CHARS] + "…"
+
+
+def raise_if_cert_rejected(exc: BaseException) -> None:
+    """Сетевая ошибка из-за того, что сертификат сервера не прошёл проверку TLS, —
+    :class:`ApiError` с подсказкой сразу: повтор тут не поможет."""
+    seen: set[int] = set()
+    cause: BaseException | None = exc
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            reason = getattr(cause, "verify_message", None) or str(cause)
+            raise ApiError(
+                f"сертификат сервера не прошёл проверку TLS ({reason}): укажите корневой "
+                "сертификат сервера (PEM) в GIGACREW_CA_BUNDLE; GIGACREW_VERIFY_SSL=0 "
+                "выключает проверку, но тогда ключ или токен можно перехватить"
+            ) from exc
+        seen.add(id(cause))
+        cause = cause.__cause__ or cause.__context__
 
 
 def iter_sse_events(lines: Iterable[str]) -> Iterator[tuple[str | None, str]]:
@@ -332,6 +350,7 @@ class HttpProvider(LLMProvider):
             try:
                 resp = do_request()
             except RETRYABLE_EXC as e:
+                raise_if_cert_rejected(e)
                 last_exc = e
                 if isinstance(e, httpx.ReadTimeout) and silent_attempts is not None:
                     silences += 1
@@ -596,6 +615,7 @@ class HttpProvider(LLMProvider):
                         self._reject_reasoning(name, rejected, on_notice)
                     return self._consume_sse(resp, emit)
             except RETRYABLE_EXC as e:
+                raise_if_cert_rejected(e)
                 last_exc = e
                 silent = isinstance(e, httpx.ReadTimeout)
                 if silent:

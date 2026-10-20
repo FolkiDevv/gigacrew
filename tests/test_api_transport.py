@@ -7,6 +7,7 @@ ApiError (иначе они роняют REPL).
 from __future__ import annotations
 
 import json
+import ssl
 import time
 
 import httpx
@@ -204,6 +205,27 @@ def test_stream_retries_connect_error_before_output():
     assert turn.message.content == "ok"
     assert deltas == ["ok"]
     assert attempts["n"] == 2
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_rejected_server_certificate_is_not_retried(streaming):
+    """Сертификат сервера не прошёл проверку — повтор не поможет: сразу ошибка с подсказкой."""
+    chat_calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        chat_calls.append(request)
+        cause = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        cause.verify_message = "unable to get local issuer certificate"
+        raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED]", request=request) from cause
+
+    p = _provider(handler)
+    with pytest.raises(ApiError, match="GIGACREW_CA_BUNDLE") as e:
+        (p.stream if streaming else p.complete)(_msgs())
+    assert "unable to get local issuer certificate" in str(e.value)
+    assert len(chat_calls) == 1
     p.close()
 
 

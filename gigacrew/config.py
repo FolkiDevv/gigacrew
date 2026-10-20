@@ -22,6 +22,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
+
 from gigacrew.permissions import PermissionMode, parse_mode
 
 
@@ -203,9 +205,12 @@ class Config:
     model: str = ""
     auth_url: str | None = None
     base_url: str = ""
+    # Проверка TLS-сертификата сервера. По умолчанию (Config.load) включена у бэкенда
+    # GigaCode — токен принадлежит официальному CLI, который сервер проверяет, — и у
+    # API v2 при заданном ca_bundle.
     verify_ssl: bool = False
     # Корневой сертификат для проверки сервера; задан — проверка TLS включена
-    # по умолчанию.
+    # по умолчанию. У бэкенда GigaCode — в дополнение к стандартным корням.
     ca_bundle: str | None = None
     # User-Agent всех запросов к бэкенду GigaCode; значения по умолчанию тоже нет.
     user_agent: str | None = None
@@ -291,8 +296,9 @@ class Config:
         if ca_bundle and not Path(ca_bundle).expanduser().is_file():
             raise ConfigError(f"GIGACREW_CA_BUNDLE: файл не найден: {ca_bundle}")
 
+        provider = _env_choice(env, "GIGACREW_PROVIDER", ("api", "gigacode"))
         return cls(
-            provider=_env_choice(env, "GIGACREW_PROVIDER", ("api", "gigacode")),
+            provider=provider,
             access_key=access_key,
             cert=cert,
             key=key,
@@ -300,7 +306,9 @@ class Config:
             model=model or env.get("GIGACREW_MODEL") or "",
             auth_url=env.get("GIGACREW_AUTH_URL") or None,
             base_url=base_url.rstrip("/"),
-            verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", ca_bundle is not None),
+            verify_ssl=_env_bool(
+                env, "GIGACREW_VERIFY_SSL", ca_bundle is not None or provider == "gigacode"
+            ),
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             user_agent=_env_header(env, "GIGACREW_USER_AGENT"),
             gigacode_home=env.get("GIGACODE_HOME") or None,
@@ -346,15 +354,24 @@ class Config:
             return "mtls"
         return "none"
 
+    @property
+    def gigacode_dir(self) -> Path:
+        """Каталог официального CLI GigaCode: ``GIGACODE_HOME``, иначе ``~/.gigacode``."""
+        if self.gigacode_home:
+            return Path(self.gigacode_home).expanduser()
+        return Path.home() / ".gigacode"
+
     def build_ssl_verify(self) -> ssl.SSLContext | bool:
         """Значение для httpx ``verify=``.
 
         Для mTLS строит SSL-контекст с клиентским сертификатом (cert+key); файлы
         проверяются на существование и загружаемость. Для OAuth — флаг проверки
-        TLS-сертификата сервера (verify_ssl) или контекст с ``ca_bundle`` — так же и
-        для бэкенда GigaCode.
+        TLS-сертификата сервера (verify_ssl) или контекст с ``ca_bundle``. Для бэкенда
+        GigaCode — контекст с корнями официального CLI (:meth:`_gigacode_ssl_context`).
         """
         if self.auth_mode != "mtls":
+            if self.provider == "gigacode" and self.verify_ssl:
+                return self._gigacode_ssl_context()
             if self.verify_ssl and self.ca_bundle:
                 return ssl.create_default_context(cafile=self.ca_bundle)
             return self.verify_ssl
@@ -381,6 +398,28 @@ class Config:
             context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
         except ssl.SSLError as e:
             raise RuntimeError(f"Не удалось загрузить клиентский сертификат: {e}") from e
+        return context
+
+    def _gigacode_ssl_context(self) -> ssl.SSLContext:
+        """Проверка сервера GigaCode с теми же корнями, что у официального CLI: стандартные
+        (как у httpx), его сертификаты — ``certs/*.pem`` и ``*.crt`` в
+        :attr:`gigacode_dir` (туда CLI кладёт свой корпоративный корень) — и ``ca_bundle``.
+        Файл, который не читается как сертификат, — ошибка, а не тихий пропуск.
+        """
+        context = httpx.create_ssl_context()
+        certs = self.gigacode_dir / "certs"
+        files = sorted(
+            path
+            for path in (certs.iterdir() if certs.is_dir() else ())
+            if path.suffix.lower() in (".pem", ".crt") and path.is_file()
+        )
+        if self.ca_bundle:
+            files.append(Path(self.ca_bundle))
+        for path in files:
+            try:
+                context.load_verify_locations(cafile=str(path))
+            except (OSError, ssl.SSLError) as e:
+                raise RuntimeError(f"не удалось загрузить корневой сертификат {path}: {e}") from e
         return context
 
     def require_credentials(self) -> None:

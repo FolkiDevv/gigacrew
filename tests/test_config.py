@@ -143,7 +143,7 @@ def test_provider_choice(tmp_path):
     assert cfg.provider == "api" and cfg.auth_mode == "oauth"
     cfg = load({"GIGACREW_PROVIDER": " GigaCode ", "GIGACREW_ACCESS_KEY": "k"})
     assert cfg.provider == "gigacode" and cfg.auth_mode == "cli_token"  # ключ не нужен
-    assert cfg.build_ssl_verify() is False  # проверка TLS — как у API v2
+    assert cfg.verify_ssl  # проверка TLS — по умолчанию, как у официального CLI
     with pytest.raises(ConfigError, match="GIGACREW_PROVIDER"):
         load({"GIGACREW_PROVIDER": "openai"})
 
@@ -303,12 +303,13 @@ def test_ca_bundle_enables_verification(tmp_path):
         )
 
 
-def _self_signed(tmp_path):
+def _self_signed(tmp_path, cn="test"):
     import shutil
     import subprocess
 
     if shutil.which("openssl") is None:
         pytest.skip("нет openssl")
+    tmp_path.mkdir(parents=True, exist_ok=True)
     cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
     subprocess.run(
         [
@@ -321,7 +322,7 @@ def _self_signed(tmp_path):
             "-days",
             "1",
             "-subj",
-            "/CN=test",
+            f"/CN={cn}",
             "-keyout",
             str(key),
             "-out",
@@ -331,6 +332,78 @@ def _self_signed(tmp_path):
         capture_output=True,
     )
     return cert, key
+
+
+@pytest.fixture
+def _certifi_roots(monkeypatch):
+    """Стандартные корни — из certifi, как у httpx: не из SSL_CERT_FILE/SSL_CERT_DIR машины
+    (корни из каталога грузятся лениво, и get_ca_certs() их не показал бы)."""
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+
+
+def _common_names(context):
+    return {
+        value
+        for cert in context.get_ca_certs()
+        for rdn in cert["subject"]
+        for key, value in rdn
+        if key == "commonName"
+    }
+
+
+def test_gigacode_verifies_tls_by_default(tmp_path, _certifi_roots):
+    import ssl
+
+    env = {"GIGACREW_PROVIDER": "gigacode"}
+    cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+    assert cfg.verify_ssl  # токен официального CLI без проверки сервера не уходит
+    context = cfg.build_ssl_verify()
+    assert isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname and context.get_ca_certs()  # стандартные корни на месте
+    cfg = Config.load(
+        project_root=tmp_path, environ={**env, "GIGACREW_VERIFY_SSL": "0"}, cwd=tmp_path
+    )
+    assert cfg.build_ssl_verify() is False  # явное значение важнее
+
+
+def test_gigacode_trusts_official_cli_certificates(tmp_path, _isolated_home, _certifi_roots):
+    certs = _isolated_home / ".gigacode" / "certs"
+    certs.mkdir(parents=True)
+    _self_signed(tmp_path / "a", "bundled")[0].rename(certs / "gigacode-bundled-1.pem")
+    _self_signed(tmp_path / "b", "extra")[0].rename(certs / "extra.crt")
+    (certs / "README.txt").write_text("не сертификат — не читается")
+    env = {"GIGACREW_PROVIDER": "gigacode"}
+
+    context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
+    assert {"bundled", "extra"} <= _common_names(context)
+
+    own, _ = _self_signed(tmp_path / "c", "own")  # GIGACREW_CA_BUNDLE — в дополнение
+    cfg = Config.load(
+        project_root=tmp_path, environ={**env, "GIGACREW_CA_BUNDLE": str(own)}, cwd=tmp_path
+    )
+    names = _common_names(cfg.build_ssl_verify())
+    assert {"bundled", "extra", "own"} <= names and len(names) > 3
+
+    other = tmp_path / "other-home"
+    (other / "certs").mkdir(parents=True)
+    _self_signed(tmp_path / "d", "other")[0].rename(other / "certs" / "root.pem")
+    cfg = Config.load(
+        project_root=tmp_path, environ={**env, "GIGACODE_HOME": str(other)}, cwd=tmp_path
+    )
+    names = _common_names(cfg.build_ssl_verify())
+    assert "other" in names and "bundled" not in names
+
+
+def test_gigacode_broken_certificate_is_an_error(tmp_path, _isolated_home):
+    certs = _isolated_home / ".gigacode" / "certs"
+    certs.mkdir(parents=True)
+    (certs / "broken.pem").write_text("-----BEGIN CERTIFICATE-----\nмусор\n")
+    cfg = Config.load(
+        project_root=tmp_path, environ={"GIGACREW_PROVIDER": "gigacode"}, cwd=tmp_path
+    )
+    with pytest.raises(RuntimeError, match="broken.pem"):
+        cfg.build_ssl_verify()
 
 
 def test_mtls_verification_loads_trust_anchors(tmp_path, monkeypatch):
