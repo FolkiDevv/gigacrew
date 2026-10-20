@@ -187,7 +187,8 @@ class Config:
 
     # --- API ---
     # Провайдер: "api" — API v2 с авторизацией по ключу или сертификату (см. ниже);
-    # "gigacode" — бэкенд GigaCode: вход через браузер, модели из его каталога.
+    # "gigacode" — бэкенд GigaCode: токен из файла его официального CLI, модели из
+    # каталога бэкенда.
     provider: str = "api"
     # Две схемы авторизации API v2 (выбирается автоматически по наличию реквизитов):
     #   * OAuth: задан access_key -> Basic-ключ обменивается на Bearer-токен на
@@ -334,11 +335,11 @@ class Config:
     def auth_mode(self) -> str:
         """Схема авторизации, выбранная по провайдеру и наличию реквизитов.
 
-        ``"browser"`` — бэкенд GigaCode (вход через браузер); ``"oauth"`` — есть
+        ``"cli_token"`` — бэкенд GigaCode (токен официального CLI); ``"oauth"`` — есть
         access_key; ``"mtls"`` — есть cert+key (и нет ключа); ``"none"`` — реквизитов нет.
         """
         if self.provider == "gigacode":
-            return "browser"
+            return "cli_token"
         if self.access_key:
             return "oauth"
         if self.cert and self.key:

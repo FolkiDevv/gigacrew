@@ -164,7 +164,7 @@ def oneshot(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     def use(provider):
-        monkeypatch.setattr(app, "_make_provider", lambda _cfg, _ui: provider)
+        monkeypatch.setattr(app, "_make_provider", lambda _cfg: provider)
 
     return use
 
@@ -981,13 +981,11 @@ def test_make_provider_follows_the_setting(tmp_path):
     from gigacrew.llm.api import ApiProvider
     from gigacrew.llm.gigacode import GigaCodeProvider
 
-    ui = Console(no_color=True)
     api = app._make_provider(
-        Config(access_key="k", auth_url="https://auth.test", base_url="https://api.test/v1"), ui
+        Config(access_key="k", auth_url="https://auth.test", base_url="https://api.test/v1")
     )
     giga = app._make_provider(
-        Config(provider="gigacode", base_url="https://code.test", user_agent="ua"),
-        ui,
+        Config(provider="gigacode", base_url="https://code.test", user_agent="ua")
     )
     assert isinstance(api, ApiProvider) and isinstance(giga, GigaCodeProvider)
     api.close()

@@ -270,7 +270,7 @@ def test_oneshot_expands_skill(tmp_path, monkeypatch):
     }.items():
         monkeypatch.setenv(name, value)
     provider = ScriptedProvider([text_turn("сделано")])
-    monkeypatch.setattr(app, "_make_provider", lambda _cfg, _ui: provider)
+    monkeypatch.setattr(app, "_make_provider", lambda _cfg: provider)
     _project_skill(tmp_path, "deploy", "x", body="Выкати $ARGUMENTS.")
     code = app.main(["-C", str(tmp_path), "-p", "/deploy prod", "--no-color", "--no-stream"])
     assert code == 0

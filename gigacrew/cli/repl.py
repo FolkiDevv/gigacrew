@@ -132,7 +132,7 @@ def run_repl(
         mode=agent.mode,
     )
     cfg = agent.config
-    if cfg.auth_mode in ("oauth", "browser") and not cfg.verify_ssl:
+    if cfg.auth_mode in ("oauth", "cli_token") and not cfg.verify_ssl:
         ui.warn(TLS_OFF_WARNING)
     if resumed is not None:
         ui.chat_resumed(resumed, agent.conversation.messages)

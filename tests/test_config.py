@@ -142,7 +142,7 @@ def test_provider_choice(tmp_path):
     cfg = load({"GIGACREW_ACCESS_KEY": "k"})
     assert cfg.provider == "api" and cfg.auth_mode == "oauth"
     cfg = load({"GIGACREW_PROVIDER": " GigaCode ", "GIGACREW_ACCESS_KEY": "k"})
-    assert cfg.provider == "gigacode" and cfg.auth_mode == "browser"  # ключ не нужен
+    assert cfg.provider == "gigacode" and cfg.auth_mode == "cli_token"  # ключ не нужен
     assert cfg.build_ssl_verify() is False  # проверка TLS — как у API v2
     with pytest.raises(ConfigError, match="GIGACREW_PROVIDER"):
         load({"GIGACREW_PROVIDER": "openai"})

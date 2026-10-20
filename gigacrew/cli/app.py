@@ -119,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _make_provider(config: Config, ui: Console) -> LLMProvider:
+def _make_provider(config: Config) -> LLMProvider:
     if config.provider == "gigacode":
         return GigaCodeProvider(config)
     return ApiProvider(config)
@@ -219,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     try:
-        provider = _make_provider(config, ui)
+        provider = _make_provider(config)
     except Exception as e:
         ui.error(f"не удалось инициализировать провайдера: {e}")
         return EXIT_ERROR
