@@ -201,10 +201,37 @@ def test_catalogue_sources_in_order():
     )
 
 
+def test_model_id_from_the_model_key():
+    """Реальный бэкенд называет id модели model; id по контракту — важнее."""
+    item = {
+        "model": "Qwen3.6-35B",
+        "description": "Qwen3.6-35B-262k",
+        "default_system_message": "",
+        "ai_api": {
+            "frequency_penalty": 0,
+            "max_tokens": 32768,
+            "n": 1,
+            "presence_penalty": 0,
+            "stream": True,
+            "temperature": 0.6,
+        },
+    }
+    catalogue = parse_catalogue(
+        {"agent": {"models": [item]}, "default_model": "Qwen3.6-35B"}, CONFIG
+    )
+    (model,) = catalogue.models
+    assert model.id == catalogue.default_model == "Qwen3.6-35B"
+    assert model.context_window == DEFAULT_CONTEXT_WINDOW and model.streams
+    assert dict(model.sampling) == {"frequency_penalty": 0, "presence_penalty": 0}
+    assert parse_catalogue({"models": [{"id": "a", "model": "b"}]}, CONFIG).models[0].id == "a"
+
+
 @pytest.mark.parametrize(
     ("data", "message"),
     [
         ({}, "ни одной модели"),
+        ({"models": [{"model": ""}]}, "id или model"),
+        ({"models": [{"description": "без id"}]}, "id или model"),
         ({"models": []}, "ни одной модели"),
         ({"models": [{"id": "a"}, {"id": "a"}]}, "повторяется"),
         ({"models": [{"id": ""}]}, "id"),

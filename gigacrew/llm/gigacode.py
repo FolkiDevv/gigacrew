@@ -99,13 +99,16 @@ def _number(value: Any) -> int | float | None:
 
 
 def _parse_model(raw: Any) -> CatalogueModel:
-    model_id = raw.get("id") if isinstance(raw, Mapping) else None
+    model_id = None
+    if isinstance(raw, Mapping):
+        # id — по контракту официального CLI; реальный бэкенд называет его model.
+        model_id = raw.get("id") if raw.get("id") is not None else raw.get("model")
     if (
         not isinstance(model_id, str)
         or not model_id.strip()
         or any(not ch.isprintable() for ch in model_id)
     ):
-        raise ApiError(f"в каталоге GigaCode модель без корректного id: {str(raw)[:200]}")
+        raise ApiError(f"в каталоге GigaCode модель без корректного id или model: {str(raw)[:200]}")
     window = _window(_mapping(raw.get("plugin_side")).get("context_window_size")) or _window(
         raw.get("context_window_size")
     )
@@ -140,7 +143,8 @@ def _chat_endpoint(value: Any, config_url: str) -> str:
 def parse_catalogue(data: Mapping[str, Any], config_url: str) -> Catalogue:
     """Каталог моделей из конфигурации бэкенда; некорректный — :class:`ApiError`.
 
-    Модели — из ``chat.models``, иначе ``agent.models``, иначе ``models``; окно —
+    Модели — из ``chat.models``, иначе ``agent.models``, иначе ``models``; id модели —
+    ``id``, иначе ``model``; окно —
     ``plugin_side.context_window_size`` или ``context_window_size``; модель по умолчанию —
     ``chat.default_model``, затем ``default_model`` (только из каталога), иначе первая.
     Адрес чата — ``chat.url`` или ``chatEndpoint``, иначе ``…/chat/completions`` рядом с
