@@ -303,6 +303,23 @@ def test_ca_bundle_enables_verification(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", True), (" Yes ", True), ("ON", True), ("off", False), ("No", False)],
+)
+def test_boolean_settings(tmp_path, value, expected):
+    env = {"GIGACREW_PROVIDER": "gigacode", "GIGACREW_VERIFY_SSL": value}
+    assert Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).verify_ssl is expected
+
+
+@pytest.mark.parametrize("value", ["ture", "enabled", "y"])
+def test_invalid_boolean_is_an_error(tmp_path, value):
+    """Опечатка не выключает проверку TLS молча — ошибка конфигурации."""
+    env = {"GIGACREW_PROVIDER": "gigacode", "GIGACREW_VERIFY_SSL": value}
+    with pytest.raises(ConfigError, match="GIGACREW_VERIFY_SSL"):
+        Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+
+
 def _self_signed(tmp_path, cn="test"):
     import shutil
     import subprocess

@@ -96,7 +96,13 @@ def _env_bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     val = env.get(name)
     if val is None or not val.strip():
         return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
+    norm = val.strip().lower()
+    if norm in ("1", "true", "yes", "on"):
+        return True
+    if norm in ("0", "false", "no", "off"):
+        return False
+    # Опечатка не должна молча выключать настройку — например, проверку TLS у GigaCode.
+    raise ConfigError(f"{name}: ожидается 1/0, true/false, yes/no или on/off, получено {val!r}")
 
 
 def _env_int(
