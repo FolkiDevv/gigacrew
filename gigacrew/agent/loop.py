@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -32,7 +33,7 @@ from gigacrew.agent.context_window import (
     estimate_tokens,
     fit_history,
 )
-from gigacrew.agent.conversation import Conversation, Summary
+from gigacrew.agent.conversation import HOOK_CONTEXT_HEADER, Conversation, Summary
 from gigacrew.agent.events import (
     AgentEvents,
     Approval,
@@ -49,12 +50,14 @@ from gigacrew.agent.guard import (
     ToolOutcome,
     call_key,
 )
+from gigacrew.agent.hooks import HookResult, HookRunner, PromptBlocked
 from gigacrew.agent.prompts import (
     SYSTEM_PROMPT,
     build_project_context,
     compose_system_prompt,
     mode_prompt,
     nested_instructions_prompt,
+    session_context_prompt,
     subagent_system_prompt,
     summary_prompt,
 )
@@ -77,10 +80,12 @@ from gigacrew.llm.model_windows import ModelWindows
 from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolChoice, ToolSpec, Usage
 from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide, next_mode
 from gigacrew.project.instructions import NestedInstructions
+from gigacrew.project.settings import HookEvent
 from gigacrew.project.workspace import Workspace
 from gigacrew.security import RiskLevel
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 from gigacrew.tools.plan import PlanReview, review_plan
+from gigacrew.tools.questions import Answer, Question
 from gigacrew.tools.task import SUBAGENTS, SubagentSpec
 
 # Заметки для модели — на английском, как и промпты (пользователь их не видит).
@@ -123,6 +128,15 @@ OUTPUT_CUT_NOTE = (
     "long file as an outline with write_file and add the sections with edit_file; keep a "
     "text answer shorter."
 )
+HOOK_BLOCKED_NOTE = (
+    "Not executed: the user's PreToolUse hook blocked this call. Reason:\n{reason}\n"
+    "Do not repeat the same call; change the approach or ask the user."
+)
+HOOK_FEEDBACK_NOTE = "The user's {event} hook reported:\n{text}"
+STOP_HOOK_NOTE = (
+    "# Turn not finished\nThe user's {event} hook did not let you finish yet. Reason:\n"
+    "{reason}\nAddress it, then give your final answer."
+)
 OUTPUT_LIMIT_MESSAGE = (
     "Прервано: ответ модели {count} раза подряд оборвался, не дойдя до конца "
     "(finish_reason={reason}). Задача может быть не завершена."
@@ -133,6 +147,10 @@ OUTPUT_LIMIT_MESSAGE = (
 # раз за ход).
 CUT_REASONS = frozenset({"length", "incomplete"})
 MAX_CUT_RETRIES = 2
+
+# Сколько раз за ход хуки Stop/SubagentStop могут вернуть модель к работе: хук, который
+# никогда не отпускает, не должен крутить ход до предела шагов.
+MAX_STOP_HOOK_BLOCKS = 5
 
 
 # Сжатие контекста — доли бюджета истории (бюджет запроса за вычетом системного
@@ -164,6 +182,14 @@ def _reminder(note: str) -> str:
     return f"<system-reminder>\n{note}\n</system-reminder>"
 
 
+def _join_notes(*notes: str | None) -> str:
+    return "\n\n".join(n for n in notes if n)
+
+
+def _first_line(text: str) -> str:
+    return text.strip().splitlines()[0] if text.strip() else ""
+
+
 class Agent:
     def __init__(
         self,
@@ -178,6 +204,7 @@ class Agent:
         parent: Agent | None = None,
         subagent: SubagentSpec | None = None,
         chat_id: str | None = None,
+        hooks: HookRunner | None = None,
     ):
         """Конструктор не обращается к файловой системе и сети.
 
@@ -190,6 +217,8 @@ class Agent:
         и задавать вопросы пользователю суб-агент не может.
 
         ``chat_id`` — id чата: по нему назван файл плана (по умолчанию — новый id).
+
+        ``hooks`` — хуки пользователя (по умолчанию нет); у суб-агента — основного агента.
         """
         self._provider = provider
         self._registry = registry
@@ -202,9 +231,15 @@ class Agent:
         # Файл плана чата — только у основного агента: суб-агент план не пишет.
         self._chat_id = chat_id or ChatStore.new_id()
         self._plan = None if parent is not None else PlanFile(self._plan_path(self._chat_id))
+        self._hooks = (
+            parent._hooks if parent is not None else HookRunner() if hooks is None else hooks
+        )
+        # Контекст хуков SessionStart: в системном сообщении до reset().
+        self._session_context = ""
         self._ctx = ToolContext(
             workspace=self._workspace,
-            ask_user=self._events.ask_user,
+            # Вопрос пользователю — повод для хука Notification (суб-агент не спрашивает).
+            ask_user=self._events.ask_user if parent is not None else self._ask_user,
             get_mode=lambda: self.mode,
             set_mode=self.set_mode,
             semantic=config.ty,
@@ -273,6 +308,15 @@ class Agent:
         return self._mode if self._parent is None else self._parent.mode
 
     @property
+    def hooks(self) -> HookRunner:
+        return self._hooks
+
+    @hooks.setter
+    def hooks(self, value: HookRunner) -> None:
+        """Заменить хуки (``/hooks reload``); действует со следующего события."""
+        self._hooks = value
+
+    @property
     def context_tokens(self) -> int:
         """Размер контекста в токенах текущей модели (0 — диалог пуст).
 
@@ -309,6 +353,7 @@ class Agent:
             self._model,
             self.mode,
             len(self._nested.files),
+            self._session_context,
         )
         if self._context_estimate is None or self._context_estimate[0] != key:
             specs = self._registry.specs()
@@ -467,17 +512,75 @@ class Agent:
         self.chat_id = chat_id or ChatStore.new_id()
         self._conversation = Conversation() if conversation is None else conversation
         self._project_context = None
+        self._session_context = ""  # новый чат — хуки SessionStart запустит вызывающий
         self._nested.reset()
         # usage продолженного чата — в токенах его модели: она становится текущей до reset().
         self._context = None
         self._context_model = self._model
 
     # ------------------------------------------------------------------ #
+    def start_session(self, source: str) -> None:
+        """Хуки SessionStart (``source``: ``startup``, ``resume``, ``clear``).
+
+        Их контекст уходит в системное сообщение — переживает обрезку и сжатие истории —
+        до следующего :meth:`reset`.
+        """
+        result = self._hook(HookEvent.SESSION_START, source, source=source, model=self._model)
+        self._session_context = result.context_text
+
+    def end_session(self, reason: str) -> None:
+        """Хуки SessionEnd (``reason``: ``prompt_input_exit``, ``other``, ``clear``,
+        ``resume``) — только побочные действия хуков."""
+        self._hook(HookEvent.SESSION_END, reason, reason=reason)
+
+    def _hook(self, event: HookEvent, target: str = "", **fields: Any) -> HookResult:
+        """Запустить хуки события; нет подходящих — пустой результат без процессов.
+
+        Общие поля stdin — как у Claude Code; id чата у суб-агента — основного агента.
+        """
+        if not self._hooks.has(event, target):
+            return HookResult()
+        chat_id = self._parent.chat_id if self._parent is not None else self._chat_id
+        payload = {
+            "session_id": chat_id,
+            "transcript_path": str(self._workspace.chats_dir / f"{chat_id}.json"),
+            "cwd": str(self._workspace.root),
+            "hook_event_name": event.value,
+            "permission_mode": self.mode.value,
+            **fields,
+        }
+        return self._hooks.run(
+            event, payload, cwd=self._workspace.root, events=self._events, target=target
+        )
+
+    def _notify(self, kind: str, message: str) -> None:
+        """Хуки Notification: gigacrew ждёт пользователя."""
+        self._hook(HookEvent.NOTIFICATION, kind, message=message, notification_type=kind)
+
+    def _ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
+        if questions:
+            first = questions[0]
+            self._notify("question", f"gigacrew задаёт вопрос: {first.header or first.text}")
+        return self._events.ask_user(questions)
+
+    def _prompt_hooks(self, prompt: str) -> str:
+        """Хуки UserPromptSubmit: запрос с их контекстом или :class:`PromptBlocked`."""
+        result = self._hook(HookEvent.USER_PROMPT_SUBMIT, prompt=prompt)
+        if result.blocked:
+            raise PromptBlocked(result.reason)
+        if not result.context:
+            return prompt
+        context = _reminder(f"{HOOK_CONTEXT_HEADER}\n{result.context_text}")
+        return f"{prompt}\n\n{context}"
+
+    # ------------------------------------------------------------------ #
     def run_turn(self, user_input: str) -> str:
         """Обрабатывает один запрос пользователя до финального ответа.
 
         При любом прерывании (Ctrl+C, ошибка LLM) история приводится в
-        согласованное состояние, исключение пробрасывается дальше.
+        согласованное состояние, исключение пробрасывается дальше. Запрос, отклонённый
+        хуком UserPromptSubmit, — :class:`~gigacrew.agent.hooks.PromptBlocked`, история
+        не меняется.
         """
         self._last_turn = None
         try:
@@ -487,6 +590,8 @@ class Agent:
             raise
 
     def _run_turn(self, user_input: str) -> str:
+        if self._parent is None:  # задачу суб-агента пишет модель, а не пользователь
+            user_input = self._prompt_hooks(user_input)
         # Рассуждения прошлых ходов модели больше не нужны (GIGACREW_REASONING=turn).
         self._conversation.forget_reasoning()
         self._conversation.add_user(user_input)
@@ -566,6 +671,7 @@ class Agent:
         checked = False  # самопроверка — не больше одной за ход
         reviews = self._plan.reviews if self._plan is not None else 0  # показы плана до хода
         cuts = 0  # оборванных ответов за ход
+        held = 0  # сколько раз хуки Stop вернули модель к работе
         note = ""
         while True:
             context = self._subagent_context(specs, stats)
@@ -583,7 +689,15 @@ class Agent:
                         self._conversation.add_assistant(turn.message, turn.usage)
                         review = self._auto_review()
                         if review is None or not review.continues:
-                            return turn.message.content
+                            # План отклонён (Esc) — пользователь остановил ход: без хуков.
+                            if review is not None and review.outcome == "declined":
+                                return turn.message.content
+                            shown = "" if review is None else review.content
+                            pending = AUTO_REVIEW_NOTE.format(result=shown) if shown else ""
+                            if not self._hold_turn(turn.message.content, held, pending):
+                                return turn.message.content
+                            held += 1
+                            continue
                         result = AUTO_REVIEW_NOTE.format(result=review.content)
                         self._conversation.add_user(_reminder(result), meta=True)
                         continue
@@ -591,7 +705,10 @@ class Agent:
                         checked = True
                         followup = self._self_check(specs, turn, stats)
                         if followup is None:
-                            return turn.message.content
+                            if not self._hold_turn(turn.message.content, held):
+                                return turn.message.content
+                            held += 1
+                            continue
                         turn = followup  # с вызовами или оборван — дальше как обычно
                 msg = turn.message
                 # Повтор ниже: ответ текстом не идёт в историю — запрос не должен кончаться
@@ -615,10 +732,56 @@ class Agent:
                 self._conversation.add_assistant(msg, turn.usage)
 
                 if not turn.wants_tool:
-                    return msg.content
+                    if not self._hold_turn(msg.content, held):
+                        return msg.content
+                    held += 1
+                    continue
                 stop = self._run_calls(msg.function_calls, guard, stats)
             if stop is not None:
                 return self._stopped(specs, stop, stats)
+
+    def _hold_turn(self, text: str, held: int, pending: str = "") -> bool:
+        """Хуки Stop (у суб-агента — SubagentStop) перед концом хода: True — хук вернул
+        модель к работе, причина и ``pending`` (служебная заметка, которая иначе не
+        понадобилась бы) записаны в историю служебным сообщением.
+
+        Ответ ``text`` уже в истории, поэтому прерывание хука (Ctrl+C, Esc) не теряет
+        его: ход заканчивается этим ответом. Только жёсткая остановка суб-агента
+        пробрасывается.
+        """
+        if self._parent is None:
+            event, target, extra = HookEvent.STOP, "", {}
+        else:
+            name = self._subagent.name if self._subagent is not None else ""
+            event, target, extra = HookEvent.SUBAGENT_STOP, name, {"agent_type": name}
+        if not self._hooks.has(event, target):
+            return False
+        try:
+            result = self._hook(
+                event,
+                target,
+                stop_hook_active=held > 0,
+                last_assistant_message=text,
+                **extra,
+            )
+        except KeyboardInterrupt:
+            if self._parent is not None and not self._take_soft_stop():
+                raise
+            self._events.on_notice(f"хук {event} прерван — ход завершён", level="warn")
+            return False
+        if not result.blocked:
+            return False
+        if held >= MAX_STOP_HOOK_BLOCKS:
+            self._events.on_notice(
+                f"хук {event} снова не дал закончить ход — ход завершён "
+                f"(уже {MAX_STOP_HOOK_BLOCKS} раз подряд)",
+                level="warn",
+            )
+            return False
+        self._events.on_notice(f"хук {event} вернул агента к работе: {_first_line(result.reason)}")
+        stop_note = STOP_HOOK_NOTE.format(event=event, reason=result.reason)
+        self._conversation.add_user(_reminder(_join_notes(pending, stop_note)), meta=True)
+        return True
 
     def _plan_unsubmitted(self) -> bool:
         """Режим плана, а план менялся после того, как его показали пользователю."""
@@ -852,6 +1015,7 @@ class Agent:
         подкаталогов, правила режима."""
         parts = [
             self.system_prompt(),
+            session_context_prompt(self._session_context),
             nested_instructions_prompt(self._nested.files),
             mode_prompt(
                 self.mode, subagent=self._parent is not None, plan_path=self._plan_display()
@@ -979,6 +1143,10 @@ class Agent:
             plan = plan_compaction(conversation, keep_tokens=0)
         if plan is None:
             return None
+        trigger = "auto" if auto else "manual"
+        self._hook(
+            HookEvent.PRE_COMPACT, trigger, trigger=trigger, custom_instructions=instructions
+        )
 
         def count(usage: Usage) -> None:
             self._bill(usage)
@@ -1124,6 +1292,23 @@ class Agent:
         self._events.on_tool_call(call)
         key = call_key(function_call)
 
+        # Хуки PreToolUse: запретить вызов или решить, спрашивать ли пользователя.
+        hook_fields = {
+            "tool_name": name,
+            "tool_input": function_call.arguments,
+            "tool_use_id": function_call.id,
+        }
+        pre = self._hook(HookEvent.PRE_TOOL_USE, name, **hook_fields)
+        if pre.blocked:
+            self._fail(
+                call,
+                f"заблокировано хуком: {pre.reason}",
+                model_text=HOOK_BLOCKED_NOTE.format(reason=pre.reason),
+                note=note,
+            )
+            # Запрет хука — не застревание модели: серия ошибок не растёт.
+            return ToolOutcome(ok=False, soft=True)
+
         # 2) Разрешение по режиму: выполнить, спросить или заблокировать
         previewed = False
         risk = RiskLevel.SAFE
@@ -1137,9 +1322,11 @@ class Agent:
                 auto_approve=self._cfg.auto_approve,
                 yes_all=self._cfg.yes_all,
                 read_only=read_only,
+                hook=pre.decision,
             )
-            if decision is Decision.ASK and key in self._session_allowed:
-                decision = Decision.ALLOW  # пользователь разрешил этот вызов «всегда»
+            # Пользователь разрешил этот вызов «всегда» — если хук не требует спросить.
+            if decision is Decision.ASK and key in self._session_allowed and pre.decision != "ask":
+                decision = Decision.ALLOW
             if decision is Decision.BLOCK:
                 if read_only:
                     error, model_text = "заблокировано: агент только читает", READ_ONLY_BLOCKED_NOTE
@@ -1165,9 +1352,15 @@ class Agent:
                 # не запускается и подтверждение не запрашивается.
                 preview = tool.preview(params, self._ctx)
                 dangerous = risk >= RiskLevel.DANGEROUS
+                self._notify(
+                    "permission_prompt",
+                    f"gigacrew ждёт подтверждения: {name} {call.summary}".strip(),
+                )
                 answer = self._events.confirm(call, preview, dangerous=dangerous)
                 if isinstance(answer, bool):
                     answer = Approval.YES if answer else Approval.NO
+                if answer is Approval.ALWAYS and pre.decision == "ask":
+                    answer = Approval.YES  # хук спрашивает каждый раз — «всегда» не запомнить
                 if answer is Approval.ALWAYS and not dangerous:
                     self._allow_always(call, key)
                 elif answer is not Approval.YES:
@@ -1197,10 +1390,38 @@ class Agent:
         if result.ok and risk >= RiskLevel.WRITE:
             result.changed = True  # UI и журнал суб-агента видят изменение
         self._events.on_tool_result(call, result, previewed=previewed)
-        self._conversation.add_function_result(name, _with_note(result.as_function_content(), note))
+        content = result.as_function_content()
+        try:
+            feedback = self._post_tool_hooks(name, hook_fields, result)
+        except BaseException:
+            # Инструмент уже выполнен: модель должна знать результат, даже если хук прерван.
+            self._conversation.add_function_result(name, _with_note(content, note))
+            raise
+        self._conversation.add_function_result(
+            name, _with_note(content, _join_notes(feedback, note))
+        )
         if result.ok:
             self._attach_instructions(tool, params)
         return ToolOutcome(ok=result.ok, changed=result.changed, soft=result.soft)
+
+    def _post_tool_hooks(self, name: str, fields: dict[str, Any], result: ToolResult) -> str:
+        """Хуки PostToolUse: их отзыв для модели (дописывается к результату) или ""."""
+        hook = self._hook(
+            HookEvent.POST_TOOL_USE,
+            name,
+            **fields,
+            tool_response={"ok": result.ok, "content": result.content},
+        )
+        parts = list(hook.context)
+        if hook.blocked:
+            parts.insert(0, hook.reason)
+            self._events.on_notice(
+                f"хук PostToolUse ({name}): {_first_line(hook.reason)}", level="warn"
+            )
+        if not parts:
+            return ""
+        text = "\n\n".join(parts)
+        return _reminder(HOOK_FEEDBACK_NOTE.format(event=HookEvent.POST_TOOL_USE, text=text))
 
     def _run_subagent(self, name: str, description: str, prompt: str) -> ToolResult:
         """Запустить суб-агента ``name`` с задачей ``prompt`` (инструмент ``task``).

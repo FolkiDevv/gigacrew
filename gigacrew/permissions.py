@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 from enum import Enum, StrEnum
+from typing import Literal
 
 from gigacrew.security import RiskLevel
 
@@ -97,6 +98,7 @@ def decide(
     auto_approve: bool,
     yes_all: bool = False,
     read_only: bool = False,
+    hook: Literal["allow", "ask"] | None = None,
 ) -> Decision:
     """Как поступить с вызовом инструмента.
 
@@ -106,7 +108,30 @@ def decide(
     кроме опасных операций (``rm -rf``, ``git reset --hard``…) — их без вопроса
     выполняет только явный ``--yes-all``. ``read_only`` (суб-агент для исследования)
     блокирует любые изменения, включая команды shell, независимо от режима и флагов.
+
+    ``hook`` — решение хука PreToolUse: ``"ask"`` требует подтверждения даже там, где
+    вызов выполнился бы без вопроса; ``"allow"`` снимает вопрос, как ``-y``, — опасные
+    операции всё равно спрашиваются. Запрет режима (BLOCK) хук не снимает.
     """
+    decision = _decide(
+        mode, risk, kind, auto_approve=auto_approve, yes_all=yes_all, read_only=read_only
+    )
+    if hook == "ask" and decision is Decision.ALLOW:
+        return Decision.ASK
+    if hook == "allow" and decision is Decision.ASK and risk < RiskLevel.DANGEROUS:
+        return Decision.ALLOW
+    return decision
+
+
+def _decide(
+    mode: PermissionMode,
+    risk: RiskLevel,
+    kind: ToolKind,
+    *,
+    auto_approve: bool,
+    yes_all: bool,
+    read_only: bool,
+) -> Decision:
     if risk < RiskLevel.WRITE:
         return Decision.ALLOW
     if read_only:

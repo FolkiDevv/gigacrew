@@ -152,6 +152,9 @@ class SubagentEvents(AgentEvents):
     def on_compact_end(self, result: CompactResult | None) -> None:
         """Не передаётся: интерфейс остановил бы индикатор суб-агента."""
 
+    def on_hook_start(self, event: str, command: str) -> None:
+        self._activity(f"хук {event}")
+
     def on_wrap_up(self, reason: str) -> None:
         self._wrapping = True
         self._activity("подвожу итог")

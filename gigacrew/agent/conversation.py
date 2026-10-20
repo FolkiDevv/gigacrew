@@ -19,6 +19,16 @@ from typing import Any
 from gigacrew.llm.types import FunctionCall, Message, Usage
 
 INTERRUPTED_NOTE = "Execution was interrupted by the user (Ctrl+C). No result."
+# Первая строка блока <system-reminder>, который хуки UserPromptSubmit дописывают к запросу
+# пользователя: по ней блок отрезается при показе запроса (заголовок чата, продолжение).
+HOOK_CONTEXT_HEADER = "Context from the user's UserPromptSubmit hooks:"
+_HOOK_CONTEXT_TAIL = f"\n\n<system-reminder>\n{HOOK_CONTEXT_HEADER}\n"
+
+
+def request_text(content: str) -> str:
+    """Текст запроса пользователя для показа — без контекста хуков UserPromptSubmit."""
+    head, found, _ = content.partition(_HOOK_CONTEXT_TAIL)
+    return head if found else content
 
 
 @dataclass(frozen=True)

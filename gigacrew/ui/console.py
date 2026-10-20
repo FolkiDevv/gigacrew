@@ -39,6 +39,7 @@ from rich.text import Text
 from rich.theme import Theme
 
 from gigacrew.agent.chat_store import ChatInfo
+from gigacrew.agent.conversation import request_text
 from gigacrew.agent.events import (
     AgentEvents,
     Approval,
@@ -48,6 +49,7 @@ from gigacrew.agent.events import (
     ToolCallInfo,
     TurnStats,
 )
+from gigacrew.agent.hooks import short_command
 from gigacrew.llm.types import Message
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.ask_user import format_answer
@@ -599,8 +601,19 @@ class Console(AgentEvents):
             f"{n} {plural(n, 'сообщение', 'сообщения', 'сообщений')}"
         )
 
+    def on_hook_start(self, event: str, command: str) -> None:
+        title = f"хук {event} · {sanitize(short_command(command))}"
+        if not self._live_ok:
+            self.system(f"{title}…")
+            return
+        self._start_live(_LiveView(title, hint=self._turn_hint))
+
+    def on_hook_end(self) -> None:
+        self.stop_live()
+
     def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:
-        {"info": self.info, "warn": self.warn, "error": self.error}[level](text)
+        # В тексте может быть вывод хуков пользователя — escape-последовательности убираются.
+        {"info": self.info, "warn": self.warn, "error": self.error}[level](sanitize(text))
 
     def on_turn_end(self, stats: TurnStats) -> None:
         steps = stats.steps
@@ -815,7 +828,7 @@ class Console(AgentEvents):
             None,
         )
         if last is not None:
-            shown = clip_lines(messages[last].content, head=3, tail=2, max_chars=600)
+            shown = clip_lines(request_text(messages[last].content), head=3, tail=2, max_chars=600)
             self._c.print(Text("› ", style=f"bold {USER}").append(sanitize(shown), style=USER))
             # Ответ ищется только после этого запроса: у прерванного хода его нет, и
             # ответ на предыдущий запрос здесь выглядел бы ответом на этот.

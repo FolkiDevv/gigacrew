@@ -249,6 +249,12 @@ class RecordingEvents(AgentEvents):
     def on_wrap_up(self, reason):
         self.events.append(("wrap_up", reason))
 
+    def on_hook_start(self, event, command):
+        self.events.append(("hook_start", (event, command)))
+
+    def on_hook_end(self):
+        self.events.append(("hook_end", None))
+
     def on_subagent_start(self, info):
         self.events.append(("subagent_start", info))
 

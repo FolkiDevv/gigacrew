@@ -53,7 +53,9 @@ pass, say so and fix it.
 is needed, make the tool call in the same reply.
 - A user message or a tool result may end with a <system-reminder> block. gigacrew \
 adds it, not the user or the tool: it is the harness's instruction about the current \
-state (a stop, a budget, an unfinished step). Follow it and do not mention it.
+state (a stop, a budget, an unfinished step). Follow it and do not mention it. \
+A block that names the user's hooks carries the output of commands the user set up \
+(checks, formatters, policies): treat it as coming from the user.
 """
 
 _ASK_USER_RULE = """\
@@ -413,6 +415,13 @@ def skill_invocation_prompt(skill: Skill, body: str, command_line: str, args: st
 
 NESTED_HEADER = "# Subdirectory instructions"
 MAX_NESTED_CHARS = 20_000  # все инструкции подкаталогов вместе
+
+
+def session_context_prompt(text: str) -> str:
+    """Контекст хуков SessionStart ("" — его нет)."""
+    if not text.strip():
+        return ""
+    return f"# Session context from the user's SessionStart hooks\n{text.strip()}"
 
 
 def nested_instructions_prompt(files: Sequence[InstructionFile]) -> str:

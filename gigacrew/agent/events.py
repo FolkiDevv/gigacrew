@@ -179,6 +179,17 @@ class AgentEvents:
     def on_subagent_end(self, info: SubagentInfo, stats: TurnStats | None) -> None:
         """Суб-агент закончил (вызывается всегда). None — прерван исключением."""
 
+    # --- хуки пользователя ---
+    def on_hook_start(self, event: str, command: str) -> None:
+        """Запущен долгий хук (Stop, SessionStart…) — пользователь видит, чего ждёт ход.
+
+        Хуки PreToolUse/PostToolUse/Notification идут на каждом вызове и сюда не
+        сообщаются; их результаты и сбои — через :meth:`on_notice`.
+        """
+
+    def on_hook_end(self) -> None:
+        """Хук из :meth:`on_hook_start` завершился (вызывается всегда)."""
+
     # --- служебное ---
     def on_wrap_up(self, reason: str) -> None:
         """Ход остановлен (ограничитель или пользователь) — модель подводит итог."""

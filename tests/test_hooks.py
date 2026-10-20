@@ -1,0 +1,190 @@
+"""Запуск хуков пользователя (HookRunner) настоящими командами: коды выхода, JSON, stdin."""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+
+import pytest
+from fakes import RecordingEvents
+
+from gigacrew.agent.hooks import HOOK_OUTPUT_LIMIT, NO_REASON, HookRunner
+from gigacrew.project.settings import HookCommand, HookEvent, HookGroup, HookSettings
+
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="команды хуков — через /bin/sh")
+
+
+def _script(tmp_path: Path, body: str, name: str = "hook.py") -> str:
+    """Команда хука: python-скрипт ``body`` (stdin — JSON события)."""
+    path = tmp_path / name
+    path.write_text("import json, os, sys\n" + body, encoding="utf-8")
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(path))}"
+
+
+def _runner(event: HookEvent, *commands: str, matcher: str = "", timeout: int = 30) -> HookRunner:
+    hooks = tuple(HookCommand(c, timeout) for c in commands)
+    return HookRunner(HookSettings((HookGroup(event, matcher, hooks),)))
+
+
+def _run(runner, event, tmp_path, *, target="", payload=None, events=None):
+    events = events if events is not None else RecordingEvents()
+    payload = payload if payload is not None else {"hook_event_name": event.value}
+    return runner.run(event, payload, cwd=tmp_path, events=events, target=target), events
+
+
+def test_payload_on_stdin_and_env(tmp_path):
+    log = tmp_path / "log.json"
+    cmd = _script(
+        tmp_path,
+        f"data = json.load(sys.stdin)\n"
+        f"data['env'] = [os.environ.get('GIGACREW_PROJECT_DIR'), os.environ.get('CLAUDE_PROJECT_DIR')]\n"
+        f"data['cwd_real'] = os.getcwd()\n"
+        f"open({str(log)!r}, 'w').write(json.dumps(data))\n",
+    )
+    result, _ = _run(
+        _runner(HookEvent.STOP, cmd),
+        HookEvent.STOP,
+        tmp_path,
+        payload={"hook_event_name": "Stop", "prompt": "привет", "path": Path("/x")},
+    )
+    assert not result.blocked and result.context == []
+    data = json.loads(log.read_text())
+    assert data["prompt"] == "привет" and data["path"] == "/x"
+    assert data["env"] == [str(tmp_path), str(tmp_path)]
+    assert Path(data["cwd_real"]).resolve() == tmp_path.resolve()
+
+
+def test_exit_2_blocks_with_stderr_and_stops_other_hooks(tmp_path):
+    marker = tmp_path / "second-ran"
+    first = _script(tmp_path, "print('нельзя: опасно', file=sys.stderr); sys.exit(2)", "a.py")
+    second = _script(tmp_path, f"open({str(marker)!r}, 'w')", "b.py")
+    result, _ = _run(
+        _runner(HookEvent.PRE_TOOL_USE, first, second), HookEvent.PRE_TOOL_USE, tmp_path
+    )
+    assert result.blocked and result.reason == "нельзя: опасно"
+    assert not marker.exists()
+
+
+def test_exit_2_without_stderr_has_default_reason(tmp_path):
+    result, _ = _run(_runner(HookEvent.STOP, "exit 2"), HookEvent.STOP, tmp_path)
+    assert result.blocked and result.reason == NO_REASON
+
+
+def test_other_exit_code_warns_and_continues(tmp_path):
+    cmd = _script(tmp_path, "print('сломался', file=sys.stderr); sys.exit(1)")
+    result, events = _run(_runner(HookEvent.POST_TOOL_USE, cmd), HookEvent.POST_TOOL_USE, tmp_path)
+    assert not result.blocked
+    ((level, text),) = events.notices
+    assert level == "warn" and "кодом 1" in text and "сломался" in text
+
+
+def test_missing_command_warns(tmp_path):
+    result, events = _run(
+        _runner(HookEvent.STOP, "definitely-not-a-command-xyz"), HookEvent.STOP, tmp_path
+    )
+    assert not result.blocked
+    assert events.notices and events.notices[0][0] == "warn"
+
+
+def test_timeout_warns(tmp_path):
+    cmd = _script(tmp_path, "import time; time.sleep(30)")
+    result, events = _run(_runner(HookEvent.STOP, cmd, timeout=1), HookEvent.STOP, tmp_path)
+    assert not result.blocked
+    assert "не уложился в 1 с" in events.notices[0][1]
+
+
+@pytest.mark.parametrize(
+    ("output", "decision", "blocked", "reason"),
+    [
+        ({"hookSpecificOutput": {"permissionDecision": "allow"}}, "allow", False, ""),
+        ({"hookSpecificOutput": {"permissionDecision": "ask"}}, "ask", False, ""),
+        (
+            {
+                "hookSpecificOutput": {
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "нет",
+                }
+            },
+            None,
+            True,
+            "нет",
+        ),
+        ({"decision": "approve"}, "allow", False, ""),
+        ({"decision": "block", "reason": "старый формат"}, None, True, "старый формат"),
+    ],
+)
+def test_pre_tool_use_json(tmp_path, output, decision, blocked, reason):
+    cmd = _script(tmp_path, f"print(json.dumps({output!r}))")
+    result, _ = _run(_runner(HookEvent.PRE_TOOL_USE, cmd), HookEvent.PRE_TOOL_USE, tmp_path)
+    assert (result.decision, result.blocked, result.reason) == (decision, blocked, reason)
+
+
+def test_ask_wins_over_allow(tmp_path):
+    allow = _script(tmp_path, "print(json.dumps({'decision': 'approve'}))", "a.py")
+    ask = _script(
+        tmp_path, "print(json.dumps({'hookSpecificOutput': {'permissionDecision': 'ask'}}))", "b.py"
+    )
+    for order in ((allow, ask), (ask, allow)):
+        result, _ = _run(_runner(HookEvent.PRE_TOOL_USE, *order), HookEvent.PRE_TOOL_USE, tmp_path)
+        assert result.decision == "ask"
+
+
+def test_block_context_and_system_message(tmp_path):
+    cmd = _script(
+        tmp_path,
+        "print(json.dumps({'decision': 'block', 'reason': 'тесты падают', "
+        "'systemMessage': 'проверка', 'hookSpecificOutput': {'additionalContext': 'лог'}}))",
+    )
+    result, events = _run(_runner(HookEvent.STOP, cmd), HookEvent.STOP, tmp_path)
+    assert result.blocked and result.reason == "тесты падают"
+    assert result.context == ["лог"]
+    assert events.notices == [("info", "хук Stop: проверка")]
+
+
+def test_plain_stdout_is_context_only_for_prompt_and_session_start(tmp_path):
+    cmd = "echo 'ветка: main'"
+    for event, expected in (
+        (HookEvent.USER_PROMPT_SUBMIT, ["ветка: main"]),
+        (HookEvent.SESSION_START, ["ветка: main"]),
+        (HookEvent.POST_TOOL_USE, []),
+        (HookEvent.STOP, []),
+    ):
+        result, _ = _run(_runner(event, cmd), event, tmp_path)
+        assert result.context == expected, event
+
+
+def test_contexts_are_joined(tmp_path):
+    result, _ = _run(
+        _runner(HookEvent.SESSION_START, "echo один", "echo два"), HookEvent.SESSION_START, tmp_path
+    )
+    assert result.context_text == "один\n\nдва"
+
+
+def test_long_output_is_clipped(tmp_path):
+    cmd = _script(tmp_path, "sys.stderr.write('x' * 50000); sys.exit(2)")
+    result, _ = _run(_runner(HookEvent.STOP, cmd), HookEvent.STOP, tmp_path)
+    assert result.blocked and len(result.reason) < HOOK_OUTPUT_LIMIT + 100
+
+
+def test_matcher_selects_hooks(tmp_path):
+    runner = _runner(HookEvent.PRE_TOOL_USE, "exit 2", matcher="run_shell")
+    blocked, _ = _run(runner, HookEvent.PRE_TOOL_USE, tmp_path, target="run_shell")
+    skipped, _ = _run(runner, HookEvent.PRE_TOOL_USE, tmp_path, target="read_file")
+    assert blocked.blocked and not skipped.blocked
+    assert runner.has(HookEvent.PRE_TOOL_USE, "run_shell")
+    assert not runner.has(HookEvent.PRE_TOOL_USE, "read_file")
+
+
+def test_indicator_only_for_slow_events(tmp_path):
+    _, events = _run(_runner(HookEvent.STOP, "true"), HookEvent.STOP, tmp_path)
+    assert [e for e, _ in events.events] == ["hook_start", "hook_end"]
+    _, events = _run(_runner(HookEvent.PRE_TOOL_USE, "true"), HookEvent.PRE_TOOL_USE, tmp_path)
+    assert events.events == []
+
+
+def test_empty_runner_does_nothing(tmp_path):
+    result, events = _run(HookRunner(), HookEvent.STOP, tmp_path)
+    assert not result.blocked and events.events == [] and events.notices == []
