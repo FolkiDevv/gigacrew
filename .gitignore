@@ -39,6 +39,7 @@ htmlcov/
 # Отчёты eval/probe (tests/behavior.py) пишутся мимо Workspace.ensure_data_dir.
 .gigacode/evals/
 GIGACREW.local.md
+.gigacode/settings.local.json
 
 # --- Редакторы и ОС ---
 .vscode/
