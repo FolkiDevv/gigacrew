@@ -32,7 +32,10 @@ from gigacrew.project.workspace import SKILLS_DIR_NAME, Workspace, user_data_dir
 
 SKILL_FILE = "SKILL.md"
 MAX_SKILL_BYTES = 200_000  # SKILL.md больше — не скилл, а случайный файл
-_NAME_RE = re.compile(r"[^\W_][\w-]*")  # как имя команды REPL (cli.commands)
+# Имя команды REPL — общее правило для скиллов и cli.commands: иначе скилл виден в
+# списках, но «/имя» не распознаётся как команда.
+COMMAND_NAME_PATTERN = r"[a-zA-Zа-яА-ЯёЁ][\w-]*"
+_NAME_RE = re.compile(COMMAND_NAME_PATTERN)
 _KEY_RE = re.compile(r"([A-Za-z_][\w-]*)\s*:\s?(.*)")
 
 SkillSource = Literal["project", "user"]

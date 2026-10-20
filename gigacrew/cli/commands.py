@@ -28,7 +28,7 @@ from gigacrew.llm.base import LLMError
 from gigacrew.permissions import MODE_CYCLE, PermissionMode, parse_mode
 from gigacrew.project import semantic
 from gigacrew.project.index import ProjectIndex
-from gigacrew.project.skills import SkillCatalog
+from gigacrew.project.skills import COMMAND_NAME_PATTERN, SkillCatalog
 from gigacrew.ui.console import Console
 
 
@@ -99,7 +99,7 @@ class CommandRegistry:
 # Команда REPL — это слеш + слово (/help, /model ...). Чистый путь
 # (/home/...) или начало регэкспа содержит дополнительные слеши и НЕ считается
 # командой, а уходит обычным запросом агенту.
-_REPL_COMMAND_RE = re.compile(r"^/[a-zA-Zа-яА-Я][\w-]*$")
+_REPL_COMMAND_RE = re.compile(rf"^/{COMMAND_NAME_PATTERN}$")
 
 
 def is_repl_command(line: str) -> bool:

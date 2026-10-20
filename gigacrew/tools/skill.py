@@ -53,7 +53,8 @@ def _skill_files(skill: Skill) -> list[str]:
 
 def _read(path: Path, shown: str) -> str:
     try:
-        text = path.read_text(encoding="utf-8")
+        with path.open(encoding="utf-8") as fh:  # не больше лимита: файл может быть огромным
+            text = fh.read(MAX_SKILL_CHARS + 1)
     except UnicodeDecodeError:
         raise ToolError(f"Не текстовый файл (не UTF-8): {shown}") from None
     except OSError as e:

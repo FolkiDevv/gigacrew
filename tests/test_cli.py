@@ -24,7 +24,7 @@ from gigacrew.ui.console import Console
 
 @pytest.mark.parametrize(
     "line",
-    ["/help", "/exit", "/q", "/clear", "/model Alpha-2-Max", "/model"],
+    ["/help", "/exit", "/q", "/clear", "/model Alpha-2-Max", "/model", "/ёлка"],
 )
 def test_recognised_commands(line):
     assert is_repl_command(line) is True

@@ -77,7 +77,7 @@ def test_parse_skill_name_defaults_to_directory(tmp_path):
     assert skill.body() == "Без frontmatter."
 
 
-@pytest.mark.parametrize("name", ["with space", "-dash", "a/b", "_x"])
+@pytest.mark.parametrize("name", ["with space", "-dash", "a/b", "_x", "2fa", "αβ"])
 def test_parse_skill_rejects_names_unfit_for_command(tmp_path, name):
     assert parse_skill(_skill(tmp_path, "d", f"---\nname: {name}\n---\nx\n")) is None
 
@@ -170,6 +170,17 @@ def test_skill_tool_unknown_lists_available(ctx):
     tool = SkillTool()
     with pytest.raises(ToolError, match="Доступные: deploy"):
         tool.run(tool.parse({"name": "nope"}), ctx)
+
+
+def test_skill_tool_truncates_large_file(ctx, monkeypatch):
+    import gigacrew.tools.skill as skill_module
+
+    monkeypatch.setattr(skill_module, "MAX_SKILL_CHARS", 10)
+    _project_skill(ctx.root, "deploy", "x")
+    (ctx.root / ".gigacode" / "skills" / "deploy" / "big.md").write_text("я" * 50)
+    tool = SkillTool()
+    text = tool.run(tool.parse({"name": "deploy", "file": "big.md"}), ctx).content
+    assert text.startswith("я" * 10 + "\n…") and "обрезано" in text
 
 
 def test_skill_tool_registered():
