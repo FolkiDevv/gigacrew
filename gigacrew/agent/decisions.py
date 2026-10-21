@@ -106,7 +106,7 @@ def _main_worktree(root: Path) -> Path | None:
 # Вырезание секретов из журнала
 # --------------------------------------------------------------------------- #
 _SECRET_ASSIGN = re.compile(
-    r"\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASS(?:WORD)?|PWD|CRED\w*|AUTH\w*))="
+    r"\b([A-Za-z0-9_]*(?:KEY(?:_ID)?|TOKEN|SECRET|PASS(?:WORD)?|PWD|CRED\w*|AUTH\w*))="
     r"(\"[^\"]*\"|'[^']*'|\S+)",
     re.IGNORECASE,
 )

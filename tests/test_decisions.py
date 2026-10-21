@@ -207,6 +207,7 @@ def test_in_memory_only():
     [
         ("API_KEY=secret123 make deploy", "API_KEY=*** make deploy"),
         ("TOKEN=abc PASSWORD=x ./run", "TOKEN=*** PASSWORD=*** ./run"),
+        ("AWS_ACCESS_KEY_ID=AKIA123 aws s3 ls", "AWS_ACCESS_KEY_ID=*** aws s3 ls"),
         ("git clone https://user:pa55@host/repo", "git clone https://user:***@host/repo"),
         ("curl -H 'Authorization: Bearer abc.def' x", "curl -H 'Authorization: Bearer ***' x"),
         ("tool --password hunter2 --x", "tool --password ***** --x".replace("*****", "***")),
