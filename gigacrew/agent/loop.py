@@ -1403,14 +1403,23 @@ class Agent:
             )
             source = _auto_source(risk, self._cfg.auto_approve, kind, self.mode)
             if (
-                decision is Decision.ASK
+                decision in (Decision.ASK, Decision.ALLOW)  # -y не снимает запрет плана
                 and self.mode is PermissionMode.PLAN
                 and verdict is not None
                 and verdict.level is not None
                 and verdict.level >= CommandLevel.WRITE
             ):
                 decision = Decision.BLOCK  # план: изменяющая команда, а не проверка
-            # Хук — после запрета режима плана: allow его не снимает.
+            if (
+                decision is Decision.ALLOW
+                and source == "yes_flag"
+                and self.mode is PermissionMode.PLAN
+                and verdict is not None
+                and verdict.level is None
+            ):
+                # план: -y не ручается за непроверенную команду — решает пользователь
+                decision = Decision.ASK
+            # Хук — после уточнений по вердикту: allow не снимает запрет режима плана.
             hooked = apply_hook(decision, risk, pre.decision)
             if hooked is Decision.ALLOW and decision is not Decision.ALLOW:
                 source = "hook"

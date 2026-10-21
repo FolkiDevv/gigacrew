@@ -106,7 +106,7 @@ def _main_worktree(root: Path) -> Path | None:
 # Вырезание секретов из журнала
 # --------------------------------------------------------------------------- #
 _SECRET_ASSIGN = re.compile(
-    r"\b([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASS(?:WORD)?|PWD|CRED\w*|AUTH\w*))="
+    r"\b([A-Za-z0-9_]*(?:KEY(?:_ID)?|TOKEN|SECRET|PASS(?:WORD)?|PWD|CRED\w*|AUTH\w*))="
     r"(\"[^\"]*\"|'[^']*'|\S+)",
     re.IGNORECASE,
 )
@@ -390,9 +390,13 @@ class DecisionMemory:
             "rules_version": RULES_VERSION,
             **entry,
         }
-        for k in ("command", "feedback", "description"):
+        for k in ("command", "feedback", "description", "key"):
             if isinstance(line.get(k), str):
                 line[k] = redact(line[k])
+        for k in ("verdict", "review"):  # причины могут цитировать команду
+            nested = line.get(k)
+            if isinstance(nested, dict) and isinstance(nested.get("reason"), str):
+                line[k] = {**nested, "reason": redact(nested["reason"])}
         self._append(line)
         return entry_id
 
