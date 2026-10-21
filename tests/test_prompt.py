@@ -281,3 +281,21 @@ def test_shift_tab_in_completion_menu_moves_back(tmp_path):
         finally:
             timer.join()
     assert cycled == []
+
+
+@pytest.mark.parametrize("palette", ["MINT", "MINT_ANSI"])
+def test_completion_menu_text_is_not_black(palette):
+    """У меню дополнения в стилях prompt_toolkit по умолчанию чёрный текст: свой фон
+    меню требует и своего цвета текста, иначе команды не видно на тёмном фоне."""
+    from prompt_toolkit.styles import Style, merge_styles
+    from prompt_toolkit.styles.defaults import default_ui_style
+
+    from gigacrew.ui import theme
+
+    style = merge_styles(
+        [default_ui_style(), Style.from_dict(theme.prompt_styles(getattr(theme, palette)))]
+    )
+    for name in ("completion", "meta.completion", "multi-column-meta"):
+        attrs = style.get_attrs_for_style_str(f"class:completion-menu class:completion-menu.{name}")
+        assert attrs.color not in ("", "000000", "ansiblack"), name
+        assert attrs.bgcolor and attrs.bgcolor != attrs.color, name

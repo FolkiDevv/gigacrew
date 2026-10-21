@@ -102,11 +102,17 @@ def markdown_styles(p: Palette) -> dict[str, str]:
 
 
 def _pt(color: str) -> str:
-    """Цвет rich — в цвет prompt_toolkit: имена ANSI с приставкой ``ansi``."""
-    if color.startswith("#") or color == "dim":
+    """Цвет rich — в цвет prompt_toolkit: имена ANSI с приставкой ``ansi``.
+
+    Цвет терминала — явно (``ansidefault``): пустой стиль унаследовал бы цвет из
+    стилей prompt_toolkit по умолчанию, у меню дополнения это чёрный текст.
+    """
+    if color.startswith("#"):
         return color
     if color == "default":
-        return ""
+        return "ansidefault"
+    if color == "dim":
+        return "ansidefault dim"
     return "ansi" + color.replace("_", "")
 
 
@@ -114,7 +120,14 @@ def prompt_styles(p: Palette) -> dict[str, str]:
     """Стили строки ввода, меню вопросов и выбора чата (классы prompt_toolkit)."""
     c = _pt
     ansi = p is MINT_ANSI
-    menu = "bg:ansiblack" if ansi else "bg:#232826"
+    # Меню дополнения — на своём тёмном фоне, поэтому и текст в нём свой, светлый:
+    # цвет терминала по умолчанию в светлой теме был бы тёмным на тёмном.
+    if ansi:
+        menu, text, meta = "bg:ansiblack", "ansiwhite", "ansiwhite"
+        scrollbar, thumb = "bg:ansibrightblack", "bg:ansiwhite"
+    else:
+        menu, text, meta = "bg:#232826", "#E3E7E4", c(p.muted)
+        scrollbar, thumb = "bg:#2F3532", f"bg:{c(p.dim)}"
     current = f"bg:{c(p.brand)} {'ansiblack' if ansi else '#111111'}"
     return {
         "prompt": f"bold {c(p.brand)}",
@@ -123,7 +136,7 @@ def prompt_styles(p: Palette) -> dict[str, str]:
         "auto-suggestion": c(p.dim),
         # По умолчанию у toolbar стиль reverse — цвета текста стали бы фоном.
         "bottom-toolbar": f"noreverse {c(p.muted)}",
-        "toolbar.model": f"bold {c(p.fg)}",
+        "toolbar.model": f"bold nodim {c(p.fg)}",
         "toolbar.ok": c(p.ok),
         "toolbar.warn": c(p.warn),
         "toolbar.danger": f"bold {c(p.danger)}",
@@ -147,8 +160,12 @@ def prompt_styles(p: Palette) -> dict[str, str]:
         "choice.hint": c(p.dim),
         "choice.error": c(p.warn),
         "choice.custom": f"bold {c(p.fg)}",
-        "completion-menu": f"{menu} {c(p.fg)}",
+        "completion-menu": f"{menu} {text}",
+        "completion-menu.completion": f"{menu} {text}",
         "completion-menu.completion.current": current,
-        "completion-menu.meta.completion": f"{menu} {c(p.muted)}",
+        "completion-menu.meta.completion": f"{menu} {meta}",
         "completion-menu.meta.completion.current": current,
+        "completion-menu.multi-column-meta": f"{menu} {meta}",
+        "scrollbar.background": scrollbar,
+        "scrollbar.button": thumb,
     }
