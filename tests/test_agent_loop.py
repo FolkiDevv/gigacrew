@@ -992,18 +992,22 @@ def test_failures_crossing_the_limit_in_one_batch_are_warned_first(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="симлинки")
-@pytest.mark.parametrize("variant", ["dir", "file"])
+@pytest.mark.parametrize("variant", ["data", "dir", "file"])
 def test_plan_argument_is_not_written_through_a_link(tmp_path, variant):
     """exit_plan_mode(plan=...) не пишет через ссылку на месте файла или папки плана:
     запись шла бы мимо проверки риска write_file — в файл проекта без вопроса."""
     (tmp_path / "src").mkdir()
-    (tmp_path / ".gigacode").mkdir()
-    if variant == "dir":
-        os.symlink("../src", tmp_path / ".gigacode" / "plans")
+    data = tmp_path / ".gigacode"
+    if variant == "data":  # служебная папка — ссылка в каталог проекта
+        os.symlink("src", data)
+        target = tmp_path / "src" / "plans" / "chat1.md"
+    elif variant == "dir":
+        data.mkdir()
+        os.symlink("../src", data / "plans")
         target = tmp_path / "src" / "chat1.md"
     else:
-        (tmp_path / ".gigacode" / "plans").mkdir()
-        os.symlink("../../conftest.py", tmp_path / ".gigacode" / "plans" / "chat1.md")
+        (data / "plans").mkdir(parents=True)
+        os.symlink("../../conftest.py", data / "plans" / "chat1.md")
         target = tmp_path / "conftest.py"
     provider = ScriptedProvider(
         [tool_turn("exit_plan_mode", {"plan": "import os  # x"}), text_turn("ok")]
@@ -1035,13 +1039,38 @@ def test_plan_edited_after_approval_does_not_hide_the_next_plan(tmp_path):
     events = _PlanAnswers([Answer((APPROVE,))], [Answer((APPROVE,))])
     agent = _planning_agent(provider, tmp_path, events)
     agent.run_turn("спланируй и сделай A")
-    assert agent.mode is PermissionMode.AUTO and agent._plan.dirty
+    # правка плана в режиме «авто» — не план, ждущий показа
+    assert agent.mode is PermissionMode.AUTO and not agent._plan.dirty
     agent.set_mode(PermissionMode.PLAN)
-    assert not agent._plan.dirty
     agent.run_turn("теперь спланируй B")
     assert len(events.questions) == 1  # план A второй раз не показан
     result = _function_results(agent)[-1]
     assert "не менялся" in result and PLAN_REL in result
+
+
+def test_plan_written_in_this_cycle_survives_mode_toggle(tmp_path):
+    """Shift+Tab дважды посреди хода (план → авто → план) не теряет записанный план."""
+    holder: dict = {}
+
+    class Toggle(ScriptedProvider):
+        def complete(self, messages, tools=None, **kwargs):
+            if tools is not None and len(self.requests) == 1:
+                holder["agent"].cycle_mode()
+                holder["agent"].cycle_mode()
+            return super().complete(messages, tools, **kwargs)
+
+    provider = Toggle(
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План C"}),
+            text_turn("Вот план."),
+        ]
+    )
+    events = _PlanAnswers(None)
+    agent = _planning_agent(provider, tmp_path, events)
+    holder["agent"] = agent
+    agent.run_turn("спланируй")
+    assert agent.mode is PermissionMode.PLAN
+    assert [q[0].body for q in events.questions] == ["# План C"]  # показан сам
 
 
 def test_plan_revised_many_times_is_not_a_loop(tmp_path):

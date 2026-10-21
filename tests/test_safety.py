@@ -62,6 +62,7 @@ def level(command: str, root: Path, **kw) -> CommandLevel | None:
         "awk '{ if ($1 > 5) print $2; else print \">\" }' a.txt",
         "awk '{print ($1 > $2), $3}' a.txt",
         "awk -F: '{print $1} $3 > 1000' a.txt",
+        "awk '{ print \"/etc\"; if ($1 > 5) print $1 }' a.txt",  # «/» только в строке
         "jq .scripts package.json",
         "sort a.txt | uniq -c | sort -rn | head",
         "diff a.txt b.txt",
@@ -163,6 +164,8 @@ def test_read_only(root, command):
         "awk '{print $1 | \"sh\"}' a.txt",
         'awk \'# "\n{print > "out.txt"}\n# "\' a.txt',
         'awk \'/"/ {print > "out"} /"/\' a.txt',
+        'awk \'{print "/"; print $1 / 2 > "out"}\' a.txt',  # «/» вне строки — как раньше
+        "awk '# /\n{print > \"out\"}' a.txt",  # «/» в комментарии не прячет вывод
         'awk \'{print "a" > "out.txt"\' a.txt',
         "awk 'BEGIN{print ENVIRON[\"HOME\"]}'",
         "jq -n env",

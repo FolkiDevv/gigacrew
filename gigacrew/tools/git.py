@@ -25,8 +25,8 @@ _ALLOWED = _READ_ONLY | {
     "restore",
 }
 
-# Читающие подкоманды, которых нет в инструменте: для них — подсказка про run_shell (там
-# их проверяет классификатор команд).
+# Подкоманды, которых нет в инструменте, а в исследовании они обычно читают (у reflog есть и
+# изменяющие формы): для них — подсказка про run_shell, там их проверяет классификатор.
 _READ_ELSEWHERE = frozenset(
     {
         "blame",
@@ -150,7 +150,8 @@ class GitTool(Tool):
         sub = params.subcommand
         if sub not in _ALLOWED:
             hint = (
-                f" Читающие команды git вроде {sub} запускай через run_shell."
+                f" Команды git вроде {sub}, которых нет в этом инструменте, запускай через "
+                "run_shell."
                 if sub in _READ_ELSEWHERE
                 else ""
             )

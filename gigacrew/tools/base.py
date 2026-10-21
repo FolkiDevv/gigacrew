@@ -63,10 +63,11 @@ class PlanFile:
     def is_target(self, path: Path) -> bool:
         """Указывает ли (уже разрешённый) путь на этот файл плана.
 
-        Файл плана или папка планов — символическая ссылка: не план. Иначе ссылка
-        увела бы запись без вопроса в ``.git/config`` или в файл чата.
+        Файл плана, папка планов или служебная папка над ней — символическая ссылка: не
+        план. Иначе ссылка увела бы запись без вопроса в ``.git/config``, в файл чата или в
+        каталог проекта.
         """
-        if self.path.is_symlink() or self.path.parent.is_symlink():
+        if any(p.is_symlink() for p in (self.path, self.path.parent, self.path.parent.parent)):
             return False
         return Path(path).resolve() == self.path.resolve()
 

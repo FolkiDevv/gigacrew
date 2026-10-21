@@ -556,17 +556,12 @@ class Agent:
     def set_mode(self, mode: PermissionMode) -> None:
         """Сменить режим разрешений (действует со следующего вызова инструмента).
 
-        У суб-агента режим — основного агента. Вход в режим плана начинает новый цикл
-        планирования: правки файла плана вне него (отметки о выполненных шагах) — не
-        новый план, который ждёт показа.
+        У суб-агента режим — основного агента.
         """
         if self._parent is not None:
             self._parent.set_mode(mode)
             return
-        mode = PermissionMode(mode)
-        if mode is PermissionMode.PLAN and self._mode is not mode and self._plan is not None:
-            self._plan.dirty = False
-        self._mode = mode
+        self._mode = PermissionMode(mode)
 
     def cycle_mode(self) -> PermissionMode:
         """Следующий режим по кругу (Shift+Tab); возвращает новый режим."""

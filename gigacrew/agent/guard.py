@@ -340,6 +340,7 @@ class LoopGuard:
     def after_tool(self, call: FunctionCall, outcome: ToolOutcome) -> StopReason | None:
         """Вызывается после каждого выполненного (или отклонённого) вызова."""
         key = call_key(call)
+        failed = not (outcome.ok or outcome.rejected or outcome.soft)
         if outcome.rejected:
             self._rejected.add(key)  # серия ошибок не меняется: модель не застряла
         elif not outcome.soft:
@@ -356,10 +357,12 @@ class LoopGuard:
             if outcome.changed:
                 # Правки одного файла подряд — работа, а не топтание на месте.
                 self._similar.pop(similar, None)
-        # Без предупреждения не останавливаемся: предел могла перейти пачка вызовов одного
-        # ответа — тогда модель получит предупреждение в следующем запросе.
-        if self._failures >= self._max_failures and (
-            self._failures_warned or self._max_failures < 2
+        # Останавливает неудача, и только после предупреждения: предел могла перейти пачка
+        # вызовов одного ответа — тогда модель получит предупреждение в следующем запросе.
+        if (
+            failed
+            and self._failures >= self._max_failures
+            and (self._failures_warned or self._max_failures < 2)
         ):
             return StopReason(
                 "tool_failures",

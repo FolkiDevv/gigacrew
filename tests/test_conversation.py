@@ -363,6 +363,21 @@ def test_guard_stops_on_failures_only_after_the_warning_was_sent():
     assert LoopGuard(max_steps=1, max_failures=1).after_tool(call, FAIL) is not None
 
 
+@pytest.mark.parametrize(
+    "outcome", [REJECTED, ToolOutcome(ok=False, soft=True)], ids=["rejected", "soft"]
+)
+def test_guard_over_the_limit_stops_only_on_a_failure(outcome):
+    """Серия за пределом (её перешла пачка) и предупреждение ушло: отказ пользователя или
+    мягкая неудача — не неудача, ход не останавливают."""
+    guard = LoopGuard(max_steps=100, max_failures=2)
+    call = FunctionCall(name="x")
+    for _ in range(3):
+        guard.after_tool(call, FAIL)
+    assert guard.failure_warning() is not None
+    assert guard.after_tool(call, outcome) is None
+    assert guard.after_tool(call, OK) is None  # успех сбрасывает серию
+
+
 def test_call_key_is_canonical():
     a = FunctionCall(name="f", arguments={"b": 1, "a": "я"})
     b = FunctionCall(name="f", arguments={"a": "я", "b": 1})

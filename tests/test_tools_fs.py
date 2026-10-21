@@ -348,6 +348,26 @@ def test_plan_dir_symlinked_into_git_is_rejected(ctx):
     assert list(git.iterdir()) == []
 
 
+def test_plan_under_symlinked_data_dir_is_not_a_plan(ctx):
+    """.gigacode — ссылка на каталог проекта: файл плана под ней — не план, запись туда —
+    правка проекта (без «безопасно» и без вопроса — нельзя)."""
+    import os
+
+    from gigacrew.security import RiskLevel
+
+    if os.name == "nt":
+        pytest.skip("симлинки")
+    (ctx.root / "src").mkdir()
+    (ctx.root / ".gigacode").symlink_to(ctx.root / "src", target_is_directory=True)
+    pctx = _plan_ctx(ctx)
+    w = WriteFileTool()
+    params = w.parse({"path": ".gigacode/plans/chat1.md", "content": "x"})
+    assert w.risk(params, pctx) is RiskLevel.WRITE
+    with pytest.raises(ToolError, match="Служебная папка"):
+        w.run(params, pctx)
+    assert not (ctx.root / "src" / "plans").exists() and not pctx.plan.dirty
+
+
 def test_plan_file_edit_does_not_mark_other_writes(ctx):
     pctx = _plan_ctx(ctx)
     w = WriteFileTool()
