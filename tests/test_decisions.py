@@ -179,6 +179,13 @@ def test_session_rejections_and_reviewer_entries(root, home):
     assert not again.rejected_in_session((".", "make")) and again.history((".", "make")) == (0, 1)
 
 
+def test_journal_key_is_redacted(root, home):
+    mem = memory(root, home)
+    command = "API_KEY=secret123 make deploy"
+    mem.record({"command": command, "cwd": ".", "key": command, "decision": "no", "source": "user"})
+    assert "secret123" not in mem.journal_path.read_text()
+
+
 def test_in_memory_only():
     mem = DecisionMemory()
     assert mem.approvals_path is None and mem.journal_path is None

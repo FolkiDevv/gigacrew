@@ -100,7 +100,7 @@ _TOKENS = frozenset(
     }
 )
 _SEPARATORS = frozenset({"&&", "||", ";", "&", "\n", "|", "|&", ";;"})
-_OUTPUT_OPS = frozenset({">", ">>", ">|", "&>", "&>>"})
+_OUTPUT_OPS = frozenset({">", ">>", ">|", "&>", "&>>", "&>|"})
 _GLOB_CHARS = re.compile(r"[*?\[]")
 _BRACE = re.compile(r"\{[^{}\0]*(,|\.\.)[^{}\0]*\}")
 

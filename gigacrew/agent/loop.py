@@ -1211,7 +1211,7 @@ class Agent:
             )
             source = _auto_source(risk, self._cfg.auto_approve, kind, self.mode)
             if (
-                decision is Decision.ASK
+                decision in (Decision.ASK, Decision.ALLOW)  # -y не снимает запрет плана
                 and self.mode is PermissionMode.PLAN
                 and verdict is not None
                 and verdict.level is not None

@@ -1571,6 +1571,15 @@ def test_confirm_shows_reason_and_feedback_reaches_model(tmp_path):
     assert "REJECTED" in results[0] and "используй uv add" in results[0]
 
 
+def test_plan_mode_blocks_changing_commands_even_with_yes(tmp_path):
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "touch new.txt"}), text_turn("ок")]
+    )
+    agent = _agent(provider, tmp_path, auto_approve=True, mode=PermissionMode.PLAN)
+    agent.run_turn("x")
+    assert not (tmp_path / "new.txt").exists()
+
+
 def test_plan_mode_blocks_known_changing_commands(tmp_path):
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "touch new.txt"}), text_turn("ок")]

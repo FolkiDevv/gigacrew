@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -342,6 +343,9 @@ _PATH_WRITERS = frozenset(
         "move_into",
     }
 )
+# Из них — только у путей: у объекта неизвестного типа такой вызов — возможно, запись.
+_PATH_ONLY_WRITERS = _PATH_WRITERS - {"rename", "replace", "copy", "move"}
+_MODE_TEXT = re.compile(r"[rwxabt+U]+")
 # Методы путей, читающие содержимое.
 _PATH_READERS = frozenset({"read_text", "read_bytes"})
 # Методы путей, перечисляющие каталог.
@@ -1041,8 +1045,12 @@ def _check_call(node: ast.Call, ctx: _Ctx) -> None:
             _check_write(target, ctx, f".{attr}()", recursive=False)
         elif attr in _PATH_READERS:
             _check_read(_path_of(func.value, ctx), ctx, f".{attr}()")
+        elif attr in _PATH_ONLY_WRITERS:
+            ctx.flag(None, f".{attr}(): объект неизвестен — возможно, запись в файл")
         elif attr == "open" and _looks_like_path(func.value, ctx):
             _check_open(node, _path_of(func.value, ctx), 0, ctx, ".open()")
+        elif attr == "open" and _opens_for_write(node):
+            ctx.flag(None, ".open(): объект неизвестен, режим — запись")
         elif attr in _PATH_LISTERS and _looks_like_path(func.value, ctx):
             _check_list(_path_of(func.value, ctx), ctx, f".{attr}()")
             if attr in ("glob", "rglob"):
@@ -1061,6 +1069,17 @@ def _check_call(node: ast.Call, ctx: _Ctx) -> None:
                 ctx.flag(None, "str.format: шаблон не литерал")
         return
     ctx.flag(None, "вызов результата выражения")
+
+
+def _opens_for_write(node: ast.Call) -> bool:
+    """``x.open(...)`` у объекта неизвестного типа: режим записи или неизвестный режим."""
+    for kw in node.keywords:
+        if kw.arg == "mode" and not isinstance(_const_str(kw.value), str):
+            return True
+    modes = [_const_str(arg) for arg in [*node.args, *(kw.value for kw in node.keywords)]]
+    return any(
+        isinstance(m, str) and _MODE_TEXT.fullmatch(m) and _WRITE_MODES & set(m) for m in modes
+    )
 
 
 def _defined(name: str, ctx: _Ctx) -> bool:

@@ -390,7 +390,7 @@ class DecisionMemory:
             "rules_version": RULES_VERSION,
             **entry,
         }
-        for k in ("command", "feedback", "description"):
+        for k in ("command", "feedback", "description", "key"):
             if isinstance(line.get(k), str):
                 line[k] = redact(line[k])
         self._append(line)

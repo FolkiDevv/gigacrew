@@ -95,6 +95,13 @@ def test_read_only_code(root, code):
         ("import gc; gc.get_objects()", DANGER),
         ("import pickle", DANGER),
         ("def (", None),
+        # запись методом пути у объекта, тип которого не выведен, — «не знаю», а не чтение
+        ("from pathlib import Path; a, b = Path('/home/u/.bashrc'), 0; a.write_text('x')", None),
+        ("from pathlib import Path; ps = [Path('x')]; ps[0].unlink()", None),
+        ("from pathlib import Path\ndef f():\n    return Path('x')\nf().touch()", None),
+        ("def f():\n    return 1\nf().open('w')", None),
+        ("def f():\n    return 1\nf().open(mode=m)", None),
+        ("print('a b'.replace('a', 'b'))", READ),
     ],
 )
 def test_risky_code(root, code, expected):
