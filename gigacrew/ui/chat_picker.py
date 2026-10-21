@@ -22,7 +22,7 @@ from prompt_toolkit.utils import get_cwidth
 
 from gigacrew.agent.chat_store import ChatInfo
 from gigacrew.ui.colors import prompt_color_depth, prompt_style
-from gigacrew.ui.format import format_when, plural
+from gigacrew.ui.format import chat_size, format_when
 
 WINDOW = 8  # сколько чатов видно одновременно
 _ESC_TIMEOUT = 0.05
@@ -99,8 +99,7 @@ def _fit(text: str, width: int) -> str:
 
 
 def _meta(chat: ChatInfo, now: datetime | None) -> str:
-    n = chat.requests
-    return f"{format_when(chat.updated_at, now)} · {n} {plural(n, 'запрос', 'запроса', 'запросов')}"
+    return f"{format_when(chat.updated_at, now)} · {chat_size(chat.requests, chat.messages)}"
 
 
 def render(state: PickerState, width: int = 80) -> list[tuple[str, str]]:

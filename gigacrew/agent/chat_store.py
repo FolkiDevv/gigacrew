@@ -46,6 +46,7 @@ class ChatInfo:
     model: str = ""
     requests: int = 0  # запросов пользователя
     preview: str = ""  # начало последнего ответа модели
+    messages: int = 0  # сообщений диалога, с шагами инструментов (0 — неизвестно)
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,15 @@ def _preview(messages: tuple[Message, ...]) -> str:
         if m.role == "assistant" and not m.function_calls and m.content.strip():
             return _one_line(m.content, PREVIEW_LIMIT)
     return ""
+
+
+def _message_count(data: dict[str, Any]) -> int:
+    """Число сообщений чата; в файлах до появления ключа ``messages`` — по самому диалогу."""
+    if "messages" in data:
+        return int(data["messages"] or 0)
+    raw = data.get("conversation")
+    messages = raw.get("messages") if isinstance(raw, dict) else None
+    return len(messages) if isinstance(messages, list) else 0
 
 
 class ChatStore:
@@ -131,6 +141,7 @@ class ChatStore:
             model=model,
             requests=sum(1 for m in messages if m.is_request),
             preview=_preview(messages),
+            messages=len(messages),
         )
         data = {
             "version": self.FORMAT_VERSION,
@@ -141,6 +152,7 @@ class ChatStore:
             "model": info.model,
             "requests": info.requests,
             "preview": info.preview,
+            "messages": info.messages,
             "conversation": conversation.to_dict(),
         }
         path = self._path(chat_id)
@@ -188,6 +200,7 @@ class ChatStore:
             model=str(data.get("model") or ""),
             requests=int(data.get("requests") or 0),
             preview=str(data.get("preview") or ""),
+            messages=_message_count(data),
         )
 
     def _files(self) -> list[Path]:

@@ -105,8 +105,8 @@ def run_repl(
     ввода построить индекс проекта, если его нет (:func:`~gigacrew.cli.indexing.ensure_index`).
 
     ``chats`` — куда сохранять диалог (None — не сохранять); ``resumed`` — чат,
-    продолженный при запуске (``--continue``/``--resume``): после баннера показывается
-    его последний обмен.
+    продолженный при запуске (``--continue``/``--resume``): после баннера показываются
+    его последние обмены.
 
     ``models`` — каталог моделей для ``/model``; по умолчанию с настоящей строкой
     ввода список загружается в фоне. Замер окна незамеренной модели предлагается
@@ -148,7 +148,7 @@ def run_repl(
     if cfg.auth_mode in ("oauth", "cli_token") and not cfg.verify_ssl:
         ui.warn(TLS_OFF_WARNING)
     if resumed is not None:
-        ui.chat_resumed(resumed, agent.conversation.messages)
+        ui.chat_resumed(resumed, agent.conversation.messages, agent.call_info)
     # Ввод не принимается, пока строится индекс (Esc/Ctrl+C — отменить построение).
     if index_on_start:
         ensure_index(agent.workspace, ui, esc)

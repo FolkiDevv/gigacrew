@@ -1848,6 +1848,21 @@ class Agent:
         self._conversation.add_function_result(call.name, _with_note(content, note))
         return ToolOutcome(ok=False)
 
+    def call_info(self, call: FunctionCall) -> ToolCallInfo:
+        """Вызов из истории (показ продолженного чата) в том виде, в каком его показывает
+        интерфейс во время хода: описание, вид, только ли смотрит проект. Неизвестный
+        инструмент — только имя, неверные аргументы — без описания."""
+        tool = self._registry.get(call.name)
+        if tool is None:
+            return ToolCallInfo(call.name)
+        try:
+            params = tool.parse(call.arguments)
+        except Exception:
+            return ToolCallInfo(call.name, kind=tool.kind, read_only=tool.read_only)
+        return ToolCallInfo(
+            call.name, self._describe(tool, params), tool.kind, read_only=tool.read_only
+        )
+
     @staticmethod
     def _describe(tool: Tool, params: BaseModel) -> str:
         try:

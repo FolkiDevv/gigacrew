@@ -64,12 +64,13 @@ from gigacrew.agent.events import (
     TurnStats,
 )
 from gigacrew.agent.hooks import short_command
-from gigacrew.llm.types import Message
+from gigacrew.llm.types import FunctionCall, Message
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolResult
 from gigacrew.tools.questions import Answer, Question, QuestionsUnavailable
 from gigacrew.ui import banner as banner_art
 from gigacrew.ui.format import (
+    chat_size,
     clip_lines,
     format_tokens,
     format_when,
@@ -110,6 +111,9 @@ _SHOW_SECONDS = 1.0  # время шага в ленте — от секунды
 _SELF_REPORTING = ("ask_user",)
 # Обзорные инструменты в счётчиках группы; read_file — «прочитал», остальное — поиски.
 _OVERVIEW_TOOLS = ("file_outline", "repo_map", "list_dir")
+# Продолжение чата: сколько последних обменов показать и шагов (групп вызовов) в обмене.
+RESUME_EXCHANGES = 3
+RESUME_CALLS = 5
 
 
 def sanitize(text: str) -> str:
@@ -291,11 +295,11 @@ def _clip(text: str, limit: int = _DETAIL_CHARS) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _read_counts(steps: Sequence[_Step]) -> str:
-    """«прочитал 2 файла, 3 поиска, 1 обзор» — по удачным вызовам группы."""
-    reads = sum(1 for s in steps if s.call.name == "read_file")
-    overviews = sum(1 for s in steps if s.call.name in _OVERVIEW_TOOLS)
-    searches = len(steps) - reads - overviews
+def _read_counts(calls: Sequence[ToolCallInfo]) -> str:
+    """«прочитал 2 файла, 3 поиска, 1 обзор» — по вызовам группы."""
+    reads = sum(1 for c in calls if c.name == "read_file")
+    overviews = sum(1 for c in calls if c.name in _OVERVIEW_TOOLS)
+    searches = len(calls) - reads - overviews
     parts = []
     if reads:
         parts.append(f"прочитал {reads} {plural(reads, 'файл', 'файла', 'файлов')}")
@@ -855,7 +859,7 @@ class Console(AgentEvents):
         head = Text.assemble(
             (f"{ICON_TOOL} ", p.ok if ok else p.danger), ("Изучил код", f"bold {p.fg}")
         )
-        rest = _read_counts(ok)
+        rest = _read_counts([s.call for s in ok])
         seconds = sum(s.seconds for s in steps)
         if seconds >= _SHOW_SECONDS:
             rest = f"{rest}  ·  {seconds:.1f} с" if rest else f"{seconds:.1f} с"
@@ -1027,7 +1031,7 @@ class Console(AgentEvents):
         parts = []
         reads = [s for s in ok if s.call.read_only]
         if reads:
-            parts.append(_read_counts(reads))
+            parts.append(_read_counts([s.call for s in reads]))
         edits: dict[str, list[int]] = {}
         for s in ok:
             if s.call.kind is ToolKind.EDIT:
@@ -1444,10 +1448,7 @@ class Console(AgentEvents):
         table.add_column(style=p.dim, no_wrap=True)
         table.add_column()
         for k, chat in enumerate(chats, 1):
-            n = chat.requests
-            meta = (
-                f"{format_when(chat.updated_at)} · {n} {plural(n, 'запрос', 'запроса', 'запросов')}"
-            )
+            meta = f"{format_when(chat.updated_at)} · {chat_size(chat.requests, chat.messages)}"
             title = Text(sanitize(chat.title), style=p.fg)
             if chat.id == current_id:
                 title.append(" (текущий)", style=p.muted)
@@ -1467,44 +1468,120 @@ class Console(AgentEvents):
                 return chats[int(raw) - 1]
             self.warn(f"введите номер от 1 до {len(chats)}")
 
-    def chat_resumed(self, info: ChatInfo, messages: Sequence[Message]) -> None:
-        """Сообщение о продолжении чата и последний обмен репликами."""
+    def chat_resumed(
+        self,
+        info: ChatInfo,
+        messages: Sequence[Message],
+        describe: Callable[[FunctionCall], ToolCallInfo] | None = None,
+    ) -> None:
+        """Сообщение о продолжении чата и последние обмены репликами.
+
+        Обмен — запрос пользователя и всё до следующего: шаги (вызовы инструментов,
+        ``describe`` — как они выглядели во время хода) и итоговый ответ. Шаги — как в
+        ленте, но приглушены и без итогов: результатов в истории нет. Более ранние
+        обмены — одной строкой со счётчиками: они сохранены в чате, но не печатаются.
+        """
         p = self._p
-        n = info.requests
         line = Text("↺ продолжаем чат ", style=p.muted)
         line.append(f"«{sanitize(info.title)}»", style=f"bold {p.fg}")
         line.append(
-            f" · {n} {plural(n, 'запрос', 'запроса', 'запросов')} · {format_when(info.updated_at)}",
+            f" · {chat_size(info.requests, info.messages)} · {format_when(info.updated_at)}",
             style=p.muted,
         )
         self.print(line)
-        last = next(
-            (
-                k
-                for k in range(len(messages) - 1, -1, -1)
-                if messages[k].is_request and messages[k].content.strip()
-            ),
-            None,
-        )
-        if last is not None:
-            shown = clip_lines(request_text(messages[last].content), head=3, tail=2, max_chars=600)
-            self.print(Text("❯ ", style=f"bold {p.brand}").append(sanitize(shown), style=p.fg))
-            # Ответ ищется только после этого запроса: у прерванного хода его нет, и
-            # ответ на предыдущий запрос здесь выглядел бы ответом на этот.
-            answer = next(
-                (
-                    m.content
-                    for m in reversed(messages[last + 1 :])
-                    if m.role == "assistant" and not m.function_calls and m.content.strip()
-                ),
-                "",
+        starts = _exchange_starts(messages)[-RESUME_EXCHANGES:]
+        if starts and starts[0] > 0:
+            earlier = messages[: starts[0]]
+            size = chat_size(sum(1 for m in earlier if m.is_request), len(earlier))
+            self.print(
+                Text(f"  … раньше: {size} — сохранены в чате, на экран не выводятся", style=p.dim)
             )
-            if answer:
-                self.on_assistant_text(answer)
-                self._gap = False
-            else:
-                self.print(Text("  (ответа нет — ход не был завершён)", style=p.muted))
+        for k, start in enumerate(starts):
+            end = starts[k + 1] if k + 1 < len(starts) else len(messages)
+            if k:
+                self.print()
+            self._resumed_exchange(messages[start:end], describe, last=k == len(starts) - 1)
         self.print()
+
+    def _resumed_exchange(
+        self,
+        messages: Sequence[Message],
+        describe: Callable[[FunctionCall], ToolCallInfo] | None,
+        *,
+        last: bool,
+    ) -> None:
+        """Обмен продолженного чата (``messages[0]`` — запрос); ответ ранних — сокращён."""
+        p = self._p
+        shown = clip_lines(request_text(messages[0].content), head=3, tail=2, max_chars=600)
+        self.print(Text.assemble(("❯ ", f"bold {p.brand}"), (sanitize(shown), p.fg)))
+        calls = [
+            describe(call) if describe is not None else ToolCallInfo(call.name)
+            for m in messages
+            if m.role == "assistant"
+            for call in m.function_calls
+        ]
+        for line in self._history_lines(calls):
+            self.print(line)
+        # Ответ ищется только в этом обмене: у прерванного хода его нет, и ответ на
+        # предыдущий запрос здесь выглядел бы ответом на этот.
+        answer = next(
+            (
+                m.content
+                for m in reversed(messages)
+                if m.role == "assistant" and not m.function_calls and m.content.strip()
+            ),
+            "",
+        )
+        if not answer:
+            self.print(Text("  (ответа нет — ход не был завершён)", style=p.muted))
+            return
+        if not last:
+            answer = clip_lines(answer, head=6, tail=2, max_chars=1200)
+        self.on_assistant_text(answer)
+        self._gap = False
+
+    def _history_lines(self, calls: Sequence[ToolCallInfo]) -> list[Text]:
+        """Шаги из истории: подряд идущие чтения и правки — одной строкой, как в ленте;
+        не больше :data:`RESUME_CALLS` строк, ранние — счётчиком."""
+        p = self._p
+        entries: list[list[ToolCallInfo]] = []
+        for call in calls:
+            kind = _group_kind(call)
+            if kind and entries and _group_kind(entries[-1][0]) == kind:
+                entries[-1].append(call)
+            else:
+                entries.append([call])
+        lines = []
+        if len(entries) > RESUME_CALLS:
+            hidden = sum(len(entry) for entry in entries[:-RESUME_CALLS])
+            word = plural(hidden, "вызов", "вызова", "вызовов")
+            lines.append(Text(f"  … ещё {hidden} {word} инструментов", style=p.dim))
+            entries = entries[-RESUME_CALLS:]
+        for entry in entries:
+            first = entry[0]
+            kind = _group_kind(first)
+            targets = list(dict.fromkeys(t for call in entry if (t := _target(call))))
+            detail = ""
+            if kind == "read" and len(entry) > 1:
+                head = f"Изучил код  {_read_counts(entry)}"
+                detail = "  ".join(targets)
+            elif kind == "edit" and targets:
+                n = len(targets)
+                files = ", ".join(targets)
+                head = f"Изменил {files}" if n <= 3 else f"Изменил {n} файлов: {files}"
+            elif first.kind is ToolKind.COMMAND and targets:
+                head = f"$ {targets[0]}"
+            else:
+                head = f"{first.name} {_target(first)}".strip()
+            lines.append(self._fit(Text.assemble((f"{ICON_TOOL} ", p.dim), (head, p.muted))))
+            if detail:
+                lines.append(self._fit(Text(f"  {detail}", style=p.dim)))
+        return lines
+
+
+def _exchange_starts(messages: Sequence[Message]) -> list[int]:
+    """Индексы запросов пользователя с текстом — начала обменов (служебные — не запросы)."""
+    return [k for k, m in enumerate(messages) if m.is_request and m.content.strip()]
 
 
 _YES = ("y", "yes", "д", "да")
