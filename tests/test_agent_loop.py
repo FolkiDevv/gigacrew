@@ -20,6 +20,7 @@ from gigacrew.agent.conversation import INTERRUPTED_NOTE
 from gigacrew.agent.loop import (
     LOOP_STOP_NOTE,
     PLAN_BLOCKED_NOTE,
+    PLAN_REMINDER_NOTE,
     REJECTED_AGAIN_NOTE,
     REJECTED_NOTE,
     SELF_CHECK_NOTE,
@@ -677,7 +678,7 @@ def test_plan_mode_blocks_edits_without_asking(tmp_path):
     agent.run_turn("поправь")
     assert tool.runs == 0 and events.confirms == []
     assert events.results[-1][1].summary == "заблокировано: режим планирования"
-    assert _function_results(agent)[-1] == PLAN_BLOCKED_NOTE
+    assert _function_results(agent)[-1] == PLAN_BLOCKED_NOTE.format(path=agent._plan_display())
 
 
 def test_plan_mode_blocks_even_with_auto_approve(tmp_path):
@@ -801,6 +802,30 @@ def test_approved_plan_switches_mode_within_the_turn(tmp_path):
     assert PLAN_REL in prompts[0]
 
 
+def test_plan_mode_reminder_goes_with_every_request(tmp_path):
+    """Правила режима плана — не только в системном промпте: короткое напоминание с путём
+    файла плана — в хвосте каждого запроса (модели теряют правила к концу хода)."""
+    (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            tool_turn("read_file", {"path": "f.txt"}),
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            tool_turn("exit_plan_mode", {}),
+            tool_turn("write_file", {"path": "a.txt", "content": "x"}),
+            text_turn("готово"),
+        ]
+    )
+    events = RecordingEvents(confirm_answer=False, answers=[Answer((APPROVE,))])
+    agent = _planning_agent(provider, tmp_path, events)
+    agent.run_turn("спланируй и сделай")
+    reminder = PLAN_REMINDER_NOTE.format(path=PLAN_REL)
+    tails = [r["messages"][-1].content for r in provider.requests]
+    assert [reminder in tail for tail in tails] == [True, True, True, False, False]
+    assert tails[0].startswith("спланируй и сделай") and "<system-reminder>" in tails[0]
+    assert all(reminder not in r["messages"][0].content for r in provider.requests)
+    assert all(reminder not in m.content for m in agent.conversation.messages)  # не в истории
+
+
 def test_plan_mode_allows_only_the_plan_file(tmp_path):
     provider = ScriptedProvider(
         [
@@ -815,8 +840,9 @@ def test_plan_mode_allows_only_the_plan_file(tmp_path):
     agent = _planning_agent(provider, tmp_path, events)
     agent.run_turn("спланируй")
     results = _function_results(agent)
-    assert results[0] == PLAN_BLOCKED_NOTE
-    assert results[1] == PLAN_BLOCKED_NOTE  # чужой план — обычная правка
+    blocked = PLAN_BLOCKED_NOTE.format(path=PLAN_REL)  # отказ называет файл плана
+    assert results[0] == blocked
+    assert results[1] == blocked  # чужой план — обычная правка
     assert (tmp_path / PLAN_REL).read_text(encoding="utf-8") == "# План"
     assert not (tmp_path / "a.txt").exists() and events.confirms == []
 
@@ -890,6 +916,42 @@ def test_plan_left_in_text_with_remarks_is_revised_and_shown_again(tmp_path):
     # после отказа (Esc) ход кончился ответом модели, без служебного сообщения
     assert agent.conversation.messages[-1].content == "Исправил"
     assert len(provider.requests) == 4 and events.stats[-1].self_checks == 0
+
+
+def test_plan_revised_many_times_is_not_a_loop(tmp_path):
+    """Правка плана между показами — изменение: exit_plan_mode после неё — не повтор."""
+    rounds = []
+    for i in range(4):
+        fix = {"path": PLAN_REL, "old_string": f"{i}.", "new_string": f"{i}.\n{i + 1}."}
+        rounds += [tool_turn("exit_plan_mode", {}), tool_turn("edit_file", fix)]
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План\n0."}),
+            *rounds,
+            tool_turn("exit_plan_mode", {}),
+            text_turn("жду"),
+        ]
+    )
+    remarks = [Answer((), custom=f"замечание {i}") for i in range(4)]
+    events = _PlanAnswers(*remarks, None)
+    agent = _planning_agent(provider, tmp_path, events)
+    assert agent.run_turn("спланируй") == "жду"
+    assert len(events.questions) == 5 and events.stats[-1].stop_reason is None
+    assert not any("WARNING" in r for r in _function_results(agent))
+
+
+def test_unchanged_plan_shown_again_and_again_is_a_loop(tmp_path):
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            *[tool_turn("exit_plan_mode", {}) for _ in range(4)],
+            text_turn("итог"),
+        ]
+    )
+    events = _PlanAnswers(QuestionsUnavailable("нет терминала"))
+    agent = _planning_agent(provider, tmp_path, events)
+    agent.run_turn("спланируй")
+    assert events.stats[-1].stop_reason == "tool_repeats"
 
 
 @pytest.mark.parametrize(

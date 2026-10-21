@@ -8,7 +8,7 @@ import pytest
 
 from gigacrew.agent.context_window import estimate_tokens, fit_history
 from gigacrew.agent.conversation import Conversation, Summary
-from gigacrew.agent.guard import LoopGuard, ToolOutcome, call_key
+from gigacrew.agent.guard import LoopGuard, ToolOutcome, call_key, target_key
 from gigacrew.llm.types import FunctionCall, Message, Usage
 
 
@@ -321,12 +321,54 @@ def test_guard_failures_reset_on_success():
     assert stop is not None and stop.kind == "tool_failures"
 
 
+def test_guard_warns_one_failure_before_stop():
+    guard = LoopGuard(max_steps=100, max_failures=4)
+    call = FunctionCall(name="x")
+    for _ in range(2):
+        guard.after_tool(call, FAIL)
+        assert guard.failure_warning() is None
+    guard.after_tool(call, FAIL)
+    warning = guard.failure_warning()
+    assert warning is not None and "the last 3 tool calls failed" in warning.model
+    assert "ещё одна неудача остановит ход" in warning.notice
+    assert guard.failure_warning() is None  # один раз на серию
+    guard.after_tool(call, ToolOutcome(ok=False, soft=True))  # мягкая неудача серию не меняет
+    assert guard.failure_warning() is None
+    guard.after_tool(call, OK)  # серия прервалась — новая предупреждается снова
+    for _ in range(3):
+        guard.after_tool(call, FAIL)
+    assert guard.failure_warning() is not None
+    stop = guard.after_tool(call, FAIL)
+    assert stop is not None and stop.kind == "tool_failures"
+    assert LoopGuard(max_steps=1, max_failures=1).failure_warning() is None
+
+
 def test_call_key_is_canonical():
     a = FunctionCall(name="f", arguments={"b": 1, "a": "я"})
     b = FunctionCall(name="f", arguments={"a": "я", "b": 1})
     assert call_key(a) == call_key(b)
     assert call_key(a) != call_key(FunctionCall(name="f", arguments={"a": "я", "b": 2}))
     assert call_key(a) != call_key(FunctionCall(name="g", arguments={"a": "я", "b": 1}))
+
+
+def test_call_key_ignores_description_and_nulls():
+    """Та же команда с перефразированным пояснением или явным null — тот же вызов."""
+    a = FunctionCall(name="run_shell", arguments={"command": "ls", "description": "файлы"})
+    b = FunctionCall(name="run_shell", arguments={"command": "ls", "description": "список"})
+    c = FunctionCall(name="run_shell", arguments={"command": "ls", "cwd": None})
+    assert call_key(a) == call_key(b) == call_key(c)
+    guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
+    checks = [_run(guard, call) for call in (a, b, c, a)]
+    assert checks[2].warning is not None and checks[3].stop is not None
+
+
+def test_target_key_normalizes_paths():
+    def key(path: str) -> str:
+        return target_key(FunctionCall(name="read_file", arguments={"path": path}))
+
+    assert key("a.py") == key("./a.py") == key(" a.py ")
+    assert key("src/") == key("src") and key("src\\a.py") == key("src/a.py")
+    assert key("a.py") != key("b.py")
 
 
 def _run(guard: LoopGuard, call: FunctionCall, outcome: ToolOutcome = OK):
@@ -346,6 +388,22 @@ def test_guard_repeats_warn_then_stop(outcome):
     assert [c.warning is not None for c in checks] == [False, False, True, False]
     assert [c.stop is not None for c in checks[:3]] == [False, False, False]
     assert checks[3].stop is not None and checks[3].stop.kind == "tool_repeats"
+    assert checks[2].notice is not None and "3-й раз повторяет вызов" in checks[2].notice
+
+
+def test_guard_similar_notice_names_the_similar_count():
+    """Предупреждение о похожих вызовах — не «1-й раз повторяет»: счёт похожих и предел."""
+    guard = LoopGuard(max_steps=100, max_failures=100, max_similar=5, max_context=10**6)
+    calls = [
+        FunctionCall(name="read_file", arguments={"path": "a", "start_line": i}) for i in range(7)
+    ]
+    checks = [_run(guard, call) for call in calls]
+    assert [c.notice is not None for c in checks] == [False] * 4 + [True, True, False]
+    assert checks[4].notice == (
+        "Модель 5-й раз подряд вызывает read_file с той же целью — предупреждена; "
+        "ход остановится на 7-м таком вызове."
+    )
+    assert checks[6].stop is not None and checks[6].stop.kind == "similar_calls"
 
 
 def test_guard_change_by_other_call_resets_repeats():

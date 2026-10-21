@@ -222,7 +222,7 @@ def test_pre_tool_use_allow_keeps_plan_mode_block(tmp_path):
     agent = _shell_agent(provider, tmp_path, hooks, events=events, mode=PermissionMode.PLAN)
     agent.run_turn("создай каталог")
     assert not (tmp_path / "newdir").exists() and events.confirms == []
-    assert _function_results(agent)[0] == PLAN_BLOCKED_NOTE
+    assert _function_results(agent)[0] == PLAN_BLOCKED_NOTE.format(path=agent._plan_display())
 
 
 def test_notification_before_confirmation(tmp_path):

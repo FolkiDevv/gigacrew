@@ -221,6 +221,23 @@ def test_explore_cannot_change_even_with_yes_all(tmp_path):
     assert blocked[0].summary == "заблокировано: агент только читает"
 
 
+def test_explore_unsupported_git_subcommand_is_not_called_a_change(tmp_path):
+    """git blame через инструмент git: подсказка про run_shell, а не «изменения запрещены»."""
+    provider = ScriptedProvider(
+        [
+            _task(),
+            tool_turn("git", {"subcommand": "blame", "args": ["a.py"]}),
+            text_turn("итог"),
+            text_turn("ок"),
+        ]
+    )
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("x")
+    child_result = _results(provider.requests[2]["messages"])[-1]
+    assert child_result != READ_ONLY_BLOCKED_NOTE
+    assert "не поддерживается" in child_result and "run_shell" in child_result
+
+
 def _sub_results(events):
     return [(k, p) for k, p in events.events if k == "subagent_tool_result"]
 
@@ -371,6 +388,19 @@ def test_parent_mode_change_reaches_running_subagent(tmp_path):
     last = provider.requests[3]["messages"]
     assert _results(last)[-1] == SUBAGENT_PLAN_BLOCKED_NOTE
     assert "# Plan mode" in last[0].content and "exit_plan_mode" not in last[0].content
+
+
+def test_explore_gets_no_plan_mode_rules(tmp_path):
+    """Explore и так только читает: правила режима плана обещали бы ему тесты с
+    подтверждением, а у него они заблокированы."""
+    provider = ScriptedProvider(
+        [_task("explore"), text_turn("итог"), text_turn("ок"), text_turn("OK")]
+    )
+    agent = _agent(provider, tmp_path, mode=PermissionMode.PLAN)
+    agent.run_turn("x")
+    child_system = provider.requests[1]["messages"][0].content
+    assert "Agent explore" in child_system and "# Plan mode" not in child_system
+    assert "Plan mode is on" not in provider.requests[1]["messages"][-1].content
 
 
 def test_subagent_answer_in_plan_mode_gets_no_self_check(tmp_path):
@@ -756,6 +786,24 @@ def test_subagent_similar_calls_warned_then_stopped(tmp_path):
     assert len(child) == 7  # 6 выполнено, 7-й — заглушка остановки
     assert "going in circles" in child[4]
     assert "similar calls" in _results(agent.conversation.messages)[0]
+
+
+def test_explore_blocked_commands_are_warned_then_stopped(tmp_path):
+    """Explore перебирает отклонённые команды: предупреждение перед остановкой, затем стоп."""
+    shells = [tool_turn("run_shell", {"command": f"frobnicate {i}"}) for i in range(4)]
+    provider = ScriptedProvider([_task(), *shells, text_turn("итог"), text_turn("ок")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    agent.run_turn("x")
+    # запросы суб-агента после 1–3-го вызова и итог после остановки на 4-м
+    child = [r["messages"][-1].content for r in provider.requests[2:6]]
+    assert ["the last 3 tool calls failed" in c for c in child] == [False, False, True, False]
+    assert provider.requests[5]["tool_choice"] == "none"
+    assert all(c.startswith("Not executed: here run_shell runs only") for c in child[:2])
+    report = _results(agent.conversation.messages)[0]
+    assert "too many failed tool calls in a row" in report and "итог" in report
+    notices = [text for _, text in events.notices]
+    assert any("ещё одна неудача остановит ход" in text for text in notices)
 
 
 def test_subagent_budget_pressure_note(tmp_path):

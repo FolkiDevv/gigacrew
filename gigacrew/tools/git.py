@@ -105,6 +105,9 @@ class GitTool(Tool):
     Params = GitParams
 
     def risk(self, params: GitParams, ctx: ToolContext) -> RiskLevel:
+        # Недоступная подкоманда — ошибка до решения по режиму: иначе в режиме плана и у
+        # суб-агента explore `git blame` отклонялся бы как изменение.
+        self._check(params)
         sub, args = params.subcommand, params.args
         reading = (
             sub in _READ_ONLY
@@ -122,7 +125,11 @@ class GitTool(Tool):
     def _check(self, params: GitParams) -> None:
         sub = params.subcommand
         if sub not in _ALLOWED:
-            raise ToolError(f"Подкоманда git '{sub}' не разрешена. Доступно: {sorted(_ALLOWED)}.")
+            raise ToolError(
+                f"Подкоманда git '{sub}' не поддерживается этим инструментом. Доступно: "
+                f"{sorted(_ALLOWED)}. Другие читающие команды git (blame, grep, ls-files…) "
+                "запускай через run_shell — они выполняются без вопроса."
+            )
         for arg in params.args:
             if arg == "--":
                 break  # дальше — пути, а не опции

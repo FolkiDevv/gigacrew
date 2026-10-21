@@ -128,8 +128,17 @@ INTERRUPTED_ANSWER_NOTE = "\n\n(ответ прерван пользовател
 BROKEN_ANSWER_NOTE = "\n\n(ответ оборван из-за ошибки)"
 PLAN_BLOCKED_NOTE = (
     "Not executed: plan mode is on, changes are forbidden. Do not try to make them: "
-    "describe the needed changes in the plan file and hand it to the user with "
+    "describe the needed changes in the plan. The only file you may write is the plan "
+    "file {path} (write_file, fixes — edit_file); then hand it to the user with "
     "exit_plan_mode."
+)
+# Каждому запросу основного агента в режиме плана: правила режима в системном промпте
+# модели теряют к концу длинного хода и пишут план текстом ответа.
+PLAN_REMINDER_NOTE = (
+    "Plan mode is on: research and plan, change nothing in the project. A plan goes only "
+    "to the plan file {path} (write_file, fixes — edit_file) and is handed to the user "
+    "with exit_plan_mode, not written in the reply text. If the user only asked a "
+    "question, just answer it."
 )
 AUTO_REVIEW_NOTE = (
     "You ended your reply without calling exit_plan_mode, so gigacrew showed the plan file "
@@ -137,9 +146,11 @@ AUTO_REVIEW_NOTE = (
 )
 SELF_CHECK_NOTE = (
     "# Turn ended in plan mode\nYou ended your turn in plan mode without handing over a "
-    "plan (exit_plan_mode) or asking the user (ask_user). If you meant to continue — for "
-    "example, to write the plan to {path} — do it now with tool calls. If your answer is "
-    "complete and no plan is needed, reply with one word: OK"
+    "plan (exit_plan_mode) or asking the user (ask_user). The user approves a plan only "
+    "from the plan file, not from the reply text. If the user asked for a change — even "
+    "if your reply already describes the plan — or you meant to continue, write the plan "
+    "to {path} with write_file now and call exit_plan_mode. If the user only asked a "
+    "question and your answer is complete, reply with one word: OK"
 )
 OUTPUT_CUT_NOTE = (
     "# Reply cut off\nYour previous reply was cut off before it finished (finish_reason: "
@@ -752,7 +763,15 @@ class Agent:
                 stats.steps = guard.steps
                 if self._cfg.auto_compact and not compact_failed:
                     compact_failed = not self._auto_compact(specs, stats)
-                notes = [guard.pressure(context) or "", note]
+                warning = guard.failure_warning()
+                if warning is not None:
+                    self._events.on_notice(warning.notice, level="warn")
+                notes = [
+                    guard.pressure(context) or "",
+                    warning.model if warning is not None else "",
+                    self._plan_reminder(),
+                    note,
+                ]
                 turn = self._next_turn(specs, note="\n\n".join(n for n in notes if n))
                 note = ""
                 self._account(turn.usage, stats)
@@ -855,6 +874,12 @@ class Agent:
         self._conversation.add_user(_reminder(_join_notes(pending, stop_note)), meta=True)
         return True
 
+    def _plan_reminder(self) -> str:
+        """Напоминание о режиме плана для запроса основного агента ("" — не план)."""
+        if self._plan is None or self._parent is not None or self.mode is not PermissionMode.PLAN:
+            return ""
+        return PLAN_REMINDER_NOTE.format(path=self._plan_display())
+
     def _plan_unsubmitted(self) -> bool:
         """Режим плана, а план менялся после того, как его показали пользователю."""
         return (
@@ -954,12 +979,8 @@ class Agent:
                 self._conversation.add_function_result(call.name, LOOP_STOP_NOTE)
                 self._conversation.repair(SKIPPED_NOTE)
                 return check.stop
-            if check.warning:
-                self._events.on_notice(
-                    f"Модель {check.repeats}-й раз повторяет вызов {call.name} "
-                    "без изменений — предупреждена; следующий повтор остановит ход.",
-                    level="warn",
-                )
+            if check.notice:
+                self._events.on_notice(check.notice, level="warn")
             stats.tool_calls += 1
             outcome = self._execute_tool_call(call, check)
             stop = guard.after_tool(call, outcome)
@@ -1090,7 +1111,10 @@ class Agent:
             session_context_prompt(self._session_context),
             nested_instructions_prompt(self._nested.files),
             mode_prompt(
-                self.mode, subagent=self._parent is not None, plan_path=self._plan_display()
+                self.mode,
+                subagent=self._parent is not None,
+                read_only=self._subagent is not None and self._subagent.read_only,
+                plan_path=self._plan_display(),
             ),
         ]
         return "\n\n".join(part for part in parts if part)
@@ -1442,8 +1466,9 @@ class Agent:
                     journal = self._journal_start(call, params, verdict, risk, "blocked", "")
                     self._journal_end(journal, blocked=True)
                 if read_only and verdict is not None:
-                    # Непроверенная команда у исследователя — не ошибка, а «нельзя здесь».
-                    self._fail(
+                    # Непроверенная команда у исследователя: «нельзя здесь». В серию неудач
+                    # идёт — иначе модель без конца перебирает варианты отклонённой команды.
+                    return self._fail(
                         call,
                         "заблокировано: агент только читает",
                         model_text=READ_ONLY_SHELL_NOTE.format(
@@ -1451,7 +1476,6 @@ class Agent:
                         ),
                         note=note,
                     )
-                    return ToolOutcome(ok=False, soft=True)
                 if read_only:
                     error, model_text = "заблокировано: агент только читает", READ_ONLY_BLOCKED_NOTE
                 elif self._parent is not None:
@@ -1460,7 +1484,8 @@ class Agent:
                         (SUBAGENT_PLAN_BLOCKED_NOTE),
                     )
                 else:
-                    error, model_text = "заблокировано: режим планирования", PLAN_BLOCKED_NOTE
+                    error = "заблокировано: режим планирования"
+                    model_text = PLAN_BLOCKED_NOTE.format(path=self._plan_display())
                 return self._fail(call, error, model_text=model_text, note=note)
             if decision is Decision.ASK:
                 if check.rejected_before:
@@ -1529,6 +1554,7 @@ class Agent:
         # 3) Выполнение
         result: ToolResult | None = None
         error = ""
+        plan_writes = self._plan.writes if self._plan is not None else 0
         started = time.monotonic()
         self._events.on_tool_start(call)
         try:
@@ -1561,7 +1587,9 @@ class Agent:
         )
         if result.ok:
             self._attach_instructions(tool, params)
-        return ToolOutcome(ok=result.ok, changed=result.changed, soft=result.soft)
+        # Правка плана — изменение для ограничителя: показ исправленного плана — не повтор.
+        replanned = self._plan is not None and self._plan.writes != plan_writes
+        return ToolOutcome(ok=result.ok, changed=result.changed or replanned, soft=result.soft)
 
     def _post_tool_hooks(self, name: str, fields: dict[str, Any], result: ToolResult) -> str:
         """Хуки PostToolUse: их отзыв для модели (дописывается к результату) или ""."""

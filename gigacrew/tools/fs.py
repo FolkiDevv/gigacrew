@@ -198,6 +198,7 @@ def _plan_written(ctx: ToolContext, p: Path) -> bool:
     if ctx.plan is None or not ctx.plan.is_target(p):
         return False
     ctx.plan.dirty = True
+    ctx.plan.writes += 1
     return True
 
 
