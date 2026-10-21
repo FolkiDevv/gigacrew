@@ -1392,7 +1392,59 @@ def _sed(env: Env, args: list[Word]) -> Part:
     return bad if bad is not None else _read("sed: вывод с заменами")
 
 
-_AWK_UNSAFE = re.compile(r"system|getline|\||>|close|fflush|ENVIRON|PROCINFO|@load|@include")
+_AWK_UNSAFE = re.compile(r"system|getline|close|fflush|ENVIRON|PROCINFO|@load|@include")
+_AWK_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _awk_redirects(program: str) -> bool:
+    """Выводит ли программа awk в файл или команду (``print > f``, ``print | "cmd"``).
+
+    ``>`` — вывод только после print/printf вне скобок, иначе это сравнение
+    (``NR>=10``, ``if ($1 > 5)``, ``print (a > b)``). ``|`` (кроме ``||``) — всегда
+    вывод или ввод команды. С ``/`` в программе регулярное выражение не отличить от
+    деления без полного разбора — тогда любые ``>`` и ``|`` считаются выводом.
+    """
+    if "/" in program:
+        return ">" in program or "|" in program
+    depth = 0
+    output: list[int] = []  # глубины скобок, где начались print/printf
+    i, n = 0, len(program)
+    while i < n:
+        ch = program[i]
+        if ch == '"':
+            j = i + 1
+            while j < n and program[j] != '"':
+                j += 2 if program[j] == "\\" else 1
+            if j >= n:
+                return True  # строка не закрыта — не разобрать
+            i = j + 1
+            continue
+        if ch == "#":  # комментарий до конца строки
+            j = program.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        name = _AWK_NAME.match(program, i)
+        if name is not None:
+            if name.group() in ("print", "printf"):
+                output.append(depth)
+            i = name.end()
+            continue
+        if ch == "|":
+            if not program.startswith("||", i):
+                return True
+            i += 2
+            continue
+        if ch == ">" and output and output[-1] == depth:
+            return True
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch in ";}":  # конец оператора: print закончился
+            while output and output[-1] >= depth:
+                output.pop()
+        i += 1
+    return False
 
 
 def _awk(env: Env, args: list[Word]) -> Part:
@@ -1418,7 +1470,7 @@ def _awk(env: Env, args: list[Word]) -> Part:
     if not pos:
         return _unknown("awk без программы")
     program = pos[0]
-    if not program.static or _AWK_UNSAFE.search(program.value):
+    if not program.static or _AWK_UNSAFE.search(program.value) or _awk_redirects(program.value):
         return _unknown("awk: программа с вызовом команд, записью или окружением")
     files = [p for p in pos[1:] if not (p.static and "=" in p.value)]
     bad = _check_read(env, files, "awk") or _check_vars(env, _values(args, "-v"), "awk")

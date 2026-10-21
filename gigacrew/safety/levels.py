@@ -8,7 +8,7 @@ from enum import IntEnum
 __all__ = ["CommandLevel", "Part", "Verdict", "worst"]
 
 # Версия правил: в журнале решений — чтобы переоценить старые записи после правок.
-RULES_VERSION = 1
+RULES_VERSION = 2
 
 
 class CommandLevel(IntEnum):

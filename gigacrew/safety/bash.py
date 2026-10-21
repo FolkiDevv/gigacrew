@@ -208,8 +208,11 @@ def _static_value(node) -> str:
     if t == "raw_string":
         return _text(node)[1:-1]
     if t == "string":
-        parts = [_text(c) for c in node.children if c.type not in ('"',)]
-        return _unescape_dquoted("".join(parts))
+        # Текст между кавычками, а не дети узла: string_content рвётся на переводах
+        # строк, и сами переводы строк в детей не попадают.
+        text = _text(node)
+        inner = text[1:-1] if len(text) >= 2 and text[0] == text[-1] == '"' else text
+        return _unescape_dquoted(inner)
     if t == "concatenation":
         return "".join(_static_value(c) for c in node.children)
     if t == "word":
