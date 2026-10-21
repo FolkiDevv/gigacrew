@@ -1,0 +1,6 @@
+# Пустые issue отключены, шаблонов нет: в форме создания остаётся только ссылка ниже.
+blank_issues_enabled: false
+contact_links:
+  - name: Issue не принимаются
+    url: https://github.com/FolkiDevv/gigacrew/blob/main/CONTRIBUTING.md
+    about: Проект закрыт для сторонних пользователей и контрибьюторов.
