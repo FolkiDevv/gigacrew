@@ -39,6 +39,7 @@ from gigacrew.agent.events import (
     Approval,
     CompactResult,
     ConfirmResult,
+    Review,
     SubagentInfo,
     ToolCallInfo,
     TurnStats,
@@ -59,6 +60,12 @@ from gigacrew.agent.prompts import (
     nested_instructions_prompt,
     subagent_system_prompt,
     summary_prompt,
+)
+from gigacrew.agent.reviewer import (
+    MAX_REVIEW_COMMAND,
+    Reviewer,
+    recent_requests,
+    review_command,
 )
 from gigacrew.agent.subagents import (
     MAX_SUBAGENTS_PER_TURN,
@@ -192,7 +199,7 @@ def _auto_source(risk: RiskLevel, auto_approve: bool, kind: ToolKind, mode: Perm
     """Почему вызов выполняется без вопроса (для журнала)."""
     if risk < RiskLevel.WRITE:
         return "read"
-    if kind is ToolKind.EDIT and mode is PermissionMode.ACCEPT_EDITS:
+    if kind is ToolKind.EDIT and mode is PermissionMode.AUTO:
         return "edits_mode"
     return "yes_flag" if auto_approve else "auto"
 
@@ -212,6 +219,7 @@ class Agent:
         subagent: SubagentSpec | None = None,
         chat_id: str | None = None,
         decisions: DecisionMemory | None = None,
+        reviewer: Reviewer | None = None,
     ):
         """Конструктор не обращается к файловой системе и сети.
 
@@ -227,6 +235,9 @@ class Agent:
 
         ``decisions`` — память решений о командах: разрешения «всегда» и журнал (по
         умолчанию — только в памяти, до конца сессии); у суб-агента — общая с основным.
+
+        ``reviewer`` — модель-рецензент изменяющих команд в режиме «авто» (по умолчанию —
+        из ``config.reviewer_model`` без проверки); у суб-агента — общая с основным.
         """
         self._provider = provider
         self._registry = registry
@@ -280,6 +291,9 @@ class Agent:
         if parent is not None:
             decisions = parent._decisions
         self._decisions = DecisionMemory() if decisions is None else decisions
+        if parent is not None:
+            reviewer = parent._reviewer
+        self._reviewer = Reviewer(config.reviewer_model) if reviewer is None else reviewer
         self._last_estimate = 0  # оценка последнего отправленного запроса
         self._turn_stats: TurnStats | None = None  # статистика идущего хода
         # Суб-агенты: запущенный сейчас (для остановки из потока клавиш) и число
@@ -309,6 +323,11 @@ class Agent:
     def decisions(self) -> DecisionMemory:
         """Память решений о командах (разрешения «всегда», журнал)."""
         return self._decisions
+
+    @property
+    def reviewer(self) -> Reviewer:
+        """Модель-рецензент изменяющих команд (режим «авто»)."""
+        return self._reviewer
 
     @property
     def config(self) -> Config:
@@ -1174,6 +1193,8 @@ class Agent:
         previewed = False
         risk = RiskLevel.SAFE
         verdict: Verdict | None = None
+        review: Review | None = None
+        review_note = ""
         journal: _Journal | None = None
         try:
             assessment = tool.assess(params, self._ctx)
@@ -1197,13 +1218,18 @@ class Agent:
                 and verdict.level >= CommandLevel.WRITE
             ):
                 decision = Decision.BLOCK  # план: изменяющая команда, а не проверка
-            if decision is Decision.ASK and verdict is not None:
+            asking = (Decision.ASK, Decision.REVIEW)
+            if decision in asking and verdict is not None:
                 rule = self._decisions.match(verdict, plan=self.mode is PermissionMode.PLAN)
                 if rule is not None:
                     decision, source = Decision.ALLOW, f"rule:{rule.id}"
                     self._events.on_notice(f"разрешено сохранённым правилом: {rule.describe()}")
-            if decision is Decision.ASK and key in self._session_allowed:
+            if decision in asking and key in self._session_allowed:
                 decision, source = Decision.ALLOW, "session"  # «всегда» до конца сессии
+            if decision is Decision.REVIEW:
+                decision, review, review_note = self._review_command(call, params, verdict, check)
+                if decision is Decision.ALLOW:
+                    source = "reviewer"
             if decision is Decision.BLOCK:
                 if verdict is not None:
                     journal = self._journal_start(call, params, verdict, risk, "blocked", "")
@@ -1250,6 +1276,7 @@ class Agent:
                     remember="" if dangerous else self._remember_label(kind, verdict),
                     history=self._history_hint(verdict),
                     purpose=assessment.purpose,
+                    review=review_note,
                 )
                 answer = _confirm_result(self._events.confirm(asked, preview, dangerous=dangerous))
                 if verdict is not None:
@@ -1261,6 +1288,7 @@ class Agent:
                         _decision_name(answer),
                         answer.feedback,
                         source="user",
+                        review=review,
                     )
                 if answer.approval is Approval.ALWAYS and not dangerous:
                     self._allow_always(asked, key, verdict)
@@ -1273,7 +1301,7 @@ class Agent:
                 previewed = preview is not None
             elif verdict is not None:
                 journal = self._journal_start(
-                    call, params, verdict, risk, "auto", "", source=source
+                    call, params, verdict, risk, "auto", "", source=source, review=review
                 )
         except ToolError as e:
             return self._fail(call, str(e), note=note)
@@ -1358,16 +1386,8 @@ class Agent:
         return subagent_report(spec, text, child.last_turn, events.trail)
 
     def _allow_always(self, call: ToolCallInfo, key: str, verdict: Verdict | None = None) -> None:
-        """«Да, и не спрашивать»: правки — режим авто-правок, команды — сохранённые
-        разрешения (части команды, которые спрашивались), прочее — этот вызов."""
-        if call.kind is ToolKind.EDIT:
-            if self.mode is PermissionMode.MANUAL:
-                self.set_mode(PermissionMode.ACCEPT_EDITS)
-                self._events.on_notice(
-                    "режим «авто-правки»: дальнейшие правки файлов — без вопросов "
-                    "(Shift+Tab — сменить)"
-                )
-            return
+        """«Да, и не спрашивать»: команды — сохранённые разрешения (части команды, которые
+        спрашивались), прочее — этот вызов до конца сессии."""
         if verdict is not None:
             try:
                 added = self._decisions.approve(verdict)
@@ -1387,6 +1407,73 @@ class Agent:
         self._events.on_notice(
             f"{call.name} с этими аргументами больше не требует подтверждения до конца сессии"
         )
+
+    def _review_command(
+        self, call: ToolCallInfo, params: BaseModel, verdict: Verdict | None, check: CallCheck
+    ) -> tuple[Decision, Review | None, str]:
+        """Режим «авто»: спросить модель-рецензента о команде.
+
+        ALLOW — выполнить без вопроса; ASK — решает пользователь, третье значение —
+        пояснение для вопроса. Рецензент не спрашивается, если пользователь уже отклонял
+        такую команду, команда слишком длинная или рецензент отключён. Сбой рецензента —
+        вопрос пользователю; сбои подряд отключают рецензента. Ctrl+C/Esc прерывают ход.
+        """
+        reviewer = self._reviewer
+        command = str(getattr(params, "command", ""))
+        if verdict is None or check.rejected_before:
+            return Decision.ASK, None, ""  # повтор отклонённого — ответит ветка вопроса
+        if not reviewer.enabled:
+            return Decision.ASK, None, f"рецензент отключён: {reviewer.disabled}"
+        key = history_key(verdict)
+        allowed, rejected = self._decisions.history(key)
+        if self._decisions.rejected_in_session(key) or rejected > allowed:
+            return Decision.ASK, None, "рецензент не спрашивался: такую команду уже отклоняли"
+        if len(command) > MAX_REVIEW_COMMAND:
+            return (
+                Decision.ASK,
+                None,
+                f"рецензент не спрашивался: команда длиннее {MAX_REVIEW_COMMAND} символов",
+            )
+        model = reviewer.model_for(self._model)
+        review: Review | None = None
+        self._events.on_review_start(call)
+        try:
+            review = review_command(
+                self._provider,
+                command=command,
+                verdict=verdict,
+                requests=self._user_requests(),
+                model=model,
+                on_usage=self._bill_side,
+            )
+        except Exception as e:  # сбой рецензента — решает пользователь
+            error = " ".join((str(e) or type(e).__name__).split())[:200]
+            review = Review(model, False, error, failed=True)
+        finally:
+            self._events.on_review_end(call, review)
+        if review.failed:
+            if reviewer.failed(review.reason):
+                self._events.on_notice(reviewer.warning, level="warn")
+            return Decision.ASK, review, f"рецензент не ответил: {review.reason}"
+        reviewer.succeeded()
+        if review.allowed:
+            return Decision.ALLOW, review, ""
+        return Decision.ASK, review, f"рецензент ({model}): {review.reason or 'решать вам'}"
+
+    def _user_requests(self) -> list[str]:
+        """Последние запросы пользователя — из диалога основного агента: у суб-агента
+        первое сообщение — поручение модели, а не слова пользователя."""
+        root = self
+        while root._parent is not None:
+            root = root._parent
+        return recent_requests(root._conversation.messages)
+
+    def _bill_side(self, usage: Usage) -> None:
+        """Расход побочного запроса (рецензент): в сессию и статистику хода, не в контекст."""
+        self._bill(usage)
+        if self._parent is None and self._turn_stats is not None:
+            self._turn_stats.prompt_tokens += usage.prompt_tokens
+            self._turn_stats.completion_tokens += usage.completion_tokens
 
     def _remember_label(self, kind: ToolKind, verdict: Verdict | None) -> str:
         """Что запомнит ответ «всегда» (пусто — формулировка интерфейса по умолчанию)."""
@@ -1420,8 +1507,17 @@ class Agent:
         feedback: str,
         *,
         source: str = "",
+        review: Review | None = None,
     ) -> _Journal | None:
         """Записать решение о команде в журнал (что, где, почему, кто решил)."""
+        extra: dict[str, object] = {}
+        if review is not None:
+            extra["review"] = {
+                "model": review.model,
+                "allowed": review.allowed,
+                "reason": review.reason,
+                "failed": review.failed,
+            }
         try:
             entry_id = self._decisions.record(
                 {
@@ -1443,6 +1539,7 @@ class Agent:
                     "decision": decision,
                     "source": source or "auto",
                     "feedback": feedback,
+                    **extra,
                 }
             )
         except Exception:  # журнал — не повод прерывать работу

@@ -147,6 +147,8 @@ class DecisionMemory:
     log: bool = True
     rules: list[Rule] = field(default_factory=list)
     _history: dict[tuple[str, str], _History] = field(default_factory=dict, repr=False)
+    # Что пользователь отклонил в этой сессии (ключ истории): такое не отдаётся рецензенту.
+    _rejected: set[tuple[str, str]] = field(default_factory=set, repr=False)
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -372,13 +374,13 @@ class DecisionMemory:
         entry_id = secrets.token_hex(6)
         decision = entry.get("decision")
         if entry.get("source") == "user" and "key" in entry:
-            h = self._history.setdefault(
-                (str(entry.get("cwd", ".")), str(entry["key"])), _History()
-            )
+            key = (str(entry.get("cwd", ".")), str(entry["key"]))
+            h = self._history.setdefault(key, _History())
             if decision in ("yes", "always"):
                 h.allowed += 1
             elif decision == "no":
                 h.rejected += 1
+                self._rejected.add(key)
         if not self.log or self.journal_path is None:
             return entry_id
         line = {
@@ -403,6 +405,10 @@ class DecisionMemory:
         """(сколько раз разрешали, сколько отклоняли) команду или программу в каталоге."""
         h = self._history.get(key)
         return (h.allowed, h.rejected) if h is not None else (0, 0)
+
+    def rejected_in_session(self, key: tuple[str, str]) -> bool:
+        """Пользователь отклонял эту команду (программу) в каталоге в этой сессии."""
+        return key in self._rejected
 
     def _append(self, line: dict[str, Any]) -> None:
         path = self.journal_path
@@ -444,11 +450,11 @@ class DecisionMemory:
             return
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
-        """Последние решения пользователя из журнала (новые в конце)."""
+        """Последние решения пользователя и модели-рецензента из журнала (новые в конце)."""
         items = [
             x
             for x in self._journal_lines()
-            if x.get("event") == "decision" and x.get("source") == "user"
+            if x.get("event") == "decision" and x.get("source") in ("user", "reviewer")
         ]
         return items[-limit:]
 

@@ -74,7 +74,8 @@ class RunShellTool(Tool):
         "run tests and utilities — not to read or search files (read_file, search_content "
         "and the navigation tools are faster and safer). Commands that only read the "
         "project (ls, cat, grep, git status/log/diff, Python one-liners that only read) run "
-        "without asking the user; others are confirmed by the user. There is no keyboard "
+        "without asking the user; others are checked by a reviewer model or confirmed by "
+        "the user. There is no keyboard "
         "input (stdin is empty) — use non-interactive flags. Network commands (curl/wget) "
         "are forbidden by the security policy."
     )

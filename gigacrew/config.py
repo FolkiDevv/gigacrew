@@ -129,7 +129,7 @@ def _env_optional_int(env: Mapping[str, str], name: str, *, minimum: int = 1) ->
 def _env_mode(env: Mapping[str, str], name: str) -> PermissionMode:
     raw = env.get(name)
     if raw is None or not raw.strip():
-        return PermissionMode.MANUAL
+        return PermissionMode.AUTO
     try:
         return parse_mode(raw)
     except ValueError as e:
@@ -205,9 +205,12 @@ class Config:
     # Ответ «всегда» на вопрос о команде сохраняется для проекта в ~/.gigacode/projects/
     # (переживает сессии); False — только до конца сессии.
     remember_approvals: bool = True
-    # Начальный режим разрешений (ручной / авто-правки / план); в работе режим
-    # меняется в агенте (Shift+Tab, /mode).
-    mode: PermissionMode = PermissionMode.MANUAL
+    # Начальный режим разрешений (авто / план); в работе режим меняется в агенте
+    # (Shift+Tab, /mode).
+    mode: PermissionMode = PermissionMode.AUTO
+    # Модель-рецензент изменяющих команд в режиме «авто»; None — модель чата (та, что
+    # выбрана сейчас, в том числе после /model).
+    reviewer_model: str | None = None
     max_steps: int = 50  # предохранитель агентного цикла
     max_tool_failures: int = 4  # стоп при N неудачных вызовах подряд (анти-залипание)
     # Одинаковый вызов без изменений между повторами: на N-м — предупреждение
@@ -303,6 +306,7 @@ class Config:
             ty=_env_bool(env, "GIGACREW_TY", True),
             safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", True),
             remember_approvals=_env_bool(env, "GIGACREW_REMEMBER_APPROVALS", True),
+            reviewer_model=(env.get("GIGACREW_REVIEWER_MODEL") or "").strip() or None,
             subagent_max_steps=_env_int(env, "GIGACREW_SUBAGENT_MAX_STEPS", 25),
             subagent_context_share=_env_int(
                 env, "GIGACREW_SUBAGENT_CONTEXT", 80, minimum=10, maximum=95

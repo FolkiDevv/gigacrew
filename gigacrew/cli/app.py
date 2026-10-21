@@ -25,6 +25,7 @@ from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
 from gigacrew.agent.decisions import DecisionMemory
 from gigacrew.agent.loop import Agent
+from gigacrew.agent.reviewer import check_reviewer
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
 from gigacrew.cli.models import (
     describe_result,
@@ -37,7 +38,7 @@ from gigacrew.config import Config, ConfigError
 from gigacrew.llm.api import ApiProvider
 from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.llm.model_windows import ModelWindows
-from gigacrew.permissions import PermissionMode
+from gigacrew.permissions import PermissionMode, parse_mode
 from gigacrew.project.skills import SkillCatalog
 from gigacrew.tools.base import build_default_registry
 from gigacrew.ui.console import Console
@@ -71,10 +72,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mode",
-        choices=[mode.value for mode in PermissionMode],
-        help="Начальный режим: manual — правки и изменяющие команды с подтверждением, "
-        "edits — правки файлов без вопросов, plan — только исследование и план "
-        "(Shift+Tab — сменить). Команды, которые только читают, — без вопросов",
+        type=_mode_arg,
+        metavar="{" + ",".join(mode.value for mode in PermissionMode) + "}",
+        help="Начальный режим: auto (по умолчанию) — правки файлов без вопросов, "
+        "изменяющие команды проверяет модель-рецензент (GIGACREW_REVIEWER_MODEL, по "
+        "умолчанию — модель чата), сомнительные и опасные — с подтверждением; plan — "
+        "только исследование и план (Shift+Tab — сменить). Команды, которые только "
+        "читают, — без вопросов",
     )
     chat = p.add_mutually_exclusive_group()
     chat.add_argument(
@@ -114,6 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version=f"gigacrew {__version__}")
     return p
+
+
+def _mode_arg(text: str) -> PermissionMode:
+    """``--mode``: режим по имени (прежние ``manual``/``edits`` — это ``auto``)."""
+    try:
+        return parse_mode(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def _make_provider(config: Config) -> LLMProvider:
@@ -197,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             auto_approve=args.yes,
             yes_all=args.yes_all,
-            mode=PermissionMode(args.mode) if args.mode else None,
+            mode=args.mode,
             stream=not args.no_stream,
             save_chats=not args.no_save,
         )
@@ -243,8 +255,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         if warning:
             ui.warn(warning)
+        reviewer, warning = check_reviewer(provider, config.reviewer_model)
+        if warning:
+            ui.warn(warning)
         agent = Agent(
-            provider, build_default_registry(), config, ui, windows=windows, decisions=decisions
+            provider,
+            build_default_registry(),
+            config,
+            ui,
+            windows=windows,
+            decisions=decisions,
+            reviewer=reviewer,
         )
         store = ChatStore(agent.workspace)
         chats = ChatRecorder(store, enabled=config.save_chats)

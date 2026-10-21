@@ -10,7 +10,7 @@ import pytest
 from fakes import FakeTool, RecordingEvents, ScriptedProvider, cut_turn, text_turn, tool_turn
 
 import gigacrew.agent.loop as loop
-from gigacrew.agent.events import Approval, TurnStats
+from gigacrew.agent.events import TurnStats
 from gigacrew.agent.guard import LoopGuard
 from gigacrew.agent.prompts import SUBAGENT_PROMPTS
 from gigacrew.agent.subagents import (
@@ -225,7 +225,7 @@ def _sub_results(events):
     return [(k, p) for k, p in events.events if k == "subagent_tool_result"]
 
 
-def test_general_edit_confirmed_and_always_switches_parent_mode(tmp_path):
+def test_general_edits_without_asking_in_auto_mode(tmp_path):
     provider = ScriptedProvider(
         [
             _task("general", "создай b.txt"),
@@ -234,11 +234,10 @@ def test_general_edit_confirmed_and_always_switches_parent_mode(tmp_path):
             text_turn("ок"),
         ]
     )
-    events = RecordingEvents(confirm_answer=Approval.ALWAYS)
+    events = RecordingEvents(confirm_answer=False)
     agent = _agent(provider, tmp_path, events=events, auto_approve=False)
     agent.run_turn("x")
-    assert len(events.confirms) == 1 and events.confirms[0][0].name == "write_file"
-    assert agent.mode is PermissionMode.ACCEPT_EDITS  # «всегда» — у основного агента
+    assert events.confirms == [] and agent.mode is PermissionMode.AUTO
     assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "new\n"
     report = _results(agent.conversation.messages)[0]
     assert "создал b.txt" in report and "Changed files: b.txt" in report
@@ -335,7 +334,7 @@ def test_rejected_operations_listed_in_report(tmp_path):
     provider = ScriptedProvider(
         [
             _task("general", "создай b.txt"),
-            tool_turn("write_file", {"path": "b.txt", "content": "new\n"}),
+            tool_turn("run_shell", {"command": "pip install requests"}),
             text_turn("не дали"),
             text_turn("ок"),
         ]
@@ -343,7 +342,7 @@ def test_rejected_operations_listed_in_report(tmp_path):
     agent = _agent(provider, tmp_path, events=RecordingEvents(False), auto_approve=False)
     agent.run_turn("x")
     report = _results(agent.conversation.messages)[0]
-    assert "Rejected by the user: write_file b.txt" in report
+    assert "Rejected by the user: run_shell pip install requests" in report
 
 
 def test_parent_mode_change_reaches_running_subagent(tmp_path):

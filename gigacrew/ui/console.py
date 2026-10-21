@@ -45,6 +45,7 @@ from gigacrew.agent.events import (
     CompactResult,
     ConfirmResult,
     NoticeLevel,
+    Review,
     SubagentInfo,
     ToolCallInfo,
     TurnStats,
@@ -91,8 +92,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _SKIPPED_RE = re.compile(rf"^{SKIPPED_MARK} пропущено .*$", re.MULTILINE)
 _REFRESH_PER_SECOND = 2 / SPINNER_INTERVAL  # два обновления на кадр — ровный шаг ракеты
 _MODE_COLORS = {
-    PermissionMode.MANUAL: MUTED,
-    PermissionMode.ACCEPT_EDITS: WARN,
+    PermissionMode.AUTO: WARN,
     PermissionMode.PLAN: BRAND,
 }
 
@@ -492,6 +492,17 @@ class Console(AgentEvents):
             line.append(sanitize(call.summary), style=ACCENT)
         self._c.print(line)
 
+    def on_review_start(self, call: ToolCallInfo) -> None:
+        self._start_live(_LiveView("рецензент проверяет команду", hint=self._turn_hint))
+
+    def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
+        self.stop_live()
+        if review is not None and review.allowed:
+            line = Text("  ")
+            line.append(f"{ICON_OK} ", style=OK)
+            line.append(sanitize(review.approval), style=MUTED)
+            self._c.print(line)
+
     def on_tool_start(self, call: ToolCallInfo) -> None:
         self._start_live(_LiveView("выполняется", hint=self._turn_hint))
 
@@ -696,6 +707,8 @@ class Console(AgentEvents):
             self._c.print(Text(f"  зачем (со слов модели): {sanitize(call.purpose)}", style=MUTED))
         if call.reason:
             self._c.print(Text(f"  почему спрашиваю: {sanitize(call.reason)}", style=MUTED))
+        if call.review:
+            self._c.print(Text(f"  {sanitize(call.review)}", style=MUTED))
         if call.history:
             self._c.print(Text(f"  {sanitize(call.history)}", style=MUTED))
         edit = call.kind is ToolKind.EDIT
@@ -708,8 +721,6 @@ class Console(AgentEvents):
         if not dangerous:  # опасное «навсегда» не разрешается
             if call.remember:
                 always = sanitize(call.remember)
-            elif edit:
-                always = "правки файлов без вопросов до конца сессии (режим «авто-правки»)"
             else:
                 always = "не спрашивать этот вызов до конца сессии"
         question = f"{action} {call.name}{target}?"

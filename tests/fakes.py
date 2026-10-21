@@ -20,9 +20,10 @@ class ScriptedProvider(LLMProvider):
     Элемент сценария — AssistantTurn либо исключение (будет брошено). Каждый
     запрос агента записывается в ``requests`` (сообщения + параметры вызова).
 
-    Запросы без инструментов (``tools=None``) — суммаризация при сжатии контекста:
-    у них своя очередь ``summaries`` (по умолчанию ответ «сводка») и журнал
-    ``summary_requests``, чтобы сжатие не съедало ходы сценария.
+    Запросы без инструментов (``tools=None``) — суммаризация при сжатии контекста и
+    модель-рецензент команд: у них своя очередь ``summaries`` (по умолчанию ответ
+    «сводка» — рецензент его не разберёт и передаст решение пользователю) и журнал
+    ``summary_requests``, чтобы такие запросы не съедали ходы сценария.
     """
 
     def __init__(
@@ -166,6 +167,7 @@ class RecordingEvents(AgentEvents):
         self.stats: list[TurnStats] = []
         self.notices: list[tuple[str, str]] = []
         self.compactions: list = []  # CompactResult | None по каждому сжатию
+        self.reviews: list = []  # Review | None по каждой проверке рецензента
 
     def on_stream_start(self) -> None:
         self.events.append(("stream_start", None))
@@ -185,6 +187,13 @@ class RecordingEvents(AgentEvents):
     def confirm(self, call, preview, *, dangerous):
         self.confirms.append((call, preview, dangerous))
         return self.confirm_answer
+
+    def on_review_start(self, call: ToolCallInfo) -> None:
+        self.events.append(("review_start", call))
+
+    def on_review_end(self, call, review) -> None:
+        self.events.append(("review_end", review))
+        self.reviews.append(review)
 
     def on_tool_start(self, call: ToolCallInfo) -> None:
         self.events.append(("tool_start", call))

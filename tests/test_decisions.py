@@ -166,6 +166,19 @@ def test_journal_off(root, home):
     assert not mem.journal_path.exists()
 
 
+def test_session_rejections_and_reviewer_entries(root, home):
+    mem = memory(root, home)
+    entry = {"command": "make", "cwd": ".", "key": "make"}
+    mem.record({**entry, "decision": "auto", "source": "reviewer", "review": {"reason": "ок"}})
+    assert not mem.rejected_in_session((".", "make"))
+    mem.record({**entry, "decision": "no", "source": "user"})
+    assert mem.rejected_in_session((".", "make")) and not mem.rejected_in_session(("src", "make"))
+    assert [x["source"] for x in mem.recent()] == ["reviewer", "user"]
+    # в новой сессии отказ — уже история, а не «отклонено в этой сессии»
+    again = memory(root, home)
+    assert not again.rejected_in_session((".", "make")) and again.history((".", "make")) == (0, 1)
+
+
 def test_in_memory_only():
     mem = DecisionMemory()
     assert mem.approvals_path is None and mem.journal_path is None

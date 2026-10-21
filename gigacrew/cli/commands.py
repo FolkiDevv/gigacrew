@@ -184,21 +184,36 @@ def _mode(ctx: CommandContext, arg: str) -> bool:
     agent = ctx.agent
     if not arg:
         lines = [f"режим: {agent.mode.label} — {agent.mode.description}"]
+        if agent.mode is PermissionMode.AUTO and agent.reviewer.enabled:
+            lines.append(f"  {agent.reviewer.describe(agent.model)}")
         lines.append("режимы (Shift+Tab — следующий по кругу):")
         lines += [f"  • {m.value} — {m.label}: {m.description}" for m in MODE_CYCLE]
         ctx.ui.info("\n".join(lines))
+        _warn_reviewer(ctx)
         return True
     try:
         mode = parse_mode(arg)
     except ValueError as e:
-        ctx.ui.error(f"{e} (использование: /mode [manual|edits|plan])")
+        ctx.ui.error(f"{e} (использование: {MODE_USAGE})")
         return True
     agent.set_mode(mode)
-    ctx.ui.info(f"режим: {mode.label} — {mode.description}")
+    text = f"режим: {mode.label} — {mode.description}"
+    if mode is PermissionMode.AUTO and agent.reviewer.enabled:
+        text += f"\n  {agent.reviewer.describe(agent.model)}"
+    ctx.ui.info(text)
+    _warn_reviewer(ctx)
     return True
 
 
+def _warn_reviewer(ctx: CommandContext) -> None:
+    """В режиме «авто» с отключённым рецензентом — напомнить, что команды спрашиваются."""
+    agent = ctx.agent
+    if agent.mode is PermissionMode.AUTO and not agent.reviewer.enabled:
+        ctx.ui.warn(agent.reviewer.warning)
+
+
 PERMISSIONS_USAGE = "/permissions [forget N | clear | log]"
+MODE_USAGE = "/mode [" + "|".join(mode.value for mode in MODE_CYCLE) + "]"
 
 
 def _permissions(ctx: CommandContext, arg: str) -> bool:
@@ -237,10 +252,15 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
             mark = {"yes": "да", "always": "всегда", "no": "нет", "no_answer": "без ответа"}.get(
                 str(item.get("decision")), str(item.get("decision"))
             )
+            review = item.get("review") if isinstance(item.get("review"), dict) else {}
+            if item.get("source") == "reviewer":
+                mark = "разрешил рецензент"
             where = "" if item.get("cwd") in (None, ".") else f" [{item.get('cwd')}]"
             text = f"  • {mark}{where}: {item.get('command', '')}"
             if item.get("feedback"):
                 text += f" — «{item['feedback']}»"
+            elif item.get("source") == "reviewer" and review.get("reason"):
+                text += f" — {review['reason']}"
             lines.append(text)
         ctx.ui.info("последние решения:\n" + "\n".join(lines))
         return True
@@ -366,11 +386,7 @@ def default_commands() -> CommandRegistry:
     registry = CommandRegistry()
     registry.register(SlashCommand("/help", "справка", _help))
     registry.register(SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"))
-    registry.register(
-        SlashCommand(
-            "/mode", "режим: ручной, авто-правки, план", _mode, usage="/mode [manual|edits|plan]"
-        )
-    )
+    registry.register(SlashCommand("/mode", "режим: авто или план", _mode, usage=MODE_USAGE))
     registry.register(
         SlashCommand(
             "/permissions",

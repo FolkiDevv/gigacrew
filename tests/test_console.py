@@ -202,7 +202,7 @@ def test_confirm_question_includes_summary(monkeypatch):
     edit = ToolCallInfo("edit_file", "a.py", ToolKind.EDIT)
     assert ui.confirm(edit, None, dangerous=False).approval is Approval.YES
     out = buf.getvalue()
-    assert "Применить edit_file (a.py)? [y/N/a]" in out and "режим «авто-правки»" in out
+    assert "Применить edit_file (a.py)? [y/N/a]" in out and "до конца сессии" in out
     danger = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND)
     assert ui.confirm(danger, None, dangerous=True).approval is Approval.NO
     assert "ОПАСНО: Выполнить run_shell (rm -rf x)? [y/N] " in buf.getvalue()
@@ -222,6 +222,30 @@ def test_confirm_question_includes_summary(monkeypatch):
     assert (
         ui.confirm(danger, None, dangerous=True).approval is Approval.NO
     )  # «a» для опасного — нет
+
+
+def test_reviewer_lines(monkeypatch):
+    from gigacrew.agent.events import Approval, Review
+    from gigacrew.permissions import ToolKind
+
+    ui, buf = _console()
+    command = ToolCallInfo("run_shell", "./deploy-check", ToolKind.COMMAND)
+    ui.on_review_start(command)  # без терминала индикатора нет
+    ui.on_review_end(command, Review("R", True, "проверка проекта"))
+    ui.on_review_end(command, Review("R", False, "не просили"))  # отказ — в вопросе
+    ui.on_review_end(command, None)
+    assert buf.getvalue().strip() == "✔ рецензент (R) разрешил: проверка проекта"
+    monkeypatch.setattr(ui._c, "input", lambda prompt: "y")
+    asked = ToolCallInfo(
+        "run_shell",
+        "./deploy-check",
+        ToolKind.COMMAND,
+        reason="выполняет код проекта",
+        review="рецензент (R): не просили",
+    )
+    assert ui.confirm(asked, None, dangerous=False).approval is Approval.YES
+    out = buf.getvalue()
+    assert out.index("почему спрашиваю") < out.index("рецензент (R): не просили")
 
 
 def test_confirm_free_text_is_feedback_and_no_answer_is_marked(monkeypatch):
@@ -399,7 +423,7 @@ def test_turn_indicator_shows_current_mode():
     from gigacrew.permissions import PermissionMode
 
     ui, buf = _live_console(width=120)
-    mode = [PermissionMode.MANUAL]
+    mode = [PermissionMode.AUTO]
     ui.set_interrupt_keys("Esc — прервать", contextlib.nullcontext)
     ui.set_mode_hint(lambda: f"{mode[0].label} (Shift+Tab)")
     ui.on_stream_start()
