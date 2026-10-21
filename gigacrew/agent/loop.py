@@ -1848,6 +1848,18 @@ class Agent:
         self._conversation.add_function_result(call.name, _with_note(content, note))
         return ToolOutcome(ok=False)
 
+    def describe_call(self, call: FunctionCall) -> str:
+        """Краткое описание вызова из истории (показ продолженного чата), как в строке
+        вызова во время хода; неизвестный инструмент или неверные аргументы — ``""``."""
+        tool = self._registry.get(call.name)
+        if tool is None:
+            return ""
+        try:
+            params = tool.parse(call.arguments)
+        except Exception:
+            return ""
+        return self._describe(tool, params)
+
     @staticmethod
     def _describe(tool: Tool, params: BaseModel) -> str:
         try:

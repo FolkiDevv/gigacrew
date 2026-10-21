@@ -117,6 +117,20 @@ def test_recent_accepts_timestamps_without_timezone(store):
     assert store.load("naive").info.created_at.tzinfo is not None
 
 
+def test_message_count_is_saved_and_read_from_older_files(store):
+    """В списке видно, сколько в чате сообщений, а не только запросов. В файлах, записанных
+    до появления счётчика, он считается по самому диалогу."""
+    info = store.save("new", _conv())
+    assert info.messages == 4 and info.requests == 1
+    store.save("old", _conv())
+    path = store.directory / "old.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["messages"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert {c.id: c.messages for c in store.recent()} == {"new": 4, "old": 4}
+    assert store.load("old").info.messages == 4
+
+
 def test_recent_on_missing_dir(store):
     assert store.recent() == []
     assert store.latest() is None

@@ -52,7 +52,7 @@ from gigacrew.agent.events import (
     TurnStats,
 )
 from gigacrew.agent.hooks import short_command
-from gigacrew.llm.types import Message
+from gigacrew.llm.types import FunctionCall, Message
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.ask_user import format_answer
 from gigacrew.tools.base import Display, ToolResult
@@ -60,6 +60,7 @@ from gigacrew.tools.questions import Answer, Question, QuestionsUnavailable
 from gigacrew.ui import banner as banner_art
 from gigacrew.ui.format import (
     SKIPPED_MARK,
+    chat_size,
     clip_lines,
     format_tokens,
     format_when,
@@ -97,6 +98,9 @@ _MODE_COLORS = {
     PermissionMode.AUTO: WARN,
     PermissionMode.PLAN: BRAND,
 }
+# Продолжение чата: сколько последних обменов показать и вызовов инструментов в обмене.
+RESUME_EXCHANGES = 3
+RESUME_CALLS = 5
 
 
 def sanitize(text: str) -> str:
@@ -905,10 +909,7 @@ class Console(AgentEvents):
         table.add_column(style=MUTED, no_wrap=True)
         table.add_column()
         for k, chat in enumerate(chats, 1):
-            n = chat.requests
-            meta = (
-                f"{format_when(chat.updated_at)} · {n} {plural(n, 'запрос', 'запроса', 'запросов')}"
-            )
+            meta = f"{format_when(chat.updated_at)} · {chat_size(chat.requests, chat.messages)}"
             title = Text(sanitize(chat.title))
             if chat.id == current_id:
                 title.append(" (текущий)", style=MUTED)
@@ -928,43 +929,80 @@ class Console(AgentEvents):
                 return chats[int(raw) - 1]
             self.warn(f"введите номер от 1 до {len(chats)}")
 
-    def chat_resumed(self, info: ChatInfo, messages: Sequence[Message]) -> None:
-        """Сообщение о продолжении чата и последний обмен репликами."""
-        n = info.requests
+    def chat_resumed(
+        self,
+        info: ChatInfo,
+        messages: Sequence[Message],
+        describe: Callable[[FunctionCall], str] | None = None,
+    ) -> None:
+        """Сообщение о продолжении чата и последние обмены репликами.
+
+        Обмен — запрос пользователя и всё до следующего: вызовы инструментов (строкой,
+        ``describe`` — описание вызова) и итоговый ответ. Более ранние обмены — одной
+        строкой со счётчиками: они восстановлены и видны модели, но не печатаются.
+        """
         line = Text("↺ продолжаем чат ", style=MUTED)
         line.append(f"«{sanitize(info.title)}»", style=f"bold {ACCENT}")
         line.append(
-            f" · {n} {plural(n, 'запрос', 'запроса', 'запросов')} · {format_when(info.updated_at)}",
+            f" · {chat_size(info.requests, info.messages)} · {format_when(info.updated_at)}",
             style=MUTED,
         )
         self._c.print(line)
-        last = next(
-            (
-                k
-                for k in range(len(messages) - 1, -1, -1)
-                if messages[k].is_request and messages[k].content.strip()
-            ),
-            None,
-        )
-        if last is not None:
-            shown = clip_lines(request_text(messages[last].content), head=3, tail=2, max_chars=600)
-            self._c.print(Text("› ", style=f"bold {USER}").append(sanitize(shown), style=USER))
-            # Ответ ищется только после этого запроса: у прерванного хода его нет, и
-            # ответ на предыдущий запрос здесь выглядел бы ответом на этот.
-            answer = next(
-                (
-                    m.content
-                    for m in reversed(messages[last + 1 :])
-                    if m.role == "assistant" and not m.function_calls and m.content.strip()
-                ),
-                "",
-            )
-            if answer:
-                self._assistant_label()
-                self._c.print(Markdown(sanitize(answer)))
-            else:
-                self._c.print(Text("  (ответа нет — ход не был завершён)", style=MUTED))
+        starts = _exchange_starts(messages)[-RESUME_EXCHANGES:]
+        if starts and starts[0] > 0:
+            earlier = messages[: starts[0]]
+            size = chat_size(sum(1 for m in earlier if m.is_request), len(earlier))
+            self._c.print(Text(f"  … раньше: {size} — восстановлены, модель их видит", style=MUTED))
+        for k, start in enumerate(starts):
+            end = starts[k + 1] if k + 1 < len(starts) else len(messages)
+            self._resumed_exchange(messages[start:end], describe, last=k == len(starts) - 1)
         self._c.print()
+
+    def _resumed_exchange(
+        self,
+        messages: Sequence[Message],
+        describe: Callable[[FunctionCall], str] | None,
+        *,
+        last: bool,
+    ) -> None:
+        """Обмен продолженного чата (``messages[0]`` — запрос); ответ ранних — сокращён."""
+        shown = clip_lines(request_text(messages[0].content), head=3, tail=2, max_chars=600)
+        self._c.print(Text("› ", style=f"bold {USER}").append(sanitize(shown), style=USER))
+        calls = [call for m in messages if m.role == "assistant" for call in m.function_calls]
+        if len(calls) > RESUME_CALLS:
+            hidden = len(calls) - RESUME_CALLS
+            word = plural(hidden, "вызов", "вызова", "вызовов")
+            self._c.print(Text(f"  … ещё {hidden} {word} инструментов", style=MUTED))
+            calls = calls[-RESUME_CALLS:]
+        for call in calls:
+            line = Text(f"{ICON_TOOL} ", style=MUTED)
+            line.append(sanitize(call.name), style=f"bold {MUTED}")
+            summary = describe(call) if describe is not None else ""
+            if summary:
+                line.append(f"  {sanitize(summary)}", style=MUTED)
+            self._c.print(line)
+        # Ответ ищется только в этом обмене: у прерванного хода его нет, и ответ на
+        # предыдущий запрос здесь выглядел бы ответом на этот.
+        answer = next(
+            (
+                m.content
+                for m in reversed(messages)
+                if m.role == "assistant" and not m.function_calls and m.content.strip()
+            ),
+            "",
+        )
+        if not answer:
+            self._c.print(Text("  (ответа нет — ход не был завершён)", style=MUTED))
+            return
+        if not last:
+            answer = clip_lines(answer, head=6, tail=2, max_chars=1200)
+        self._assistant_label()
+        self._c.print(Markdown(sanitize(answer)))
+
+
+def _exchange_starts(messages: Sequence[Message]) -> list[int]:
+    """Индексы запросов пользователя с текстом — начала обменов (служебные — не запросы)."""
+    return [k for k, m in enumerate(messages) if m.is_request and m.content.strip()]
 
 
 _YES = ("y", "yes", "д", "да")
