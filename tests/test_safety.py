@@ -176,6 +176,11 @@ def test_read_only(root, command):
         "gawk -p '{print}' a.txt",
         "gawk --as x=1 '{print > \"out.txt\"}' a.txt",
         "gawk --field : 'BEGIN{system(\"id\")}'",
+        # ARGV/ARGC: подмена входных файлов мимо проверки путей (секреты, вне проекта)
+        "awk 'BEGIN { ARGV[1] = \".env\" } { print }' a.txt",
+        "awk 'BEGIN { ARGV[ARGC++] = \"/etc/passwd\" } 1' a.txt",
+        "awk -v ARGC=3 '{print}' a.txt",
+        "awk '{print}' ARGC=3 a.txt",
         'awk \'{printf("%s\\n", $1) > "out.txt"}\' a.txt',
         "awk '{print $1,\n$2 > \"out.txt\"}' a.txt",
         "awk '$1 > 5 {print $1 > \"out.txt\"}' a.txt",

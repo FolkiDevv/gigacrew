@@ -1392,7 +1392,8 @@ def _sed(env: Env, args: list[Word]) -> Part:
     return bad if bad is not None else _read("sed: вывод с заменами")
 
 
-_AWK_UNSAFE = re.compile(r"system|getline|close|fflush|ENVIRON|PROCINFO|@load|@include")
+# ARGV/ARGC: программа подменила бы входные файлы (`ARGV[1] = ".env"`) мимо проверки путей.
+_AWK_UNSAFE = re.compile(r"system|getline|close|fflush|ENVIRON|PROCINFO|ARGV|ARGC|@load|@include")
 _AWK_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -1470,7 +1471,11 @@ def _awk(env: Env, args: list[Word]) -> Part:
     program = pos[0]
     if not program.static or _AWK_UNSAFE.search(program.value) or _awk_redirects(program.value):
         return _unknown("awk: программа с вызовом команд, записью или окружением")
-    files = [p for p in pos[1:] if not (p.static and "=" in p.value)]
+    operands = [p for p in pos[1:] if p.static and "=" in p.value]  # var=значение
+    assigns = [*_values(args, "-v", "--assign"), *operands]
+    if any(_AWK_UNSAFE.search(a.value.partition("=")[0]) for a in assigns if a.static):
+        return _unknown("awk: присваивание ARGV, ARGC или переменным окружения")
+    files = [p for p in pos[1:] if p not in operands]
     bad = _check_read(env, files, "awk") or _check_vars(env, _values(args, "-v", "--assign"), "awk")
     return bad if bad is not None else _read("awk: обработка текста")
 
