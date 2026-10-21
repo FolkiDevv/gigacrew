@@ -1392,36 +1392,91 @@ def _sed(env: Env, args: list[Word]) -> Part:
     return bad if bad is not None else _read("sed: вывод с заменами")
 
 
-_AWK_UNSAFE = re.compile(r"system|getline|\||>|close|fflush|ENVIRON|PROCINFO|@load|@include")
+# ARGV/ARGC: программа подменила бы входные файлы (`ARGV[1] = ".env"`) мимо проверки путей.
+_AWK_UNSAFE = re.compile(r"system|getline|close|fflush|ENVIRON|PROCINFO|ARGV|ARGC|@load|@include")
+_AWK_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _awk_redirects(program: str) -> bool:
+    """Выводит ли программа awk в файл или команду (``print > f``, ``print | "cmd"``).
+
+    ``>`` — вывод только после print/printf вне скобок, иначе это сравнение
+    (``NR>=10``, ``if ($1 > 5)``, ``print (a > b)``). ``|`` (кроме ``||``) — всегда
+    вывод или ввод команды. С ``/`` вне строк регулярное выражение не отличить от
+    деления без полного разбора — тогда любые ``>`` и ``|`` считаются выводом. ``/``
+    внутри строки (``print "/etc"``) не мешает: первый ``/`` регулярного выражения или
+    деления всегда вне строки — до него строки и комментарии разбираются как в awk.
+    """
+    depth = 0
+    output: list[int] = []  # глубины скобок, где начались print/printf
+    i, n = 0, len(program)
+    while i < n:
+        ch = program[i]
+        if ch == '"':
+            j = i + 1
+            while j < n and program[j] != '"':
+                j += 2 if program[j] == "\\" else 1
+            if j >= n:
+                return True  # строка не закрыта — не разобрать
+            i = j + 1
+            continue
+        if ch == "#":  # комментарий до конца строки
+            j = program.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if ch == "/":  # регулярное выражение или деление: дальше не разобрать
+            return ">" in program or "|" in program
+        name = _AWK_NAME.match(program, i)
+        if name is not None:
+            if name.group() in ("print", "printf"):
+                output.append(depth)
+            i = name.end()
+            continue
+        if ch == "|":
+            if not program.startswith("||", i):
+                return True
+            i += 2
+            continue
+        if ch == ">" and output and output[-1] == depth:
+            return True
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch in ";}":  # конец оператора: print закончился
+            while output and output[-1] >= depth:
+                output.pop()
+        i += 1
+    return False
+
+
+# Опции awk, которые не меняют, откуда берётся программа, и ничего не пишут: разделитель
+# полей и присваивания. Остальные — «не проверено»: -f/-e/-E/-i/-l (программа или
+# расширения не из первого аргумента), -W (опции реализации: mawk `-W exec файл`, gawk
+# `-W source=…`), -d/-o/-p (запись файлов), сгруппированные короткие (`-bf файл`) и
+# сокращения длинных (`--as x=1` сдвинул бы, какой аргумент — программа).
+_AWK_OPTION = re.compile(r"-[Fv].+|--(field-separator|assign)=.*")
 
 
 def _awk(env: Env, args: list[Word]) -> Part:
-    if (
-        _values(args, "-f", "--file")
-        or any(a.static and re.fullmatch(r"-[fiElE].*", a.value) for a in args)
-        or _abbrev(
-            args,
-            "--file",
-            "--include",
-            "--load",
-            "--exec",
-            "--source",
-            "--dump-variables",
-            "--debug",
-            "--profile",
-            "--pretty-print",
-        )
-    ):
-        return _unknown("awk: программа или расширения из файла, запись отладки")
     rest = _without_values(args, "-F", "-v", "--assign", "--field-separator")
     flags, pos = _split(rest)
+    for flag in flags:
+        if not _AWK_OPTION.fullmatch(flag.value):
+            return _unknown(
+                f"awk: опция {flag.value} — программа или расширения из файла, запись файлов"
+            )
     if not pos:
         return _unknown("awk без программы")
     program = pos[0]
-    if not program.static or _AWK_UNSAFE.search(program.value):
+    if not program.static or _AWK_UNSAFE.search(program.value) or _awk_redirects(program.value):
         return _unknown("awk: программа с вызовом команд, записью или окружением")
-    files = [p for p in pos[1:] if not (p.static and "=" in p.value)]
-    bad = _check_read(env, files, "awk") or _check_vars(env, _values(args, "-v"), "awk")
+    operands = [p for p in pos[1:] if p.static and "=" in p.value]  # var=значение
+    assigns = [*_values(args, "-v", "--assign"), *operands]
+    if any(_AWK_UNSAFE.search(a.value.partition("=")[0]) for a in assigns if a.static):
+        return _unknown("awk: присваивание ARGV, ARGC или переменным окружения")
+    files = [p for p in pos[1:] if p not in operands]
+    bad = _check_read(env, files, "awk") or _check_vars(env, _values(args, "-v", "--assign"), "awk")
     return bad if bad is not None else _read("awk: обработка текста")
 
 

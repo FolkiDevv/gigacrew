@@ -142,6 +142,10 @@ def test_stdlib_shadowing_in_run_directory(root):
         ("python3 -m unknown_module", None),
         ("python3 -i", None),
         ('python3 -c "$CODE"', None),
+        # многострочный код в кавычках: переводы строк — часть кода
+        ('python3 -c "\nimport ast\nprint(ast.dump(ast.parse(\\"x\\")))\n"', READ),
+        ("python3 -c '\nfor n in open(\"README.md\"):\n    print(n)\n'", READ),
+        ('python3 -c "import os\nos.remove(\\"README.md\\")"', WRITE),
         ("python3 - <<'EOF'\nimport sys\nprint(sys.argv)\nEOF", READ),
         ("python3 <<'EOF'\nimport os\nos.system('id')\nEOF", DANGER),
         ("cat <<'EOF' | python3\nprint(1)\nEOF", READ),

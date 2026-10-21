@@ -173,6 +173,35 @@ def test_plan_argument_is_ignored(tmp_path):
     assert question.body.startswith(PLAN)
 
 
+def test_plan_argument_fills_empty_plan_file(tmp_path):
+    """План только в аргументе (как у других агентов), файла нет — файлом становится он."""
+    session = _Session([Answer((APPROVE,))])
+    context = session.context(tmp_path)
+    session.plan.dirty = False
+    tool = ExitPlanModeTool()
+    result = tool.run(tool.parse({"plan": PLAN}), context)
+    assert (tmp_path / PLAN_REL).read_text(encoding="utf-8") == PLAN
+    (question,) = session.asked[0]
+    assert question.body == PLAN and result.ok and session.mode is PermissionMode.AUTO
+    assert session.plan.writes == 1
+
+
+def test_plan_argument_does_not_replace_shown_plan(tmp_path):
+    """Файл с прошлого показа не менялся, в аргументе — другой текст: не показывать старый
+    план и не стирать его пересказом, а попросить поправить файл."""
+    _write_plan(tmp_path)
+    session = _Session([Answer((APPROVE,))])
+    context = session.context(tmp_path)
+    session.plan.dirty = False
+    tool = ExitPlanModeTool()
+    with pytest.raises(ToolError, match="не менялся") as e:
+        tool.run(tool.parse({"plan": "план в двух словах"}), context)
+    assert PLAN_REL in str(e.value) and "edit_file" in str(e.value)
+    assert (tmp_path / PLAN_REL).read_text(encoding="utf-8") == PLAN and session.asked == []
+    tool.run(tool.parse({"plan": f"{PLAN}\n"}), context)  # тот же план — просто показ
+    assert session.asked[0][0].body == PLAN
+
+
 def test_schema_has_no_parameters():
     params = ExitPlanModeTool().spec().parameters
     assert params == {"type": "object", "properties": {}}

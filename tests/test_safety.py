@@ -55,6 +55,22 @@ def level(command: str, root: Path, **kw) -> CommandLevel | None:
         "printenv PATH",
         "sed -n '1,10p' README.md",
         "awk '{print $1}' a.txt",
+        # сравнения в awk — не вывод в файл
+        "awk 'NR>=10 && NR<=20' a.txt",
+        "awk '$2 > 5 || NF > 3' a.txt",
+        "awk 'length > 100 {print NR\": \"$0}' a.txt",
+        "awk '{ if ($1 > 5) print $2; else print \">\" }' a.txt",
+        "awk '{print ($1 > $2), $3}' a.txt",
+        "awk -F: '{print $1} $3 > 1000' a.txt",
+        "awk '{ print \"/etc\"; if ($1 > 5) print $1 }' a.txt",  # «/» только в строке
+        # опции, которые не меняют, откуда программа: разделитель полей и присваивания
+        "awk -F: '{print $1}' a.txt",
+        "awk -F : '{print $1}' a.txt",
+        "awk -v n=3 'NR==n' a.txt",
+        "awk -vn=3 -F, 'NR==n' a.txt",
+        "awk --field-separator=: '{print $1}' a.txt",
+        "awk --assign n=3 'NR==n' a.txt",
+        "awk -- '{print $1}' a.txt",
         "jq .scripts package.json",
         "sort a.txt | uniq -c | sort -rn | head",
         "diff a.txt b.txt",
@@ -145,6 +161,35 @@ def test_read_only(root, command):
         "sed -i 's/a/b/' a.txt",
         "awk 'BEGIN{system(\"id\")}'",
         "awk '{print > \"out.txt\"}' a.txt",
+        "awk '{print $1, $2 >> \"out.txt\"}' a.txt",
+        "awk -W exec prog.awk a.txt",  # программа из файла (mawk)
+        "awk -Wexec prog.awk a.txt",
+        "gawk -W source='BEGIN{print 1}' a.txt",
+        "awk -W file=prog.awk a.txt",
+        # gawk: сгруппированные короткие опции, второй -e, запись отладки, сокращения
+        "gawk -bWsource='BEGIN{print 1}' a.txt",
+        "gawk -bf prog.awk a.txt",
+        "gawk -nf prog.awk a.txt",
+        "gawk -e 'BEGIN{print 1}' -e 'BEGIN{system(\"id\")}'",
+        "gawk -d '{print}' a.txt",
+        "gawk -o/tmp/pp.out '{print}' a.txt",
+        "gawk -p '{print}' a.txt",
+        "gawk --as x=1 '{print > \"out.txt\"}' a.txt",
+        "gawk --field : 'BEGIN{system(\"id\")}'",
+        # ARGV/ARGC: подмена входных файлов мимо проверки путей (секреты, вне проекта)
+        "awk 'BEGIN { ARGV[1] = \".env\" } { print }' a.txt",
+        "awk 'BEGIN { ARGV[ARGC++] = \"/etc/passwd\" } 1' a.txt",
+        "awk -v ARGC=3 '{print}' a.txt",
+        "awk '{print}' ARGC=3 a.txt",
+        'awk \'{printf("%s\\n", $1) > "out.txt"}\' a.txt',
+        "awk '{print $1,\n$2 > \"out.txt\"}' a.txt",
+        "awk '$1 > 5 {print $1 > \"out.txt\"}' a.txt",
+        "awk '{print $1 | \"sh\"}' a.txt",
+        'awk \'# "\n{print > "out.txt"}\n# "\' a.txt',
+        'awk \'/"/ {print > "out"} /"/\' a.txt',
+        'awk \'{print "/"; print $1 / 2 > "out"}\' a.txt',  # «/» вне строки — как раньше
+        "awk '# /\n{print > \"out\"}' a.txt",  # «/» в комментарии не прячет вывод
+        'awk \'{print "a" > "out.txt"\' a.txt',
         "awk 'BEGIN{print ENVIRON[\"HOME\"]}'",
         "jq -n env",
         "jq -n '$ENV'",
@@ -405,6 +450,24 @@ def test_every_command_node_is_classified(root, command):
         stack.extend(n.children)
     script = shell.parse(command, root=root)
     assert script is not None and len(script.commands) + script.consumed == nodes
+
+
+@pytest.mark.parametrize(
+    "command, value",
+    [
+        ('echo "a\nb"', "a\nb"),
+        ('echo "\n  x = 1\n"', "\n  x = 1\n"),
+        ('echo "a\\"b\nc\\\\d"', 'a"b\nc\\d'),
+        ('echo "a\\\nb"', "ab"),  # перенос строки через \ внутри "…" убирается
+        ("echo 'a\nb'", "a\nb"),
+        ('echo x"a\nb"y', "xa\nby"),
+    ],
+)
+def test_quoted_word_keeps_newlines(root, command, value):
+    """Значение слова в кавычках — как его получит программа, с переводами строк."""
+    script = shell.parse(command, root=root)
+    assert script is not None
+    assert script.commands[0].argv[1].value == value
 
 
 def test_long_commands_and_other_platforms_ask(root, monkeypatch):

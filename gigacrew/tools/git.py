@@ -25,6 +25,28 @@ _ALLOWED = _READ_ONLY | {
     "restore",
 }
 
+# Подкоманды, которых нет в инструменте, а в исследовании они обычно читают (у reflog есть и
+# изменяющие формы): для них — подсказка про run_shell, там их проверяет классификатор.
+_READ_ELSEWHERE = frozenset(
+    {
+        "blame",
+        "grep",
+        "ls-files",
+        "ls-tree",
+        "rev-parse",
+        "rev-list",
+        "shortlog",
+        "describe",
+        "reflog",
+        "merge-base",
+        "cat-file",
+        "show-ref",
+        "name-rev",
+        "for-each-ref",
+        "whatchanged",
+    }
+)
+
 # Опции, позволяющие писать/читать файлы вне проекта или запускать внешние
 # программы. Запрещены для всех подкоманд (включая сокращения: git принимает
 # уникальные префиксы длинных опций).
@@ -105,6 +127,11 @@ class GitTool(Tool):
     Params = GitParams
 
     def risk(self, params: GitParams, ctx: ToolContext) -> RiskLevel:
+        # Читающая подкоманда, которой нет в инструменте, — ошибка с подсказкой до решения по
+        # режиму: иначе в режиме плана и у explore `git blame` отклонялся бы как изменение.
+        # Изменяющие (push, merge…) по-прежнему блокирует режим.
+        if params.subcommand in _READ_ELSEWHERE:
+            self._check(params)
         sub, args = params.subcommand, params.args
         reading = (
             sub in _READ_ONLY
@@ -122,7 +149,16 @@ class GitTool(Tool):
     def _check(self, params: GitParams) -> None:
         sub = params.subcommand
         if sub not in _ALLOWED:
-            raise ToolError(f"Подкоманда git '{sub}' не разрешена. Доступно: {sorted(_ALLOWED)}.")
+            hint = (
+                f" Команды git вроде {sub}, которых нет в этом инструменте, запускай через "
+                "run_shell."
+                if sub in _READ_ELSEWHERE
+                else ""
+            )
+            raise ToolError(
+                f"Подкоманда git '{sub}' не поддерживается этим инструментом. Доступно: "
+                f"{sorted(_ALLOWED)}.{hint}"
+            )
         for arg in params.args:
             if arg == "--":
                 break  # дальше — пути, а не опции

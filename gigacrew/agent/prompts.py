@@ -189,7 +189,10 @@ EXPLORE_PROMPT = """\
 You ONLY research: you change nothing (file edits and changing git commands are \
 blocked). run_shell runs only commands verified as read-only inside the project \
 (ls, wc, grep, rg, git log/show/blame, Python one-liners that only read files); \
-anything else is refused — prefer the dedicated tools.
+anything else is refused, including the project's tests and builds, importing its \
+modules, shell loops and if/case blocks, and file paths computed at run time ($(…), \
+$VAR) — prefer the dedicated tools. A refused command is not worth rephrasing: switch \
+to read_file, search_content or the navigation tools.
 
 Strategy — search, do not browse:
 1. Start from the question, not from the file tree. Turn it into concrete \
@@ -349,13 +352,17 @@ has to be changed and where.
 """
 
 
-def mode_prompt(mode: PermissionMode, *, subagent: bool = False, plan_path: str = "") -> str:
+def mode_prompt(
+    mode: PermissionMode, *, subagent: bool = False, read_only: bool = False, plan_path: str = ""
+) -> str:
     """Правила текущего режима для системного промпта ("" — особых правил нет).
 
-    Суб-агенту — без ask_user и exit_plan_mode: план одобряет основной агент.
-    ``plan_path`` — файл плана чата (относительно корня проекта).
+    Суб-агенту — без ask_user и exit_plan_mode: план одобряет основной агент. Суб-агенту
+    «только для чтения» (explore) режим ничего не меняет: правила режима обещали бы ему
+    тесты и сборку с подтверждением, а у него они заблокированы. ``plan_path`` — файл
+    плана чата (относительно корня проекта).
     """
-    if mode is not PermissionMode.PLAN:
+    if mode is not PermissionMode.PLAN or (subagent and read_only):
         return ""
     if subagent:
         return SUBAGENT_PLAN_MODE_PROMPT

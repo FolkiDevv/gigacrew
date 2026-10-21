@@ -6,7 +6,9 @@
 выбирает, выполнять ли его и в каком режиме. После одобрения режим меняется, и
 агент приступает к выполнению в том же ходе; свой ответ пользователя — замечания,
 агент точечно правит файл и отправляет план снова. План не передаётся в
-параметрах: иначе модель переписывала бы его целиком после каждого замечания.
+параметрах: иначе модель переписывала бы его целиком после каждого замечания. Если
+модель по привычке других агентов всё же передала план (``plan``), а файл плана пуст,
+текст из аргумента записывается в файл и показывается.
 
 Сам показ — :func:`review_plan`: ею же агентный цикл показывает записанный план, если
 модель закончила ход текстом, не вызвав инструмент.
@@ -16,12 +18,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 from gigacrew.permissions import PermissionMode
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolResult
+from gigacrew.tools.fs import WriteFileParams, WriteFileTool
 from gigacrew.tools.questions import Question, QuestionOption, QuestionsUnavailable
 
 APPROVE = "Да, выполнять"
@@ -53,6 +56,15 @@ REVISE_NOTE = (
     "инструментом edit_file (НЕ переписывай план целиком и не пересказывай его текстом), "
     "затем снова вызови exit_plan_mode без аргументов."
 )
+PLAN_ARGUMENT_NOTE = (
+    "exit_plan_mode показывает файл плана {path}, а не аргумент plan; файл с прошлого "
+    "показа не менялся. Внеси изменения в файл (edit_file) и снова вызови "
+    "exit_plan_mode без аргументов."
+)
+PLAN_LINK_NOTE = (
+    "Файл плана {path} или папка планов — символическая ссылка: план из аргумента не "
+    "записан. Сообщи пользователю, что ссылку нужно убрать."
+)
 APPROVED_NOTE = (
     "Пользователь одобрил план. Режим теперь «{label}» ({description}). Приступай к "
     "выполнению плана по шагам.\n\nОдобренный план ({path}):\n\n{plan}"
@@ -76,9 +88,10 @@ class PlanReview:
         return self.outcome in ("approved", "revise")
 
 
-# Без параметров: план читается из файла плана (docstring ушёл бы в схему).
+# Без параметров: план читается из файла плана (docstring ушёл бы в схему). План из
+# аргумента ``plan`` — запасной путь, в схеме его нет.
 class ExitPlanModeParams(BaseModel):
-    pass
+    _plan: str = PrivateAttr("")
 
 
 def _plan_path(ctx: ToolContext, plan: PlanFile) -> str:
@@ -102,6 +115,32 @@ def _read_plan(ctx: ToolContext, plan: PlanFile) -> str:
             "затем снова вызови exit_plan_mode (без аргументов)."
         )
     return text
+
+
+def _take_plan_argument(ctx: ToolContext, plan: PlanFile, text: str) -> None:
+    """План в аргументе ``plan``: в пустой файл плана — записать (как write_file, с теми же
+    проверками пути). Файл с другим планом, не менявшийся с прошлого показа, — ошибка:
+    показ старого плана сбил бы пользователя, а перезапись могла бы стереть план
+    кратким пересказом. Записанный в этом цикле файл важнее аргумента.
+
+    Файл плана или папка планов — ссылка: не записывать. Запись идёт мимо проверки
+    риска write_file, а ссылка увела бы её без вопроса в файл проекта.
+    """
+    if plan.dirty:
+        return
+    path = _plan_path(ctx, plan)
+    if not plan.is_target(plan.path):
+        raise ToolError(PLAN_LINK_NOTE.format(path=path))
+    try:
+        current = plan.path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        current = ""
+    except (OSError, UnicodeDecodeError) as e:
+        raise ToolError(f"Не удалось прочитать файл плана {path}: {e}") from None
+    if not current:
+        WriteFileTool().run(WriteFileParams(path=path, content=text), ctx)
+    elif current != text.strip():
+        raise ToolError(PLAN_ARGUMENT_NOTE.format(path=path))
 
 
 def review_plan(
@@ -163,9 +202,18 @@ class ExitPlanModeTool(Tool):
     )
     Params = ExitPlanModeParams
 
+    def parse(self, arguments: dict[str, Any]) -> ExitPlanModeParams:
+        params = ExitPlanModeParams.model_validate(arguments or {})
+        plan = (arguments or {}).get("plan")
+        if isinstance(plan, str):
+            params._plan = plan
+        return params
+
     def run(self, params: ExitPlanModeParams, ctx: ToolContext) -> ToolResult:
         plan_file = ctx.plan
         if plan_file is None or ctx.get_mode is None or ctx.get_mode() != PermissionMode.PLAN:
             raise ToolError(NOT_PLANNING_NOTE)
+        if params._plan.strip():
+            _take_plan_argument(ctx, plan_file, params._plan)
         review = review_plan(ctx, plan_file)
         return ToolResult(content=review.content, summary=review.summary)

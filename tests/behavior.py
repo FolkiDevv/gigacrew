@@ -75,6 +75,7 @@ DEFAULT_TIMEOUT = 1800  # с на один прогон сценария
 HARNESS_PLAN_NOTICES = ("не отправлен на одобрение",)
 # Первая строка вопроса самопроверки: так её служебное сообщение видно в истории.
 SELF_CHECK_MARK = SELF_CHECK_NOTE.splitlines()[0]
+PLAN_BLOCKED_MARK = PLAN_BLOCKED_NOTE.split("{path}")[0]
 # Уведомление о паузе из-за лимита запросов шлюза (429).
 RATE_LIMIT_MARK = "(429)"
 # Инструменты исследования кода: их вызовы основным агентом — «работа вместо суб-агента».
@@ -1122,7 +1123,7 @@ def _metrics(
             and t.get("plan_shown") == 0
             and t.get("ended_in_text")
         ),
-        "blocked_calls": sum(1 for text in results if text.startswith(PLAN_BLOCKED_NOTE)),
+        "blocked_calls": sum(1 for text in results if text.startswith(PLAN_BLOCKED_MARK)),
         "final_mode": agent.mode.value,
         # делегирование: запуски суб-агентов (task и explore) и из них — разведка
         "task_calls": len(tasks) + explores,

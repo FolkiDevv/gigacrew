@@ -3,7 +3,9 @@
 Решают, когда принудительно остановить ход:
 
 * исчерпан лимит шагов;
-* серия неудачных вызовов инструментов (модель застряла на ошибках);
+* серия неудачных вызовов инструментов (модель застряла на ошибках): за один
+  неудачный вызов до предела модель получает предупреждение (:meth:`LoopGuard.failure_warning`),
+  и ход останавливается, только когда предупреждение уже ушло ей в запросе;
 * зацикливание — модель повторяет один и тот же вызов (имя + аргументы), хотя
   между повторами ничего не менялось, и результат заведомо будет тем же. На
   ``max_repeats``-м повторе модель получает предупреждение вместе с результатом,
@@ -12,7 +14,8 @@
 «Ничего не менялось» — между двумя одинаковыми вызовами не было успешной
 изменяющей операции *другого* вызова. Собственное изменение повтор не
 сбрасывает: ``pytest`` без правок между запусками — зацикливание, правка →
-``pytest`` — нет.
+``pytest`` — нет. Одинаковые вызовы — с точностью до пояснения для пользователя
+(``description``): модель часто перефразирует его, повторяя ту же команду.
 
 Отказ пользователя не считается ошибкой инструмента, но запоминается:
 повтор отклонённого в этом ходе вызова отклоняется без нового вопроса.
@@ -32,6 +35,7 @@
 from __future__ import annotations
 
 import json
+import posixpath
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -69,6 +73,15 @@ MODEL_STOP_REASONS: dict[str, str] = {
 PRESSURE_SHARE = 0.7
 # Поля аргументов, задающие «цель» вызова, — по убыванию приоритета.
 _TARGET_FIELDS = ("pattern", "query", "path", "command", "subcommand", "focus")
+# Аргументы, от которых результат не зависит (пояснение для пользователя у run_shell и task).
+_COSMETIC_FIELDS = frozenset({"description"})
+
+FAILURES_WARNING = (
+    "WARNING: the last {count} tool calls failed or were not executed. Do not try "
+    "variations of the same: read the errors above and change the approach (other tools "
+    "or arguments), or answer with what you already have. One more failed call will stop "
+    "the work."
+)
 
 
 @dataclass(frozen=True)
@@ -97,12 +110,30 @@ class CallCheck:
     warning: str | None = None  # предупреждение для модели — дописывается к результату
     stop: StopReason | None = None  # вызов не выполнять, ход остановить
     rejected_before: bool = False  # пользователь уже отклонил этот вызов в этом ходе
+    notice: str | None = None  # то же предупреждение — строкой для пользователя
+
+
+@dataclass(frozen=True)
+class GuardWarning:
+    """Предупреждение ограничителя: ``model`` — заметка модели, ``notice`` — пользователю."""
+
+    model: str
+    notice: str
 
 
 def call_key(call: FunctionCall) -> str:
-    """Канонический ключ вызова: имя + JSON аргументов с упорядоченными ключами."""
+    """Канонический ключ вызова: имя + JSON аргументов с упорядоченными ключами.
+
+    Без пояснения для пользователя (``description``): от него результат не зависит. Не
+    строка (``null``) — не пояснение, а ошибка аргументов: такой вызов — другой.
+    """
+    arguments = {
+        name: value
+        for name, value in call.arguments.items()
+        if not (name in _COSMETIC_FIELDS and isinstance(value, str))
+    }
     args = json.dumps(
-        call.arguments, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+        arguments, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
     )
     return f"{call.name}:{args}"
 
@@ -117,7 +148,12 @@ def target_key(call: FunctionCall) -> str:
         value = call.arguments.get(field)
         if value not in (None, "", []):
             text = value if isinstance(value, str) else json.dumps(value, default=str)
-            return f"{call.name}:{field}={text.strip()}"
+            # ./a.py и a.py, src/ и src — одна цель; пробелы внутри имени — его часть
+            if field == "path":
+                text = posixpath.normpath(text.strip().replace("\\", "/"))
+            else:
+                text = " ".join(text.split())
+            return f"{call.name}:{field}={text}"
     return call.name
 
 
@@ -151,6 +187,8 @@ class LoopGuard:
         self._seen: dict[str, int] = {}  # ключ → значение _changes сразу после вызова
         self._repeats: dict[str, int] = {}  # ключ → повторов подряд без изменений
         self._rejected: set[str] = set()
+        self._failures_warned = False  # предупреждение о серии неудач ушло модели в запросе
+        self._failures_noticed = False  # ...и показано пользователю
 
     @property
     def steps(self) -> int:
@@ -235,7 +273,8 @@ class LoopGuard:
                 ),
                 rejected_before=rejected,
             )
-        if self._max_similar is not None and similar >= self._max_similar + SIMILAR_GRACE:
+        stop_similar = None if self._max_similar is None else self._max_similar + SIMILAR_GRACE
+        if stop_similar is not None and similar >= stop_similar:
             return CallCheck(
                 repeats,
                 stop=StopReason(
@@ -245,13 +284,17 @@ class LoopGuard:
                 ),
                 rejected_before=rejected,
             )
-        warning = None
+        warning = notice = None
         if repeats == self._max_repeats:
             warning = (
                 f"WARNING: this is call #{repeats} of {call.name} with the same arguments, "
                 "and nothing changed in between — the result is the same. Do not repeat "
                 "this call: use the result you already have, change the approach or answer. "
                 "The next such repeat will stop the work."
+            )
+            notice = (
+                f"Модель {repeats}-й раз повторяет вызов {call.name} без изменений — "
+                "предупреждена; следующий повтор остановит ход."
             )
         elif self._max_similar is not None and similar >= self._max_similar:
             warning = (
@@ -260,7 +303,32 @@ class LoopGuard:
                 "the approach or move on to the report. A few more such calls will stop the "
                 "work."
             )
-        return CallCheck(repeats, warning=warning, rejected_before=rejected)
+            notice = (
+                f"Модель {similar}-й раз подряд вызывает {call.name} с той же целью — "
+                f"предупреждена; ход остановится на {stop_similar}-м таком вызове."
+            )
+        return CallCheck(repeats, warning=warning, rejected_before=rejected, notice=notice)
+
+    def failure_warning(self) -> GuardWarning | None:
+        """Предупреждение о серии неудач для следующего запроса: до предела — одна неудача
+        (или серия уже на пределе: её дотянула пачка вызовов одного ответа).
+
+        Заметка модели (``model``) — в каждый такой запрос: ответ может быть отброшен
+        (оборван, самопроверка), и предупреждение не должно пропасть вместе с ним. Строка
+        пользователю (``notice``) — один раз на серию, дальше пустая. Вызов означает, что
+        заметка уйдёт в запросе: после него следующая неудача останавливает ход.
+        """
+        if self._max_failures < 2 or self._failures < self._max_failures - 1:
+            return None
+        self._failures_warned = True
+        notice = ""
+        if not self._failures_noticed:
+            self._failures_noticed = True
+            notice = (
+                f"Неудачных вызовов инструментов подряд: {self._failures} — модель "
+                "предупреждена; ещё одна неудача остановит ход."
+            )
+        return GuardWarning(FAILURES_WARNING.format(count=self._failures), notice)
 
     def _count_similar(self, call: FunctionCall) -> int:
         """Учесть вызов как похожий на предыдущие (та же цель, без изменений между)."""
@@ -275,10 +343,14 @@ class LoopGuard:
     def after_tool(self, call: FunctionCall, outcome: ToolOutcome) -> StopReason | None:
         """Вызывается после каждого выполненного (или отклонённого) вызова."""
         key = call_key(call)
+        failed = not (outcome.ok or outcome.rejected or outcome.soft)
         if outcome.rejected:
             self._rejected.add(key)  # серия ошибок не меняется: модель не застряла
         elif not outcome.soft:
             self._failures = 0 if outcome.ok else self._failures + 1
+            if self._failures < self._max_failures - 1:
+                # Серия прервалась — новая предупреждается снова.
+                self._failures_warned = self._failures_noticed = False
         if outcome.changed:
             self._changes += 1
         self._seen[key] = self._changes
@@ -288,7 +360,13 @@ class LoopGuard:
             if outcome.changed:
                 # Правки одного файла подряд — работа, а не топтание на месте.
                 self._similar.pop(similar, None)
-        if self._failures >= self._max_failures:
+        # Останавливает неудача, и только после предупреждения: предел могла перейти пачка
+        # вызовов одного ответа — тогда модель получит предупреждение в следующем запросе.
+        if (
+            failed
+            and self._failures >= self._max_failures
+            and (self._failures_warned or self._max_failures < 2)
+        ):
             return StopReason(
                 "tool_failures",
                 f"Прервано: {self._failures} неудачных вызовов инструментов подряд. "

@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from pydantic import BaseModel, Field
 
-from gigacrew.permissions import ToolKind
+from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.files import GIT_DIR_NAME, glob_match, is_git_internal, walk_files
 from gigacrew.project.workspace import DATA_DIR_NAME
 from gigacrew.security import RiskLevel, resolve_in_root
@@ -194,10 +194,17 @@ def _is_plan_file(ctx: ToolContext, path: str) -> bool:
 
 
 def _plan_written(ctx: ToolContext, p: Path) -> bool:
-    """Отмечает изменение плана после записи; True — записан файл плана."""
+    """Отмечает изменение плана после записи; True — записан файл плана.
+
+    «План ждёт показа» (``dirty``) — только после правки в режиме плана: отметки о
+    выполненных шагах в режиме «авто» — не новый план, иначе в следующем цикле
+    планирования harness показал бы старый план сам.
+    """
     if ctx.plan is None or not ctx.plan.is_target(p):
         return False
-    ctx.plan.dirty = True
+    if ctx.get_mode is None or ctx.get_mode() is PermissionMode.PLAN:
+        ctx.plan.dirty = True
+    ctx.plan.writes += 1
     return True
 
 
