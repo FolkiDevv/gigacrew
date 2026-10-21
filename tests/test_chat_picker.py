@@ -201,8 +201,8 @@ def test_chat_resumed_shows_last_exchanges(monkeypatch):
     )
     out = buf.getvalue()
     assert "продолжаем чат «почини тесты» · 4 запроса · 10 сообщений" in out
-    # Ранние обмены — строкой: восстановлены, но не печатаются.
-    assert "раньше: 1 запрос · 2 сообщения — восстановлены, модель их видит" in out
+    # Ранние обмены — строкой: сохранены в чате, но не печатаются.
+    assert "раньше: 1 запрос · 2 сообщения — сохранены в чате, на экран не выводятся" in out
     assert "нулевой" not in out
     assert out.index("› первый вопрос") < out.index("первый ответ") < out.index("› второй вопрос")
     assert "\x1b" not in out and "› почини [31mтесты" in out  # sanitize убрал ESC

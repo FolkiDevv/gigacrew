@@ -939,7 +939,7 @@ class Console(AgentEvents):
 
         Обмен — запрос пользователя и всё до следующего: вызовы инструментов (строкой,
         ``describe`` — описание вызова) и итоговый ответ. Более ранние обмены — одной
-        строкой со счётчиками: они восстановлены и видны модели, но не печатаются.
+        строкой со счётчиками: они сохранены в чате, но не печатаются.
         """
         line = Text("↺ продолжаем чат ", style=MUTED)
         line.append(f"«{sanitize(info.title)}»", style=f"bold {ACCENT}")
@@ -952,7 +952,9 @@ class Console(AgentEvents):
         if starts and starts[0] > 0:
             earlier = messages[: starts[0]]
             size = chat_size(sum(1 for m in earlier if m.is_request), len(earlier))
-            self._c.print(Text(f"  … раньше: {size} — восстановлены, модель их видит", style=MUTED))
+            self._c.print(
+                Text(f"  … раньше: {size} — сохранены в чате, на экран не выводятся", style=MUTED)
+            )
         for k, start in enumerate(starts):
             end = starts[k + 1] if k + 1 < len(starts) else len(messages)
             self._resumed_exchange(messages[start:end], describe, last=k == len(starts) - 1)
