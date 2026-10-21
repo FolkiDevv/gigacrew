@@ -57,10 +57,10 @@ READ_ONLY_BLOCKED_NOTE = (
 READ_ONLY_SHELL_NOTE = (
     "Not executed: here run_shell runs only commands verified as read-only inside the "
     "project (ls, cat, grep, rg, git status/log/diff, Python one-liners that only read); "
-    "this one is not: {reason}. Loops and if/case blocks, the project's tests and builds "
-    "and arguments known only at run time are not verified. Do not just rephrase the "
-    "command: use read_file, search_content, find_files and git instead, or put the "
-    "command in the final report for the main agent."
+    "this one is not: {reason}. Shell loops and if/case blocks, the project's tests and "
+    "builds and file paths computed at run time ($(…), $VAR) are not verified. Do not just "
+    "rephrase the command: use read_file, search_content, find_files and git instead, or "
+    "put the command in the final report for the main agent."
 )
 SUBAGENT_PLAN_BLOCKED_NOTE = (
     "Not executed: plan mode is on, changes are forbidden. Do not try to make them: "

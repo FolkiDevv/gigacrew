@@ -394,6 +394,8 @@ def test_call_key_ignores_description():
     # null — не значение по умолчанию: у str-поля это ошибка валидации, другой вызов
     c = FunctionCall(name="run_shell", arguments={"command": "ls", "cwd": None})
     assert call_key(c) != call_key(a)
+    d = FunctionCall(name="run_shell", arguments={"command": "ls", "description": None})
+    assert call_key(d) != call_key(a)
     guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
     checks = [_run(guard, call) for call in (a, b, a, b)]
     assert checks[2].warning is not None and checks[3].stop is not None

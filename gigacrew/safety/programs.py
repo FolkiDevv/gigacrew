@@ -1449,35 +1449,29 @@ def _awk_redirects(program: str) -> bool:
     return False
 
 
+# Опции awk, которые не меняют, откуда берётся программа, и ничего не пишут: разделитель
+# полей и присваивания. Остальные — «не проверено»: -f/-e/-E/-i/-l (программа или
+# расширения не из первого аргумента), -W (опции реализации: mawk `-W exec файл`, gawk
+# `-W source=…`), -d/-o/-p (запись файлов), сгруппированные короткие (`-bf файл`) и
+# сокращения длинных (`--as x=1` сдвинул бы, какой аргумент — программа).
+_AWK_OPTION = re.compile(r"-[Fv].+|--(field-separator|assign)=.*")
+
+
 def _awk(env: Env, args: list[Word]) -> Part:
-    if (
-        _values(args, "-f", "--file")
-        # -W: опции реализации, в том числе программа из файла или из опции
-        # (mawk `-W exec файл`, gawk `-W source=…`, `-W file=…`).
-        or any(a.static and re.fullmatch(r"-[fiElEW].*", a.value) for a in args)
-        or _abbrev(
-            args,
-            "--file",
-            "--include",
-            "--load",
-            "--exec",
-            "--source",
-            "--dump-variables",
-            "--debug",
-            "--profile",
-            "--pretty-print",
-        )
-    ):
-        return _unknown("awk: программа или расширения из файла, запись отладки")
     rest = _without_values(args, "-F", "-v", "--assign", "--field-separator")
     flags, pos = _split(rest)
+    for flag in flags:
+        if not _AWK_OPTION.fullmatch(flag.value):
+            return _unknown(
+                f"awk: опция {flag.value} — программа или расширения из файла, запись файлов"
+            )
     if not pos:
         return _unknown("awk без программы")
     program = pos[0]
     if not program.static or _AWK_UNSAFE.search(program.value) or _awk_redirects(program.value):
         return _unknown("awk: программа с вызовом команд, записью или окружением")
     files = [p for p in pos[1:] if not (p.static and "=" in p.value)]
-    bad = _check_read(env, files, "awk") or _check_vars(env, _values(args, "-v"), "awk")
+    bad = _check_read(env, files, "awk") or _check_vars(env, _values(args, "-v", "--assign"), "awk")
     return bad if bad is not None else _read("awk: обработка текста")
 
 

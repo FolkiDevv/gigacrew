@@ -124,10 +124,13 @@ class GuardWarning:
 def call_key(call: FunctionCall) -> str:
     """Канонический ключ вызова: имя + JSON аргументов с упорядоченными ключами.
 
-    Без пояснения для пользователя (``description``): от него результат не зависит.
+    Без пояснения для пользователя (``description``): от него результат не зависит. Не
+    строка (``null``) — не пояснение, а ошибка аргументов: такой вызов — другой.
     """
     arguments = {
-        name: value for name, value in call.arguments.items() if name not in _COSMETIC_FIELDS
+        name: value
+        for name, value in call.arguments.items()
+        if not (name in _COSMETIC_FIELDS and isinstance(value, str))
     }
     args = json.dumps(
         arguments, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
