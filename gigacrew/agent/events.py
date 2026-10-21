@@ -44,6 +44,7 @@ class ToolCallInfo:
     history: str = ""
     purpose: str = ""  # зачем вызов — со слов модели (параметр description)
     review: str = ""  # мнение модели-рецензента (режим «авто»)
+    read_only: bool = False  # инструмент только смотрит проект (Tool.read_only)
 
 
 class Approval(Enum):

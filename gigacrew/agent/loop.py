@@ -1360,7 +1360,7 @@ class Agent:
             self._events.on_tool_call(invalid)
             return self._fail(invalid, f"валидация аргументов: {e}", note=note)
 
-        call = ToolCallInfo(name, self._describe(tool, params), tool.kind)
+        call = ToolCallInfo(name, self._describe(tool, params), tool.kind, read_only=tool.read_only)
         self._events.on_tool_call(call)
         key = call_key(function_call)
 

@@ -2,9 +2,10 @@
 
 Встроенное (не полноэкранное) приложение prompt_toolkit: ↑↓ — выбор, цифры — сразу
 выбрать (в мультивыборе — отметить), Пробел — отметить, Enter — подтвердить,
-Esc/Ctrl+C — отказаться отвечать. Последний пункт — «Свой ответ…»: когда он выбран,
-набираемый текст попадает прямо в него (Backspace — стереть, Ctrl+U — очистить).
-После ответа меню стирается — итог печатает вызывающий код.
+Esc/Ctrl+C — отказаться отвечать. Последний пункт — «Свой ответ…» (подпись задаёт
+вопрос: у плана — «Замечания…»): когда он выбран, набираемый текст попадает прямо в
+него (Backspace — стереть, Ctrl+U — очистить). Слева — полоса, как у подтверждения
+команды. После ответа меню стирается — итог печатает вызывающий код.
 """
 
 from __future__ import annotations
@@ -18,11 +19,9 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import FormattedTextControl, Layout, Window
-from prompt_toolkit.output import ColorDepth
-from prompt_toolkit.styles import Style
 
 from gigacrew.tools.questions import Answer, Question
-from gigacrew.ui.theme import PROMPT_STYLES
+from gigacrew.ui.colors import prompt_color_depth, prompt_style
 
 CUSTOM_LABEL = "Свой ответ…"
 CUSTOM_DESCRIPTION = "Начните печатать — ответ своими словами"
@@ -69,53 +68,103 @@ class ChoiceState:
         return Answer(tuple(options[k].label for k in picked), custom)
 
 
-def _wrap(text: str, width: int, indent: str = " ") -> list[str]:
-    return textwrap.wrap(text, max(width - 1, 20), initial_indent=indent, subsequent_indent=indent)
+BAR = "  ▌ "  # полоса слева — как у подтверждения команды: всё, что ждёт ответа
+
+
+def _wrap(text: str, width: int, indent: str = "") -> list[str]:
+    room = max(width - len(BAR) - 1, 20)
+    return textwrap.wrap(text, room, initial_indent=indent, subsequent_indent=indent)
+
+
+def _line(*parts: tuple[str, str]) -> list[tuple[str, str]]:
+    """Строка меню: полоса слева, части, перевод строки."""
+    return [("class:question.bar", BAR), *parts, ("", "\n")]
+
+
+def custom_label(question: Question) -> str:
+    return question.custom_label or CUSTOM_LABEL
 
 
 def render(state: ChoiceState, width: int = 80) -> list[tuple[str, str]]:
     """Отрисовка меню: список пар (стиль prompt_toolkit, текст)."""
     q = state.question
-    out: list[tuple[str, str]] = [
-        ("class:question.counter", f" Вопрос {state.index} из {state.total}")
-    ]
-    if q.header:
-        out += [("class:choice.hint", " · "), ("class:question.header", q.header)]
-    out.append(("", "\n"))
-    for line in _wrap(q.text, width) or [" "]:
-        out.append(("class:question.text", line + "\n"))
-    if q.multi_select:
-        out.append(("class:choice.hint", " можно выбрать несколько вариантов\n"))
+    multi = q.multi_select
+    out: list[tuple[str, str]] = []
+    tag = q.header
+    if state.total > 1:
+        counter = f"{state.index} из {state.total}"
+        tag = f"{tag} · {counter}" if tag else counter
+    text_lines = _wrap(q.text, width) or [" "]
+    for i, line in enumerate(text_lines):
+        mark = ("class:question.mark", "? " if i == 0 else "  ")
+        parts = [mark, ("class:question.text", line)]
+        if tag and i == len(text_lines) - 1:
+            parts.append(("class:question.tag", f"   {tag}"))
+        out += _line(*parts)
+    if multi:
+        out += _line(("class:choice.hint", "можно выбрать несколько вариантов"))
+    out += _line()
 
-    items = [(o.label, o.description) for o in q.options] + [(CUSTOM_LABEL, CUSTOM_DESCRIPTION)]
+    items = [(o.label, o.description) for o in q.options]
+    items.append((custom_label(q), q.custom_hint or CUSTOM_DESCRIPTION))
     for k, (label, description) in enumerate(items):
         current = k == state.cursor
-        style = "class:choice.selected" if current else "class:choice"
-        box = ""
-        if q.multi_select and k != state.custom_index:
-            box = "[x] " if k in state.checked else "[ ] "
-        prefix = f" {'❯' if current else ' '} {k + 1}. "
-        if k == state.custom_index and (state.custom or current):
-            out += [(style, prefix + "Свой ответ: "), ("class:choice.custom", state.custom)]
+        is_custom = k == state.custom_index
+        number = f"{k + 1}. "
+        parts: list[tuple[str, str]] = [
+            ("class:choice.selected", "❯ " if current else "  "),
+            ("class:choice.number.selected" if current else "class:choice.number", number),
+        ]
+        box_width = 0
+        if multi:
+            box_width = 4
+            if is_custom:
+                parts.append(("", "    "))
+            elif k in state.checked:
+                parts += [
+                    ("class:choice.box", "["),
+                    ("class:choice.box.checked", "✔"),
+                    ("class:choice.box", "] "),
+                ]
+            else:
+                parts.append(("class:choice.box", "[ ] "))
+        if is_custom and (state.custom or current):
+            prefix = custom_label(q).rstrip("…") + ": "
+            parts += [("class:choice.description", prefix), ("class:choice.custom", state.custom)]
             if current:
-                out.append(("[SetCursorPosition]", ""))
-            out.append(("", "\n"))
+                parts.append(("[SetCursorPosition]", ""))
+            out += _line(*parts)
             if state.custom:
                 continue
         else:
-            out += [(style, prefix + box + label), ("", "\n")]
+            if current:
+                style = "class:choice.selected"
+            elif multi and k in state.checked:
+                style = "class:choice.checked"
+            else:
+                style = "class:choice"
+            out += _line(*parts, (style, label))
         if description:
-            indent = " " * (len(prefix) + len(box))
+            indent = " " * (2 + len(number) + box_width)
+            faint = "class:choice.description" if current else "class:choice.description.faint"
             for line in _wrap(description, width, indent):
-                out.append(("class:choice.description", line + "\n"))
+                out += _line((faint, line))
 
+    out += _line()
     if state.error:
-        out.append(("class:choice.error", f" {state.error}\n"))
-    if q.multi_select:
-        hint = "↑↓ выбор · Пробел или цифра — отметить · Enter — готово · Esc — отказаться"
+        out += _line(("class:choice.error", state.error))
+    if multi:
+        hint = (
+            f"отмечено {len(state.checked)} · Пробел/цифра — отметить · Enter — готово · "
+            "Esc — отказаться"
+        )
     else:
         hint = "↑↓ выбор · цифра — сразу · Enter — подтвердить · Esc — отказаться"
-    out.append(("class:choice.hint", "\n".join(_wrap(hint, width))))
+    hint_lines = _wrap(hint, width)
+    for i, line in enumerate(hint_lines):
+        out += [("class:question.bar", BAR), ("class:choice.hint", line)]
+        if i < len(hint_lines) - 1:
+            out.append(("", "\n"))
     return out
 
 
@@ -200,8 +249,8 @@ def choose(
     app: Application[Answer | None] = Application(
         layout=Layout(Window(control, wrap_lines=True, dont_extend_height=True)),
         key_bindings=kb,
-        style=Style.from_dict(PROMPT_STYLES),
-        color_depth=ColorDepth.MONOCHROME if no_color else None,
+        style=prompt_style(),
+        color_depth=prompt_color_depth(no_color),
         full_screen=False,
         erase_when_done=True,
         **io,

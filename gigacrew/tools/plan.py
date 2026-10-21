@@ -34,6 +34,8 @@ PLAN_QUESTION = Question(
             APPROVE, f"Режим «{PermissionMode.AUTO.label}»: {PermissionMode.AUTO.description}"
         ),
     ),
+    custom_label="Замечания…",
+    custom_hint="Напишите, что поправить — модель исправит план и покажет снова",
 )
 
 NOT_PLANNING_NOTE = "Режим планирования не активен — одобрение плана не требуется. Выполняй задачу."
@@ -124,11 +126,10 @@ def review_plan(
     if ctx.ask_user is None:
         plan_file.dirty = False
         return no_approver
-    body = f"{plan}\n\n---\nФайл плана: `{path}`"
     if on_show is not None:
         on_show()
     try:
-        answers = ctx.ask_user([replace(PLAN_QUESTION, body=body)])
+        answers = ctx.ask_user([replace(PLAN_QUESTION, body=plan, source=path)])
     except QuestionsUnavailable:
         plan_file.dirty = False
         return no_approver

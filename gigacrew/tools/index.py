@@ -99,6 +99,7 @@ class FindSymbolParams(BaseModel):
 
 class FindSymbolTool(Tool):
     name = "find_symbol"
+    read_only = True
     description = (
         "Finds definitions (classes, functions, methods, types, constants, Markdown "
         "headings) by name in the project index. Returns 'path:lines kind name — "
@@ -154,6 +155,7 @@ def _entry_line(entry: FileEntry, shown_path: str) -> str:
 
 class FileOutlineTool(Tool):
     name = "file_outline"
+    read_only = True
     description = (
         "Outline from the project index. For a file — its definitions (classes, "
         "functions, methods, headings) with line numbers and nesting, so you can read "
@@ -293,6 +295,7 @@ class RepoMapParams(BaseModel):
 
 class RepoMapTool(Tool):
     name = "repo_map"
+    read_only = True
     description = (
         "Project map: the most important definitions (classes, functions, methods with "
         "signatures and line numbers), ranked by how often and from where they are "

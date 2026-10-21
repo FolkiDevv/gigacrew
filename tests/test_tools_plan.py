@@ -73,7 +73,9 @@ def test_approval_switches_mode(tmp_path):
     # одобренный план (в итоговой редакции) — в результате: модель выполняет его
     assert PLAN in result.content and PLAN_REL in result.content
     (question,) = session.asked[0]
-    assert question.body.startswith(PLAN) and PLAN_REL in question.body
+    # план — в рамке, путь к файлу — в её подписи; свой ответ — замечания к плану
+    assert question.body == PLAN and question.source == PLAN_REL
+    assert question.custom_label == "Замечания…"
     assert question.header == "План"
     assert [o.label for o in question.options] == [APPROVE]
     assert not session.plan.dirty

@@ -1,6 +1,6 @@
 """Индикатор ожидания: ракета пролетает через строку, оставляя мерцающее пламя.
 
-Кадры генерируются один раз при импорте из генератора с фиксированным seed:
+Кадры генерируются один раз на палитру из генератора с фиксированным seed:
 анимация выглядит «живой» (след пульсирует, символы и цвета мерцают, за ракетой
 остаются гаснущие искры), но одинакова при каждом запуске.
 """
@@ -8,28 +8,30 @@
 from __future__ import annotations
 
 import random
+from functools import cache
 
 from rich.text import Text
 
-from gigacrew.ui.theme import BRAND, DANGER, FLAME, MUTED, WARN
+from gigacrew.ui.theme import MINT, Palette
 
 WIDTH = 8  # ширина полосы полёта, в колонках
 INTERVAL = 0.11  # длительность кадра, с
 
-_ROCKET = ("➤", BRAND)
+# Клетки — (символ, роль цвета в палитре).
+_ROCKET = ("➤", "brand")
 # Варианты пламени по удалённости от сопла: ближе — горячее.
 _FLAME: tuple[tuple[tuple[str, str], ...], ...] = (
-    (("≈", FLAME), ("≈", WARN), ("=", FLAME)),
-    (("~", WARN), ("≈", DANGER), ("=", DANGER)),
-    (("-", DANGER), ("~", MUTED)),
-    (("·", MUTED), ("-", MUTED), (" ", MUTED)),
+    (("≈", "flame"), ("≈", "warn"), ("=", "flame")),
+    (("~", "warn"), ("≈", "danger"), ("=", "danger")),
+    (("-", "danger"), ("~", "dim")),
+    (("·", "dim"), ("-", "dim"), (" ", "dim")),
 )
-_SPARK = (("·", WARN), ("˙", MUTED))  # искра на месте: вспыхнула → гаснет
+_SPARK = (("·", "warn"), ("˙", "dim"))  # искра на месте: вспыхнула → гаснет
 _SPARK_CHANCE = 0.45
 _BLANK = (" ", "")
 
 
-def _build_frames(seed: int = 11, passes: int = 3) -> tuple[Text, ...]:
+def _build_frames(palette: Palette, seed: int = 11, passes: int = 3) -> tuple[Text, ...]:
     rnd = random.Random(seed)
     frames: list[list[tuple[str, str]]] = []
     for _ in range(passes):
@@ -52,12 +54,22 @@ def _build_frames(seed: int = 11, passes: int = 3) -> tuple[Text, ...]:
                     cells[x] = _ROCKET
             frames.append(cells)
         frames.append([_BLANK] * WIDTH)  # пауза между пролётами
-    return tuple(Text.assemble(*cells) for cells in frames)
+    return tuple(
+        Text.assemble(*((ch, getattr(palette, role) if role else "") for ch, role in cells))
+        for cells in frames
+    )
 
 
-FRAMES = _build_frames()
+@cache
+def frames(palette: Palette = MINT) -> tuple[Text, ...]:
+    """Кадры анимации в цветах палитры."""
+    return _build_frames(palette)
 
 
-def rocket_frame(elapsed: float) -> Text:
+FRAMES = frames(MINT)
+
+
+def rocket_frame(elapsed: float, palette: Palette = MINT) -> Text:
     """Кадр анимации для момента ``elapsed`` секунд от её начала."""
-    return FRAMES[int(elapsed / INTERVAL) % len(FRAMES)]
+    shown = frames(palette)
+    return shown[int(elapsed / INTERVAL) % len(shown)]

@@ -27,8 +27,10 @@ def test_stream_and_output_are_sanitized():
     ui.on_stream_start()
     ui.on_stream_delta("hi \x1b]0;pwned\x07there")
     ui.on_stream_end()
+    from gigacrew.permissions import ToolKind
+
     ui.on_tool_result(
-        ToolCallInfo("run_shell", "ls"),
+        ToolCallInfo("run_shell", "ls", ToolKind.COMMAND),
         ToolResult(content="", summary="ok", display=Display("\x1b[2Jcleared", title="$ ls")),
         previewed=False,
     )
@@ -37,15 +39,15 @@ def test_stream_and_output_are_sanitized():
     assert "there" in out and "cleared" in out
 
 
-def test_previewed_diff_not_repeated():
+def test_edit_shows_file_and_line_counts_not_diff():
+    from gigacrew.permissions import ToolKind
+
     ui, buf = _console()
-    result = ToolResult(
-        content="", summary="изменён a.py", display=Display("+UNIQUE", "diff", "a.py")
-    )
-    ui.on_tool_result(ToolCallInfo("edit_file", "a.py"), result, previewed=True)
-    assert "UNIQUE" not in buf.getvalue()
-    ui.on_tool_result(ToolCallInfo("edit_file", "a.py"), result, previewed=False)
-    assert "UNIQUE" in buf.getvalue()
+    diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n-old\n+UNIQUE\n+new\n"
+    result = ToolResult(content="", summary="изменён a.py", display=Display(diff, "diff", "a.py"))
+    ui.on_tool_result(ToolCallInfo("edit_file", "a.py", ToolKind.EDIT), result, previewed=False)
+    out = buf.getvalue()
+    assert "● Изменил a.py  +2 −1" in out and "UNIQUE" not in out
 
 
 def test_turn_stats_line():
@@ -179,17 +181,26 @@ def test_no_live_area_without_terminal():
     assert buf.getvalue() == ""
 
 
-def test_long_tool_output_is_clipped():
+def test_command_shows_last_line_or_tail_of_failure():
+    from gigacrew.permissions import ToolKind
+
     ui, buf = _console()
     text = "\n".join(f"line{i}" for i in range(100))
+    call = ToolCallInfo("run_shell", "seq 100", ToolKind.COMMAND)
     ui.on_tool_result(
-        ToolCallInfo("run_shell", "seq"),
-        ToolResult(content=text, summary="ok", display=Display(text, title="$ seq")),
+        call, ToolResult(content=text, summary="ok", display=Display(text)), previewed=False
+    )
+    assert buf.getvalue() == "● $ seq 100  ✔ line99\n"
+    failed = text + "\n" + "=" * 30 + " short test summary " + "=" * 30
+    ui.on_tool_result(
+        call,
+        ToolResult(content="", ok=False, summary="код 1", display=Display(failed), exit_code=1),
         previewed=False,
     )
     out = buf.getvalue()
-    assert "line0" in out and "line99" in out and "line50" not in out
-    assert "пропущено 84 строки" in out
+    assert "● $ seq 100  ✘ код 1" in out
+    assert "│ line97\n" in out and "│ line99\n" in out and "line96" not in out
+    assert "short test summary" not in out  # строка-разделитель в хвост не идёт
 
 
 def test_confirm_question_includes_summary(monkeypatch):
@@ -202,10 +213,13 @@ def test_confirm_question_includes_summary(monkeypatch):
     edit = ToolCallInfo("edit_file", "a.py", ToolKind.EDIT)
     assert ui.confirm(edit, None, dangerous=False).approval is Approval.YES
     out = buf.getvalue()
-    assert "Применить edit_file (a.py)? [y/N/a]" in out and "до конца сессии" in out
-    danger = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND)
+    assert "▌ edit_file a.py\n" in out and "▌ ? Применить правку? [y/N/a]" in out
+    assert "до конца сессии" in out
+    danger = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND, reason="удаление без возврата")
     assert ui.confirm(danger, None, dangerous=True).approval is Approval.NO
-    assert "ОПАСНО: Выполнить run_shell (rm -rf x)? [y/N] " in buf.getvalue()
+    out = buf.getvalue()
+    assert "▌ $ rm -rf x\n" in out and "▌ почему опасно  удаление без возврата" in out
+    assert "▌ ⚠ Выполнить опасную команду? [y/N] " in out and "запомнить нельзя" in out
     command = ToolCallInfo(
         "run_shell",
         "pytest -q",
@@ -216,8 +230,8 @@ def test_confirm_question_includes_summary(monkeypatch):
     )
     assert ui.confirm(command, None, dangerous=False).approval is Approval.ALWAYS
     out = buf.getvalue()
-    assert "Выполнить run_shell (pytest -q)?" in out
-    assert "почему спрашиваю: выполняет код проекта" in out and "раньше: разрешали 2" in out
+    assert "▌ $ pytest -q\n" in out and "▌ ? Выполнить команду? [y/N/a]" in out
+    assert "▌ почему спрашиваю  выполняет код проекта" in out and "раньше: разрешали 2" in out
     assert "a — всегда разрешать «pytest»" in out
     assert (
         ui.confirm(danger, None, dangerous=True).approval is Approval.NO
@@ -234,7 +248,17 @@ def test_reviewer_lines(monkeypatch):
     ui.on_review_end(command, Review("R", True, "проверка проекта"))
     ui.on_review_end(command, Review("R", False, "не просили"))  # отказ — в вопросе
     ui.on_review_end(command, None)
-    assert buf.getvalue().strip() == "✔ рецензент (R) разрешил: проверка проекта"
+    assert buf.getvalue().strip() == "рецензент (R) разрешил: проверка проекта"
+    # у шага — строкой под ним, когда он выполнится
+    ui, buf = _console()
+    ui.on_tool_call(command)
+    ui.on_review_end(command, Review("R", True, "проверка проекта"))
+    assert buf.getvalue() == ""
+    ui.on_tool_result(command, ToolResult(content="", summary="ok", exit_code=0), previewed=False)
+    assert buf.getvalue() == (
+        "● $ ./deploy-check  ✔ код 0\n  рецензент (R) разрешил: проверка проекта\n"
+    )
+    ui, buf = _console()
     monkeypatch.setattr(ui._c, "input", lambda prompt: "y")
     asked = ToolCallInfo(
         "run_shell",
@@ -350,8 +374,9 @@ def test_plain_questions(monkeypatch, replies, expected):
     answers = ui.ask_user([_DB, _PARTS])
     assert answers[0] == expected[0]
     out = buf.getvalue()
-    assert "Вопрос 1 из 2 · БД" in out and "с сервером" in out and "3. Свой ответ" in out
-    assert "? Какую БД?" in out  # итог в ленте
+    assert "▌ ? Какую БД?   БД · 1 из 2" in out and "с сервером" in out
+    assert "3. Свой ответ" in out
+    assert "● Какую БД?  " in out  # итог в ленте
 
 
 def test_plain_multi_select(monkeypatch):
@@ -393,9 +418,17 @@ def test_banner_shows_rocket_title_and_meta():
     ui, buf = _console()
     ui.banner(version="9.9.9", model="Alpha-Max", root="/work/proj", hints=[("/help", "справка")])
     out = _plain(buf)
-    assert "▟█▙" in out and "┃╺┓" in out  # ракета и крупное название
+    assert "▄▄▄██▀▀▀▀█" in out and "┃╺┓" in out  # ракета и крупное название
     assert "v9.9.9" in out and "Alpha-Max" in out and "/work/proj" in out
     assert "/help справка" in out
+
+
+def test_banner_without_rocket_in_narrow_terminal():
+    buf = io.StringIO()
+    ui = Console(no_color=True, file=buf, width=60)
+    ui.banner(version="1", model="m", root="/r")
+    out = buf.getvalue()
+    assert "┃╺┓" in out and "▀" not in out
 
 
 def test_banner_shows_mode():
@@ -403,18 +436,21 @@ def test_banner_shows_mode():
 
     ui, buf = _console()
     ui.banner(version="1", model="m", root="/r", mode=PermissionMode.PLAN)
-    assert "режим  ⏸ план  Shift+Tab — сменить" in _plain(buf)
+    assert "режим   ⏸ план   Shift+Tab — сменить" in _plain(buf)
 
 
 def test_question_body_is_shown_before_options(monkeypatch):
     from dataclasses import replace
 
     ui, buf = _asking_console(monkeypatch, "1")
-    question = replace(_DB, header="План", body="## Шаги\n1. **Поправить** `a.py`")
+    question = replace(
+        _DB, header="План", body="## Шаги\n1. **Поправить** `a.py`", source="plans/x.md"
+    )
     assert ui.ask_user([question]) == [Answer(("PostgreSQL",))]
     out = buf.getvalue()
     assert "План" in out and "Шаги" in out and "Поправить" in out and "**" not in out
-    assert out.index("Поправить") < out.index("Вопрос 1 из 1")
+    assert "plans/x.md" in out  # файл — в подписи рамки
+    assert out.index("Поправить") < out.index("? Какую БД?")
 
 
 def test_turn_indicator_shows_current_mode():
@@ -455,13 +491,11 @@ def test_subagent_steps_nested_and_text_hidden(tmp_path):
     cfg = Config(access_key="x", project_root=tmp_path, stream=True, auto_approve=True)
     Agent(provider, build_default_registry(), cfg, ui).run_turn("где foo?")
     out = _plain(buf)
-    assert "task  explore · foo" in out
-    assert "○ search_content  /def foo/" in out and "○ read_file  nope.py" in out
-    assert "✘ Файл не найден: nope.py" in out  # неудача шага суб-агента видна
+    assert "● task explore · foo  ✔ explore · инструментов: 2" in out
+    assert "  1 поиск\n" in out  # что сделал суб-агент — под строкой его вызова
+    assert "✘ read_file nope.py  Файл не найден: nope.py" in out  # неудача шага видна
     assert "СЕКРЕТНЫЙ ОТЧЁТ" not in out  # отчёт получает основной агент, не пользователь
-    assert "Итог основного" in out
-    assert out.count("gigacrew") == 1  # метка ответа — только у основного агента
-    assert "explore · инструментов: 2" in out
+    assert "✦ Итог основного" in out
     assert ui._live is None
 
 
@@ -528,8 +562,8 @@ def test_confirm_shows_long_command_entirely_and_offers_pager(monkeypatch):
     assert all(f"line {i:03d}" in out for i in range(200))  # ничего не обрезано
     assert "202 │ EOF" in out and "202 строки" in out  # номера строк и размер
     assert "v — открыть целиком" in out and "[y/N/a/v]" in out
-    assert "Выполнить run_shell (python3 - <<'EOF' …)?" in out  # вопрос — одной строкой
-    assert "зачем (со слов модели): печать строк" in out
+    assert "▌ $ python3 - <<'EOF' …\n" in out  # первая строка команды — над рамкой
+    assert "▌ зачем  печать строк  со слов модели" in out
     assert pages == [f"$ {command}"]  # просмотрщик открыт, потом вопрос задан снова
 
 
@@ -545,3 +579,121 @@ def test_confirm_makes_invisible_characters_visible():
     out = buf.getvalue()
     assert "⟨U+202E⟩" in out and "⟨U+001B⟩" in out and "‮" not in out
     assert "v — открыть" not in out  # короткая команда помещается на экран
+
+
+# ------------------------- группы шагов в ленте ------------------------- #
+def _read(path: str) -> ToolCallInfo:
+    return ToolCallInfo("read_file", path, read_only=True)
+
+
+def _edit(path: str) -> ToolCallInfo:
+    from gigacrew.permissions import ToolKind
+
+    return ToolCallInfo("edit_file", path, ToolKind.EDIT)
+
+
+def _diff(added: int, removed: int) -> Display:
+    body = "".join(f"-old{i}\n" for i in range(removed)) + "".join(
+        f"+new{i}\n" for i in range(added)
+    )
+    return Display(f"--- a/x\n+++ b/x\n@@ -1 +1 @@\n{body}", "diff", "x")
+
+
+def _step(ui, call, result):
+    ui.on_tool_call(call)
+    ui.on_tool_start(call)
+    ui.on_tool_end(call)
+    ui.on_tool_result(call, result, previewed=False)
+
+
+def test_read_calls_collapse_into_group_until_answer():
+    ui, buf = _console()
+    _step(ui, _read("a.py"), ToolResult(content="", summary="прочитан a.py (3 строк)"))
+    search = ToolCallInfo("search_content", "/foo/", read_only=True)
+    _step(ui, search, ToolResult(content="", summary="совпадений: 2"))
+    _step(ui, _read("nope.py"), ToolResult(content="", ok=False, summary="Файл не найден"))
+    assert buf.getvalue() == ""  # группа ещё идёт — в ленте ничего
+    ui.on_assistant_text("Нашёл")
+    out = "".join(line.rstrip() + "\n" for line in buf.getvalue().splitlines())
+    assert out == (
+        "● Изучил код  прочитал 1 файл, 1 поиск\n"
+        "  a.py  /foo/\n"
+        "  ✘ read_file nope.py  Файл не найден\n"
+        "\n"
+        "✦ Нашёл\n"
+    )
+
+
+def test_single_read_is_one_line_without_repeated_path():
+    ui, buf = _console()
+    _step(ui, _read("a.py"), ToolResult(content="", summary="прочитан a.py (3 строк)"))
+    ui.on_turn_end(TurnStats(steps=1))
+    assert buf.getvalue().startswith("● read_file a.py  ✔ прочитан (3 строк)\n")
+
+
+def test_edits_collapse_per_file():
+    ui, buf = _console()
+    for path, stat in (("a.py", (3, 1)), ("b.py", (1, 0)), ("a.py", (2, 2))):
+        _step(ui, _edit(path), ToolResult(content="", summary="изменён", display=_diff(*stat)))
+    command = ToolCallInfo("run_shell", "pytest")
+    ui.on_tool_call(command)  # другой вызов закрывает группу правок
+    assert buf.getvalue() == ("● Изменил 2 файла  +6 −3\n  a.py  +5 −3\n  b.py  +1 −0\n")
+
+
+def test_group_is_shown_in_live_area_while_running():
+    ui, buf = _live_console(width=100)
+    ui.on_stream_start()
+    _step(ui, _read("a.py"), ToolResult(content="", summary="прочитан"))
+    ui.on_tool_call(_read("b.py"))
+    rows = [row.plain for row in ui._live_steps()]
+    assert rows[0].startswith("● Изучаю код  2 вызова")
+    assert rows[1].startswith("  ✔ read_file  a.py") and rows[2].startswith("  ◌ read_file  b.py")
+    ui.stop_live()
+
+
+def test_asked_call_leaves_group_and_gets_own_line(monkeypatch):
+    ui, buf = _console()
+    monkeypatch.setattr(ui._c, "input", lambda prompt: "y")
+    _step(ui, _edit("a.py"), ToolResult(content="", summary="изменён", display=_diff(1, 0)))
+    asked = _edit("b.py")
+    ui.on_tool_call(asked)
+    from dataclasses import replace
+
+    ui.confirm(replace(asked, reason="хук требует подтверждения"), _diff(2, 0), dangerous=False)
+    ui.on_tool_result(
+        asked, ToolResult(content="", summary="изменён", display=_diff(2, 0)), previewed=True
+    )
+    out = buf.getvalue()
+    # группа до вопроса — итогом, спрошенная правка — своей строкой после ответа
+    assert out.index("● Изменил a.py  +1 −0") < out.index("▌ edit_file b.py")
+    assert out.rstrip().endswith("● Изменил b.py  +2 −0")
+
+
+def test_sixteen_color_terminal_gets_ansi_palette(monkeypatch):
+    from gigacrew.ui.theme import MINT, MINT_ANSI
+
+    monkeypatch.delenv("COLORTERM", raising=False)
+    monkeypatch.setenv("TERM", "xterm")
+    ui, _ = _live_console()
+    assert ui._p is MINT_ANSI
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    ui, _ = _live_console()
+    assert ui._p is MINT
+
+
+def test_prompt_toolkit_color_depth_follows_rich(monkeypatch):
+    from prompt_toolkit.output import ColorDepth
+
+    from gigacrew.ui import colors
+
+    monkeypatch.delenv("PROMPT_TOOLKIT_COLOR_DEPTH", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    for system, depth in [
+        ("truecolor", ColorDepth.TRUE_COLOR),
+        ("256", ColorDepth.DEPTH_8_BIT),
+        ("standard", ColorDepth.DEPTH_4_BIT),
+        (None, None),
+    ]:
+        monkeypatch.setattr(colors, "color_system", lambda s=system: s)
+        assert colors.prompt_color_depth(False) == depth
+    assert colors.prompt_color_depth(True) == ColorDepth.MONOCHROME

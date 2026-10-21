@@ -33,13 +33,11 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition, has_completions
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
-from prompt_toolkit.output import ColorDepth
-from prompt_toolkit.styles import Style
 
 from gigacrew.permissions import PermissionMode
 from gigacrew.project.workspace import Workspace
+from gigacrew.ui.colors import prompt_color_depth, prompt_style
 from gigacrew.ui.format import format_tokens, mode_badge
-from gigacrew.ui.theme import PROMPT_STYLES
 
 if TYPE_CHECKING:  # commands импортирует KEY_HELP отсюда
     from gigacrew.cli.commands import CommandRegistry
@@ -265,8 +263,8 @@ def create_prompt_session(
         bottom_toolbar=lambda: toolbar_fragments(status()),
         prompt_continuation=_continuation,
         placeholder=[("class:placeholder", PLACEHOLDER)],
-        style=Style.from_dict(PROMPT_STYLES),
-        color_depth=ColorDepth.MONOCHROME if no_color else None,
+        style=prompt_style(),
+        color_depth=prompt_color_depth(no_color),
         **kwargs,
     )
 

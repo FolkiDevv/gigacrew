@@ -31,6 +31,7 @@ class SearchContentParams(BaseModel):
 
 class SearchContentTool(Tool):
     name = "search_content"
+    read_only = True
     description = (
         "Searches project files for lines matching a regular expression, like grep -rn. "
         "Returns matches as path:line:text. Use it for strings, messages, config keys and "

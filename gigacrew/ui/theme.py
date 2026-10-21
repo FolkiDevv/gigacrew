@@ -1,75 +1,154 @@
 """Визуальный язык gigacrew: палитра и иконки.
 
 Отдельный модуль, чтобы одни и те же цвета использовали вывод rich и стили
-prompt_toolkit (строка ввода, автодополнение, статус-строка). Библиотеки здесь не
-импортируются: стили — обычные словари, объекты строят потребители.
+prompt_toolkit (строка ввода, меню вопросов, выбор чата). Библиотеки здесь не
+импортируются: палитры — обычные данные, объекты строят потребители.
+
+У каждого цвета палитры одна роль, роли перечислены от заметного к тихому: цвет
+получает то, что ждёт пользователя или пошло не так, служебное приглушено. Точные
+цвета рассчитаны на тёмный фон; основной текст — цвет терминала по умолчанию, он
+читается на любом фоне. В терминале на 16 цветов пастель превратилась бы в белый
+(rich подбирает ближайший цвет ANSI), поэтому там — запасная палитра из цветов
+ANSI темы терминала (:func:`palette_for`).
 """
 
 from __future__ import annotations
 
-BRAND = "#A78BFA"  # фиолетовый — бренд
-BRAND_SOFT = "#C4B5FD"  # светло-фиолетовый — звёзды на стартовом экране
-ACCENT = "#22D3EE"  # бирюзовый — акценты/пути
-OK = "#34D399"  # зелёный — успех
-WARN = "#FBBF24"  # жёлтый — предупреждение/подтверждение
-DANGER = "#F87171"  # красный — ошибки/опасность
-MUTED = "#7C7C8A"  # серый — второстепенное
-USER = "#93C5FD"  # голубой — пользователь
-FLAME = "#FDE68A"  # светло-жёлтый — ядро пламени в индикаторе ожидания
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Palette:
+    """Цвета по ролям в формате стилей rich: ``#RRGGBB``, имя цвета ANSI или ``dim``."""
+
+    warn: str  # внимание: вопрос пользователю, идущая работа, режим «авто», пламя
+    danger: str  # ошибка, опасная команда, удалённые строки
+    fg: str  # содержание: ответ модели, файлы и команды шагов
+    brand: str  # знак: ✦ ❯ ●, «giga», ракета, выбранный пункт, заголовки Markdown
+    soft: str  # тихий акцент: инлайн-код и ссылки в ответе модели, иллюминатор
+    ok: str  # успех, добавленные строки
+    muted: str  # служебное: итоги вызовов, цели группы, подписи
+    dim: str  # фон: статистика хода, рецензент, подсказки клавиш, рамки, звёзды
+    flame: str  # ядро пламени ракеты-индикатора
+    rocket_deep: str  # ракета стартового экрана: тёмная обводка
+    rocket_shade: str  # ракета стартового экрана: штриховка корпуса
+
+
+MINT = Palette(
+    warn="#F2CC8F",
+    danger="#F4978E",
+    fg="default",
+    brand="#8EDDB0",
+    soft="#BFEBD2",
+    ok="#8EDDB0",
+    # Контраст к тёмным темам (WCAG): служебное — от 4.6, фон — от 2.7 (Nord) до 3.7.
+    muted="#979F99",
+    dim="#6D7670",
+    flame="#FBE3B0",
+    rocket_deep="#5DA67F",
+    rocket_shade="#3F7358",
+)
+# Терминал на 16 цветов: цвета из его темы, служебное — атрибутом dim.
+MINT_ANSI = Palette(
+    warn="yellow",
+    danger="red",
+    fg="default",
+    brand="green",
+    soft="green",
+    ok="green",
+    muted="dim",
+    dim="bright_black",
+    flame="yellow",
+    rocket_deep="green",
+    rocket_shade="green",
+)
+
+
+def palette_for(color_system: str | None) -> Palette:
+    """Палитра для цветовой системы терминала — как её называет rich
+    (``truecolor``, ``256``, ``standard``, ``windows``; None — без цвета)."""
+    return MINT_ANSI if color_system in ("standard", "windows") else MINT
+
 
 ICON_TOOL = "●"
 ICON_OK = "✔"
 ICON_FAIL = "✘"
 ICON_BRAND = "✦"
-ICON_ARROW = "↳"
-ICON_SUBSTEP = "○"  # шаг суб-агента под вызовом task
+ICON_PENDING = "◌"  # шаг ещё выполняется
+ICON_BAR = "▌"  # полоса слева у всего, что ждёт ответа пользователя
+ICON_DANGER = "⚠"
 SPINNER = "✦"
 # Значки режимов разрешений (ключ — PermissionMode.value).
 MODE_ICONS: dict[str, str] = {"auto": "⏵⏵", "plan": "⏸"}
 
-# Стили Markdown-ответа модели (имена стилей rich: markdown.*).
-MARKDOWN_STYLES: dict[str, str] = {
-    "markdown.h1": f"bold underline {BRAND}",
-    "markdown.h2": f"bold {BRAND}",
-    "markdown.h3": "bold",
-    "markdown.h4": "bold italic",
-    "markdown.h5": "italic",
-    "markdown.h6": "italic",
-    "markdown.code": f"bold {ACCENT}",  # inline-код — без фона, читается в любой теме
-    "markdown.link": ACCENT,
-    "markdown.link_url": f"underline {ACCENT}",
-    "markdown.item.bullet": f"bold {BRAND}",
-    "markdown.item.number": f"bold {BRAND}",
-    "markdown.block_quote": f"italic {MUTED}",
-    "markdown.hr": MUTED,
-}
 
-# Стили строки ввода (классы prompt_toolkit).
-PROMPT_STYLES: dict[str, str] = {
-    "prompt": f"bold {BRAND}",
-    "continuation": MUTED,
-    "placeholder": MUTED,
-    "auto-suggestion": MUTED,
-    # По умолчанию у toolbar стиль reverse — цвета текста стали бы фоном.
-    "bottom-toolbar": f"noreverse {MUTED}",
-    "toolbar.model": f"bold {ACCENT}",
-    "toolbar.ok": OK,
-    "toolbar.warn": WARN,
-    "toolbar.danger": f"bold {DANGER}",
-    "toolbar.mode.auto": f"bold {WARN}",
-    "toolbar.mode.plan": f"bold {BRAND}",
-    # меню вопросов агента (ask_user)
-    "question.counter": f"bold {BRAND}",
-    "question.header": f"bold {ACCENT}",
-    "question.text": "bold",
-    "choice": "",
-    "choice.selected": f"bold {ACCENT}",
-    "choice.description": MUTED,
-    "choice.hint": MUTED,
-    "choice.error": WARN,
-    "choice.custom": "underline",
-    "completion-menu": "bg:#26262e #d4d4d8",
-    "completion-menu.completion.current": f"bg:{BRAND} #111111",
-    "completion-menu.meta.completion": f"bg:#26262e {MUTED}",
-    "completion-menu.meta.completion.current": f"bg:{BRAND} #111111",
-}
+def markdown_styles(p: Palette) -> dict[str, str]:
+    """Стили Markdown-ответа модели (имена стилей rich: markdown.*)."""
+    return {
+        "markdown.h1": f"bold underline {p.brand}",
+        "markdown.h2": f"bold {p.brand}",
+        "markdown.h3": "bold",
+        "markdown.h4": "bold italic",
+        "markdown.h5": "italic",
+        "markdown.h6": "italic",
+        "markdown.code": p.soft,  # inline-код — без фона, читается в любой теме
+        "markdown.link": p.soft,
+        "markdown.link_url": f"underline {p.soft}",
+        "markdown.item.bullet": f"bold {p.brand}",
+        "markdown.item.number": f"bold {p.brand}",
+        "markdown.block_quote": f"italic {p.muted}",
+        "markdown.hr": p.dim,
+    }
+
+
+def _pt(color: str) -> str:
+    """Цвет rich — в цвет prompt_toolkit: имена ANSI с приставкой ``ansi``."""
+    if color.startswith("#") or color == "dim":
+        return color
+    if color == "default":
+        return ""
+    return "ansi" + color.replace("_", "")
+
+
+def prompt_styles(p: Palette) -> dict[str, str]:
+    """Стили строки ввода, меню вопросов и выбора чата (классы prompt_toolkit)."""
+    c = _pt
+    ansi = p is MINT_ANSI
+    menu = "bg:ansiblack" if ansi else "bg:#232826"
+    current = f"bg:{c(p.brand)} {'ansiblack' if ansi else '#111111'}"
+    return {
+        "prompt": f"bold {c(p.brand)}",
+        "continuation": c(p.dim),
+        "placeholder": c(p.dim),
+        "auto-suggestion": c(p.dim),
+        # По умолчанию у toolbar стиль reverse — цвета текста стали бы фоном.
+        "bottom-toolbar": f"noreverse {c(p.muted)}",
+        "toolbar.model": f"bold {c(p.fg)}",
+        "toolbar.ok": c(p.ok),
+        "toolbar.warn": c(p.warn),
+        "toolbar.danger": f"bold {c(p.danger)}",
+        "toolbar.mode.auto": f"bold {c(p.warn)}",
+        "toolbar.mode.plan": f"bold {c(p.brand)}",
+        # меню вопросов агента (ask_user) и выбор чата
+        "question.bar": c(p.warn),
+        "question.mark": f"bold {c(p.warn)}",
+        "question.text": f"bold {c(p.fg)}",
+        "question.tag": c(p.muted),
+        "question.counter": f"bold {c(p.brand)}",
+        "choice": c(p.fg),
+        "choice.selected": f"bold {c(p.brand)}",
+        "choice.number": c(p.muted),
+        "choice.number.selected": c(p.brand),
+        "choice.box": c(p.dim),
+        "choice.box.checked": f"bold {c(p.brand)}",
+        "choice.checked": f"bold {c(p.fg)}",
+        "choice.description": c(p.muted),
+        "choice.description.faint": c(p.dim),
+        "choice.hint": c(p.dim),
+        "choice.error": c(p.warn),
+        "choice.custom": f"bold {c(p.fg)}",
+        "completion-menu": f"{menu} {c(p.fg)}",
+        "completion-menu.completion.current": current,
+        "completion-menu.meta.completion": f"{menu} {c(p.muted)}",
+        "completion-menu.meta.completion.current": current,
+    }

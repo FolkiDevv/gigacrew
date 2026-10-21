@@ -176,7 +176,7 @@ def test_chat_resumed_shows_last_exchange(monkeypatch):
     ui.chat_resumed(_chat(1, "почини тесты"), messages)
     out = buf.getvalue()
     assert "продолжаем чат «почини тесты» · 2 запроса" in out
-    assert "\x1b" not in out and "› почини [31mтесты" in out  # sanitize убрал ESC
+    assert "\x1b" not in out and "❯ почини [31mтесты" in out  # sanitize убрал ESC
     assert "Готово: тесты проходят" in out
     assert "первый ответ" not in out
 
@@ -191,7 +191,7 @@ def test_chat_resumed_skips_meta_messages(monkeypatch):
     ]
     ui.chat_resumed(_chat(0, "спланируй промокоды"), messages)
     out = buf.getvalue()
-    assert "› спланируй промокоды" in out and "Промокоды готовы" in out
+    assert "❯ спланируй промокоды" in out and "Промокоды готовы" in out
     assert "system-reminder" not in out
 
 
@@ -206,5 +206,5 @@ def test_chat_resumed_after_interrupted_turn_shows_no_stale_answer(monkeypatch):
     ]
     ui.chat_resumed(_chat(1, "первый вопрос"), messages)
     out = buf.getvalue()
-    assert "› второй вопрос" in out
+    assert "❯ второй вопрос" in out
     assert "ответ на первый" not in out and "ответа нет" in out

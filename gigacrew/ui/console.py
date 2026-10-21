@@ -1,16 +1,26 @@
 """Терминальный UI gigacrew.
 
 Обёртка над rich, изолирующая остальной код от деталей вывода. Задаёт единый
-визуальный язык: брендовые цвета, панели, рендеринг вызовов инструментов,
-потоковый вывод ответа модели с живым Markdown, индикаторы ожидания, диффы и
+визуальный язык (палитра — :mod:`gigacrew.ui.theme`): шаги агента строкой,
+потоковый вывод ответа модели с живым Markdown, индикаторы ожидания, вопросы и
 подтверждения.
 
+Лента — это scrollback терминала: напечатанное в ней уже не изменить. Поэтому
+подряд идущие вызовы, которые только смотрят проект, и подряд идущие правки
+собираются в группу: пока она идёт, её шаги видны во временной области, а в ленту
+уходит итог одной-двумя строками, когда группа закончилась (начался ответ модели,
+другой вызов, вопрос пользователю, любое сообщение или конец хода). Диффы правок в
+ленте не показываются — файл и число строк; дифф виден в вопросе о правке.
+Всё, что ждёт ответа пользователя, отмечено полосой слева: жёлтой, у опасного —
+красной.
+
 Временная область внизу экрана (``rich.live.Live``) — одна на всю консоль: в ней
-крутится индикатор ожидания модели или работы инструмента и рисуется ещё растущий
-хвост ответа. Перед запуском новой области предыдущая всегда останавливается,
-перед вопросом пользователю — тоже. Анимацию двигает собственный поток под общей
-с печатью блокировкой: встроенное авто-обновление rich перерисовывает область
-параллельно с печатью над ней, и при гонке стирает уже напечатанные строки.
+крутится индикатор ожидания модели или работы инструмента, идёт группа шагов и
+рисуется ещё растущий хвост ответа. Перед запуском новой области предыдущая всегда
+останавливается, перед вопросом пользователю — тоже. Анимацию двигает собственный
+поток под общей с печатью блокировкой: встроенное авто-обновление rich
+перерисовывает область параллельно с печатью над ней, и при гонке стирает уже
+напечатанные строки.
 
 В не-терминале (pipe, файл, «глупый» терминал) живой области нет: ответ модели
 печатается как есть, по мере поступления — так его удобно перенаправлять в файл.
@@ -25,12 +35,14 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
+from dataclasses import dataclass, field
 from typing import IO
 
 from rich.box import ROUNDED
 from rich.console import Console as RichConsole
-from rich.console import ConsoleOptions, Group, RenderResult
+from rich.console import ConsoleOptions, Group, RenderableType, RenderResult
 from rich.live import Live
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.segment import Segment, SegmentLines
 from rich.syntax import Syntax
@@ -54,12 +66,10 @@ from gigacrew.agent.events import (
 from gigacrew.agent.hooks import short_command
 from gigacrew.llm.types import Message
 from gigacrew.permissions import PermissionMode, ToolKind
-from gigacrew.tools.ask_user import format_answer
 from gigacrew.tools.base import Display, ToolResult
 from gigacrew.tools.questions import Answer, Question, QuestionsUnavailable
 from gigacrew.ui import banner as banner_art
 from gigacrew.ui.format import (
-    SKIPPED_MARK,
     clip_lines,
     format_tokens,
     format_when,
@@ -67,36 +77,39 @@ from gigacrew.ui.format import (
     plural,
 )
 from gigacrew.ui.markdown import Markdown
-from gigacrew.ui.markdown_stream import MarkdownStream
+from gigacrew.ui.markdown_stream import Lines, MarkdownStream
 from gigacrew.ui.spinner import INTERVAL as SPINNER_INTERVAL
 from gigacrew.ui.spinner import rocket_frame
 from gigacrew.ui.theme import (
-    ACCENT,
-    BRAND,
-    DANGER,
-    ICON_ARROW,
+    ICON_BAR,
     ICON_BRAND,
+    ICON_DANGER,
     ICON_FAIL,
     ICON_OK,
-    ICON_SUBSTEP,
+    ICON_PENDING,
     ICON_TOOL,
-    MARKDOWN_STYLES,
-    MUTED,
-    OK,
-    USER,
-    WARN,
+    MINT,
+    Palette,
+    markdown_styles,
+    palette_for,
 )
 
 # Управляющие символы, которые нельзя пропускать в терминал из текста модели и
 # вывода команд: ESC-последовательности могут перекрасить/стереть экран,
 # подменить заголовок окна и т.п. Оставляем только \n и \t.
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-_SKIPPED_RE = re.compile(rf"^{SKIPPED_MARK} пропущено .*$", re.MULTILINE)
+# Строка-разделитель в выводе команды («===== FAILURES =====», «-----»): в хвост не идёт.
+_SEPARATOR_RE = re.compile(r"^[=_\-*~#]{3,}.*[=_\-*~#]{3,}$|^[=_\-*~#]{3,}$")
 _REFRESH_PER_SECOND = 2 / SPINNER_INTERVAL  # два обновления на кадр — ровный шаг ракеты
-_MODE_COLORS = {
-    PermissionMode.AUTO: WARN,
-    PermissionMode.PLAN: BRAND,
-}
+_TAIL_LINES = 3  # строк вывода упавшей команды
+_LIVE_STEPS = 5  # шагов группы во временной области
+_DETAIL_CHARS = 100  # итог шага (последняя строка вывода) — не длиннее
+_BANNER_MIN_WIDTH = 76  # уже — стартовый экран без ракеты
+_SHOW_SECONDS = 1.0  # время шага в ленте — от секунды
+# Вызовы, итог которых уже показан пользователю их же диалогом.
+_SELF_REPORTING = ("ask_user",)
+# Обзорные инструменты в счётчиках группы; read_file — «прочитал», остальное — поиски.
+_OVERVIEW_TOOLS = ("file_outline", "repo_map", "list_dir")
 
 
 def sanitize(text: str) -> str:
@@ -106,14 +119,12 @@ def sanitize(text: str) -> str:
 
 # Невидимые символы: управляющие, смена направления текста, нулевой ширины. В команде,
 # которую подтверждает пользователь, их нельзя убирать молча — она выполнится с ними.
-_INVISIBLE_RE = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
-)
+_INVISIBLE_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏‪-‮⁠-⁤⁦-⁩﻿]")
 # Многострочная команда длиннее — с номерами строк.
 _NUMBER_LINES_FROM = 4
 
 
-def visible_text(text: str, *, numbered: bool | None = None) -> Text:
+def visible_text(text: str, *, numbered: bool | None = None, palette: Palette = MINT) -> Text:
     """Текст как есть, но с видимыми невидимыми символами (``⟨U+202E⟩``) и, у длинного
     многострочного, номерами строк. Ничего не обрезается: длинные строки переносятся."""
     lines = text.replace("\r\n", "\n").split("\n")
@@ -123,11 +134,11 @@ def visible_text(text: str, *, numbered: bool | None = None) -> Text:
     out = Text(overflow="fold")
     for i, line in enumerate(lines, 1):
         if numbered:
-            out.append(f"{i:>{width}} │ ", style=MUTED)
+            out.append(f"{i:>{width}} │ ", style=palette.dim)
         pos = 0
         for m in _INVISIBLE_RE.finditer(line):
             out.append(line[pos : m.start()])
-            out.append(f"⟨U+{ord(m.group()):04X}⟩", style=f"bold {DANGER}")
+            out.append(f"⟨U+{ord(m.group()):04X}⟩", style=f"bold {palette.danger}")
             pos = m.end()
         out.append(line[pos:])
         if i < len(lines):
@@ -136,7 +147,7 @@ def visible_text(text: str, *, numbered: bool | None = None) -> Text:
 
 
 class _LiveView:
-    """Содержимое временной области: хвост ответа (если есть) + строка индикатора.
+    """Содержимое временной области: идущая группа шагов или хвост ответа + индикатор.
 
     Вызывается из потока обновления ``Live``. Сама обрезает себя по высоте экрана:
     то, что ушло за верх экрана, временная область уже не сможет стереть.
@@ -145,29 +156,40 @@ class _LiveView:
     def __init__(
         self,
         label: str | Callable[[], str],
-        tail: Callable[[], list[list[Segment]]] | None = None,
+        tail: Callable[[], Lines] | None = None,
         *,
         hint: str | Callable[[], str] = "Ctrl+C — прервать",
         started: float | None = None,
+        above: Callable[[], list[Text]] | None = None,
+        palette: Palette = MINT,
     ):
         self._label = label
         self._tail = tail
         self._hint = hint
+        self._above = above
+        self._p = palette
         # Отсчёт времени — с ``started`` (например, с запуска суб-агента, а не с
         # последнего перезапуска области после вопроса).
         self._started = time.monotonic() if started is None else started
 
     def __rich_console__(self, console: RichConsole, options: ConsoleOptions) -> RenderResult:
+        p = self._p
         elapsed = time.monotonic() - self._started
+        label = self._label() if callable(self._label) else self._label
         indicator = Text.assemble(
-            rocket_frame(elapsed),
-            (f"  {self._label() if callable(self._label) else self._label}… ", MUTED),
-            (f"{int(elapsed)} с", MUTED),
-            (f"  ·  {self._hint() if callable(self._hint) else self._hint}", MUTED),
+            rocket_frame(elapsed, p),
+            (f"  {label.removesuffix('…')}… ", p.muted),
+            (f"{int(elapsed)} с", p.muted),
+            (f"  ·  {self._hint() if callable(self._hint) else self._hint}", p.dim),
         )
+        room = max(console.size.height - 3, 1)  # индикатор + отступ + запас
+        steps = self._above() if self._above else []
+        if steps:
+            yield from steps[-room:]
+            yield Text("")
+            room = max(room - len(steps) - 1, 1)
         lines = self._tail() if self._tail else []
         if lines:
-            room = max(console.size.height - 3, 1)  # индикатор + отступ + запас
             yield SegmentLines(lines[-room:], new_lines=True)
             yield Text("")
         yield indicator
@@ -217,6 +239,73 @@ class _LiveArea:
             self._live.stop()
 
 
+@dataclass
+class _Step:
+    """Вызов инструмента в ленте: строка печатается, когда известен результат."""
+
+    call: ToolCallInfo
+    result: ToolResult | None = None
+    started: float = 0.0  # начало выполнения (on_tool_start)
+    seconds: float = 0.0
+    review: Review | None = None  # рецензент разрешил — строка под шагом
+
+
+@dataclass
+class _Group:
+    """Подряд идущие вызовы одного вида: ``read`` — только смотрят проект, ``edit`` — правки."""
+
+    kind: str
+    steps: list[_Step] = field(default_factory=list)
+
+
+def _group_kind(call: ToolCallInfo) -> str:
+    if call.read_only:
+        return "read"
+    if call.kind is ToolKind.EDIT:
+        return "edit"
+    return ""
+
+
+def _target(call: ToolCallInfo) -> str:
+    """Цель вызова одной строкой: путь, шаблон, первая строка команды (+ «…»)."""
+    summary = sanitize(call.summary).strip()
+    first = summary.split("\n", 1)[0].rstrip()
+    return f"{first} …" if "\n" in summary else first
+
+
+def _diff_stat(result: ToolResult) -> tuple[int, int] | None:
+    """Добавлено и удалено строк по диффу правки; None — диффа нет."""
+    shown = result.display
+    if shown is None or shown.kind != "diff":
+        return None
+    added = removed = 0
+    for line in shown.text.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return added, removed
+
+
+def _clip(text: str, limit: int = _DETAIL_CHARS) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _read_counts(steps: Sequence[_Step]) -> str:
+    """«прочитал 2 файла, 3 поиска, 1 обзор» — по удачным вызовам группы."""
+    reads = sum(1 for s in steps if s.call.name == "read_file")
+    overviews = sum(1 for s in steps if s.call.name in _OVERVIEW_TOOLS)
+    searches = len(steps) - reads - overviews
+    parts = []
+    if reads:
+        parts.append(f"прочитал {reads} {plural(reads, 'файл', 'файла', 'файлов')}")
+    if searches:
+        parts.append(f"{searches} {plural(searches, 'поиск', 'поиска', 'поисков')}")
+    if overviews:
+        parts.append(f"{overviews} {plural(overviews, 'обзор', 'обзора', 'обзоров')}")
+    return ", ".join(parts)
+
+
 class Console(AgentEvents):
     """Терминальный интерфейс на rich; реализует события агента.
 
@@ -240,23 +329,32 @@ class Console(AgentEvents):
             file=file,
             force_terminal=force_terminal,
             width=width,
-            theme=Theme(MARKDOWN_STYLES),
         )
+        # Точные цвета или, в терминале на 16 цветов, цвета ANSI его темы.
+        self._p = palette_for(self._c.color_system)
+        self._c.push_theme(Theme(markdown_styles(self._p)))
         self._no_color = no_color
         self._live_ok = self._c.is_terminal and not self._c.is_dumb_terminal
         self._auto_refresh = auto_refresh
         self._live: _LiveArea | None = None
         self._md: MarkdownStream | None = None  # потоковый ответ (живой режим)
-        self._raw_started = False  # потоковый ответ (не-терминал): метка уже напечатана
+        self._raw_started = False  # потоковый ответ (не-терминал): знак уже напечатан
+        self._answer_open = False  # у текущего ответа уже напечатан знак ✦
+        self._blank = True  # последняя напечатанная строка — пустая
+        self._gap = False  # после ответа модели — пустая строка перед следующим
         self._interrupt_hint = "Ctrl+C — прервать"
         self._mode_hint: Callable[[], str] | None = None
         self._input_guard: Callable[[], AbstractContextManager[None]] = contextlib.nullcontext
         self._esc_stops_subagent = False
-        # Работающий суб-агент: кто, с какого момента, чем занят, подводит ли итог.
+        # Шаги: идущая группа и вызов вне группы, ждущий результата.
+        self._group: _Group | None = None
+        self._step: _Step | None = None
+        # Работающий суб-агент: кто, с какого момента, чем занят, подводит ли итог, шаги.
         self._sub: SubagentInfo | None = None
         self._sub_started = 0.0
         self._sub_activity = ""
         self._sub_wrapping = False
+        self._sub_steps: list[_Step] = []
 
     def set_interrupt_keys(
         self,
@@ -303,32 +401,81 @@ class Console(AgentEvents):
 
     # ----------------------------- базовое ----------------------------- #
     def print(self, *args, **kwargs) -> None:
+        self._flush_group()
+        self._gap = False
         self._c.print(*args, **kwargs)
+        self._blank = not args
 
     def blank(self) -> None:
-        self._c.print()
+        self.print()
 
     def rule(self, title: str = "") -> None:
-        self._c.rule(Text(title, style=MUTED) if title else "", style=MUTED)
+        self._flush_group()
+        self._c.rule(Text(title, style=self._p.muted) if title else "", style=self._p.dim)
+        self._blank = False
 
     # Сообщения печатаются над временной областью, если она есть (например,
     # уведомление суб-агента во время его работы).
     def system(self, text: str) -> None:
-        self._print_above_live(Text(text, style=MUTED))
+        self._emit(Text(text, style=self._p.muted))
 
     def error(self, text: str) -> None:
-        self._print_above_live(Text(f"{ICON_FAIL} {text}", style=f"bold {DANGER}"))
+        self._emit(Text(f"{ICON_FAIL} {text}", style=f"bold {self._p.danger}"))
 
     def warn(self, text: str) -> None:
-        self._print_above_live(Text(f"⚠ {text}", style=WARN))
+        self._emit(Text(f"{ICON_DANGER} {text}", style=self._p.warn))
 
     def info(self, text: str) -> None:
-        self._print_above_live(Text(text, style=ACCENT))
+        self._emit(Text(text, style=self._p.muted))
 
     def success(self, text: str) -> None:
-        self._print_above_live(Text(f"{ICON_OK} {text}", style=f"bold {OK}"))
+        self._emit(Text(f"{ICON_OK} {text}", style=f"bold {self._p.ok}"))
+
+    # ------------------------------ вывод ------------------------------ #
+    def _out(self, renderable: RenderableType = "", **options) -> None:
+        """Печать над временной областью (если она есть)."""
+        if self._live is not None:
+            self._live.print(renderable, **options)
+        else:
+            self._c.print(renderable, **options)
+        self._blank = isinstance(renderable, str) and not renderable
+
+    def _gap_line(self) -> None:
+        """Пустая строка после ответа модели — перед первым, что печатается за ним."""
+        if self._gap:
+            self._gap = False
+            if not self._blank:
+                self._out()
+
+    def _emit(self, renderable: RenderableType, **options) -> None:
+        """Строка ленты: сначала — итог идущей группы шагов и отступ после ответа."""
+        self._flush_group()
+        self._gap_line()
+        self._out(renderable, **options)
+
+    def _fit(self, text: Text) -> Text:
+        """Строка по ширине экрана: не переносится, а обрезается многоточием."""
+        text.truncate(max(self._c.width - 1, 20), overflow="ellipsis")
+        return text
 
     # ------------------------- временная область ------------------------ #
+    def _view(
+        self,
+        label: str | Callable[[], str],
+        tail: Callable[[], Lines] | None = None,
+        *,
+        hint: str | Callable[[], str] | None = None,
+        started: float | None = None,
+    ) -> _LiveView:
+        return _LiveView(
+            label,
+            tail,
+            hint=self._turn_hint if hint is None else hint,
+            started=started,
+            above=self._live_steps,
+            palette=self._p,
+        )
+
     def _start_live(self, view: _LiveView) -> None:
         self.stop_live()
         if not self._live_ok:
@@ -336,12 +483,6 @@ class Console(AgentEvents):
         area = _LiveArea(self._c, view, animate=self._auto_refresh)
         area.start()
         self._live = area
-
-    def _print_above_live(self, renderable, **options) -> None:
-        if self._live is not None:
-            self._live.print(renderable, **options)
-        else:
-            self._c.print(renderable, **options)
 
     def stop_live(self) -> None:
         """Убирает временную область (идемпотентно). Безопасно вызывать всегда."""
@@ -364,13 +505,16 @@ class Console(AgentEvents):
         def label() -> str:
             return f"{title}: {detail()}" if detail is not None else title
 
-        self._start_live(_LiveView(label, hint=self._interrupt_hint))
+        self._start_live(self._view(label, hint=self._interrupt_hint))
         try:
             yield
         finally:
             self.stop_live()
 
     # ------------------------------ баннер ------------------------------ #
+    def _mode_color(self, mode: PermissionMode) -> str:
+        return self._p.warn if mode is PermissionMode.AUTO else self._p.brand
+
     def banner(
         self,
         *,
@@ -382,48 +526,53 @@ class Console(AgentEvents):
         mode: PermissionMode | None = None,
     ) -> None:
         """Приветственная панель; ``hints`` — пары (команда, краткое описание)."""
+        p = self._p
         rows = [
-            banner_art.title(),
-            Text(f"v{version}", style=MUTED),
+            banner_art.title(p),
+            Text(f"v{version}", style=p.dim),
             Text(""),
-            Text.assemble(("модель ", MUTED), (model, f"bold {ACCENT}")),
-            Text.assemble(("проект ", MUTED), root),
+            Text.assemble(("модель  ", p.muted), (model, f"bold {p.fg}")),
+            Text.assemble(("проект  ", p.muted), (root, p.fg)),
         ]
         if mode is not None:
             rows.append(
                 Text.assemble(
-                    ("режим  ", MUTED),
-                    (mode_badge(mode), f"bold {_MODE_COLORS[mode]}"),
-                    ("  Shift+Tab — сменить", MUTED),
+                    ("режим   ", p.muted),
+                    (mode_badge(mode), f"bold {self._mode_color(mode)}"),
+                    ("   Shift+Tab — сменить", p.dim),
                 )
             )
         info = Group(*rows)
-        body = Table.grid(padding=(0, 3))
-        body.add_column(vertical="middle", no_wrap=True)
-        body.add_column(vertical="middle")
-        body.add_row(banner_art.rocket(), info)
-        self._c.print(Panel(body, box=ROUNDED, border_style=BRAND, padding=(1, 2), expand=False))
-        hint = Text("  ", style=MUTED)
+        if self._c.width < _BANNER_MIN_WIDTH:
+            body: RenderableType = info
+        else:
+            grid = Table.grid(padding=(0, 3))
+            grid.add_column(vertical="middle", no_wrap=True)
+            grid.add_column(vertical="middle")
+            grid.add_row(banner_art.rocket(p, mono=self._c.no_color), info)
+            body = grid
+        self._c.print(Panel(body, box=ROUNDED, border_style=p.dim, padding=(1, 2), expand=False))
+        hint = Text("  ")
         for i, (cmd, desc) in enumerate(hints):
             if i:
-                hint.append("   ", style=MUTED)
-            hint.append(cmd, style=ACCENT)
-            hint.append(f" {desc}", style=MUTED)
+                hint.append("   ")
+            hint.append(cmd, style=p.muted)
+            hint.append(f" {desc}", style=p.dim)
         self._c.print(hint)
         if auto_approve:
             self.warn(
                 "авто-подтверждение включено (-y): изменения применяются без вопросов, "
                 "опасные команды — с вопросом (--yes-all — и они без вопроса)"
             )
-        self._c.print()
+        self.print()
 
     def help(
         self, commands: Sequence[tuple[str, str]], keys: Sequence[tuple[str, str]] = ()
     ) -> None:
         """Справка: таблица команд и клавиш."""
         table = Table.grid(padding=(0, 2))
-        table.add_column(style=ACCENT, no_wrap=True)
-        table.add_column(style=MUTED)
+        table.add_column(style=self._p.fg, no_wrap=True)
+        table.add_column(style=self._p.muted)
         for name, desc in commands:
             # Text, а не строка: «/resume [id]» и описания скиллов — не разметка Rich.
             table.add_row(Text(name), Text(desc))
@@ -431,25 +580,53 @@ class Console(AgentEvents):
             table.add_row("", "")
             for key, desc in keys:
                 table.add_row(Text(key, style="bold"), desc)
-        self._c.print(table)
+        self.print(table)
 
-    # --------------------------- сообщения LLM -------------------------- #
+    # --------------------------- ответ модели --------------------------- #
+    def _answer_start(self) -> None:
+        """Начало ответа модели: итог группы шагов и пустая строка перед ответом."""
+        self._flush_group()
+        self._gap = False
+        if not self._blank:
+            self._out()
+        self._answer_open = False
+
+    def _gutter(self, lines: Lines, *, commit: bool = True) -> Lines:
+        """Строки ответа: знак ✦ слева у первой строки ответа, отступ у остальных."""
+        mark = Segment(f"{ICON_BRAND} ", self._c.get_style(f"bold {self._p.brand}"))
+        pad = Segment("  ")
+        first = not self._answer_open
+        out = []
+        for line in lines:
+            out.append([mark if first else pad, *line])
+            first = False
+        if commit and lines:
+            self._answer_open = True
+        return out
+
+    def _answer_width(self) -> int:
+        return max(self._c.width - 2, 20)
+
     def on_assistant_text(self, text: str) -> None:
         """Печать ответа модели целиком (не потоковый режим)."""
         if not text.strip():
             return
-        self._assistant_label()
-        self._c.print(Markdown(sanitize(text)))
-
-    def _assistant_label(self) -> None:
-        self._print_above_live(Text(f"{ICON_BRAND} gigacrew", style=f"bold {BRAND}"))
+        self._answer_start()
+        options = self._c.options.update_width(self._answer_width())
+        lines = self._c.render_lines(Markdown(sanitize(text)), options, pad=False)
+        self._out(SegmentLines(self._gutter(lines), new_lines=True))
+        self._gap = True
 
     # ----------------------- потоковый вывод LLM ------------------------ #
     def on_stream_start(self) -> None:
         """Запрос отправлен: индикатор ожидания до первого токена."""
         self._md = None
         self._raw_started = False
-        self._start_live(_LiveView("думаю", hint=self._turn_hint))
+        self._start_live(self._view("думаю"))
+
+    def _answer_tail(self) -> Lines:
+        md = self._md
+        return self._gutter(md.tail_lines(), commit=False) if md is not None else []
 
     def on_stream_delta(self, text: str) -> None:
         """Очередной кусок текста модели."""
@@ -459,17 +636,19 @@ class Console(AgentEvents):
         if not self._live_ok:
             if not self._raw_started:
                 self._raw_started = True
-                self._assistant_label()
+                self._answer_start()
+                self._c.file.write(f"{ICON_BRAND} ")
+                self._blank = False
             self._c.file.write(text)
             self._c.file.flush()
             return
         if self._md is None:
-            self._md = MarkdownStream(self._c)
-            self._assistant_label()  # при активной области печатается над ней
-            self._start_live(_LiveView("печатает", tail=self._md.tail_lines, hint=self._turn_hint))
+            self._answer_start()
+            self._md = MarkdownStream(self._c, width=self._answer_width())
+            self._start_live(self._view("печатает", tail=self._answer_tail))
         lines = self._md.feed(text)
         if lines:
-            self._print_above_live(SegmentLines(lines, new_lines=True))
+            self._out(SegmentLines(self._gutter(lines), new_lines=True))
 
     def on_stream_end(self) -> None:
         """Ответ закончен (или прерван): убрать индикатор, дорисовать хвост."""
@@ -478,140 +657,330 @@ class Console(AgentEvents):
         if md is not None:
             lines = md.finish()
             if lines:
-                self._c.print(SegmentLines(lines, new_lines=True))
+                self._out(SegmentLines(self._gutter(lines), new_lines=True))
+            self._gap = True
         if self._raw_started:
             self._raw_started = False
             self._c.file.write("\n")
             self._c.file.flush()
+            self._gap = True
 
     # --------------------------- инструменты ---------------------------- #
+    def _find(self, call: ToolCallInfo, steps: Sequence[_Step] = ()) -> _Step | None:
+        """Шаг вызова: тот же объект или (для копии с подробностями вопроса) последний
+        шаг без результата с тем же именем и описанием."""
+        candidates = list(steps)
+        if not candidates:
+            if self._group is not None:
+                candidates += self._group.steps
+            if self._step is not None:
+                candidates.append(self._step)
+        for step in reversed(candidates):
+            if step.call is call:
+                return step
+        for step in reversed(candidates):
+            if step.result is None and (step.call.name, step.call.summary) == (
+                call.name,
+                call.summary,
+            ):
+                return step
+        return None
+
+    def _in_group(self, step: _Step) -> bool:
+        return self._group is not None and any(s is step for s in self._group.steps)
+
     def on_tool_call(self, call: ToolCallInfo) -> None:
-        line = Text()
-        line.append(f"{ICON_TOOL} ", style=f"bold {OK}")
-        line.append(call.name, style="bold")
-        if call.summary:
-            line.append("  ", style=MUTED)
-            line.append(sanitize(call.summary), style=ACCENT)
-        self._c.print(line)
+        kind = _group_kind(call)
+        if self._group is not None and self._group.kind != kind:
+            self._flush_group()
+        step = _Step(call)
+        if kind:
+            if self._group is None:
+                self._group = _Group(kind)
+            self._group.steps.append(step)
+        else:
+            self._step = step
 
     def on_review_start(self, call: ToolCallInfo) -> None:
-        self._start_live(_LiveView("рецензент проверяет команду", hint=self._turn_hint))
+        self._start_live(self._view("рецензент проверяет команду"))
 
     def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
         self.stop_live()
-        if review is not None and review.allowed:
-            line = Text("  ")
-            line.append(f"{ICON_OK} ", style=OK)
-            line.append(sanitize(review.approval), style=MUTED)
-            self._c.print(line)
+        if review is None or not review.allowed:
+            return  # отказ или сбой — дальше вопрос пользователю с подробностями
+        step = self._find(call)
+        if step is not None:
+            step.review = review  # строкой под шагом, когда он выполнится
+        else:
+            self._emit(Text(f"  {sanitize(review.approval)}", style=self._p.dim))
 
     def on_tool_start(self, call: ToolCallInfo) -> None:
-        self._start_live(_LiveView("выполняется", hint=self._turn_hint))
+        step = self._find(call)
+        if step is not None:
+            step.started = time.monotonic()
+        target = _clip(_target(call), 50)
+        if call.kind is ToolKind.COMMAND and target:
+            label = f"$ {target}"
+        else:
+            label = f"{call.name} · {target}" if target else call.name
+        self._start_live(self._view(label))
 
     def on_tool_end(self, call: ToolCallInfo) -> None:
+        step = self._find(call)
+        if step is not None and step.started:
+            step.seconds = time.monotonic() - step.started
         self.stop_live()
 
     def on_tool_result(self, call: ToolCallInfo, result: ToolResult, *, previewed: bool) -> None:
-        self.tool_result(result.summary or ("готово" if result.ok else "ошибка"), ok=result.ok)
+        step = self._find(call)
+        if step is None:  # результат без on_tool_call — строкой сразу
+            step = _Step(call)
+        step.result = result
+        if self._in_group(step):
+            return  # итог группы — когда она закончится
+        if step is self._step:
+            self._step = None
+        if call.name in _SELF_REPORTING and result.ok:
+            return
+        for line in self._step_lines(step):
+            self._emit(line)
+        if self._sub_steps:
+            for line in self._subagent_lines(self._sub_steps):
+                self._emit(line)
+            self._sub_steps = []
+
+    # -------- строки шагов -------- #
+    def _stat(self, added: int, removed: int) -> Text:
+        return Text.assemble((f"+{added}", self._p.ok), " ", (f"−{removed}", self._p.danger))
+
+    def _detail(self, call: ToolCallInfo, result: ToolResult) -> str:
+        """Итог удачного шага: у команды — последняя строка вывода (итог тестов, сборки),
+        у прочего — размер вывода, код выхода или итог без цели."""
         shown = result.display
-        if not shown or not shown.text.strip():
-            return
-        if shown.kind == "diff":
-            # дифф уже показан при подтверждении — не дублируем
-            if not previewed:
-                self.diff(shown.text, title=shown.title or None)
+        if shown is not None and shown.kind == "text":
+            lines = [x.strip() for x in shown.text.splitlines() if x.strip()]
+            if lines and call.kind is ToolKind.COMMAND:
+                return _clip(sanitize(lines[-1]))
+            if lines:
+                n = len(lines)
+                return f"вывод: {n} {plural(n, 'строка', 'строки', 'строк')}"
+        if result.exit_code is not None:
+            return f"код {result.exit_code}"
+        summary = sanitize(result.summary or "готово")
+        target = _target(call)
+        if target and target in summary:  # «прочитан a.py (12 строк)» — путь уже в шаге
+            summary = summary.replace(target, " ").strip(" :")
+            summary = re.sub(r"\s{2,}", " ", summary)
+        return _clip(summary or "готово")
+
+    def _failure(self, result: ToolResult) -> str:
+        if result.exit_code is not None:
+            return f"код {result.exit_code}"
+        return sanitize(result.summary or "ошибка")
+
+    def _edit_line(self, call: ToolCallInfo, result: ToolResult) -> Text:
+        p = self._p
+        path = _target(call)
+        if not result.ok:
+            return Text.assemble(
+                (f"{ICON_TOOL} ", p.danger),
+                (f"{call.name} {path}".strip(), f"bold {p.fg}"),
+                (f"  {ICON_FAIL} {sanitize(result.summary or 'ошибка')}", f"bold {p.danger}"),
+            )
+        verb = "Создал" if result.summary.startswith("создан") else "Изменил"
+        line = Text.assemble((f"{ICON_TOOL} ", p.ok), (f"{verb} {path}", f"bold {p.fg}"))
+        stat = _diff_stat(result)
+        if stat is not None:
+            line.append("  ")
+            line.append_text(self._stat(*stat))
+        return line
+
+    def _step_lines(self, step: _Step) -> list[Text]:
+        """Шаг одной строкой: ● что сделано  ✔ итог · время; под ней — рецензент и,
+        если шаг упал, последние строки вывода."""
+        p = self._p
+        call, result = step.call, step.result
+        assert result is not None
+        if call.kind is ToolKind.EDIT:
+            lines = [self._edit_line(call, result)]
         else:
-            self.output_block(clip_lines(shown.text), title=shown.title or "вывод")
+            target = _target(call)
+            head = f"$ {target}" if call.kind is ToolKind.COMMAND else f"{call.name} {target}"
+            status = Text()
+            if result.ok:
+                status.append(f"{ICON_OK} ", style=p.ok)
+                status.append(self._detail(call, result), style=p.muted)
+            else:
+                status.append(f"{ICON_FAIL} {self._failure(result)}", style=f"bold {p.danger}")
+            if step.seconds >= _SHOW_SECONDS:
+                status.append(f"  ·  {step.seconds:.1f} с", style=p.dim)
+            # Не помещается в строку — короче команда, а не итог.
+            room = self._c.width - 1 - len(status) - 4
+            head = head.strip()
+            if len(head) > room:
+                head = _clip(head, max(room, 24))
+            line = Text.assemble(
+                (f"{ICON_TOOL} ", p.ok if result.ok else p.danger),
+                (head, f"bold {p.fg}"),
+                ("  ", ""),
+            )
+            lines = [self._fit(line + status)]
+        if step.review is not None:
+            lines.append(Text(f"  {sanitize(step.review.approval)}", style=p.dim))
+        if not result.ok and result.display is not None and result.display.kind == "text":
+            output = [x for x in sanitize(result.display.text).splitlines() if x.strip()]
+            output = [x for x in output if not _SEPARATOR_RE.match(x.strip())]
+            for out_line in output[-_TAIL_LINES:]:
+                lines.append(self._fit(Text.assemble(("  │ ", p.danger), (out_line, ""))))
+        return lines
 
-    def tool_result(self, summary: str, ok: bool = True, *, indent: str = "  ") -> None:
-        summary = sanitize(summary)
-        line = Text(indent)
-        if ok:
-            line.append(f"{ICON_ARROW} ", style=OK)
-            line.append(summary, style=MUTED)
-        else:
-            line.append(f"{ICON_ARROW} {ICON_FAIL} ", style=f"bold {DANGER}")
-            line.append(summary, style=DANGER)
-        self._print_above_live(line)
+    def _failed_line(self, step: _Step) -> Text:
+        """Неудачный шаг внутри группы: ✘ что — почему."""
+        p = self._p
+        assert step.result is not None
+        return Text.assemble(
+            (f"  {ICON_FAIL} ", f"bold {p.danger}"),
+            (f"{step.call.name} {_target(step.call)}".strip(), p.danger),
+            ("  ", ""),
+            (sanitize(step.result.summary or "ошибка"), p.danger),
+        )
 
-    def diff(self, diff_text: str, *, title: str | None = None) -> None:
-        if not diff_text.strip():
+    def _read_lines(self, steps: Sequence[_Step]) -> list[Text]:
+        """Итог группы чтений: «Изучил код» со счётчиками, цели, ошибки."""
+        p = self._p
+        if len(steps) == 1:
+            return self._step_lines(steps[0])
+        ok = [s for s in steps if s.result is not None and s.result.ok]
+        failed = [s for s in steps if s.result is not None and not s.result.ok]
+        head = Text.assemble(
+            (f"{ICON_TOOL} ", p.ok if ok else p.danger), ("Изучил код", f"bold {p.fg}")
+        )
+        rest = _read_counts(ok)
+        seconds = sum(s.seconds for s in steps)
+        if seconds >= _SHOW_SECONDS:
+            rest = f"{rest}  ·  {seconds:.1f} с" if rest else f"{seconds:.1f} с"
+        if rest:
+            head.append(f"  {rest}", style=p.muted)
+        lines = [head]
+        targets = list(dict.fromkeys(_target(s.call) for s in ok if _target(s.call)))
+        if targets:
+            lines.append(self._fit(Text("  " + "  ".join(targets), style=p.muted)))
+        lines += [self._failed_line(s) for s in failed]
+        return lines
+
+    def _edit_lines(self, steps: Sequence[_Step]) -> list[Text]:
+        """Итог группы правок: файл и +N −M; несколько файлов — строка на файл."""
+        p = self._p
+        ok = [s for s in steps if s.result is not None and s.result.ok]
+        failed = [s for s in steps if s.result is not None and not s.result.ok]
+        files: dict[str, list[int]] = {}
+        for s in ok:
+            stat = _diff_stat(s.result) or (0, 0)  # type: ignore[arg-type]
+            total = files.setdefault(_target(s.call), [0, 0])
+            total[0] += stat[0]
+            total[1] += stat[1]
+        if len(files) <= 1:
+            # Один файл (в том числе несколько правок подряд) — как одна правка.
+            lines = []
+            if ok:
+                last = ok[-1]
+                line = self._edit_line(last.call, last.result)  # type: ignore[arg-type]
+                if len(ok) > 1:
+                    line = Text.assemble(
+                        (f"{ICON_TOOL} ", p.ok), (f"Изменил {_target(last.call)}", f"bold {p.fg}")
+                    )
+                    added, removed = next(iter(files.values()))
+                    line.append("  ")
+                    line.append_text(self._stat(added, removed))
+                lines.append(line)
+            if not ok:  # все правки упали — каждая своей строкой
+                return [line for s in failed for line in self._step_lines(s)]
+            return lines + [self._failed_line(s) for s in failed]
+        n = len(files)
+        head = Text.assemble(
+            (f"{ICON_TOOL} ", p.ok),
+            (f"Изменил {n} {plural(n, 'файл', 'файла', 'файлов')}", f"bold {p.fg}"),
+            ("  ", ""),
+        )
+        head.append_text(
+            self._stat(sum(a for a, _ in files.values()), sum(r for _, r in files.values()))
+        )
+        lines = [head]
+        width = max(len(path) for path in files)
+        for path, (added, removed) in files.items():
+            line = Text(f"  {path:<{width}}  ", style=p.fg)
+            line.append_text(self._stat(added, removed))
+            lines.append(line)
+        return lines + [self._failed_line(s) for s in failed]
+
+    def _flush_group(self) -> None:
+        """Итог идущей группы — в ленту (идемпотентно)."""
+        group, self._group = self._group, None
+        if group is None:
             return
-        syntax = Syntax(
-            sanitize(diff_text).rstrip(),
-            "diff",
-            theme="ansi_dark",
-            background_color="default",
-            word_wrap=True,
-        )
-        self._print_above_live(
-            Panel(
-                syntax,
-                title=Text(title or "изменения", style=ACCENT),
-                title_align="left",
-                box=ROUNDED,
-                border_style=MUTED,
-                padding=(0, 1),
-                expand=False,
-            )
-        )
-
-    def _exact_block(self, preview: Display) -> bool:
-        """Превью того, что выполнится: целиком, без обрезки и молча удалённых символов.
-
-        Возвращает True, если оно не помещается на экран (тогда предлагается просмотрщик).
-        """
-        text = preview.text.rstrip("\n")
-        lines = text.split("\n")
-        title = preview.title or "превью"
-        if len(lines) >= _NUMBER_LINES_FROM:
-            n = len(lines)
-            title += f" · {n} {plural(n, 'строка', 'строки', 'строк')}"
-        self._print_above_live(
-            Panel(
-                visible_text(text),
-                title=Text(title, style=MUTED),
-                title_align="left",
-                box=ROUNDED,
-                border_style=MUTED,
-                padding=(0, 1),
-                expand=False,
-            )
-        )
-        width = max(self._c.size.width - 4, 20)
-        height = sum(max(1, -(-len(line) // width)) for line in lines)
-        return height > max(self._c.size.height - 8, 10)
-
-    def _page(self, preview: Display) -> None:
-        """Показать превью в просмотрщике (less и т.п.) — длинную команду целиком."""
-        body = visible_text(preview.text.rstrip("\n"), numbered=True)
-        with self._input_guard(), self._c.pager(styles=True):
-            self._c.print(Text(preview.title or "превью", style=MUTED))
-            self._c.print(body)
-
-    def output_block(self, text: str, *, title: str = "вывод") -> None:
-        if not text.strip():
+        steps = [s for s in group.steps if s.result is not None]
+        if not steps:
             return
-        body = Text(sanitize(text).rstrip())
-        body.highlight_regex(_SKIPPED_RE, f"italic {MUTED}")
-        self._print_above_live(
-            Panel(
-                body,
-                title=Text(title, style=MUTED),
-                title_align="left",
-                box=ROUNDED,
-                border_style=MUTED,
-                padding=(0, 1),
-                expand=False,
+        lines = self._read_lines(steps) if group.kind == "read" else self._edit_lines(steps)
+        self._gap_line()
+        for line in lines:
+            self._out(line)
+
+    def _live_rows(self, steps: Sequence[_Step]) -> list[Text]:
+        """Последние шаги для временной области: ✔/✘/◌, инструмент, цель, итог."""
+        p = self._p
+        rows = []
+        hidden = len(steps) - _LIVE_STEPS
+        if hidden > 0:
+            rows.append(Text(f"  … ещё {hidden}", style=p.dim))
+            steps = steps[-_LIVE_STEPS:]
+        for s in steps:
+            result = s.result
+            if result is None:
+                mark = (f"  {ICON_PENDING} ", p.warn)
+            elif result.ok:
+                mark = (f"  {ICON_OK} ", p.ok)
+            else:
+                mark = (f"  {ICON_FAIL} ", p.danger)
+            row = Text.assemble(mark, (s.call.name, p.muted), ("  ", ""), (_target(s.call), p.fg))
+            if result is not None:
+                row.append("  ")
+                stat = _diff_stat(result) if result.ok else None
+                if stat is not None:
+                    row.append_text(self._stat(*stat))
+                else:
+                    row.append(
+                        sanitize(result.summary or ""), style=p.dim if result.ok else p.danger
+                    )
+            rows.append(self._fit(row))
+        return rows
+
+    def _live_steps(self) -> list[Text]:
+        """Что показать над индикатором: идущую группу или шаги суб-агента."""
+        group = self._group
+        if group is not None and group.steps:
+            p = self._p
+            steps = list(group.steps)
+            n = len(steps)
+            title = "Изучаю код" if group.kind == "read" else "Правлю файлы"
+            head = Text.assemble(
+                (f"{ICON_TOOL} ", p.warn),
+                (title, f"bold {p.fg}"),
+                (f"  {n} {plural(n, 'вызов', 'вызова', 'вызовов')}", p.muted),
             )
-        )
+            return [head, *self._live_rows(steps)]
+        if self._sub is not None and self._sub_steps:
+            return self._live_rows(list(self._sub_steps))
+        return []
 
     # ---------------------------- суб-агенты ----------------------------- #
     def on_subagent_start(self, info: SubagentInfo) -> None:
+        self._flush_group()
         self._sub = info
         self._sub_started = time.monotonic()
         self._sub_activity = "думаю"
         self._sub_wrapping = False
+        self._sub_steps = []
         self._start_subagent_live()
 
     def _subagent_label(self) -> str:
@@ -622,7 +991,7 @@ class Console(AgentEvents):
         if self._sub is None:
             return
         self._start_live(
-            _LiveView(self._subagent_label, hint=self._subagent_hint, started=self._sub_started)
+            self._view(self._subagent_label, hint=self._subagent_hint, started=self._sub_started)
         )
 
     def on_subagent_activity(
@@ -634,29 +1003,53 @@ class Console(AgentEvents):
             self._start_subagent_live()
 
     def on_subagent_tool_call(self, info: SubagentInfo, call: ToolCallInfo) -> None:
-        line = Text(f"    {ICON_SUBSTEP} ", style=MUTED)
-        line.append(call.name, style="bold")
-        if call.summary:
-            line.append("  ", style=MUTED)
-            line.append(sanitize(call.summary), style=MUTED)
-        self._print_above_live(line)
+        self._sub_steps.append(_Step(call))
 
     def on_subagent_tool_result(
         self, info: SubagentInfo, call: ToolCallInfo, result: ToolResult, *, previewed: bool
     ) -> None:
-        # Шаги суб-агента — коротко: только неудачи и правки, не показанные при
-        # подтверждении (вывод команд и найденное читает сам суб-агент).
-        if not result.ok:
-            self.tool_result(result.summary or "ошибка", ok=False, indent="      ")
-            return
-        shown = result.display
-        if shown and shown.kind == "diff" and shown.text.strip() and not previewed:
-            self.diff(shown.text, title=shown.title or None)
+        step = self._find(call, self._sub_steps) if self._sub_steps else None
+        if step is None:
+            step = _Step(call)
+            self._sub_steps.append(step)
+        step.result = result
 
     def on_subagent_end(self, info: SubagentInfo, stats: TurnStats | None) -> None:
         self.stop_live()  # до сброса: последняя отрисовка ещё читает метку
         self._sub = None
         self._sub_wrapping = False
+
+    def _subagent_lines(self, steps: Sequence[_Step]) -> list[Text]:
+        """Что сделал суб-агент — под строкой его вызова: счётчики, правки, неудачи."""
+        p = self._p
+        done = [s for s in steps if s.result is not None]
+        ok = [s for s in done if s.result.ok]  # type: ignore[union-attr]
+        parts = []
+        reads = [s for s in ok if s.call.read_only]
+        if reads:
+            parts.append(_read_counts(reads))
+        edits: dict[str, list[int]] = {}
+        for s in ok:
+            if s.call.kind is ToolKind.EDIT:
+                stat = _diff_stat(s.result) or (0, 0)  # type: ignore[arg-type]
+                total = edits.setdefault(_target(s.call), [0, 0])
+                total[0] += stat[0]
+                total[1] += stat[1]
+        if edits:
+            if len(edits) <= 3:
+                shown = ", ".join(f"{path} +{a} −{r}" for path, (a, r) in edits.items())
+                parts.append(f"изменил {shown}")
+            else:
+                n = len(edits)
+                parts.append(f"изменил {n} {plural(n, 'файл', 'файла', 'файлов')}")
+        commands = sum(1 for s in ok if s.call.kind is ToolKind.COMMAND)
+        if commands:
+            parts.append(f"{commands} {plural(commands, 'команда', 'команды', 'команд')}")
+        lines = []
+        if parts:
+            lines.append(Text("  " + ", ".join(parts), style=p.muted))
+        lines += [self._failed_line(s) for s in done if not s.result.ok]  # type: ignore[union-attr]
+        return lines
 
     # ---------------------------- статистика ---------------------------- #
     def on_compact_start(self, *, auto: bool) -> None:
@@ -664,7 +1057,7 @@ class Console(AgentEvents):
         if not self._live_ok:
             self.system(f"{title}…")
             return
-        self._start_live(_LiveView(title, hint=self._turn_hint))
+        self._start_live(self._view(title))
 
     def on_compact_end(self, result: CompactResult | None) -> None:
         self.stop_live()
@@ -682,7 +1075,7 @@ class Console(AgentEvents):
         if not self._live_ok:
             self.system(f"{title}…")
             return
-        self._start_live(_LiveView(title, hint=self._turn_hint))
+        self._start_live(self._view(title))
 
     def on_hook_end(self) -> None:
         self.stop_live()
@@ -703,40 +1096,77 @@ class Console(AgentEvents):
             parts.append(f"контекст ~{format_tokens(stats.context_tokens)}")
         if stats.billed_tokens:
             parts.append(f"потрачено {format_tokens(stats.billed_tokens)} ток.")
-        self._c.print(Text("  " + "  ·  ".join(parts), style=MUTED))
+        self._emit(Text("  " + "  ·  ".join(parts), style=self._p.dim))
 
     # -------------------------- подтверждения --------------------------- #
+    def _bar(self, *, dangerous: bool = False) -> tuple[str, str]:
+        return (f"  {ICON_BAR} ", self._p.danger if dangerous else self._p.warn)
+
+    def _confirm_head(self, call: ToolCallInfo, preview: Display | None, bar: tuple[str, str]):
+        """Что спрашивается — первой строкой вопроса. Однострочное превью команды
+        показывается здесь же, как выполнится (с видимыми невидимыми символами)."""
+        p = self._p
+        text = preview.text.rstrip("\n") if preview is not None else ""
+        if preview is not None and preview.kind != "diff" and text.strip() and "\n" not in text:
+            head = visible_text(text, numbered=False, palette=p)
+            head.stylize("bold")
+            self._out(Text.assemble(bar) + head)
+            return False
+        target = _target(call)
+        if call.kind is ToolKind.COMMAND:
+            head_text = f"$ {target}"
+        else:
+            head_text = f"{call.name} {target}".strip()
+        self._out(Text.assemble(bar, (head_text, f"bold {p.fg}")))
+        if not text.strip():
+            return False
+        if preview is not None and preview.kind == "diff":
+            self._out(Padding(self._diff_panel(preview), (0, 0, 0, 4)))
+            return False
+        return self._exact_block(preview, border=bar[1])  # type: ignore[arg-type]
+
     def confirm(
         self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
     ) -> ConfirmResult:
+        step = self._find(call)
+        if step is not None and self._group is not None and self._in_group(step):
+            # Спрошенный вызов — не часть группы: его строка — после ответа.
+            self._group.steps = [s for s in self._group.steps if s is not step]
+            self._step = step
+        self._flush_group()
         self.stop_live()  # превью печатается до вопроса — область уже не нужна
-        long_preview = False
-        if preview and preview.text.strip():
-            if preview.kind == "diff":
-                self.diff(preview.text, title=preview.title or None)
-            else:
-                long_preview = self._exact_block(preview)
-        if call.purpose:
-            self._c.print(Text(f"  зачем (со слов модели): {sanitize(call.purpose)}", style=MUTED))
+        self._gap_line()
+        p = self._p
+        bar = self._bar(dangerous=dangerous)
+        long_preview = self._confirm_head(call, preview, bar)
+        labeled = []
         if call.reason:
-            self._c.print(Text(f"  почему спрашиваю: {sanitize(call.reason)}", style=MUTED))
+            label = "почему опасно" if dangerous else "почему спрашиваю"
+            style = f"bold {p.danger}" if dangerous else p.muted
+            labeled.append((label, style, Text(sanitize(call.reason), style=p.fg)))
+        if call.purpose:
+            purpose = Text.assemble((sanitize(call.purpose), p.muted), ("  со слов модели", p.dim))
+            labeled.append(("зачем", p.muted, purpose))
+        width = max((len(label) for label, _, _ in labeled), default=0)
+        for label, style, text in labeled:
+            self._out(Text.assemble(bar, (f"{label:<{width}}  ", style)) + text)
         if call.review:
-            self._c.print(Text(f"  {sanitize(call.review)}", style=MUTED))
+            self._out(Text.assemble(bar, (sanitize(call.review), p.muted)))
         if call.history:
-            self._c.print(Text(f"  {sanitize(call.history)}", style=MUTED))
-        edit = call.kind is ToolKind.EDIT
-        action = "Применить" if edit else "Выполнить"
-        summary = sanitize(call.summary).strip()
-        if "\n" in summary:  # многострочная команда целиком — в превью выше
-            summary = summary.split("\n", 1)[0].rstrip() + " …"
-        target = f" ({summary})" if summary else ""
+            self._out(Text.assemble(bar, (sanitize(call.history), p.muted)))
+        self._out(Text.assemble(bar))
+        if call.kind is ToolKind.EDIT:
+            question = "Применить правку?"
+        elif call.kind is ToolKind.COMMAND:
+            question = "Выполнить опасную команду?" if dangerous else "Выполнить команду?"
+        else:
+            question = f"Выполнить {call.name}?"
         always = None
         if not dangerous:  # опасное «навсегда» не разрешается
             if call.remember:
                 always = sanitize(call.remember)
             else:
                 always = "не спрашивать этот вызов до конца сессии"
-        question = f"{action} {call.name}{target}?"
         while True:
             raw = self._question_raw(
                 question, dangerous=dangerous, always=always, feedback=True, view=long_preview
@@ -757,6 +1187,57 @@ class Console(AgentEvents):
         # Свой ответ вместо y/n — отказ с объяснением: его получит модель.
         return ConfirmResult(Approval.NO, feedback=raw.strip())
 
+    def _diff_panel(self, preview: Display) -> Panel:
+        syntax = Syntax(
+            sanitize(preview.text).rstrip(),
+            "diff",
+            theme="ansi_dark",
+            background_color="default",
+            word_wrap=True,
+        )
+        return Panel(
+            syntax,
+            title=Text(preview.title or "изменения", style=self._p.fg),
+            title_align="left",
+            box=ROUNDED,
+            border_style=self._p.dim,
+            padding=(0, 1),
+            expand=False,
+        )
+
+    def _exact_block(self, preview: Display, *, border: str) -> bool:
+        """Превью того, что выполнится: целиком, без обрезки и молча удалённых символов.
+
+        Возвращает True, если оно не помещается на экран (тогда предлагается просмотрщик).
+        """
+        p = self._p
+        text = preview.text.rstrip("\n")
+        lines = text.split("\n")
+        title = preview.title or "превью"
+        if len(lines) >= _NUMBER_LINES_FROM:
+            n = len(lines)
+            title += f" · {n} {plural(n, 'строка', 'строки', 'строк')}"
+        panel = Panel(
+            visible_text(text, palette=p),
+            title=Text(title, style=p.muted),
+            title_align="left",
+            box=ROUNDED,
+            border_style=border,
+            padding=(0, 1),
+            expand=False,
+        )
+        self._out(Padding(panel, (0, 0, 0, 4)))
+        width = max(self._c.size.width - 8, 20)
+        height = sum(max(1, -(-len(line) // width)) for line in lines)
+        return height > max(self._c.size.height - 8, 10)
+
+    def _page(self, preview: Display) -> None:
+        """Показать превью в просмотрщике (less и т.п.) — длинную команду целиком."""
+        body = visible_text(preview.text.rstrip("\n"), numbered=True, palette=self._p)
+        with self._input_guard(), self._c.pager(styles=True):
+            self._c.print(Text(preview.title or "превью", style=self._p.muted))
+            self._c.print(body)
+
     def ask(self, question: str, *, dangerous: bool = False) -> bool:
         """Вопрос да/нет. Ctrl+C/Ctrl+D — «нет»."""
         return self._question(question, dangerous=dangerous) in _YES
@@ -776,33 +1257,50 @@ class Console(AgentEvents):
         view: bool = False,
     ) -> str | None:
         """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода)."""
+        self._flush_group()
         self.stop_live()
-        color = DANGER if dangerous else WARN
+        p = self._p
+        bar = self._bar(dangerous=dangerous)
+        notes = []
         if always is not None:
-            self._c.print(Text(f"  a — {always}", style=MUTED))
+            notes.append(f"a — {always}")
+        elif dangerous and feedback:
+            notes.append("запомнить нельзя")
         if view:
-            self._c.print(Text("  v — открыть целиком в просмотрщике", style=MUTED))
+            notes.append("v — открыть целиком в просмотрщике")
         if feedback:
-            self._c.print(Text("  или напишите, что сделать вместо этого", style=MUTED))
-        prompt = Text("  ")
-        prompt.append("⚠ ОПАСНО: " if dangerous else "? ", style=f"bold {color}")
-        prompt.append(question, style="bold")
+            notes.append("или напишите, что сделать вместо этого")
+        joined = " · ".join(notes)
+        if len(joined) + len(bar[0]) < self._c.width:
+            notes = [joined] if notes else []
+        for note in notes:  # не помещаются в строку — по строке на подсказку
+            self._out(Text.assemble(bar, (note, p.dim)))
+        mark = f"{ICON_DANGER} " if dangerous else "? "
         keys = "y/N" + ("/a" if always is not None else "") + ("/v" if view else "")
-        prompt.append(f" [{keys}] ", style=MUTED)
+        prompt = Text.assemble(
+            bar,
+            (mark, f"bold {bar[1]}"),
+            (question, f"bold {p.fg}"),
+            (f" [{keys}] ", p.muted),
+        )
         try:
             with self._input_guard():
                 answer = self._c.input(prompt)
         except (EOFError, KeyboardInterrupt):
             self._c.print()
             return None
+        finally:
+            self._blank = False
         return answer
 
     # ---------------------------- вопросы агента ---------------------------- #
     def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
         """Задаёт вопросы по очереди (меню со стрелками или ввод номера). None — отказ."""
+        self._flush_group()
         self.stop_live()
         if not _stdin_is_terminal():
             raise QuestionsUnavailable("ввод не с клавиатуры")
+        p = self._p
         answers: list[Answer] = []
         with self._input_guard():
             for i, question in enumerate(questions, 1):
@@ -810,26 +1308,53 @@ class Console(AgentEvents):
                     self._question_body(question)
                 answer = self._ask_one(question, i, len(questions))
                 if answer is None:
-                    self._c.print(Text("  ? пользователь отказался отвечать", style=MUTED))
+                    self._emit(
+                        Text.assemble(
+                            (f"{ICON_TOOL} ", p.dim),
+                            (sanitize(question.text), p.muted),
+                            ("  пользователь отказался отвечать", p.dim),
+                        )
+                    )
                     return None
-                line = Text("  ? ", style=f"bold {BRAND}")
-                line.append(sanitize(question.text), style="bold")
-                line.append(f" {ICON_ARROW} ", style=MUTED)
-                line.append(sanitize(format_answer(answer)), style=ACCENT)
-                self._c.print(line)
+                self._emit(self._answered(question, answer))
                 answers.append(answer)
         return answers
 
+    def _answered(self, question: Question, answer: Answer) -> Text:
+        """Строка ленты после ответа: вопрос серым, ответ ярким."""
+        p = self._p
+        line = Text.assemble(
+            (f"{ICON_TOOL} ", p.ok), (sanitize(question.text), p.muted), ("  ", "")
+        )
+        for i, label in enumerate(answer.selected):
+            if i:
+                line.append(", ", style=p.muted)
+            line.append(sanitize(label), style=f"bold {p.fg}")
+        if answer.custom:
+            if answer.selected:
+                line.append(", ", style=p.muted)
+            label = (question.custom_label or "Свой ответ…").rstrip("…").lower()
+            line.append(f"{label} ", style=p.muted)
+            line.append(f"«{sanitize(answer.custom)}»", style=f"bold {p.fg}")
+        if not answer.selected and not answer.custom:
+            line.append("(без ответа)", style=p.muted)
+        return line
+
     def _question_body(self, question: Question) -> None:
         """Подробности к вопросу (например, план на одобрение) — Markdown в рамке."""
-        self._c.print(
+        p = self._p
+        self._emit(
             Panel(
                 Markdown(sanitize(question.body)),
-                title=Text(question.header or "подробности", style=f"bold {BRAND}"),
+                title=Text(f" {question.header or 'подробности'} ", style=f"bold {p.brand}"),
                 title_align="left",
+                subtitle=Text(f" {sanitize(question.source)} ", style=p.dim)
+                if question.source
+                else None,
+                subtitle_align="right",
                 box=ROUNDED,
-                border_style=BRAND,
-                padding=(0, 1),
+                border_style=p.dim,
+                padding=(1, 2),
             )
         )
 
@@ -845,22 +1370,32 @@ class Console(AgentEvents):
 
     def _ask_plain(self, question: Question, index: int, total: int) -> Answer | None:
         """Запасной режим без интерактивного меню: номер(а) варианта или свой текст."""
-        title = Text(f"Вопрос {index} из {total}", style=f"bold {BRAND}")
-        if question.header:
-            title.append(f" · {question.header}", style=ACCENT)
-        self._c.print(title)
-        self._c.print(Text(question.text, style="bold"))
+        p = self._p
+        bar = self._bar()
+        head = Text.assemble(bar, ("? ", f"bold {p.warn}"), (question.text, f"bold {p.fg}"))
+        tag = question.header
+        if total > 1:
+            tag = f"{tag} · {index} из {total}" if tag else f"{index} из {total}"
+        if tag:
+            head.append(f"   {tag}", style=p.muted)
+        self._out(head)
         options = question.options
         for k, option in enumerate(options, 1):
-            self._c.print(Text(f"  {k}. {option.label}"))
+            self._out(Text.assemble(bar, (f"  {k}. ", p.muted), (option.label, p.fg)))
             if option.description:
-                self._c.print(Text(f"     {option.description}", style=MUTED))
+                self._out(Text.assemble(bar, (f"     {option.description}", p.dim)))
         custom = len(options) + 1
-        self._c.print(Text(f"  {custom}. Свой ответ (или просто напишите текст)"))
+        label = (question.custom_label or "Свой ответ…").rstrip("…")
+        self._out(
+            Text.assemble(
+                bar, (f"  {custom}. ", p.muted), (f"{label} (или просто напишите текст)", p.fg)
+            )
+        )
         hint = "номера через пробел" if question.multi_select else "номер"
         while True:
             try:
-                raw = self._c.input(Text(f"  {hint} или ответ: ", style=MUTED)).strip()
+                prompt = Text.assemble(bar, (f"{hint} или ответ: ", p.muted))
+                raw = self._c.input(prompt).strip()
                 if not raw:
                     continue
                 numbers = raw.replace(",", " ").split()
@@ -875,7 +1410,7 @@ class Console(AgentEvents):
                     continue
                 text = ""
                 if custom in picked:
-                    text = self._c.input(Text("  ваш ответ: ", style=MUTED)).strip()
+                    text = self._c.input(Text.assemble(bar, ("ваш ответ: ", p.muted))).strip()
                     if not text:
                         continue
                 labels = tuple(options[n - 1].label for n in picked if n != custom)
@@ -883,10 +1418,13 @@ class Console(AgentEvents):
             except (EOFError, KeyboardInterrupt):
                 self._c.print()
                 return None
+            finally:
+                self._blank = False
 
     # ---------------------------- сохранённые чаты ---------------------------- #
     def pick_chat(self, chats: Sequence[ChatInfo], current_id: str = "") -> ChatInfo | None:
         """Выбор чата: меню со стрелками и поиском, без терминала — номер. None — отмена."""
+        self._flush_group()
         self.stop_live()
         if not chats:
             return None
@@ -900,24 +1438,25 @@ class Console(AgentEvents):
         return self._pick_chat_plain(chats, current_id)
 
     def _pick_chat_plain(self, chats: Sequence[ChatInfo], current_id: str) -> ChatInfo | None:
+        p = self._p
         table = Table.grid(padding=(0, 2))
-        table.add_column(style=ACCENT, justify="right", no_wrap=True)
-        table.add_column(style=MUTED, no_wrap=True)
+        table.add_column(style=p.muted, justify="right", no_wrap=True)
+        table.add_column(style=p.dim, no_wrap=True)
         table.add_column()
         for k, chat in enumerate(chats, 1):
             n = chat.requests
             meta = (
                 f"{format_when(chat.updated_at)} · {n} {plural(n, 'запрос', 'запроса', 'запросов')}"
             )
-            title = Text(sanitize(chat.title))
+            title = Text(sanitize(chat.title), style=p.fg)
             if chat.id == current_id:
-                title.append(" (текущий)", style=MUTED)
+                title.append(" (текущий)", style=p.muted)
             table.add_row(f"{k}.", meta, title)
-        self._c.print(Text(f"Чаты проекта · {len(chats)}", style=f"bold {BRAND}"))
-        self._c.print(table)
+        self.print(Text(f"Чаты проекта · {len(chats)}", style=f"bold {p.brand}"))
+        self.print(table)
         while True:
             try:
-                raw = self._c.input(Text("  номер чата (Enter — отмена): ", style=MUTED))
+                raw = self._c.input(Text("  номер чата (Enter — отмена): ", style=p.muted))
             except (EOFError, KeyboardInterrupt):
                 self._c.print()
                 return None
@@ -930,14 +1469,15 @@ class Console(AgentEvents):
 
     def chat_resumed(self, info: ChatInfo, messages: Sequence[Message]) -> None:
         """Сообщение о продолжении чата и последний обмен репликами."""
+        p = self._p
         n = info.requests
-        line = Text("↺ продолжаем чат ", style=MUTED)
-        line.append(f"«{sanitize(info.title)}»", style=f"bold {ACCENT}")
+        line = Text("↺ продолжаем чат ", style=p.muted)
+        line.append(f"«{sanitize(info.title)}»", style=f"bold {p.fg}")
         line.append(
             f" · {n} {plural(n, 'запрос', 'запроса', 'запросов')} · {format_when(info.updated_at)}",
-            style=MUTED,
+            style=p.muted,
         )
-        self._c.print(line)
+        self.print(line)
         last = next(
             (
                 k
@@ -948,7 +1488,7 @@ class Console(AgentEvents):
         )
         if last is not None:
             shown = clip_lines(request_text(messages[last].content), head=3, tail=2, max_chars=600)
-            self._c.print(Text("› ", style=f"bold {USER}").append(sanitize(shown), style=USER))
+            self.print(Text("❯ ", style=f"bold {p.brand}").append(sanitize(shown), style=p.fg))
             # Ответ ищется только после этого запроса: у прерванного хода его нет, и
             # ответ на предыдущий запрос здесь выглядел бы ответом на этот.
             answer = next(
@@ -960,11 +1500,11 @@ class Console(AgentEvents):
                 "",
             )
             if answer:
-                self._assistant_label()
-                self._c.print(Markdown(sanitize(answer)))
+                self.on_assistant_text(answer)
+                self._gap = False
             else:
-                self._c.print(Text("  (ответа нет — ход не был завершён)", style=MUTED))
-        self._c.print()
+                self.print(Text("  (ответа нет — ход не был завершён)", style=p.muted))
+        self.print()
 
 
 _YES = ("y", "yes", "д", "да")

@@ -18,13 +18,11 @@ from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import FormattedTextControl, Layout, Window
-from prompt_toolkit.output import ColorDepth
-from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 
 from gigacrew.agent.chat_store import ChatInfo
+from gigacrew.ui.colors import prompt_color_depth, prompt_style
 from gigacrew.ui.format import format_when, plural
-from gigacrew.ui.theme import PROMPT_STYLES
 
 WINDOW = 8  # сколько чатов видно одновременно
 _ESC_TIMEOUT = 0.05
@@ -235,8 +233,8 @@ def pick_chat(
     app: Application[ChatInfo | None] = Application(
         layout=Layout(Window(control, wrap_lines=True, dont_extend_height=True)),
         key_bindings=kb,
-        style=Style.from_dict(PROMPT_STYLES),
-        color_depth=ColorDepth.MONOCHROME if no_color else None,
+        style=prompt_style(),
+        color_depth=prompt_color_depth(no_color),
         full_screen=False,
         erase_when_done=True,
         **io,
