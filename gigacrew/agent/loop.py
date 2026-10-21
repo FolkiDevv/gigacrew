@@ -1218,6 +1218,15 @@ class Agent:
                 and verdict.level >= CommandLevel.WRITE
             ):
                 decision = Decision.BLOCK  # план: изменяющая команда, а не проверка
+            if (
+                decision is Decision.ALLOW
+                and source == "yes_flag"
+                and self.mode is PermissionMode.PLAN
+                and verdict is not None
+                and verdict.level is None
+            ):
+                # план: -y не ручается за непроверенную команду — решает пользователь
+                decision = Decision.ASK
             asking = (Decision.ASK, Decision.REVIEW)
             if decision in asking and verdict is not None:
                 rule = self._decisions.match(verdict, plan=self.mode is PermissionMode.PLAN)

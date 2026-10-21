@@ -1580,6 +1580,16 @@ def test_plan_mode_blocks_changing_commands_even_with_yes(tmp_path):
     assert not (tmp_path / "new.txt").exists()
 
 
+def test_plan_mode_asks_for_unverified_commands_even_with_yes(tmp_path):
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "frobnicate --all"}), text_turn("ок")]
+    )
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=True, mode=PermissionMode.PLAN)
+    agent.run_turn("x")
+    assert len(events.confirms) == 1
+
+
 def test_plan_mode_blocks_known_changing_commands(tmp_path):
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "touch new.txt"}), text_turn("ок")]
