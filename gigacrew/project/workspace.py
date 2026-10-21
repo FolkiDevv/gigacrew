@@ -1,12 +1,14 @@
 """Рабочее пространство проекта и служебная папка ``.gigacode/``.
 
 ``.gigacode/`` в корне проекта — место для данных агента (индекс проекта, чаты,
-планы, история ввода) и скиллов (``skills/``, см. :mod:`gigacrew.project.skills`).
+планы, история ввода), скиллов (``skills/``, см. :mod:`gigacrew.project.skills`) и
+настроек (``settings.json`` и личный ``settings.local.json``, см.
+:mod:`gigacrew.project.settings`).
 Папка создаётся лениво, первым компонентом, которому нужно туда писать
 (:meth:`Workspace.ensure_data_dir`), и сразу получает собственный ``.gitignore``:
 рабочие данные агента в репозиторий не попадают, а скиллы — коммитятся.
 Пользовательская папка ``~/.gigacode`` (:func:`user_data_dir`) — замеры окон
-моделей и скиллы, общие для всех проектов.
+моделей, скиллы и настройки, общие для всех проектов.
 """
 
 from __future__ import annotations
@@ -17,10 +19,20 @@ from pathlib import Path
 DATA_DIR_NAME = ".gigacode"
 SKILLS_DIR_NAME = "skills"
 HISTORY_FILE_NAME = "history"
-# Игнорируются только рабочие данные агента — не вся папка: skills/ коммитятся.
-GITIGNORED_DATA: tuple[str, ...] = ("/chats/", "/plans/", "/index/", f"/{HISTORY_FILE_NAME}")
+SETTINGS_FILE_NAME = "settings.json"
+LOCAL_SETTINGS_FILE_NAME = "settings.local.json"
+# Игнорируются только рабочие данные агента и личные настройки — не вся папка: skills/ и
+# settings.json коммитятся.
+GITIGNORED_DATA: tuple[str, ...] = (
+    "/chats/",
+    "/plans/",
+    "/index/",
+    f"/{HISTORY_FILE_NAME}",
+    f"/{LOCAL_SETTINGS_FILE_NAME}",
+)
 _GITIGNORE_BODY = (
-    "# Создано gigacrew: рабочие данные агента не коммитятся, скиллы (skills/) — коммитятся.\n"
+    "# Создано gigacrew: рабочие данные агента и settings.local.json не коммитятся,\n"
+    "# скиллы (skills/) и settings.json — коммитятся.\n"
     + "".join(f"{pattern}\n" for pattern in GITIGNORED_DATA)
 )
 
@@ -28,6 +40,11 @@ _GITIGNORE_BODY = (
 def user_data_dir() -> Path:
     """``~/.gigacode`` — данные пользователя, общие для всех проектов."""
     return Path.home() / DATA_DIR_NAME
+
+
+def user_settings_file() -> Path:
+    """``~/.gigacode/settings.json`` — настройки пользователя (хуки)."""
+    return user_data_dir() / SETTINGS_FILE_NAME
 
 
 @dataclass(frozen=True)
@@ -68,6 +85,16 @@ class Workspace:
     def skills_dir(self) -> Path:
         """Скиллы проекта: ``<имя>/SKILL.md``."""
         return self.data_dir / SKILLS_DIR_NAME
+
+    @property
+    def settings_file(self) -> Path:
+        """Настройки проекта (коммитятся): ``.gigacode/settings.json``."""
+        return self.data_dir / SETTINGS_FILE_NAME
+
+    @property
+    def local_settings_file(self) -> Path:
+        """Личные настройки в проекте (не коммитятся): ``.gigacode/settings.local.json``."""
+        return self.data_dir / LOCAL_SETTINGS_FILE_NAME
 
     def is_data_path(self, path: Path) -> bool:
         """Лежит ли (уже разрешённый) путь внутри ``.gigacode/``.

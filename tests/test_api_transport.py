@@ -7,6 +7,7 @@ ApiError (иначе они роняют REPL).
 from __future__ import annotations
 
 import json
+import ssl
 import time
 
 import httpx
@@ -207,6 +208,27 @@ def test_stream_retries_connect_error_before_output():
     p.close()
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_rejected_server_certificate_is_not_retried(streaming):
+    """Сертификат сервера не прошёл проверку — повтор не поможет: сразу ошибка с подсказкой."""
+    chat_calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        chat_calls.append(request)
+        cause = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        cause.verify_message = "unable to get local issuer certificate"
+        raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED]", request=request) from cause
+
+    p = _provider(handler)
+    with pytest.raises(ApiError, match="GIGACREW_CA_BUNDLE") as e:
+        (p.stream if streaming else p.complete)(_msgs())
+    assert "unable to get local issuer certificate" in str(e.value)
+    assert len(chat_calls) == 1
+    p.close()
+
+
 @pytest.mark.parametrize("exc", [httpx.ProxyError, httpx.LocalProtocolError])
 def test_non_retryable_transport_errors_wrapped(exc):
     def handler(request: httpx.Request) -> httpx.Response:
@@ -286,6 +308,20 @@ def test_usage_from_raw_is_tolerant():
     assert Usage.from_raw("garbage") == Usage()  # type: ignore[arg-type]
     u = Usage.from_raw({"prompt_tokens": "5", "completion_tokens": None, "total_tokens": "x"})
     assert (u.prompt_tokens, u.completion_tokens, u.total_tokens) == (5, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"input_tokens": 10, "input_tokens_details": {"cached_tokens": 4}},
+        {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 4}},
+        {"prompt_tokens": 10, "cached_tokens": 4},
+        {"prompt_tokens": 10, "precached_prompt_tokens": 4, "cached_tokens": 9},
+    ],
+)
+def test_usage_cached_tokens_in_every_layout(raw):
+    usage = Usage.from_raw(raw)
+    assert (usage.prompt_tokens, usage.precached_prompt_tokens) == (10, 4)
 
 
 # ------------------------------ замер окна ------------------------------ #
@@ -435,7 +471,7 @@ def test_measure_prompt_token_errors_are_not_oversize():
     p.close()
 
 
-@pytest.mark.parametrize("status", [502, 503])
+@pytest.mark.parametrize("status", [502, 503, 529])
 def test_measure_prompt_unavailable_gateway_is_not_oversize(status):
     """Временная недоступность — не «не помещается»: иначе окно занизилось бы навсегда."""
 
@@ -448,6 +484,27 @@ def test_measure_prompt_unavailable_gateway_is_not_oversize(status):
     with pytest.raises(ApiError) as e:
         p.measure_prompt("x" * 10)
     assert not isinstance(e.value, PromptTooLong) and "временно недоступен" in str(e.value)
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_overloaded_model_server_is_retried(streaming):
+    """529 — перегрузка сервера модели: повторяется, как 503."""
+    calls = {"chat": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        calls["chat"] += 1
+        if calls["chat"] == 1:
+            return httpx.Response(529, json={"message": "overloaded"})
+        if streaming:
+            return httpx.Response(200, content=_done("ok"))
+        return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+    p = _provider(handler)
+    assert (p.stream if streaming else p.complete)(_msgs()).message.content == "ok"
+    assert calls["chat"] == 2
     p.close()
 
 

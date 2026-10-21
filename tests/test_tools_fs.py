@@ -520,9 +520,7 @@ def test_git_config_write_rejected_in_accept_edits_mode(tmp_path):
         ]
     )
     events = RecordingEvents()
-    cfg = Config(
-        access_key="x", project_root=tmp_path, stream=False, mode=PermissionMode.ACCEPT_EDITS
-    )
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, mode=PermissionMode.AUTO)
     Agent(provider, build_default_registry(), cfg, events).run_turn("настрой git")
     assert events.confirms == []
     assert (tmp_path / ".git" / "config").read_text(encoding="utf-8") == "[core]\n"

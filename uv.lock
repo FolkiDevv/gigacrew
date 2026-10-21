@@ -44,7 +44,7 @@ wheels = [
 
 [[package]]
 name = "gigacrew"
-version = "0.7.0"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -84,7 +84,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.5" },
     { name = "rich", specifier = ">=13.0" },
     { name = "tree-sitter", specifier = "~=0.26.0" },
-    { name = "tree-sitter-bash", specifier = ">=0.25" },
+    { name = "tree-sitter-bash", specifier = ">=0.25,<0.26" },
     { name = "tree-sitter-c", specifier = ">=0.24" },
     { name = "tree-sitter-c-sharp", specifier = ">=0.23.5" },
     { name = "tree-sitter-cpp", specifier = ">=0.23.4" },

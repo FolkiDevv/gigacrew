@@ -14,7 +14,7 @@ from gigacrew.errors import SandboxError, ToolError
 from gigacrew.security import RiskLevel, classify_shell_command
 from gigacrew.tools.fs import MAX_READ_LINES, ReadFileTool
 from gigacrew.tools.git import GitTool
-from gigacrew.tools.process import subprocess_env, truncate_middle
+from gigacrew.tools.process import run_process, subprocess_env, truncate_middle
 from gigacrew.tools.shell import RunShellTool
 
 posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX-only поведение")
@@ -80,6 +80,32 @@ def test_shell_stdin_is_empty(ctx):
     started = time.monotonic()
     res = _sh(ctx, "cat", timeout=20)
     assert res.ok and time.monotonic() - started < 10
+
+
+def test_run_process_feeds_input_to_stdin(tmp_path):
+    big = "ж" * 200_000  # больше буфера канала: запись не должна зависнуть
+    code = "import sys; data = sys.stdin.read(); print(len(data), data[:3])"
+    res = run_process([sys.executable, "-c", code], cwd=tmp_path, timeout=30, input=big)
+    assert res.returncode == 0
+    assert res.stdout.split() == ["200000", "жжж"]
+
+
+def test_run_process_input_ignored_by_command(tmp_path):
+    # Процесс не читает stdin и сразу выходит — без зависания и ошибок канала.
+    res = run_process([sys.executable, "-c", "pass"], cwd=tmp_path, timeout=30, input="x" * 10**6)
+    assert res.returncode == 0 and not res.timed_out
+
+
+def test_run_process_extra_env_survives_secret_filter(tmp_path):
+    code = "import os; print(os.environ.get('GIGACREW_PROJECT_DIR'), os.environ.get('GIGACREW_X'))"
+    res = run_process(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        timeout=30,
+        environ={**os.environ, "GIGACREW_X": "secret"},
+        extra_env={"GIGACREW_PROJECT_DIR": "/proj"},
+    )
+    assert res.stdout.split() == ["/proj", "None"]
 
 
 @posix_only

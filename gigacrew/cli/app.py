@@ -8,23 +8,36 @@
     сохраняется в ``~/.gigacode/models.json``. Окно незамеренной модели
     замеряется и автоматически — при запуске и смене модели.
 
+Провайдер — ``GIGACREW_PROVIDER``: API v2 (по умолчанию) или бэкенд GigaCode
+(``gigacode``): токен — из файла официального CLI GigaCode, модели и их окна — из
+каталога бэкенда, модель по умолчанию — его же.
+
 Чаты сохраняются в ``.gigacode/chats/`` (``--no-save`` — нет); ``-c`` продолжает
 последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
 
+Хуки пользователя — из ``~/.gigacode/settings.json`` и ``.gigacode/settings*.json``
+проекта (:mod:`gigacrew.cli.hooks`), после подтверждения или с ``--trust-hooks``; хук
+PreRequest срабатывает перед каждым запросом к бэкенду GigaCode.
+
 Коды возврата: 0 — успех, 1 — ошибка конфигурации/внутренняя, 2 — ошибка LLM,
-3 — ход остановлен ограничителем (лимит шагов, серия ошибок, зацикливание),
-130 — прервано пользователем (Ctrl+C).
+3 — ход остановлен ограничителем (лимит шагов, серия ошибок, зацикливание) или запрос
+отклонён хуком, 130 — прервано пользователем (Ctrl+C).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from pathlib import Path
 
 from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
+from gigacrew.agent.decisions import DecisionMemory
+from gigacrew.agent.hooks import PromptBlocked
 from gigacrew.agent.loop import Agent
+from gigacrew.agent.reviewer import check_reviewer
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
+from gigacrew.cli.hooks import hook_session, install_request_hook, load_hooks
 from gigacrew.cli.models import (
     describe_result,
     ensure_context_window,
@@ -35,9 +48,11 @@ from gigacrew.cli.repl import autosave, esc_interrupt_for, run_repl
 from gigacrew.config import Config, ConfigError
 from gigacrew.llm.api import ApiProvider
 from gigacrew.llm.base import LLMError, LLMProvider
+from gigacrew.llm.gigacode import GigaCodeProvider
 from gigacrew.llm.model_windows import ModelWindows
-from gigacrew.permissions import PermissionMode
+from gigacrew.permissions import PermissionMode, parse_mode
 from gigacrew.project.skills import SkillCatalog
+from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import build_default_registry
 from gigacrew.ui.console import Console
 
@@ -60,7 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-y",
         "--yes",
         action="store_true",
-        help="Авто-подтверждение операций, кроме опасных (rm -rf, git reset --hard…)",
+        help="Авто-подтверждение операций, кроме опасных (rm -rf, git reset --hard, "
+        "секреты, файлы вне проекта…)",
     )
     p.add_argument(
         "--yes-all",
@@ -69,9 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mode",
-        choices=[mode.value for mode in PermissionMode],
-        help="Начальный режим: manual — всё с подтверждением, edits — правки файлов "
-        "без вопросов, plan — только исследование и план (Shift+Tab — сменить)",
+        type=_mode_arg,
+        metavar="{" + ",".join(mode.value for mode in PermissionMode) + "}",
+        help="Начальный режим: auto (по умолчанию) — правки файлов без вопросов, "
+        "изменяющие команды проверяет модель-рецензент (GIGACREW_REVIEWER_MODEL, по "
+        "умолчанию — модель чата), сомнительные и опасные — с подтверждением; plan — "
+        "только исследование и план (Shift+Tab — сменить). Команды, которые только "
+        "читают, — без вопросов",
     )
     chat = p.add_mutually_exclusive_group()
     chat.add_argument(
@@ -92,7 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-save",
         action="store_true",
-        help="Не сохранять чат в .gigacode/chats/",
+        help="Не сохранять чат в .gigacode/chats/ и журнал решений о командах",
+    )
+    p.add_argument(
+        "--trust-hooks",
+        action="store_true",
+        help="Запускать хуки (~/.gigacode/settings.json, .gigacode/settings*.json) без "
+        "подтверждения — для -p в CI; подтверждение не запоминается",
     )
     p.add_argument("--no-color", action="store_true", help="Отключить цвет")
     p.add_argument(
@@ -113,29 +139,58 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _mode_arg(text: str) -> PermissionMode:
+    """``--mode``: режим по имени (прежние ``manual``/``edits`` — это ``auto``)."""
+    try:
+        return parse_mode(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def _make_provider(config: Config) -> LLMProvider:
+    if config.provider == "gigacode":
+        return GigaCodeProvider(config)
     return ApiProvider(config)
 
 
-def run_oneshot(agent: Agent, ui: Console, prompt: str, chats: ChatRecorder | None = None) -> int:
+def _not_in_catalogue(model: str, known: list[str]) -> str:
+    return f"модели {model} нет в каталоге бэкенда; доступны: {', '.join(known)}"
+
+
+def run_oneshot(
+    agent: Agent,
+    ui: Console,
+    prompt: str,
+    chats: ChatRecorder | None = None,
+    *,
+    resumed: bool = False,
+) -> int:
+    """Один ход; хуки SessionStart/SessionEnd — вокруг него (SessionEnd — после
+    сохранения чата). ``resumed`` — чат продолжен (``-c``/``-r``)."""
     esc = esc_interrupt_for(ui, agent=agent)
-    try:
-        with esc:
-            agent.run_turn(prompt)
-    except LLMError as e:
-        ui.stop_live()
-        ui.error(str(e))
-        return EXIT_LLM_ERROR
-    except KeyboardInterrupt:
-        ui.stop_live()
-        ui.system("\n(прервано)")
-        return EXIT_INTERRUPTED
-    except Exception as e:  # как в REPL: сообщение вместо traceback
-        ui.stop_live()
-        ui.error(f"внутренняя ошибка: {type(e).__name__}: {e}")
-        return EXIT_ERROR
-    finally:
-        autosave(chats, agent, ui)
+    source = "resume" if resumed else "startup"
+    with hook_session(agent, ui, source=source, end_reason="other"):
+        try:
+            with esc:
+                agent.run_turn(prompt)
+        except PromptBlocked as e:
+            ui.stop_live()
+            ui.warn(f"запрос отклонён хуком UserPromptSubmit: {e.reason}")
+            return EXIT_STOPPED
+        except LLMError as e:
+            ui.stop_live()
+            ui.error(str(e))
+            return EXIT_LLM_ERROR
+        except KeyboardInterrupt:
+            ui.stop_live()
+            ui.system("\n(прервано)")
+            return EXIT_INTERRUPTED
+        except Exception as e:  # как в REPL: сообщение вместо traceback
+            ui.stop_live()
+            ui.error(f"внутренняя ошибка: {type(e).__name__}: {e}")
+            return EXIT_ERROR
+        finally:
+            autosave(chats, agent, ui)
     stats = agent.last_turn
     return EXIT_STOPPED if stats is not None and stats.stop_reason else EXIT_OK
 
@@ -194,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             auto_approve=args.yes,
             yes_all=args.yes_all,
-            mode=PermissionMode(args.mode) if args.mode else None,
+            mode=args.mode,
             stream=not args.no_stream,
             save_chats=not args.no_save,
         )
@@ -213,6 +268,23 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     try:
+        # Хуки — до подключения: подтверждение спрашивается до начала работы, а хук
+        # PreRequest идёт уже перед запросом конфигурации (может обновить токен).
+        hooks = load_hooks(
+            Workspace(config.project_root),
+            ui,
+            interactive=not args.prompt and ui.interactive(),
+            trust=args.trust_hooks,
+        )
+        install_request_hook(provider, hooks, ui, config)
+        try:
+            provider.connect()  # токен и каталог моделей (бэкенд GigaCode)
+        except KeyboardInterrupt:
+            ui.system("\n(подключение прервано)")
+            return EXIT_INTERRUPTED
+        except LLMError as e:
+            ui.error(f"не удалось подключиться: {e}")
+            return EXIT_LLM_ERROR
         if args.list_models:
             try:
                 models = provider.list_models()
@@ -222,20 +294,49 @@ def main(argv: list[str] | None = None) -> int:
             ui.info("Доступные модели:\n" + "\n".join(f"  • {m}" for m in models))
             return EXIT_OK
 
+        catalogue = provider.known_models()  # None — каталога нет, модель любая
+        known = None if catalogue is None else [m.id for m in catalogue]
         windows, warning = ModelWindows.load(base_url=config.base_url)
         if warning:
             ui.warn(warning)
+        if catalogue is not None:
+            windows.report({m.id: m.context_window for m in catalogue})
         if args.test_context:
-            return run_test_context(
-                provider, windows, args.test_context.strip(), ui, base_url=config.base_url
-            )
+            model = args.test_context.strip()
+            if known is not None and model not in known:
+                ui.error(_not_in_catalogue(model, known))
+                return EXIT_ERROR
+            return run_test_context(provider, windows, model, ui, base_url=config.base_url)
 
+        if known is not None:
+            if not config.model:  # модель по умолчанию — бэкенда
+                config = dataclasses.replace(config, model=provider.model)
+            elif config.model not in known:
+                ui.error(_not_in_catalogue(config.model, known) + " (список — --list-models)")
+                return EXIT_ERROR
         if not config.model:
             ui.error(
                 "не задана модель: укажите GIGACREW_MODEL или --model (список — --list-models)"
             )
             return EXIT_ERROR
-        agent = Agent(provider, build_default_registry(), config, ui, windows=windows)
+        decisions, warning = DecisionMemory.load(
+            config.project_root, remember=config.remember_approvals, log=config.save_chats
+        )
+        if warning:
+            ui.warn(warning)
+        reviewer, warning = check_reviewer(provider, config.reviewer_model)
+        if warning:
+            ui.warn(warning)
+        agent = Agent(
+            provider,
+            build_default_registry(),
+            config,
+            ui,
+            windows=windows,
+            decisions=decisions,
+            reviewer=reviewer,
+            hooks=hooks,
+        )
         store = ChatStore(agent.workspace)
         chats = ChatRecorder(store, enabled=config.save_chats)
         agent.chat_id = chats.chat_id  # файл плана назван по id чата
@@ -246,7 +347,9 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_ERROR
         if saved is not None:
             # Модель чата, если модель не задана явно через -m.
-            resume_chat(agent, chats, saved, keep_model=args.model is not None)
+            skipped = resume_chat(agent, chats, saved, keep_model=args.model is not None)
+            if skipped:
+                ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {agent.model}")
         commands = default_commands()
         if args.prompt:
             skills = SkillCatalog(agent.workspace)
@@ -257,8 +360,10 @@ def main(argv: list[str] | None = None) -> int:
                 ui.error(str(e))
                 return EXIT_ERROR
             ensure_context_window(agent, ui, interactive=False)
-            return run_oneshot(agent, ui, prompt, chats)
+            return run_oneshot(agent, ui, prompt, chats, resumed=saved is not None)
         resumed = saved.info if saved is not None else None
-        return run_repl(agent, ui, commands, chats=chats, resumed=resumed)
+        return run_repl(
+            agent, ui, commands, chats=chats, resumed=resumed, trust_hooks=args.trust_hooks
+        )
     finally:
         provider.close()

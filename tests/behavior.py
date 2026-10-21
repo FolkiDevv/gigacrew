@@ -56,7 +56,7 @@ from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.index import INDEX_ERRORS, ProjectIndex
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import build_default_registry
-from gigacrew.tools.plan import APPROVE_EDITS, PLAN_QUESTION
+from gigacrew.tools.plan import APPROVE, PLAN_QUESTION
 from gigacrew.tools.questions import Answer, Question
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -822,7 +822,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         goal="одобренный план выполнен в том же ходе",
         mode=PermissionMode.PLAN,
         turns=(Turn(CLEAR_TASK[0].upper() + CLEAR_TASK[1:]),),
-        plan_answers=(Answer((APPROVE_EDITS,)),),
+        plan_answers=(Answer((APPROVE,)),),
         files_expect={"shop/cart.py": "def clear"},
         run_tests=True,
         check=lambda r: r["plan_shown"] >= 1 and bool(r["files_ok"]),
@@ -833,7 +833,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mode=PermissionMode.PLAN,
         turns=(
             Turn(f"Спланируй: {CLEAR_TASK}"),
-            Turn("Выполни план.", mode=PermissionMode.ACCEPT_EDITS),
+            Turn("Выполни план.", mode=PermissionMode.AUTO),
         ),
         plan_answers=(None,),
         files_expect={"shop/cart.py": "def clear"},
@@ -852,7 +852,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
         id="delegate_broad",
         goal="широкий вопрос — разведка через explore",
-        mode=PermissionMode.MANUAL,
+        mode=PermissionMode.AUTO,
         turns=(
             Turn(
                 "Как в проекте устроена обработка ошибок: где какие исключения возникают и "
@@ -865,7 +865,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
         id="delegate_pinpoint",
         goal="точечный вопрос — без суб-агентов",
-        mode=PermissionMode.MANUAL,
+        mode=PermissionMode.AUTO,
         turns=(Turn("Какое исключение бросает parse_price из shop/money.py на пустую строку?"),),
         expect=("ValidationError",),
         check=lambda r: r["task_calls"] == 0 and r["answer_hits"] == 1.0,
@@ -889,7 +889,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         # Справочный: правки — дело основного агента, суб-агенты — на выбор модели
         # (столбец task показывает, звала ли она их).
         goal="две независимые подзадачи выполнены (суб-агенты — на выбор модели)",
-        mode=PermissionMode.ACCEPT_EDITS,
+        mode=PermissionMode.AUTO,
         turns=(
             Turn(
                 "Напиши тесты для shop/payments.py (в tests/test_payments.py) и для "

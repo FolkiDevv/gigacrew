@@ -23,11 +23,23 @@ def _imports(path: Path) -> set[str]:
 
 
 def test_core_does_not_import_ui():
-    core = ["agent", "llm", "tools", "project"]
+    core = ["agent", "llm", "tools", "project", "safety"]
     offenders = []
     for sub in core:
         for path in (PKG / sub).rglob("*.py"):
             for name in _imports(path):
                 if name.startswith(FORBIDDEN_FOR_CORE):
                     offenders.append(f"{path.relative_to(PKG)}: {name}")
+    assert offenders == []
+
+
+def test_tree_sitter_is_imported_only_by_treesitter_module():
+    """API tree-sitter ломается между версиями — он загружается в одном месте."""
+    offenders = []
+    for path in PKG.rglob("*.py"):
+        if path.relative_to(PKG).as_posix() == "project/treesitter.py":
+            continue
+        for name in _imports(path):
+            if name.split(".")[0] in ("tree_sitter", "tree_sitter_bash"):
+                offenders.append(f"{path.relative_to(PKG)}: {name}")
     assert offenders == []

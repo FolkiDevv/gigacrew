@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from gigacrew.agent.events import AgentEvents, ToolCallInfo, TurnStats
-from gigacrew.llm.base import LLMProvider, PromptTooLong
+from gigacrew.llm.base import LLMProvider, ModelInfo, PromptTooLong
 from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, Usage
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, Tool, ToolContext, ToolResult
@@ -20,9 +20,10 @@ class ScriptedProvider(LLMProvider):
     Элемент сценария — AssistantTurn либо исключение (будет брошено). Каждый
     запрос агента записывается в ``requests`` (сообщения + параметры вызова).
 
-    Запросы без инструментов (``tools=None``) — суммаризация при сжатии контекста:
-    у них своя очередь ``summaries`` (по умолчанию ответ «сводка») и журнал
-    ``summary_requests``, чтобы сжатие не съедало ходы сценария.
+    Запросы без инструментов (``tools=None``) — суммаризация при сжатии контекста и
+    модель-рецензент команд: у них своя очередь ``summaries`` (по умолчанию ответ
+    «сводка» — рецензент его не разберёт и передаст решение пользователю) и журнал
+    ``summary_requests``, чтобы такие запросы не съедали ходы сценария.
     """
 
     def __init__(
@@ -112,6 +113,39 @@ class WindowProvider(ScriptedProvider):
         return tokens
 
 
+class CatalogueProvider(WindowProvider):
+    """Провайдер с каталогом моделей, как бэкенд GigaCode: ``connect()`` (токен и каталог)
+    считается и может бросать заготовленные ошибки, модель по умолчанию — первая в каталоге.
+    """
+
+    def __init__(
+        self,
+        turns: Iterable[AssistantTurn | BaseException] = (),
+        *,
+        models: Iterable[tuple[str, int]] = (("cat-a", 64_000), ("cat-b", 32_000)),
+        connect_errors: Iterable[BaseException] = (),
+    ):
+        super().__init__(16_384, turns)
+        self.catalogue = [ModelInfo(name, window) for name, window in models]
+        self.connect_errors = list(connect_errors)
+        self.connects = 0
+
+    @property
+    def model(self) -> str:
+        return self.catalogue[0].id
+
+    def connect(self) -> None:
+        self.connects += 1
+        if self.connect_errors:
+            raise self.connect_errors.pop(0)
+
+    def list_models(self) -> list[str]:
+        return [m.id for m in self.catalogue]
+
+    def known_models(self) -> list[ModelInfo]:
+        return list(self.catalogue)
+
+
 def text_turn(text: str, usage: Usage | None = None) -> AssistantTurn:
     return AssistantTurn(message=Message(role="assistant", content=text), usage=usage or Usage())
 
@@ -166,6 +200,7 @@ class RecordingEvents(AgentEvents):
         self.stats: list[TurnStats] = []
         self.notices: list[tuple[str, str]] = []
         self.compactions: list = []  # CompactResult | None по каждому сжатию
+        self.reviews: list = []  # Review | None по каждой проверке рецензента
 
     def on_stream_start(self) -> None:
         self.events.append(("stream_start", None))
@@ -185,6 +220,13 @@ class RecordingEvents(AgentEvents):
     def confirm(self, call, preview, *, dangerous):
         self.confirms.append((call, preview, dangerous))
         return self.confirm_answer
+
+    def on_review_start(self, call: ToolCallInfo) -> None:
+        self.events.append(("review_start", call))
+
+    def on_review_end(self, call, review) -> None:
+        self.events.append(("review_end", review))
+        self.reviews.append(review)
 
     def on_tool_start(self, call: ToolCallInfo) -> None:
         self.events.append(("tool_start", call))
@@ -215,6 +257,12 @@ class RecordingEvents(AgentEvents):
 
     def on_wrap_up(self, reason):
         self.events.append(("wrap_up", reason))
+
+    def on_hook_start(self, event, command):
+        self.events.append(("hook_start", (event, command)))
+
+    def on_hook_end(self):
+        self.events.append(("hook_end", None))
 
     def on_subagent_start(self, info):
         self.events.append(("subagent_start", info))

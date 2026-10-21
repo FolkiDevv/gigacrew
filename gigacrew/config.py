@@ -22,6 +22,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
+
 from gigacrew.permissions import PermissionMode, parse_mode
 
 
@@ -94,7 +96,13 @@ def _env_bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     val = env.get(name)
     if val is None or not val.strip():
         return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
+    norm = val.strip().lower()
+    if norm in ("1", "true", "yes", "on"):
+        return True
+    if norm in ("0", "false", "no", "off"):
+        return False
+    # Опечатка не должна молча выключать настройку — например, проверку TLS у GigaCode.
+    raise ConfigError(f"{name}: ожидается 1/0, true/false, yes/no или on/off, получено {val!r}")
 
 
 def _env_int(
@@ -129,7 +137,7 @@ def _env_optional_int(env: Mapping[str, str], name: str, *, minimum: int = 1) ->
 def _env_mode(env: Mapping[str, str], name: str) -> PermissionMode:
     raw = env.get(name)
     if raw is None or not raw.strip():
-        return PermissionMode.MANUAL
+        return PermissionMode.AUTO
     try:
         return parse_mode(raw)
     except ValueError as e:
@@ -144,6 +152,22 @@ def _env_choice(env: Mapping[str, str], name: str, choices: tuple[str, ...]) -> 
     if raw not in choices:
         raise ConfigError(f"{name}: ожидается одно из {', '.join(choices)}, получено {raw!r}")
     return raw
+
+
+_HEADER_VALUE_RE = re.compile(r"[\x20-\x7e]+")
+
+
+def _env_header(env: Mapping[str, str], name: str) -> str | None:
+    """Значение HTTP-заголовка: печатный ASCII (пробелы по краям обрезаются); пусто — None.
+
+    Иначе запрос не собрать — ошибка при запуске, а не на первом запросе.
+    """
+    value = (env.get(name) or "").strip()
+    if not value:
+        return None
+    if not _HEADER_VALUE_RE.fullmatch(value):
+        raise ConfigError(f"{name}: допустимы только печатные ASCII-символы, получено {value!r}")
+    return value
 
 
 def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, hi: float) -> float:
@@ -170,7 +194,11 @@ class Config:
     """
 
     # --- API ---
-    # Две схемы авторизации (выбирается автоматически по наличию реквизитов):
+    # Провайдер: "api" — API v2 с авторизацией по ключу или сертификату (см. ниже);
+    # "gigacode" — бэкенд GigaCode: токен из файла его официального CLI, модели из
+    # каталога бэкенда.
+    provider: str = "api"
+    # Две схемы авторизации API v2 (выбирается автоматически по наличию реквизитов):
     #   * OAuth: задан access_key -> Basic-ключ обменивается на Bearer-токен на
     #     auth_url, запросы идут с заголовком Authorization;
     #   * mTLS: заданы cert+key -> клиентский сертификат предъявляется на
@@ -183,10 +211,18 @@ class Config:
     model: str = ""
     auth_url: str | None = None
     base_url: str = ""
+    # Проверка TLS-сертификата сервера. По умолчанию (Config.load) включена у бэкенда
+    # GigaCode — токен принадлежит официальному CLI, который сервер проверяет, — и у
+    # API v2 при заданном ca_bundle.
     verify_ssl: bool = False
     # Корневой сертификат для проверки сервера; задан — проверка TLS включена
-    # по умолчанию.
+    # по умолчанию. У бэкенда GigaCode — в дополнение к стандартным корням.
     ca_bundle: str | None = None
+    # User-Agent всех запросов к бэкенду GigaCode; значения по умолчанию тоже нет.
+    user_agent: str | None = None
+    # Каталог официального CLI GigaCode (GIGACODE_HOME, иначе ~/.gigacode): оттуда
+    # читается токен бэкенда (gigacode_token.json).
+    gigacode_home: str | None = None
     timeout: int = 120
     # Ожидание ответа модели в запросах чата, с (не меньше timeout): вызовы инструментов
     # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план, файл),
@@ -199,9 +235,18 @@ class Config:
     project_root: Path = field(default_factory=Path.cwd)
     auto_approve: bool = False  # пропускать подтверждения, кроме опасных операций (-y)
     yes_all: bool = False  # пропускать и подтверждения опасных операций (--yes-all)
-    # Начальный режим разрешений (ручной / авто-правки / план); в работе режим
-    # меняется в агенте (Shift+Tab, /mode).
-    mode: PermissionMode = PermissionMode.MANUAL
+    # Команды, которые классификатор признал «только чтение» (ls, grep, git log, python
+    # без записи), — без вопроса в любом режиме; False — каждая команда с подтверждением.
+    safe_commands: bool = True
+    # Ответ «всегда» на вопрос о команде сохраняется для проекта в ~/.gigacode/projects/
+    # (переживает сессии); False — только до конца сессии.
+    remember_approvals: bool = True
+    # Начальный режим разрешений (авто / план); в работе режим меняется в агенте
+    # (Shift+Tab, /mode).
+    mode: PermissionMode = PermissionMode.AUTO
+    # Модель-рецензент изменяющих команд в режиме «авто»; None — модель чата (та, что
+    # выбрана сейчас, в том числе после /model).
+    reviewer_model: str | None = None
     max_steps: int = 50  # предохранитель агентного цикла
     max_tool_failures: int = 4  # стоп при N неудачных вызовах подряд (анти-залипание)
     # Одинаковый вызов без изменений между повторами: на N-м — предупреждение
@@ -266,7 +311,9 @@ class Config:
         if ca_bundle and not Path(ca_bundle).expanduser().is_file():
             raise ConfigError(f"GIGACREW_CA_BUNDLE: файл не найден: {ca_bundle}")
 
+        provider = _env_choice(env, "GIGACREW_PROVIDER", ("api", "gigacode"))
         return cls(
+            provider=provider,
             access_key=access_key,
             cert=cert,
             key=key,
@@ -274,8 +321,12 @@ class Config:
             model=model or env.get("GIGACREW_MODEL") or "",
             auth_url=env.get("GIGACREW_AUTH_URL") or None,
             base_url=base_url.rstrip("/"),
-            verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", ca_bundle is not None),
+            verify_ssl=_env_bool(
+                env, "GIGACREW_VERIFY_SSL", ca_bundle is not None or provider == "gigacode"
+            ),
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
+            user_agent=_env_header(env, "GIGACREW_USER_AGENT"),
+            gigacode_home=env.get("GIGACODE_HOME") or None,
             timeout=_env_int(env, "GIGACREW_TIMEOUT", 120),
             read_timeout=_env_int(env, "GIGACREW_READ_TIMEOUT", 600),
             rate_limit_wait=_env_int(env, "GIGACREW_RATE_LIMIT_WAIT", 120, minimum=0),
@@ -295,6 +346,9 @@ class Config:
             save_chats=save_chats and _env_bool(env, "GIGACREW_SAVE_CHATS", True),
             auto_measure=_env_bool(env, "GIGACREW_AUTO_MEASURE", True),
             ty=_env_bool(env, "GIGACREW_TY", True),
+            safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", True),
+            remember_approvals=_env_bool(env, "GIGACREW_REMEMBER_APPROVALS", True),
+            reviewer_model=(env.get("GIGACREW_REVIEWER_MODEL") or "").strip() or None,
             subagent_max_steps=_env_int(env, "GIGACREW_SUBAGENT_MAX_STEPS", 25),
             subagent_context_share=_env_int(
                 env, "GIGACREW_SUBAGENT_CONTEXT", 80, minimum=10, maximum=95
@@ -305,25 +359,37 @@ class Config:
 
     @property
     def auth_mode(self) -> str:
-        """Схема авторизации, выбранная по наличию реквизитов.
+        """Схема авторизации, выбранная по провайдеру и наличию реквизитов.
 
-        ``"oauth"`` — есть access_key; ``"mtls"`` — есть cert+key (и нет ключа);
-        ``"none"`` — реквизитов нет.
+        ``"cli_token"`` — бэкенд GigaCode (токен официального CLI); ``"oauth"`` — есть
+        access_key; ``"mtls"`` — есть cert+key (и нет ключа); ``"none"`` — реквизитов нет.
         """
+        if self.provider == "gigacode":
+            return "cli_token"
         if self.access_key:
             return "oauth"
         if self.cert and self.key:
             return "mtls"
         return "none"
 
+    @property
+    def gigacode_dir(self) -> Path:
+        """Каталог официального CLI GigaCode: ``GIGACODE_HOME``, иначе ``~/.gigacode``."""
+        if self.gigacode_home:
+            return Path(self.gigacode_home).expanduser()
+        return Path.home() / ".gigacode"
+
     def build_ssl_verify(self) -> ssl.SSLContext | bool:
         """Значение для httpx ``verify=``.
 
         Для mTLS строит SSL-контекст с клиентским сертификатом (cert+key); файлы
         проверяются на существование и загружаемость. Для OAuth — флаг проверки
-        TLS-сертификата сервера (verify_ssl) или контекст с ``ca_bundle``.
+        TLS-сертификата сервера (verify_ssl) или контекст с ``ca_bundle``. Для бэкенда
+        GigaCode — контекст с корнями официального CLI (:meth:`_gigacode_ssl_context`).
         """
         if self.auth_mode != "mtls":
+            if self.provider == "gigacode" and self.verify_ssl:
+                return self._gigacode_ssl_context()
             if self.verify_ssl and self.ca_bundle:
                 return ssl.create_default_context(cafile=self.ca_bundle)
             return self.verify_ssl
@@ -352,8 +418,42 @@ class Config:
             raise RuntimeError(f"Не удалось загрузить клиентский сертификат: {e}") from e
         return context
 
+    def _gigacode_ssl_context(self) -> ssl.SSLContext:
+        """Проверка сервера GigaCode с теми же корнями, что у официального CLI: стандартные
+        (как у httpx), его сертификаты — ``certs/*.pem`` и ``*.crt`` в
+        :attr:`gigacode_dir` (туда CLI кладёт свой корпоративный корень) — и ``ca_bundle``.
+        Файл, который не читается как сертификат, — ошибка, а не тихий пропуск.
+        """
+        context = httpx.create_ssl_context()
+        certs = self.gigacode_dir / "certs"
+        files = sorted(
+            path
+            for path in (certs.iterdir() if certs.is_dir() else ())
+            if path.suffix.lower() in (".pem", ".crt") and path.is_file()
+        )
+        if self.ca_bundle:
+            files.append(Path(self.ca_bundle))
+        for path in files:
+            try:
+                context.load_verify_locations(cafile=str(path))
+            except (OSError, ssl.SSLError) as e:
+                raise RuntimeError(f"не удалось загрузить корневой сертификат {path}: {e}") from e
+        return context
+
     def require_credentials(self) -> None:
         """Проверяет, что заданы реквизиты и адреса API (значений по умолчанию нет)."""
+        if self.provider == "gigacode":
+            if not self.base_url:
+                raise RuntimeError(
+                    "Не задан адрес бэкенда GigaCode. Укажите GIGACREW_API_URL в .env или "
+                    "переменных окружения. См. .env.example."
+                )
+            if not self.user_agent:
+                raise RuntimeError(
+                    "Не задан User-Agent для запросов к GigaCode. Укажите GIGACREW_USER_AGENT "
+                    "в .env или переменных окружения. См. .env.example."
+                )
+            return
         if self.auth_mode == "none":
             raise RuntimeError(
                 "Не заданы реквизиты API. Укажите либо GIGACREW_ACCESS_KEY (OAuth), "

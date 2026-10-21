@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 from gigacrew.llm.types import AssistantTurn, Message, ToolChoice, ToolSpec
 
@@ -34,6 +35,14 @@ class PromptTooLong(LLMError):
         super().__init__(f"запрос слишком велик ({code}): {detail[:300]}")
 
 
+@dataclass(frozen=True)
+class ModelInfo:
+    """Модель из каталога провайдера; ``context_window`` — окно, если его сообщает API."""
+
+    id: str
+    context_window: int | None = None
+
+
 class LLMProvider(ABC):
     """Минимальный контракт провайдера для агентного цикла."""
 
@@ -48,9 +57,25 @@ class LLMProvider(ABC):
     def close(self) -> None:  # noqa: B027 — необязательный хук
         """Освобождает ресурсы (соединения). По умолчанию ничего не делает."""
 
+    def connect(self) -> None:  # noqa: B027 — необязательный хук
+        """Подготовка к запросам: проверка токена, загрузка каталога моделей. По умолчанию
+        ничего.
+
+        CLI вызывает его при запуске и перед каждым запросом пользователя — вне хода,
+        поэтому истёкший токен — понятная ошибка до хода, а не сбой посреди него. Ошибки —
+        :class:`LLMError`, Ctrl+C — ``KeyboardInterrupt``.
+        """
+
     def list_models(self) -> list[str]:
         """Доступные чат-модели (для выбора и диагностики). По умолчанию — только текущая."""
         return [self.model]
+
+    def known_models(self) -> list[ModelInfo] | None:
+        """Каталог моделей, если его даёт API: модель выбирается только из него.
+
+        None (по умолчанию) — каталога нет, модель может быть любой.
+        """
+        return None
 
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
         """Отправляет ``text`` одним сообщением с минимальным ответом; возвращает

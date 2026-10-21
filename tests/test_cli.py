@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from fakes import ScriptedProvider, WindowProvider, text_turn, tool_turn
+from fakes import CatalogueProvider, ScriptedProvider, WindowProvider, text_turn, tool_turn
 
 import gigacrew.cli.app as app
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore
@@ -108,6 +108,42 @@ def test_model_and_clear_commands(cli_env, capsys):
     assert len(agent.conversation) == 0
 
 
+def test_permissions_command_lists_forgets_and_shows_log(tmp_path, capsys):
+    from gigacrew.agent.decisions import DecisionMemory
+    from gigacrew.safety import classify
+
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    ui = Console(no_color=True)
+    agent = Agent(ScriptedProvider(), build_default_registry(), cfg, ui, decisions=memory)
+    commands = default_commands()
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands)
+    commands.dispatch("/permissions", ctx)
+    assert "сохранённых разрешений нет" in _out(capsys)
+    memory.approve(classify("pytest -q", root=tmp_path))
+    memory.record(
+        {
+            "command": "pip install x",
+            "cwd": ".",
+            "key": "pip install x",
+            "decision": "no",
+            "source": "user",
+            "feedback": "не надо",
+        }
+    )
+    commands.dispatch("/permissions", ctx)
+    out = _out(capsys)
+    assert "1. «pytest» с проверенными аргументами" in out and "approvals.json" in out
+    commands.dispatch("/permissions log", ctx)
+    assert "нет: pip install x — «не надо»" in _out(capsys)
+    commands.dispatch("/permissions forget 1", ctx)
+    assert "разрешение удалено" in _out(capsys) and memory.rules == []
+    commands.dispatch("/permissions forget 5", ctx)
+    assert "нет разрешения №5" in _out(capsys)
+    commands.dispatch("/permissions bogus", ctx)
+    assert "использование" in _out(capsys)
+
+
 # ------------------------------- REPL ------------------------------- #
 def _reader(*items):
     queue = list(items)
@@ -142,31 +178,7 @@ def test_repl_survives_errors_in_turn(cli_env, capsys, monkeypatch):
 
 
 # ---------------------------- one-shot e2e ---------------------------- #
-@pytest.fixture
-def oneshot(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("GIGACREW_ACCESS_KEY", "dummy")
-    monkeypatch.setenv("GIGACREW_AUTH_URL", "https://auth.test/oauth")
-    monkeypatch.setenv("GIGACREW_API_URL", "https://api.test/v1")
-    monkeypatch.setenv("GIGACREW_MODEL", "M-default")
-    for name in (
-        "GIGACREW_TIMEOUT",
-        "GIGACREW_TEMPERATURE",
-        "GIGACREW_CONTEXT_TOKENS",
-        "GIGACREW_SAVE_CHATS",
-        "GIGACREW_MODE",
-        "GIGACREW_AUTO_COMPACT",
-        "GIGACREW_COMPACT_THRESHOLD",
-        "GIGACREW_AUTO_MEASURE",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-    def use(provider):
-        monkeypatch.setattr(app, "_make_provider", lambda _cfg: provider)
-
-    return use
-
-
+# Фикстура oneshot — в conftest.py (нужна и тестам хуков).
 def test_oneshot_end_to_end(tmp_path, oneshot, capsys):
     (tmp_path / "hello.txt").write_text("привет из файла", encoding="utf-8")
     provider = ScriptedProvider(
@@ -875,14 +887,16 @@ def test_mode_command(cli_env, capsys):
     agent, _, commands, ctx, _ = cli_env
     assert commands.dispatch("/mode", ctx) is True
     out = _out(capsys)
-    assert "режим: ручной" in out and "plan — план" in out and "Shift+Tab" in out
+    assert "режим: авто" in out and "plan — план" in out and "Shift+Tab" in out
+    assert "модель чата" in out  # кто проверяет команды
     commands.dispatch("/mode plan", ctx)
     assert agent.mode is PermissionMode.PLAN
     assert "режим: план" in _out(capsys)
-    commands.dispatch("/mode EDITS", ctx)
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
-    commands.dispatch("/mode auto", ctx)
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    commands.dispatch("/mode EDITS", ctx)  # прежнее имя — это «авто»
+    assert agent.mode is PermissionMode.AUTO
+    commands.dispatch("/mode plan", ctx)
+    commands.dispatch("/mode yolo", ctx)
+    assert agent.mode is PermissionMode.PLAN
     assert "неизвестный режим" in _out(capsys)
 
 
@@ -912,12 +926,12 @@ def test_repl_shows_mode_and_wires_shift_tab(cli_env, capsys):
     esc = FakeEsc()
     assert run_repl(agent, ui, commands, read_input=_reader("/exit"), interrupt=esc) == 0
     out = _out(capsys)
-    assert "режим" in out and "ручной" in out and "Shift+Tab" in out  # баннер
+    assert "режим" in out and "авто" in out and "Shift+Tab" in out  # баннер
     # Shift+Tab во время хода — смена режима агента и подсказка в индикаторе
     esc.on_backtab()
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
-    assert status_of(agent).mode is PermissionMode.ACCEPT_EDITS
-    assert "авто-правки (Shift+Tab)" in ui._turn_hint()
+    assert agent.mode is PermissionMode.PLAN
+    assert status_of(agent).mode is PermissionMode.PLAN
+    assert "план (Shift+Tab)" in ui._turn_hint()
 
 
 def test_oneshot_mode_flag_and_env(tmp_path, oneshot, monkeypatch):
@@ -928,7 +942,51 @@ def test_oneshot_mode_flag_and_env(tmp_path, oneshot, monkeypatch):
     assert _main(tmp_path, "-p", "x", "--no-save") == 0
     assert all("# Plan mode" in r["messages"][0].content for r in provider.requests)
     with pytest.raises(SystemExit):
-        _main(tmp_path, "--mode", "auto", "-p", "x")
+        _main(tmp_path, "--mode", "yolo", "-p", "x")
+
+
+def test_startup_warns_about_missing_reviewer_model(tmp_path, oneshot, capsys, monkeypatch):
+    script = tmp_path / "build.sh"
+    script.write_text("#!/bin/sh\necho built\n")
+    script.chmod(0o755)
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "./build.sh"}), text_turn("готово")],
+        summaries=[text_turn('{"allow": true, "reason": "сборка"}')],
+    )
+    monkeypatch.setattr(provider, "list_models", lambda: ["M-default", "Reviewer-Max"])
+    oneshot(provider)
+    monkeypatch.setenv("GIGACREW_REVIEWER_MODEL", "nope")
+    assert _main(tmp_path, "-p", "собери", "--no-save") == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "модели «nope» (GIGACREW_REVIEWER_MODEL) нет — модель-рецензент отключена" in out
+    assert "больше команд будут требовать ручного подтверждения" in out
+    # рецензента нет — команда ушла пользователю (без терминала ответа нет)
+    assert provider.summary_requests == [] and "built" not in out
+
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "./build.sh"}), text_turn("готово")],
+        summaries=[text_turn('{"allow": true, "reason": "сборка"}')],
+    )
+    monkeypatch.setattr(provider, "list_models", lambda: ["M-default", "Reviewer-Max"])
+    oneshot(provider)
+    monkeypatch.setenv("GIGACREW_REVIEWER_MODEL", "reviewer-max")
+    assert _main(tmp_path, "-p", "собери", "--no-save") == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "GIGACREW_REVIEWER_MODEL" not in out and "рецензент (Reviewer-Max) разрешил" in out
+    assert "built" in out
+    assert provider.summary_requests[0]["model"] == "Reviewer-Max"
+
+
+def test_mode_command_warns_when_reviewer_is_disabled(cli_env, capsys):
+    from gigacrew.agent.reviewer import Reviewer
+
+    agent, _, commands, ctx, _ = cli_env
+    agent._reviewer = Reviewer("nope", disabled="модели «nope» (GIGACREW_REVIEWER_MODEL) нет")
+    commands.dispatch("/mode plan", ctx)
+    assert "отключена" not in _out(capsys)
+    commands.dispatch("/mode auto", ctx)
+    out = " ".join(_out(capsys).split())
+    assert "режим: авто" in out and "модель-рецензент отключена" in out
 
 
 def test_oneshot_plan_without_approver_ends_with_plan(tmp_path, oneshot, capsys, monkeypatch):
@@ -968,3 +1026,139 @@ def test_oneshot_plan_left_in_text_ends_without_extra_requests(
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert "План: 1. поправить a.py" in output and plan in output  # где лежит план
+
+
+# ------------------------ провайдер с каталогом моделей ------------------------ #
+def _flat(capsys) -> str:
+    return " ".join(capsys.readouterr().out.split())  # без переносов по ширине терминала
+
+
+def test_make_provider_follows_the_setting(tmp_path):
+    from gigacrew.llm.api import ApiProvider
+    from gigacrew.llm.gigacode import GigaCodeProvider
+
+    api = app._make_provider(
+        Config(access_key="k", auth_url="https://auth.test", base_url="https://api.test/v1")
+    )
+    giga = app._make_provider(
+        Config(provider="gigacode", base_url="https://code.test", user_agent="ua")
+    )
+    assert isinstance(api, ApiProvider) and isinstance(giga, GigaCodeProvider)
+    api.close()
+    giga.close()
+
+
+def test_gigacode_without_user_agent_stops_before_any_request(
+    tmp_path, oneshot, monkeypatch, capsys
+):
+    monkeypatch.setenv("GIGACREW_PROVIDER", "gigacode")
+    monkeypatch.setattr(app, "_make_provider", lambda *_a: pytest.fail("провайдер не нужен"))
+    assert _main(tmp_path, "-p", "x") == 1
+    assert "GIGACREW_USER_AGENT" in _flat(capsys)
+    monkeypatch.setenv("GIGACREW_USER_AGENT", "агент")  # не ASCII — ошибка конфигурации
+    assert _main(tmp_path, "-p", "x") == 1
+    assert "ошибка конфигурации: GIGACREW_USER_AGENT" in _flat(capsys)
+
+
+def test_catalogue_gives_the_default_model_and_its_window(tmp_path, oneshot, monkeypatch, capsys):
+    monkeypatch.delenv("GIGACREW_MODEL")
+    provider = CatalogueProvider([text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, "-p", "x") == 0
+    assert provider.connects == 1 and provider.requests[-1]["model"] == "cat-a"
+    assert "не замерено" not in _flat(capsys)  # окно — из каталога, замер не нужен
+    assert provider.measured == []
+
+
+def test_model_outside_the_catalogue_is_refused(tmp_path, oneshot, capsys):
+    provider = CatalogueProvider([text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, "-p", "x") == 1  # GIGACREW_MODEL=M-default из фикстуры
+    out = _flat(capsys)
+    assert "модели M-default нет в каталоге бэкенда; доступны: cat-a, cat-b" in out
+    assert "--list-models" in out and provider.requests == []
+    assert _main(tmp_path, "--list-models") == 0  # список работает и с чужой моделью
+    assert "cat-b" in _flat(capsys)
+    assert _main(tmp_path, "-m", "cat-b", "-p", "x") == 0
+    assert provider.requests[-1]["model"] == "cat-b"
+    assert _main(tmp_path, "--test-context", "чужая") == 1
+    assert "модели чужая нет в каталоге" in _flat(capsys)
+
+
+def test_connect_interrupted_or_failed(tmp_path, oneshot, capsys):
+    from gigacrew.llm.base import LLMError
+
+    oneshot(CatalogueProvider(connect_errors=[KeyboardInterrupt()]))
+    assert _main(tmp_path, "-m", "cat-a", "-p", "x") == 130
+    assert "подключение прервано" in _flat(capsys)
+    oneshot(CatalogueProvider(connect_errors=[LLMError("бэкенд недоступен")]))
+    assert _main(tmp_path, "-m", "cat-a", "--list-models") == 2
+    assert "не удалось подключиться: бэкенд недоступен" in _flat(capsys)
+
+
+def test_continue_with_a_model_missing_from_the_catalogue(tmp_path, oneshot, monkeypatch, capsys):
+    oneshot(ScriptedProvider([text_turn("a")]))
+    assert _main(tmp_path, "-m", "old-model", "-p", "первый") == 0
+    monkeypatch.delenv("GIGACREW_MODEL")
+    provider = CatalogueProvider([text_turn("b")])
+    oneshot(provider)
+    assert _main(tmp_path, "-c", "-p", "второй") == 0
+    assert "модели чата old-model нет в каталоге бэкенда — модель: cat-a" in _flat(capsys)
+    assert provider.requests[-1]["model"] == "cat-a"
+
+
+def _catalogue_env(tmp_path, provider, **cfg):
+    config = Config(access_key="x", project_root=tmp_path, stream=False, model="cat-a", **cfg)
+    ui = Console(no_color=True)
+    agent = Agent(provider, build_default_registry(), config, ui)
+    ctx = CommandContext(
+        agent=agent,
+        ui=ui,
+        commands=default_commands(),
+        chats=ChatRecorder(ChatStore(agent.workspace)),
+    )
+    return agent, ui, ctx
+
+
+def test_model_command_refuses_models_outside_the_catalogue(tmp_path, capsys):
+    agent, _, ctx = _catalogue_env(tmp_path, CatalogueProvider())
+    ctx.commands.dispatch("/model чужая", ctx)
+    assert agent.model == "cat-a"
+    assert "модели чужая нет в каталоге бэкенда; доступны: cat-a, cat-b" in _flat(capsys)
+    ctx.commands.dispatch("/model CAT-B", ctx)  # регистр исправляется
+    assert agent.model == "cat-b"
+    ctx.commands.dispatch("/model", ctx)
+    out = _flat(capsys)
+    assert "доступные модели" in out and "• cat-a" in out
+
+
+def test_resume_command_keeps_the_model_missing_from_the_catalogue(tmp_path, capsys):
+    agent, _, ctx = _catalogue_env(tmp_path, CatalogueProvider([text_turn("ответ")]))
+    agent.conversation.add_user("старый вопрос")
+    info = ctx.chats.store.save("20260101-000000-abcd", agent.conversation, model="old-model")
+    ctx.commands.dispatch(f"/resume {info.id}", ctx)
+    assert agent.model == "cat-a"
+    assert "модели чата old-model нет в каталоге бэкенда — модель: cat-a" in _flat(capsys)
+
+
+def test_repl_connects_before_each_turn(tmp_path, capsys):
+    from gigacrew.llm.base import LLMError
+
+    provider = CatalogueProvider(
+        [text_turn("ответ")], connect_errors=[LLMError("вход не подтверждён")]
+    )
+    agent, ui, ctx = _catalogue_env(tmp_path, provider, auto_approve=True)
+    read = _reader("раз", "два", "/exit")
+    assert run_repl(agent, ui, ctx.commands, read_input=read, index_on_start=False) == 0
+    assert provider.connects == 2
+    assert "вход не подтверждён" in _flat(capsys)
+    assert len(provider.requests) == 1  # первый запрос не ушёл: вход не удался
+
+
+def test_repl_warns_about_tls_for_the_backend_token(tmp_path, capsys):
+    from dataclasses import replace
+
+    agent, ui, ctx = _catalogue_env(tmp_path, CatalogueProvider(), auto_approve=True)
+    agent._cfg = replace(agent.config, provider="gigacode", access_key=None)
+    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
+    assert "ключ или токен можно перехватить" in _flat(capsys)

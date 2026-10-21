@@ -462,3 +462,11 @@ def test_consume_sse_multiline_data_and_comments():
 def test_consume_sse_error_event_raises(event):
     with pytest.raises(ApiError, match="ошибку в потоке"):
         ApiProvider._consume_sse(_FakeSSE(event), lambda _s: None)
+
+
+def test_provider_without_catalogue_defaults():
+    """Провайдер без каталога: подключаться не к чему, модель — любая."""
+    p = _provider()
+    p.connect()  # ничего не делает и не ходит в сеть
+    assert p.known_models() is None
+    p.close()

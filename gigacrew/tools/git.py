@@ -6,6 +6,7 @@ import shlex
 
 from pydantic import BaseModel, Field
 
+from gigacrew.safety.gitconfig import repo_config_runs_programs
 from gigacrew.security import RiskLevel
 from gigacrew.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.process import run_process, truncate_middle
@@ -105,13 +106,18 @@ class GitTool(Tool):
 
     def risk(self, params: GitParams, ctx: ToolContext) -> RiskLevel:
         sub, args = params.subcommand, params.args
-        if sub in _READ_ONLY:
-            return RiskLevel.SAFE
-        if sub == "branch" and _branch_is_listing(args):
-            return RiskLevel.SAFE
-        if sub == "stash" and args and args[0] in ("list", "show"):
-            return RiskLevel.SAFE
-        return RiskLevel.WRITE
+        reading = (
+            sub in _READ_ONLY
+            or (sub == "branch" and _branch_is_listing(args))
+            or (sub == "stash" and bool(args) and args[0] in ("list", "show"))
+        )
+        if not reading:
+            return RiskLevel.WRITE
+        # diff/log/show запускают textconv и clean-фильтры из настроек репозитория:
+        # если такие есть, чтение — уже не только чтение.
+        if repo_config_runs_programs(ctx.root) is not False:
+            return RiskLevel.WRITE
+        return RiskLevel.SAFE
 
     def _check(self, params: GitParams) -> None:
         sub = params.subcommand

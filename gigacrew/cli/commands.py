@@ -21,10 +21,16 @@ from dataclasses import dataclass, field
 from gigacrew.agent.chat_store import ChatRecorder, ChatStoreError, SavedChat
 from gigacrew.agent.loop import Agent
 from gigacrew.agent.prompts import skill_invocation_prompt
+from gigacrew.cli.hooks import (
+    describe_hooks,
+    install_request_hook,
+    load_hooks,
+    restart_session,
+)
 from gigacrew.cli.indexing import describe_index, run_indexing
 from gigacrew.cli.models import ModelCatalog, describe_model, ensure_context_window
 from gigacrew.cli.prompt import KEY_HELP
-from gigacrew.llm.base import LLMError
+from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.permissions import MODE_CYCLE, PermissionMode, parse_mode
 from gigacrew.project import semantic
 from gigacrew.project.index import ProjectIndex
@@ -44,6 +50,7 @@ class CommandContext:
     # Модели, замер окна которых пользователь отклонил в этой сессии (не спрашивать снова).
     declined_windows: set[str] = field(default_factory=set)
     skills: SkillCatalog | None = None  # для /help и подсказок (None — без скиллов)
+    trust_hooks: bool = False  # --trust-hooks: /hooks reload не спрашивает подтверждение
 
 
 # Обработчик получает контекст и аргумент (текст после имени команды).
@@ -147,9 +154,16 @@ def _help(ctx: CommandContext, _arg: str) -> bool:
     return True
 
 
+def catalogue_ids(provider: LLMProvider) -> list[str] | None:
+    """Модели каталога провайдера — выбрать можно только их; None — каталога нет."""
+    models = provider.known_models()
+    return None if models is None else [m.id for m in models]
+
+
 def _model(ctx: CommandContext, arg: str) -> bool:
     agent = ctx.agent
-    known = ctx.models.models if ctx.models is not None else None
+    catalogue = catalogue_ids(agent.provider)
+    known = catalogue if catalogue is not None else ctx.models.models if ctx.models else None
     if not arg:
         lines = [f"текущая модель: {agent.model} ({describe_model(agent.model, agent.windows)})"]
         if known:
@@ -160,6 +174,9 @@ def _model(ctx: CommandContext, arg: str) -> bool:
     if known and arg not in known:
         # имена моделей в API регистрозависимы: «model-large» → «Model-Large»
         arg = next((name for name in known if name.lower() == arg.lower()), arg)
+    if catalogue is not None and arg not in catalogue:
+        ctx.ui.error(f"модели {arg} нет в каталоге бэкенда; доступны: {', '.join(catalogue)}")
+        return True
     agent.set_model(arg)
     if known and arg not in known:
         ctx.ui.warn(f"модели {arg} нет в списке доступных чат-моделей")
@@ -184,26 +201,114 @@ def _mode(ctx: CommandContext, arg: str) -> bool:
     agent = ctx.agent
     if not arg:
         lines = [f"режим: {agent.mode.label} — {agent.mode.description}"]
+        if agent.mode is PermissionMode.AUTO and agent.reviewer.enabled:
+            lines.append(f"  {agent.reviewer.describe(agent.model)}")
         lines.append("режимы (Shift+Tab — следующий по кругу):")
         lines += [f"  • {m.value} — {m.label}: {m.description}" for m in MODE_CYCLE]
         ctx.ui.info("\n".join(lines))
+        _warn_reviewer(ctx)
         return True
     try:
         mode = parse_mode(arg)
     except ValueError as e:
-        ctx.ui.error(f"{e} (использование: /mode [manual|edits|plan])")
+        ctx.ui.error(f"{e} (использование: {MODE_USAGE})")
         return True
     agent.set_mode(mode)
-    ctx.ui.info(f"режим: {mode.label} — {mode.description}")
+    text = f"режим: {mode.label} — {mode.description}"
+    if mode is PermissionMode.AUTO and agent.reviewer.enabled:
+        text += f"\n  {agent.reviewer.describe(agent.model)}"
+    ctx.ui.info(text)
+    _warn_reviewer(ctx)
+    return True
+
+
+def _warn_reviewer(ctx: CommandContext) -> None:
+    """В режиме «авто» с отключённым рецензентом — напомнить, что команды спрашиваются."""
+    agent = ctx.agent
+    if agent.mode is PermissionMode.AUTO and not agent.reviewer.enabled:
+        ctx.ui.warn(agent.reviewer.warning)
+
+
+PERMISSIONS_USAGE = "/permissions [forget N | clear | log]"
+MODE_USAGE = "/mode [" + "|".join(mode.value for mode in MODE_CYCLE) + "]"
+
+
+def _permissions(ctx: CommandContext, arg: str) -> bool:
+    """Сохранённые разрешения «всегда» для команд и последние решения."""
+    memory = ctx.agent.decisions
+    words = arg.split()
+    action = words[0].lower() if words else ""
+    if action in ("forget", "rm", "удалить"):
+        if len(words) != 2 or not words[1].isdigit():
+            ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
+            return True
+        try:
+            rule = memory.forget(int(words[1]))
+        except IndexError:
+            ctx.ui.error(f"нет разрешения №{words[1]} (список — /permissions)")
+        except OSError as e:
+            ctx.ui.error(f"не удалось сохранить: {e}")
+        else:
+            ctx.ui.info(f"разрешение удалено: {rule.describe()}")
+        return True
+    if action in ("clear", "очистить"):
+        try:
+            n = memory.clear()
+        except OSError as e:
+            ctx.ui.error(f"не удалось сохранить: {e}")
+        else:
+            ctx.ui.info(f"удалено разрешений: {n}")
+        return True
+    if action in ("log", "журнал"):
+        items = memory.recent()
+        if not items:
+            ctx.ui.info("журнал решений пуст" + ("" if memory.log else " (не ведётся: --no-save)"))
+            return True
+        lines = []
+        for item in items:
+            mark = {"yes": "да", "always": "всегда", "no": "нет", "no_answer": "без ответа"}.get(
+                str(item.get("decision")), str(item.get("decision"))
+            )
+            review = item.get("review") if isinstance(item.get("review"), dict) else {}
+            if item.get("source") == "reviewer":
+                mark = "разрешил рецензент"
+            where = "" if item.get("cwd") in (None, ".") else f" [{item.get('cwd')}]"
+            text = f"  • {mark}{where}: {item.get('command', '')}"
+            if item.get("feedback"):
+                text += f" — «{item['feedback']}»"
+            elif item.get("source") == "reviewer" and review.get("reason"):
+                text += f" — {review['reason']}"
+            lines.append(text)
+        ctx.ui.info("последние решения:\n" + "\n".join(lines))
+        return True
+    if action:
+        ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
+        return True
+    if not memory.rules:
+        lines = ["сохранённых разрешений нет: ответ «a» на вопрос о команде запомнит её"]
+    else:
+        lines = ["разрешено без вопросов:"]
+        for i, rule in enumerate(memory.rules, 1):
+            used = f", применялось {rule.hits}" if rule.hits else ""
+            lines.append(f"  {i}. {rule.describe()}{used}")
+        lines.append("удалить — /permissions forget N, все — /permissions clear")
+    if memory.approvals_path is not None and memory.remember:
+        lines.append(f"файл: {memory.approvals_path}")
+    elif memory.directory is None or not memory.remember:
+        lines.append("разрешения хранятся до конца сессии (GIGACREW_REMEMBER_APPROVALS=0)")
+    ctx.ui.info("\n".join(lines))
     return True
 
 
 def _clear(ctx: CommandContext, _arg: str) -> bool:
-    if ctx.chats is None:
-        ctx.agent.reset()
-    else:
-        ctx.chats.start_new()  # прежний чат остаётся сохранённым — его вернёт /resume
-        ctx.agent.reset(chat_id=ctx.chats.chat_id)
+    def switch() -> None:
+        if ctx.chats is None:
+            ctx.agent.reset()
+        else:
+            ctx.chats.start_new()  # прежний чат остаётся сохранённым — его вернёт /resume
+            ctx.agent.reset(chat_id=ctx.chats.chat_id)
+
+    restart_session(ctx.agent, ctx.ui, end_reason="clear", source="clear", switch=switch)
     ctx.ui.info("история очищена, начат новый чат")
     return True
 
@@ -235,17 +340,25 @@ RESUME_LIMIT = 100  # сколько последних чатов показы�
 
 def resume_chat(
     agent: Agent, chats: ChatRecorder, saved: SavedChat, *, keep_model: bool = False
-) -> None:
+) -> str | None:
     """Продолжить сохранённый чат: дальнейшие ходы дописываются в него же.
 
-    Модель чата становится текущей, если не ``keep_model`` (модель задана явно, ``-m``).
-    Файл плана — тоже этого чата.
+    Модель чата становится текущей, если не ``keep_model`` (модель задана явно, ``-m``)
+    и если она есть в каталоге провайдера; иначе модель не меняется, а модель чата
+    возвращается — вызывающий предупреждает. Файл плана — тоже этого чата.
     """
+    skipped = None
     # Сначала модель: сохранённый расход токенов чата посчитан в её токенах.
-    if saved.info.model and not keep_model:
-        agent.set_model(saved.info.model)
+    model = saved.info.model
+    if model and not keep_model:
+        catalogue = catalogue_ids(agent.provider)
+        if catalogue is None or model in catalogue:
+            agent.set_model(model)
+        else:
+            skipped = model
     agent.reset(saved.conversation, chat_id=saved.info.id)
     chats.switch_to(saved.info)
+    return skipped
 
 
 def _resume(ctx: CommandContext, arg: str) -> bool:
@@ -269,8 +382,17 @@ def _resume(ctx: CommandContext, arg: str) -> bool:
         ctx.ui.error(str(e))
         return True
     previous = ctx.agent.model
-    resume_chat(ctx.agent, ctx.chats, saved)
+    chats = ctx.chats
+    skipped = restart_session(
+        ctx.agent,
+        ctx.ui,
+        end_reason="resume",
+        source="resume",
+        switch=lambda: resume_chat(ctx.agent, chats, saved),
+    )
     ctx.ui.chat_resumed(saved.info, saved.conversation.messages)
+    if skipped:
+        ctx.ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {ctx.agent.model}")
     if ctx.agent.model != previous:
         ctx.ui.info(f"модель чата: {ctx.agent.model}")
         ensure_context_window(
@@ -292,6 +414,21 @@ def _index(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+def _hooks(ctx: CommandContext, arg: str) -> bool:
+    if arg not in ("", "reload"):
+        ctx.ui.error("использование: /hooks [reload]")
+        return True
+    if arg == "reload":
+        agent = ctx.agent
+        agent.hooks = load_hooks(
+            agent.workspace, ctx.ui, interactive=ctx.ui.interactive(), trust=ctx.trust_hooks
+        )
+        install_request_hook(agent.provider, agent.hooks, ctx.ui, agent.config)
+        ctx.ui.info("настройки хуков перечитаны")
+    ctx.ui.info(describe_hooks(ctx.agent.hooks.settings))
+    return True
+
+
 def _exit(ctx: CommandContext, _arg: str) -> bool:
     ctx.ui.system("до встречи!")
     return False
@@ -301,9 +438,13 @@ def default_commands() -> CommandRegistry:
     registry = CommandRegistry()
     registry.register(SlashCommand("/help", "справка", _help))
     registry.register(SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"))
+    registry.register(SlashCommand("/mode", "режим: авто или план", _mode, usage=MODE_USAGE))
     registry.register(
         SlashCommand(
-            "/mode", "режим: ручной, авто-правки, план", _mode, usage="/mode [manual|edits|plan]"
+            "/permissions",
+            "разрешённые без вопросов команды и журнал решений",
+            _permissions,
+            usage=PERMISSIONS_USAGE,
         )
     )
     registry.register(SlashCommand("/clear", "новый чат", _clear))
@@ -327,5 +468,6 @@ def default_commands() -> CommandRegistry:
     registry.register(
         SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]")
     )
+    registry.register(SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"))
     registry.register(SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")))
     return registry

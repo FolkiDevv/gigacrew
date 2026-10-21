@@ -83,6 +83,8 @@ def eval_session():
     (фикстуры сессии создаются раньше фикстур теста).
     """
     config = Config.load(project_root=REPO_ROOT, model=MODELS[0])
+    if config.provider != "api":
+        pytest.skip("eval — для API v2 (GIGACREW_PROVIDER=api)")
     try:
         config.require_credentials()
     except RuntimeError as e:

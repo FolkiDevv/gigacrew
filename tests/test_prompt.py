@@ -34,16 +34,18 @@ def _complete(text: str) -> list[tuple[str, str]]:
 def test_completes_commands_with_descriptions():
     assert _complete("/mod") == [
         ("/model", "сменить модель"),
-        ("/mode", "режим: ручной, авто-правки, план"),
+        ("/mode", "режим: авто или план"),
     ]
     assert {name for name, _ in _complete("/")} == {
         "/help",
         "/model",
         "/mode",
+        "/permissions",
         "/clear",
         "/compact",
         "/resume",
         "/index",
+        "/hooks",
         "/exit",
     }
     assert _complete("/q") == [("/quit", "выход")]  # по алиасу
@@ -171,7 +173,9 @@ def test_toolbar_contents():
     )
     assert "Alpha-2-Max" in text and "12.3k/60k (21%)" in text
     assert "потрачено 45.1k" in text and "авто-подтверждение" in text
-    assert "авто" not in "".join(t for _, t in toolbar_fragments(StatusInfo(model="m")))
+    assert "авто-подтверждение" not in "".join(
+        t for _, t in toolbar_fragments(StatusInfo(model="m"))
+    )
 
 
 def test_double_escape_clears_input_into_history(tmp_path):
@@ -226,15 +230,14 @@ def test_completes_mode_argument():
         (c.text, c.display_meta_text)
         for c in completer.get_completions(Document("/mode "), CompleteEvent())
     ]
-    assert [name for name, _ in found] == ["manual", "edits", "plan"]
-    assert "текущий" in dict(found)["plan"] and "текущий" not in dict(found)["manual"]
+    assert [name for name, _ in found] == ["auto", "plan"]
+    assert "текущий" in dict(found)["plan"] and "текущий" not in dict(found)["auto"]
 
 
 @pytest.mark.parametrize(
     ("mode", "style", "badge"),
     [
-        (PermissionMode.MANUAL, "class:toolbar.mode.manual", "ручной"),
-        (PermissionMode.ACCEPT_EDITS, "class:toolbar.mode.edits", "⏵⏵ авто-правки"),
+        (PermissionMode.AUTO, "class:toolbar.mode.auto", "⏵⏵ авто"),
         (PermissionMode.PLAN, "class:toolbar.mode.plan", "⏸ план"),
     ],
 )

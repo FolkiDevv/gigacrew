@@ -39,9 +39,10 @@ def test_gitignore_covers_agent_data_but_not_skills(tmp_path):
     ws = Workspace(tmp_path)
     ws.ensure_data_dir()
     ignored = _gitignored(ws)
-    for path in (ws.chats_dir, ws.plans_dir, ws.index_dir, ws.history_file):
+    for path in (ws.chats_dir, ws.plans_dir, ws.index_dir, ws.history_file, ws.local_settings_file):
         assert path.relative_to(ws.data_dir).as_posix() in ignored
     assert not any(p == "*" or p.startswith("skills") for p in ignored)
+    assert "settings.json" not in ignored
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="нужен git")
@@ -59,9 +60,14 @@ def test_gitignore_keeps_skills_in_git(tmp_path):
         ".gigacode/plans/a.md",
         ".gigacode/history",
         ".gigacode/index/index.sqlite3",
+        ".gigacode/settings.local.json",
     ):
         assert ignored(rel), rel
-    for rel in (".gigacode/skills/demo/SKILL.md", ".gigacode/.gitignore"):
+    for rel in (
+        ".gigacode/skills/demo/SKILL.md",
+        ".gigacode/.gitignore",
+        ".gigacode/settings.json",
+    ):
         assert not ignored(rel), rel
 
 

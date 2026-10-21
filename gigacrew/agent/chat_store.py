@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from gigacrew.agent.conversation import Conversation
+from gigacrew.agent.conversation import Conversation, request_text
 from gigacrew.llm.types import Message
 from gigacrew.project.workspace import Workspace
 
@@ -76,7 +76,7 @@ def chat_title(messages: Iterable[Message]) -> str:
     """Заголовок чата — первый запрос пользователя в одну строку."""
     for m in messages:
         if m.is_request and m.content.strip():
-            return _one_line(m.content, TITLE_LIMIT)
+            return _one_line(request_text(m.content), TITLE_LIMIT)
     return "(без названия)"
 
 

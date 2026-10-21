@@ -109,9 +109,23 @@ def test_shell_dangerous_classification(ctx):
 
     sh = RunShellTool()
     safe = sh.parse({"command": "ls -la"})
+    write = sh.parse({"command": "touch x"})
     danger = sh.parse({"command": "rm -rf /tmp/x"})
-    assert sh.risk(safe, ctx) == RiskLevel.WRITE
+    assert sh.risk(safe, ctx) == RiskLevel.SAFE  # только чтение — без вопроса
+    assert sh.risk(write, ctx) == RiskLevel.WRITE
     assert sh.risk(danger, ctx) == RiskLevel.DANGEROUS
+
+
+def test_shell_runs_in_cwd_and_rejects_outside(ctx):
+    (ctx.root / "sub").mkdir()
+    sh = RunShellTool()
+    res = sh.run(sh.parse({"command": "pwd", "cwd": "sub"}), ctx)
+    assert res.content.rstrip().endswith("/sub")
+    assert sh.paths(sh.parse({"command": "ls", "cwd": "sub"})) == ("sub",)
+    with pytest.raises(ToolError):
+        sh.run(sh.parse({"command": "pwd", "cwd": "../.."}), ctx)
+    verdict = sh.assess(sh.parse({"command": "cd sub && ls"}), ctx).verdict
+    assert verdict is not None and verdict.cwd == "sub" and verdict.command == "ls"
 
 
 # -------------------------------- git --------------------------------- #

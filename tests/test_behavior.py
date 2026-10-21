@@ -38,7 +38,7 @@ from gigacrew.llm.model_windows import ModelWindows
 from gigacrew.llm.types import FunctionCall, Message
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display
-from gigacrew.tools.plan import APPROVE_EDITS, PLAN_QUESTION
+from gigacrew.tools.plan import APPROVE, PLAN_QUESTION
 from gigacrew.tools.questions import Answer, Question, QuestionOption
 
 PLAN = ".gigacode/plans/chat1.md"
@@ -128,8 +128,8 @@ def test_other_commands_are_rejected(command):
 
 def test_scripted_user_answers_plan_and_model_questions():
     plan = replace(PLAN_QUESTION, body="# План")
-    user = ScriptedUser([Answer((APPROVE_EDITS,)), None])
-    assert user.ask_user([plan]) == [Answer((APPROVE_EDITS,))]
+    user = ScriptedUser([Answer((APPROVE,)), None])
+    assert user.ask_user([plan]) == [Answer((APPROVE,))]
     assert user.ask_user([plan]) is None
     assert user.ask_user([plan]) is None  # ответы кончились — как Esc
     question = Question("Какая БД?", (QuestionOption("SQLite"), QuestionOption("Postgres")))
@@ -241,7 +241,7 @@ def test_approved_plan_is_implemented(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["final_mode"] == "edits"
+    assert record["ok"] and record["final_mode"] == "auto"
     assert record["changed_files"] == ["shop/cart.py"] and record["changed_before_plan"] == []
     assert record["files_ok"] and record["tests_pass"]
     assert invariant_errors(SCENARIO_BY_ID["plan_implement"], record) == []
@@ -261,7 +261,7 @@ def test_manual_exit_from_plan_mode(shop):
     )
     record = result.record
     assert record["ok"] and record["answer"] == "Готово."
-    assert [turn["mode_before"] for turn in record["turns"]] == ["plan", "edits"]
+    assert [turn["mode_before"] for turn in record["turns"]] == ["plan", "auto"]
     assert record["turns"][0]["plan_shown"] == 1 and record["turns"][1]["exit_calls"] == 0
 
 
