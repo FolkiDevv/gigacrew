@@ -29,7 +29,7 @@ from gigacrew.agent.loop import (
 from gigacrew.config import Config
 from gigacrew.errors import ToolError
 from gigacrew.llm.base import LLMError
-from gigacrew.llm.types import Message, Usage
+from gigacrew.llm.types import FunctionCall, Message, Usage
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolRegistry, ToolResult, build_default_registry
 from gigacrew.tools.plan import APPROVE
@@ -169,6 +169,16 @@ def test_loop_runs_tool_then_finishes(tmp_path):
     agent = _agent(provider, tmp_path)
     assert agent.run_turn("прочитай f.txt") == "прочитал"
     assert provider.calls == 2
+
+
+def test_describe_call_from_history(tmp_path):
+    """Строка вызова при продолжении чата — та же, что во время хода."""
+    agent = _agent(ScriptedProvider(), tmp_path)
+    assert (
+        agent.describe_call(FunctionCall(name="read_file", arguments={"path": "a.txt"})) == "a.txt"
+    )
+    assert agent.describe_call(FunctionCall(name="nope", arguments={"path": "a.txt"})) == ""
+    assert agent.describe_call(FunctionCall(name="read_file", arguments={"path": 1.5})) == ""
 
 
 def test_streaming_events_wrap_each_request(tmp_path):

@@ -20,6 +20,18 @@ def plural(n: int, one: str, few: str, many: str) -> str:
     return many
 
 
+def chat_size(requests: int, messages: int) -> str:
+    """Размер чата: «2 запроса · 108 сообщений» (``messages`` 0 — неизвестно, не пишется).
+
+    Запросы — только набранные в приглашении; ответы на вопросы модели и шаги с
+    инструментами видны лишь в числе сообщений.
+    """
+    text = f"{requests} {plural(requests, 'запрос', 'запроса', 'запросов')}"
+    if messages:
+        text += f" · {messages} {plural(messages, 'сообщение', 'сообщения', 'сообщений')}"
+    return text
+
+
 def mode_badge(mode: PermissionMode) -> str:
     """Режим разрешений для статус-строки и индикатора: значок + название."""
     icon = MODE_ICONS.get(mode.value, "")

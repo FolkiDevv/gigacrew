@@ -97,6 +97,16 @@ def test_render_window_and_scroll():
     assert "❯ чат номер 9" in text and "↑ ещё 2" in text and "↓ ещё 2" in text
 
 
+def test_meta_counts_messages_besides_requests(monkeypatch):
+    """Ответы на вопросы модели и шаги с инструментами — не запросы: длинный чат из двух
+    запросов не должен выглядеть коротким."""
+    chat = _chat(1, "долгий чат", messages=108)
+    assert "сегодня 14:00 · 2 запроса · 108 сообщений" in _text(PickerState([chat], now=NOW), 100)
+    ui, buf = _console(monkeypatch, "")
+    ui.pick_chat([chat])
+    assert "2 запроса · 108 сообщений" in buf.getvalue()
+
+
 def test_render_selected_details_current_mark_and_query():
     chats = [_chat(0, "первый", preview="последний ответ", model="Alpha-2-Max"), _chat(1)]
     text = _text(PickerState(chats, current_id=chats[1].id, now=NOW))
@@ -163,22 +173,60 @@ def test_picker_without_chats(monkeypatch):
     assert ui.pick_chat([]) is None
 
 
-def test_chat_resumed_shows_last_exchange(monkeypatch):
+def _call(command: str) -> list[Message]:
+    call = FunctionCall(name="run_shell", arguments={"command": command})
+    return [
+        Message(role="assistant", function_calls=[call]),
+        Message(role="function", name="run_shell", content="ok"),
+    ]
+
+
+def test_chat_resumed_shows_last_exchanges(monkeypatch):
     ui, buf = _console(monkeypatch)
     messages = [
+        Message(role="user", content="нулевой вопрос"),
+        Message(role="assistant", content="нулевой ответ"),
         Message(role="user", content="первый вопрос"),
         Message(role="assistant", content="первый ответ"),
+        Message(role="user", content="второй вопрос"),
+        Message(role="assistant", content="второй ответ"),
         Message(role="user", content="почини \x1b[31mтесты"),
-        Message(role="assistant", function_calls=[FunctionCall(name="run_shell")]),
-        Message(role="function", name="run_shell", content="ok"),
+        *_call("pytest -x"),
         Message(role="assistant", content="**Готово**: тесты проходят"),
     ]
-    ui.chat_resumed(_chat(1, "почини тесты"), messages)
+    ui.chat_resumed(
+        _chat(3, "почини тесты", messages=10),
+        messages,
+        lambda call: str(call.arguments["command"]),
+    )
     out = buf.getvalue()
-    assert "продолжаем чат «почини тесты» · 2 запроса" in out
+    assert "продолжаем чат «почини тесты» · 4 запроса · 10 сообщений" in out
+    # Ранние обмены — строкой: сохранены в чате, но не печатаются.
+    assert "раньше: 1 запрос · 2 сообщения — сохранены в чате, на экран не выводятся" in out
+    assert "нулевой" not in out
+    assert out.index("› первый вопрос") < out.index("первый ответ") < out.index("› второй вопрос")
     assert "\x1b" not in out and "› почини [31mтесты" in out  # sanitize убрал ESC
+    assert "● run_shell  pytest -x" in out
     assert "Готово: тесты проходят" in out
-    assert "первый ответ" not in out
+
+
+def test_chat_resumed_folds_tool_calls_and_clips_earlier_answers(monkeypatch):
+    ui, buf = _console(monkeypatch)
+    long_answer = "\n\n".join(f"абзац {i}" for i in range(20))
+    messages = [
+        Message(role="user", content="разбери логи"),
+        *[m for i in range(8) for m in _call(f"cat log{i}")],
+        Message(role="assistant", content=long_answer),
+        Message(role="user", content="а теперь итог"),
+        Message(role="assistant", content=long_answer),
+    ]
+    ui.chat_resumed(_chat(1, "разбери логи"), messages)
+    out = buf.getvalue()
+    assert "раньше" not in out  # показаны все обмены
+    assert "… ещё 3 вызова инструментов" in out and out.count("● run_shell") == 5
+    first, last = out.split("› а теперь итог")
+    assert "пропущено" in first and "абзац 19" in first  # ранний ответ сокращён
+    assert "пропущено" not in last and "абзац 10" in last  # последний — целиком
 
 
 def test_chat_resumed_skips_meta_messages(monkeypatch):
@@ -206,5 +254,7 @@ def test_chat_resumed_after_interrupted_turn_shows_no_stale_answer(monkeypatch):
     ]
     ui.chat_resumed(_chat(1, "первый вопрос"), messages)
     out = buf.getvalue()
-    assert "› второй вопрос" in out
-    assert "ответ на первый" not in out and "ответа нет" in out
+    # Ответ на первый вопрос — в своём обмене, а не ответом на прерванный второй.
+    before, after = out.split("› второй вопрос")
+    assert "ответ на первый" in before
+    assert "ответ на первый" not in after and "ответа нет" in after
