@@ -25,6 +25,28 @@ _ALLOWED = _READ_ONLY | {
     "restore",
 }
 
+# Читающие подкоманды, которых нет в инструменте: для них — подсказка про run_shell (там
+# их проверяет классификатор команд).
+_READ_ELSEWHERE = frozenset(
+    {
+        "blame",
+        "grep",
+        "ls-files",
+        "ls-tree",
+        "rev-parse",
+        "rev-list",
+        "shortlog",
+        "describe",
+        "reflog",
+        "merge-base",
+        "cat-file",
+        "show-ref",
+        "name-rev",
+        "for-each-ref",
+        "whatchanged",
+    }
+)
+
 # Опции, позволяющие писать/читать файлы вне проекта или запускать внешние
 # программы. Запрещены для всех подкоманд (включая сокращения: git принимает
 # уникальные префиксы длинных опций).
@@ -105,9 +127,11 @@ class GitTool(Tool):
     Params = GitParams
 
     def risk(self, params: GitParams, ctx: ToolContext) -> RiskLevel:
-        # Недоступная подкоманда — ошибка до решения по режиму: иначе в режиме плана и у
-        # суб-агента explore `git blame` отклонялся бы как изменение.
-        self._check(params)
+        # Читающая подкоманда, которой нет в инструменте, — ошибка с подсказкой до решения по
+        # режиму: иначе в режиме плана и у explore `git blame` отклонялся бы как изменение.
+        # Изменяющие (push, merge…) по-прежнему блокирует режим.
+        if params.subcommand in _READ_ELSEWHERE:
+            self._check(params)
         sub, args = params.subcommand, params.args
         reading = (
             sub in _READ_ONLY
@@ -125,10 +149,14 @@ class GitTool(Tool):
     def _check(self, params: GitParams) -> None:
         sub = params.subcommand
         if sub not in _ALLOWED:
+            hint = (
+                f" Читающие команды git вроде {sub} запускай через run_shell."
+                if sub in _READ_ELSEWHERE
+                else ""
+            )
             raise ToolError(
                 f"Подкоманда git '{sub}' не поддерживается этим инструментом. Доступно: "
-                f"{sorted(_ALLOWED)}. Другие читающие команды git (blame, grep, ls-files…) "
-                "запускай через run_shell — они выполняются без вопроса."
+                f"{sorted(_ALLOWED)}.{hint}"
             )
         for arg in params.args:
             if arg == "--":

@@ -556,12 +556,17 @@ class Agent:
     def set_mode(self, mode: PermissionMode) -> None:
         """Сменить режим разрешений (действует со следующего вызова инструмента).
 
-        У суб-агента режим — основного агента.
+        У суб-агента режим — основного агента. Вход в режим плана начинает новый цикл
+        планирования: правки файла плана вне него (отметки о выполненных шагах) — не
+        новый план, который ждёт показа.
         """
         if self._parent is not None:
             self._parent.set_mode(mode)
             return
-        self._mode = PermissionMode(mode)
+        mode = PermissionMode(mode)
+        if mode is PermissionMode.PLAN and self._mode is not mode and self._plan is not None:
+            self._plan.dirty = False
+        self._mode = mode
 
     def cycle_mode(self) -> PermissionMode:
         """Следующий режим по кругу (Shift+Tab); возвращает новый режим."""
@@ -764,12 +769,13 @@ class Agent:
                 if self._cfg.auto_compact and not compact_failed:
                     compact_failed = not self._auto_compact(specs, stats)
                 warning = guard.failure_warning()
-                if warning is not None:
+                if warning is not None and warning.notice:
                     self._events.on_notice(warning.notice, level="warn")
+                failures_note = warning.model if warning is not None else ""
                 notes = [
                     guard.pressure(context) or "",
-                    warning.model if warning is not None else "",
-                    self._plan_reminder(),
+                    failures_note,
+                    self._plan_reminder(reviews),
                     note,
                 ]
                 turn = self._next_turn(specs, note="\n\n".join(n for n in notes if n))
@@ -794,7 +800,7 @@ class Agent:
                         continue
                     if not checked and self._self_check_due(reviews):
                         checked = True
-                        followup = self._self_check(specs, turn, stats)
+                        followup = self._self_check(specs, turn, stats, failures_note)
                         if followup is None:
                             if not self._hold_turn(turn.message.content, held):
                                 return turn.message.content
@@ -874,9 +880,16 @@ class Agent:
         self._conversation.add_user(_reminder(_join_notes(pending, stop_note)), meta=True)
         return True
 
-    def _plan_reminder(self) -> str:
-        """Напоминание о режиме плана для запроса основного агента ("" — не план)."""
-        if self._plan is None or self._parent is not None or self.mode is not PermissionMode.PLAN:
+    def _plan_reminder(self, reviews: int) -> str:
+        """Напоминание о режиме плана для запроса основного агента ("" — не план).
+
+        После показа плана в этом ходе (``reviews`` — показы до хода) не нужно: что делать
+        дальше, модели сказал исход показа (доработать, закончить, ждать).
+        """
+        plan = self._plan
+        if plan is None or self._parent is not None or self.mode is not PermissionMode.PLAN:
+            return ""
+        if plan.reviews != reviews:
             return ""
         return PLAN_REMINDER_NOTE.format(path=self._plan_display())
 
@@ -928,7 +941,7 @@ class Agent:
         )
 
     def _self_check(
-        self, specs: list[ToolSpec], turn: AssistantTurn, stats: TurnStats
+        self, specs: list[ToolSpec], turn: AssistantTurn, stats: TurnStats, note: str = ""
     ) -> AssistantTurn | None:
         """Ход в режиме плана кончился текстом — без плана и без вопроса: переспросить.
 
@@ -937,16 +950,17 @@ class Agent:
         Ответ ``turn`` остаётся в истории, за ним — служебное сообщение с вопросом, и
         ответ на него не печатается. С вызовами или оборванный ответ возвращается — ход
         идёт дальше как обычно. Только текст — служебное сообщение убирается, финальным
-        остаётся ``turn`` (None); так же при сбое запроса.
+        остаётся ``turn`` (None); так же при сбое запроса. ``note`` — заметка к запросу
+        (предупреждение о серии неудач: вызовы ответа выполнятся).
         """
         stats.self_checks += 1
         conversation = self._conversation
         conversation.add_assistant(turn.message, turn.usage)
         mark, context = len(conversation), stats.context_tokens
-        note = SELF_CHECK_NOTE.format(path=self._plan_display())
-        conversation.add_user(_reminder(note), meta=True)
+        question = SELF_CHECK_NOTE.format(path=self._plan_display())
+        conversation.add_user(_reminder(question), meta=True)
         try:
-            check = self._next_turn(specs, quiet=True)
+            check = self._next_turn(specs, note=note, quiet=True)
         except LLMError as e:
             conversation.truncate(mark)
             self._events.on_notice(f"самопроверка плана не удалась: {e}", level="warn")

@@ -1450,7 +1450,9 @@ def _awk_redirects(program: str) -> bool:
 def _awk(env: Env, args: list[Word]) -> Part:
     if (
         _values(args, "-f", "--file")
-        or any(a.static and re.fullmatch(r"-[fiElE].*", a.value) for a in args)
+        # -W: опции реализации, в том числе программа из файла или из опции
+        # (mawk `-W exec файл`, gawk `-W source=…`, `-W file=…`).
+        or any(a.static and re.fullmatch(r"-[fiElEW].*", a.value) for a in args)
         or _abbrev(
             args,
             "--file",

@@ -189,10 +189,10 @@ EXPLORE_PROMPT = """\
 You ONLY research: you change nothing (file edits and changing git commands are \
 blocked). run_shell runs only commands verified as read-only inside the project \
 (ls, wc, grep, rg, git log/show/blame, Python one-liners that only read files); \
-anything else is refused, including running the project's code (tests, builds, \
-scripts, importing its modules) and commands with loops, conditions or $(…) \
-substitutions — prefer the dedicated tools. A refused command is not worth \
-rephrasing: switch to read_file, search_content or the navigation tools.
+anything else is refused, including the project's tests and builds, importing its \
+modules, loops and if/case blocks, and arguments known only at run time — prefer the \
+dedicated tools. A refused command is not worth rephrasing: switch to read_file, \
+search_content or the navigation tools.
 
 Strategy — search, do not browse:
 1. Start from the question, not from the file tree. Turn it into concrete \

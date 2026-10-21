@@ -238,6 +238,16 @@ def test_explore_unsupported_git_subcommand_is_not_called_a_change(tmp_path):
     assert "не поддерживается" in child_result and "run_shell" in child_result
 
 
+@pytest.mark.parametrize("sub", ["push", "merge"])
+def test_explore_changing_git_subcommand_is_still_a_blocked_change(tmp_path, sub):
+    provider = ScriptedProvider(
+        [_task(), tool_turn("git", {"subcommand": sub}), text_turn("итог"), text_turn("ок")]
+    )
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("x")
+    assert _results(provider.requests[2]["messages"])[-1] == READ_ONLY_BLOCKED_NOTE
+
+
 def _sub_results(events):
     return [(k, p) for k, p in events.events if k == "subagent_tool_result"]
 

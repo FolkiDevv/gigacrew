@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -373,15 +375,17 @@ def test_guard_stop_mid_batch_closes_remaining_calls(tmp_path):
             ("read_file", {"path": "a.txt"}),
         ]
     )
-    provider = ScriptedProvider([batch, text_turn("итог")])
+    # первая неудача — серия у предела: пачка уходит в ответ на запрос с предупреждением
+    first = tool_turn("read_file", {"path": "nope0.txt"})
+    provider = ScriptedProvider([first, batch, text_turn("итог")])
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, max_tool_failures=2)
 
     assert agent.run_turn("x") == "итог"
     assert events.stats[-1].stop_reason == "tool_failures"
-    results = [m for m in agent.conversation.messages if m.role == "function"]
+    results = [m for m in agent.conversation.messages if m.role == "function"][1:]
     assert [r.call_id for r in results] == ["c1", "c2", "c3"]
-    assert results[2].content == SKIPPED_NOTE  # третий вызов не выполнялся
+    assert [r.content for r in results[1:]] == [SKIPPED_NOTE] * 2  # не выполнялись
     _assert_well_formed(agent.conversation.messages)
     _assert_well_formed(provider.requests[-1]["messages"][1:])
 
@@ -826,6 +830,25 @@ def test_plan_mode_reminder_goes_with_every_request(tmp_path):
     assert all(reminder not in m.content for m in agent.conversation.messages)  # не в истории
 
 
+@pytest.mark.parametrize(
+    "answer", [None, QuestionsUnavailable("нет терминала")], ids=["esc", "no_approver"]
+)
+def test_no_plan_reminder_after_the_plan_was_shown(tmp_path, answer):
+    """План показан — что дальше, говорит исход показа («перескажи суть», «дождись
+    указаний»); напоминание «план — не текстом ответа» ему бы противоречило."""
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
+            tool_turn("exit_plan_mode", {}),
+            text_turn("План в файле."),
+        ]
+    )
+    agent = _planning_agent(provider, tmp_path, _PlanAnswers(answer))
+    agent.run_turn("спланируй")
+    reminder = PLAN_REMINDER_NOTE.format(path=PLAN_REL)
+    assert [reminder in tail for tail in _tails(provider)] == [True, True, False]
+
+
 def test_plan_mode_allows_only_the_plan_file(tmp_path):
     provider = ScriptedProvider(
         [
@@ -916,6 +939,109 @@ def test_plan_left_in_text_with_remarks_is_revised_and_shown_again(tmp_path):
     # после отказа (Esc) ход кончился ответом модели, без служебного сообщения
     assert agent.conversation.messages[-1].content == "Исправил"
     assert len(provider.requests) == 4 and events.stats[-1].self_checks == 0
+
+
+FAILURES_MARK = "One more failed call will stop"
+
+
+def _tails(provider) -> list[str]:
+    return [r["messages"][-1].content for r in provider.requests]
+
+
+def test_failure_warning_survives_cut_retry(tmp_path):
+    """Ответ на запрос с предупреждением оборван — повтор запроса тоже с предупреждением."""
+    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(3)]
+    provider = ScriptedProvider(
+        [*bad, cut_turn("частичный"), tool_turn("read_file", {"path": "nope9.txt"})]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, max_tool_failures=4)
+    agent.run_turn("x")
+    marks = [FAILURES_MARK in tail for tail in _tails(provider)]
+    assert marks[:5] == [False, False, False, True, True]
+    assert events.stats[-1].stop_reason == "tool_failures"
+    warned = [text for _, text in events.notices if "модель предупреждена" in text]
+    assert len(warned) == 1  # пользователю — один раз
+
+
+def test_failure_warning_goes_with_plan_self_check(tmp_path):
+    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(3)]
+    provider = ScriptedProvider(
+        [*bad, text_turn("ответ"), tool_turn("read_file", {"path": "nope9.txt"}), text_turn("x")]
+    )
+    events = RecordingEvents()
+    agent = _planning_agent(provider, tmp_path, events)
+    agent.run_turn("x")
+    tails = _tails(provider)
+    assert SELF_CHECK_NOTE.splitlines()[0] in tails[4] and FAILURES_MARK in tails[4]
+
+
+def test_failures_crossing_the_limit_in_one_batch_are_warned_first(tmp_path):
+    """Пачка вызовов перешла предел — модель сначала предупреждается, стоп — после."""
+
+    def batch(*paths):
+        return tools_turn([("read_file", {"path": p}) for p in paths])
+
+    provider = ScriptedProvider([batch("n1", "n2"), batch("n3", "n4"), batch("n5"), text_turn("x")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, max_tool_failures=4)
+    agent.run_turn("x")
+    marks = [FAILURES_MARK in tail for tail in _tails(provider)]
+    assert marks[:3] == [False, False, True]
+    assert events.stats[-1].stop_reason == "tool_failures"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="симлинки")
+@pytest.mark.parametrize("variant", ["dir", "file"])
+def test_plan_argument_is_not_written_through_a_link(tmp_path, variant):
+    """exit_plan_mode(plan=...) не пишет через ссылку на месте файла или папки плана:
+    запись шла бы мимо проверки риска write_file — в файл проекта без вопроса."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / ".gigacode").mkdir()
+    if variant == "dir":
+        os.symlink("../src", tmp_path / ".gigacode" / "plans")
+        target = tmp_path / "src" / "chat1.md"
+    else:
+        (tmp_path / ".gigacode" / "plans").mkdir()
+        os.symlink("../../conftest.py", tmp_path / ".gigacode" / "plans" / "chat1.md")
+        target = tmp_path / "conftest.py"
+    provider = ScriptedProvider(
+        [tool_turn("exit_plan_mode", {"plan": "import os  # x"}), text_turn("ok")]
+    )
+    events = RecordingEvents(answers=None)
+    agent = _planning_agent(provider, tmp_path, events)
+    agent.run_turn("план")
+    assert not target.exists() and events.questions == []
+    assert "символическая ссылка" in _function_results(agent)[-1]
+
+
+def test_plan_edited_after_approval_does_not_hide_the_next_plan(tmp_path):
+    """Отметки в плане после одобрения (режим «авто») — не новый план: в новом цикле
+    планирования план из аргумента не теряется молча, старый план не показывается."""
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План A\n- [ ] a.py"}),
+            tool_turn("exit_plan_mode", {}),
+            tool_turn("edit_file", {"path": "a.py", "old_string": "x = 1", "new_string": "x = 2"}),
+            tool_turn(
+                "edit_file", {"path": PLAN_REL, "old_string": "- [ ]", "new_string": "- [x]"}
+            ),
+            text_turn("готово"),
+            tool_turn("exit_plan_mode", {"plan": "# План B\n- кэш"}),
+            text_turn("жду"),
+        ]
+    )
+    events = _PlanAnswers([Answer((APPROVE,))], [Answer((APPROVE,))])
+    agent = _planning_agent(provider, tmp_path, events)
+    agent.run_turn("спланируй и сделай A")
+    assert agent.mode is PermissionMode.AUTO and agent._plan.dirty
+    agent.set_mode(PermissionMode.PLAN)
+    assert not agent._plan.dirty
+    agent.run_turn("теперь спланируй B")
+    assert len(events.questions) == 1  # план A второй раз не показан
+    result = _function_results(agent)[-1]
+    assert "не менялся" in result and PLAN_REL in result
 
 
 def test_plan_revised_many_times_is_not_a_loop(tmp_path):

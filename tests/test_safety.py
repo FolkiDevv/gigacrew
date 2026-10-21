@@ -153,6 +153,10 @@ def test_read_only(root, command):
         "awk 'BEGIN{system(\"id\")}'",
         "awk '{print > \"out.txt\"}' a.txt",
         "awk '{print $1, $2 >> \"out.txt\"}' a.txt",
+        "awk -W exec prog.awk a.txt",  # программа из файла (mawk)
+        "awk -Wexec prog.awk a.txt",
+        "gawk -W source='BEGIN{print 1}' a.txt",
+        "awk -W file=prog.awk a.txt",
         'awk \'{printf("%s\\n", $1) > "out.txt"}\' a.txt',
         "awk '{print $1,\n$2 > \"out.txt\"}' a.txt",
         "awk '$1 > 5 {print $1 > \"out.txt\"}' a.txt",
