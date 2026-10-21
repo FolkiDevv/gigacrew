@@ -147,9 +147,11 @@ def target_key(call: FunctionCall) -> str:
         value = call.arguments.get(field)
         if value not in (None, "", []):
             text = value if isinstance(value, str) else json.dumps(value, default=str)
-            text = " ".join(text.split())
-            if field == "path":  # ./a.py и a.py, src/ и src — одна цель
-                text = posixpath.normpath(text.replace("\\", "/"))
+            # ./a.py и a.py, src/ и src — одна цель; пробелы внутри имени — его часть
+            if field == "path":
+                text = posixpath.normpath(text.strip().replace("\\", "/"))
+            else:
+                text = " ".join(text.split())
             return f"{call.name}:{field}={text}"
     return call.name
 

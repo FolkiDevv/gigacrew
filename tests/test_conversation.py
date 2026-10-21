@@ -369,6 +369,7 @@ def test_target_key_normalizes_paths():
     assert key("a.py") == key("./a.py") == key(" a.py ")
     assert key("src/") == key("src") and key("src\\a.py") == key("src/a.py")
     assert key("a.py") != key("b.py")
+    assert key("a b.txt") != key("a  b.txt")  # разные файлы
 
 
 def _run(guard: LoopGuard, call: FunctionCall, outcome: ToolOutcome = OK):
