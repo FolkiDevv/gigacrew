@@ -11,8 +11,7 @@ authors = [
     { name = "FolkiDevv", email = "hi@folki.dev" }
 ]
 requires-python = ">=3.13"
-# SPDX-выражение (PEP 639). Классификатора `License ::` нет намеренно: PyPI отклоняет пакет,
-# в котором есть и то, и другое.
+# SPDX-выражение (PEP 639) вместо классификатора `License ::` — одно из двух, не оба.
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["cli", "agent", "llm", "code", "assistant", "tree-sitter", "lsp"]
@@ -25,6 +24,9 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development",
+    # Проект не публикуется: PyPI отклоняет пакет с этим классификатором, случайный
+    # `uv publish` не пройдёт.
+    "Private :: Do Not Upload",
 ]
 dependencies = [
     "httpx>=0.27",
@@ -64,18 +66,10 @@ gigacrew = "gigacrew.cli:main"
 [project.urls]
 Homepage = "https://github.com/FolkiDevv/gigacrew"
 Repository = "https://github.com/FolkiDevv/gigacrew"
-Issues = "https://github.com/FolkiDevv/gigacrew/issues"
 
 [tool.uv.build-backend]
 # Плоская раскладка: пакет лежит в корне репозитория, а не в src/.
 module-root = ""
-
-# Только для ручного workflow публикации в TestPyPI; `explicit` не пускает индекс в разрешение зависимостей.
-[[tool.uv.index]]
-name = "testpypi"
-url = "https://test.pypi.org/simple/"
-publish-url = "https://test.pypi.org/legacy/"
-explicit = true
 
 [tool.ruff]
 line-length = 100
