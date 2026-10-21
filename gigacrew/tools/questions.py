@@ -26,6 +26,10 @@ class Question:
     header: str = ""  # короткая метка темы («База данных»)
     multi_select: bool = False
     body: str = ""  # Markdown над вариантами ответа (например, план на одобрение)
+    source: str = ""  # откуда взят body (файл плана) — подпись под ним
+    # Пункт «свой ответ» и его пояснение; пусто — общие подписи интерфейса.
+    custom_label: str = ""
+    custom_hint: str = ""
 
 
 @dataclass(frozen=True)

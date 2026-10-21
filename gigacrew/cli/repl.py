@@ -33,6 +33,13 @@ from gigacrew.project.skills import SkillCatalog
 from gigacrew.ui.console import Console
 from gigacrew.ui.format import mode_badge
 
+# Частые команды под стартовым экраном; остальные — в /help.
+BANNER_HINTS = (
+    ("/help", "все команды"),
+    ("/model", "модель"),
+    ("/resume", "чаты"),
+    ("/clear", "новый чат"),
+)
 TLS_OFF_WARNING = (
     "проверка TLS-сертификата сервера API выключена — ключ или токен можно перехватить "
     "подменой сервера; задайте GIGACREW_CA_BUNDLE (корневой сертификат сервера, PEM)"
@@ -133,7 +140,7 @@ def run_repl(
         version=__version__,
         model=agent.model,
         root=str(agent.workspace.root),
-        hints=[(cmd.name, cmd.summary) for cmd in commands],
+        hints=[(name, desc) for name, desc in BANNER_HINTS if commands.get(name) is not None],
         auto_approve=agent.config.auto_approve,
         mode=agent.mode,
     )
@@ -141,7 +148,7 @@ def run_repl(
     if cfg.auth_mode in ("oauth", "cli_token") and not cfg.verify_ssl:
         ui.warn(TLS_OFF_WARNING)
     if resumed is not None:
-        ui.chat_resumed(resumed, agent.conversation.messages, agent.describe_call)
+        ui.chat_resumed(resumed, agent.conversation.messages, agent.call_info)
     # Ввод не принимается, пока строится индекс (Esc/Ctrl+C — отменить построение).
     if index_on_start:
         ensure_index(agent.workspace, ui, esc)

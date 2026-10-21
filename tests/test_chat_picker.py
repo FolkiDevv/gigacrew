@@ -10,7 +10,9 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from gigacrew.agent.chat_store import ChatInfo
+from gigacrew.agent.events import ToolCallInfo
 from gigacrew.llm.types import FunctionCall, Message
+from gigacrew.permissions import ToolKind
 from gigacrew.ui.chat_picker import PickerState, pick_chat, render
 from gigacrew.ui.console import Console
 from gigacrew.ui.format import format_when
@@ -197,16 +199,16 @@ def test_chat_resumed_shows_last_exchanges(monkeypatch):
     ui.chat_resumed(
         _chat(3, "почини тесты", messages=10),
         messages,
-        lambda call: str(call.arguments["command"]),
+        lambda call: ToolCallInfo(call.name, str(call.arguments["command"]), ToolKind.COMMAND),
     )
     out = buf.getvalue()
     assert "продолжаем чат «почини тесты» · 4 запроса · 10 сообщений" in out
     # Ранние обмены — строкой: сохранены в чате, но не печатаются.
     assert "раньше: 1 запрос · 2 сообщения — сохранены в чате, на экран не выводятся" in out
     assert "нулевой" not in out
-    assert out.index("› первый вопрос") < out.index("первый ответ") < out.index("› второй вопрос")
-    assert "\x1b" not in out and "› почини [31mтесты" in out  # sanitize убрал ESC
-    assert "● run_shell  pytest -x" in out
+    assert out.index("❯ первый вопрос") < out.index("первый ответ") < out.index("❯ второй вопрос")
+    assert "\x1b" not in out and "❯ почини [31mтесты" in out  # sanitize убрал ESC
+    assert "● $ pytest -x" in out  # шаг — как в ленте, без итога: его нет в истории
     assert "Готово: тесты проходят" in out
 
 
@@ -224,7 +226,7 @@ def test_chat_resumed_folds_tool_calls_and_clips_earlier_answers(monkeypatch):
     out = buf.getvalue()
     assert "раньше" not in out  # показаны все обмены
     assert "… ещё 3 вызова инструментов" in out and out.count("● run_shell") == 5
-    first, last = out.split("› а теперь итог")
+    first, last = out.split("❯ а теперь итог")
     assert "пропущено" in first and "абзац 19" in first  # ранний ответ сокращён
     assert "пропущено" not in last and "абзац 10" in last  # последний — целиком
 
@@ -239,7 +241,7 @@ def test_chat_resumed_skips_meta_messages(monkeypatch):
     ]
     ui.chat_resumed(_chat(0, "спланируй промокоды"), messages)
     out = buf.getvalue()
-    assert "› спланируй промокоды" in out and "Промокоды готовы" in out
+    assert "❯ спланируй промокоды" in out and "Промокоды готовы" in out
     assert "system-reminder" not in out
 
 
@@ -255,6 +257,30 @@ def test_chat_resumed_after_interrupted_turn_shows_no_stale_answer(monkeypatch):
     ui.chat_resumed(_chat(1, "первый вопрос"), messages)
     out = buf.getvalue()
     # Ответ на первый вопрос — в своём обмене, а не ответом на прерванный второй.
-    before, after = out.split("› второй вопрос")
+    before, after = out.split("❯ второй вопрос")
     assert "ответ на первый" in before
     assert "ответ на первый" not in after and "ответа нет" in after
+
+
+def test_chat_resumed_folds_consecutive_reads_and_edits(monkeypatch):
+    ui, buf = _console(monkeypatch)
+
+    def call(name: str, path: str) -> FunctionCall:
+        return FunctionCall(name=name, arguments={"path": path})
+
+    def info(fc: FunctionCall) -> ToolCallInfo:
+        if fc.name == "read_file":
+            return ToolCallInfo(fc.name, fc.arguments["path"], read_only=True)
+        return ToolCallInfo(fc.name, fc.arguments["path"], ToolKind.EDIT)
+
+    reads = [call("read_file", "a.py"), call("read_file", "b.py")]
+    edits = [call("edit_file", "a.py"), call("edit_file", "b.py"), call("edit_file", "a.py")]
+    messages = [
+        Message(role="user", content="поправь"),
+        Message(role="assistant", function_calls=reads),
+        Message(role="assistant", function_calls=edits),
+        Message(role="assistant", content="Готово"),
+    ]
+    ui.chat_resumed(_chat(0, "поправь"), messages, info)
+    out = buf.getvalue()
+    assert "● Изучил код  прочитал 2 файла\n  a.py  b.py\n● Изменил a.py, b.py\n" in out

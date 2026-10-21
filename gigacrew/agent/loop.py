@@ -1360,7 +1360,7 @@ class Agent:
             self._events.on_tool_call(invalid)
             return self._fail(invalid, f"валидация аргументов: {e}", note=note)
 
-        call = ToolCallInfo(name, self._describe(tool, params), tool.kind)
+        call = ToolCallInfo(name, self._describe(tool, params), tool.kind, read_only=tool.read_only)
         self._events.on_tool_call(call)
         key = call_key(function_call)
 
@@ -1848,17 +1848,20 @@ class Agent:
         self._conversation.add_function_result(call.name, _with_note(content, note))
         return ToolOutcome(ok=False)
 
-    def describe_call(self, call: FunctionCall) -> str:
-        """Краткое описание вызова из истории (показ продолженного чата), как в строке
-        вызова во время хода; неизвестный инструмент или неверные аргументы — ``""``."""
+    def call_info(self, call: FunctionCall) -> ToolCallInfo:
+        """Вызов из истории (показ продолженного чата) в том виде, в каком его показывает
+        интерфейс во время хода: описание, вид, только ли смотрит проект. Неизвестный
+        инструмент — только имя, неверные аргументы — без описания."""
         tool = self._registry.get(call.name)
         if tool is None:
-            return ""
+            return ToolCallInfo(call.name)
         try:
             params = tool.parse(call.arguments)
         except Exception:
-            return ""
-        return self._describe(tool, params)
+            return ToolCallInfo(call.name, kind=tool.kind, read_only=tool.read_only)
+        return ToolCallInfo(
+            call.name, self._describe(tool, params), tool.kind, read_only=tool.read_only
+        )
 
     @staticmethod
     def _describe(tool: Tool, params: BaseModel) -> str:

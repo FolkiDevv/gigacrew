@@ -193,6 +193,7 @@ def format_ref_hits(hits: list[RefHit], ctx: ToolContext, labels: dict[str, str]
 
 class FindReferencesTool(Tool):
     name = "find_references"
+    read_only = True
     description = (
         "Finds usages of a definition: calls, attribute access, mentions, imports — with "
         "the function or class they occur in. Answers 'who calls it', 'where is it used', "
@@ -338,6 +339,7 @@ def _hover_signature(hover: str) -> str:
 
 class GotoDefinitionTool(Tool):
     name = "goto_definition"
+    read_only = True
     description = (
         "Where a name on a specific line of a file leads: its definition (taking imports, "
         "aliases and the object's type into account) and, for Python, its type or "
@@ -445,6 +447,7 @@ class CallHierarchyParams(BaseModel):
 
 class CallHierarchyTool(Tool):
     name = "call_hierarchy"
+    read_only = True
     description = (
         "Call tree of a function or method: who calls it (incoming) or what it calls "
         f"(outgoing), up to {MAX_DEPTH} levels deep, with the call sites. For Python the "

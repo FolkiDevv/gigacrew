@@ -467,6 +467,7 @@ class ReadFileParams(BaseModel):
 
 class ReadFileTool(Tool):
     name = "read_file"
+    read_only = True
     description = (
         "Reads a text file. Returns the text with line numbers. Pass a line range "
         "(start_line/end_line) to read only the part you need — use file_outline or "
@@ -747,6 +748,7 @@ class ListDirParams(BaseModel):
 
 class ListDirTool(Tool):
     name = "list_dir"
+    read_only = True
     description = (
         "Lists files and subdirectories (including hidden ones) of a directory. For an "
         "overview with languages and definitions use file_outline."
@@ -791,6 +793,7 @@ def _check_pattern(pattern: str) -> None:
 
 class FindFilesTool(Tool):
     name = "find_files"
+    read_only = True
     description = (
         "Finds files by a glob pattern (recursively, inside the project). A pattern "
         "without '/' is matched against the file name, with '/' — against the path from "

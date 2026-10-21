@@ -390,7 +390,7 @@ def _resume(ctx: CommandContext, arg: str) -> bool:
         source="resume",
         switch=lambda: resume_chat(ctx.agent, chats, saved),
     )
-    ctx.ui.chat_resumed(saved.info, saved.conversation.messages, ctx.agent.describe_call)
+    ctx.ui.chat_resumed(saved.info, saved.conversation.messages, ctx.agent.call_info)
     if skipped:
         ctx.ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {ctx.agent.model}")
     if ctx.agent.model != previous:

@@ -75,11 +75,24 @@ def _text(state: ChoiceState, width: int = 80) -> str:
 
 def test_render_shows_counter_options_descriptions_and_custom():
     text = _text(ChoiceState(DB, 1, 2))
-    assert "Вопрос 1 из 2 · База данных" in text
+    assert "▌ ? Какую БД использовать?   База данных · 1 из 2" in text
     assert "❯ 1. PostgreSQL" in text and "  2. SQLite" in text
     assert "Файл в проекте, без сервера" in text
     assert "3. Свой ответ…" in text and "Начните печатать" in text
     assert "Esc — отказаться" in text
+    assert "1 из 1" not in _text(ChoiceState(DB, 1, 1))  # один вопрос — без номера
+
+
+def test_render_custom_label_of_question():
+    from dataclasses import replace
+
+    plan = replace(DB, custom_label="Замечания…", custom_hint="что поправить")
+    assert "3. Замечания…" in _text(ChoiceState(plan, 1, 1)) and "что поправить" in _text(
+        ChoiceState(plan, 1, 1)
+    )
+    assert "Замечания: добавь тесты" in _text(
+        ChoiceState(plan, 1, 1, cursor=2, custom="добавь тесты")
+    )
 
 
 def test_render_custom_text():
@@ -90,8 +103,8 @@ def test_render_custom_text():
 def test_render_multi_select_and_wrapping():
     state = ChoiceState(PARTS, 2, 2, cursor=1, checked={0})
     text = _text(state)
-    assert "[x] Логи" in text and "❯ 2. [ ] Метрики" in text
-    assert "можно выбрать несколько" in text and "Пробел" in text
+    assert "[✔] Логи" in text and "❯ 2. [ ] Метрики" in text
+    assert "можно выбрать несколько" in text and "Пробел" in text and "отмечено 1" in text
     long = Question("Вопрос?", (QuestionOption("A", "слово " * 40), QuestionOption("B")))
     lines = _text(ChoiceState(long, 1, 1), width=40).splitlines()
     assert all(len(line) <= 40 for line in lines)

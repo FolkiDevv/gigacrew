@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "gigacrew"
-version = "0.8.0"
+version = "0.8.1"
 description = "Консольный помощник для работы с кодом проекта"
 readme = "README.md"
 authors = [
@@ -32,7 +32,7 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.5",
     "rich>=13.0",
-    "prompt_toolkit>=3.0.43",  # placeholder, create_pipe_input
+    "prompt_toolkit>=3.0.52",  # placeholder, create_pipe_input; атрибуты dim/nodim в стилях
     "ty==0.0.86",  # LSP-сервер для точной навигации по Python; бета — пин точный
     # tree-sitter: API ломается между минорами — пин; грамматики (MIT, офлайн) сверены
     # tests/test_treesitter.py, несовместимая грамматика — откат на построчные шаблоны

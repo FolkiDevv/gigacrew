@@ -171,14 +171,16 @@ def test_loop_runs_tool_then_finishes(tmp_path):
     assert provider.calls == 2
 
 
-def test_describe_call_from_history(tmp_path):
+def test_call_info_from_history(tmp_path):
     """Строка вызова при продолжении чата — та же, что во время хода."""
     agent = _agent(ScriptedProvider(), tmp_path)
-    assert (
-        agent.describe_call(FunctionCall(name="read_file", arguments={"path": "a.txt"})) == "a.txt"
-    )
-    assert agent.describe_call(FunctionCall(name="nope", arguments={"path": "a.txt"})) == ""
-    assert agent.describe_call(FunctionCall(name="read_file", arguments={"path": 1.5})) == ""
+    info = agent.call_info(FunctionCall(name="read_file", arguments={"path": "a.txt"}))
+    assert info.summary == "a.txt" and info.read_only
+    edit = agent.call_info(FunctionCall(name="edit_file", arguments={"path": "a.txt"}))
+    assert edit.kind is ToolKind.EDIT and not edit.read_only
+    assert agent.call_info(FunctionCall(name="nope", arguments={"path": "a.txt"})).summary == ""
+    bad = agent.call_info(FunctionCall(name="read_file", arguments={"path": 1.5}))
+    assert bad.summary == "" and bad.read_only
 
 
 def test_streaming_events_wrap_each_request(tmp_path):
