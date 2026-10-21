@@ -194,20 +194,42 @@ def test_save_chats_flag_and_env(tmp_path):
     assert load({"GIGACREW_SAVE_CHATS": "1"}, save_chats=False) is False  # --no-save сильнее
 
 
+def test_command_safety_settings(tmp_path):
+    def load(env):
+        cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+        return cfg.safe_commands, cfg.remember_approvals
+
+    assert load({}) == (True, True)
+    assert load({"GIGACREW_SAFE_COMMANDS": "0", "GIGACREW_REMEMBER_APPROVALS": "0"}) == (
+        False,
+        False,
+    )
+
+
 def test_mode_flag_and_env(tmp_path):
     from gigacrew.permissions import PermissionMode
 
     def load(env, **kw):
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path, **kw).mode
 
-    assert load({}) is PermissionMode.MANUAL
+    assert load({}) is PermissionMode.AUTO
     assert load({"GIGACREW_MODE": " Plan "}) is PermissionMode.PLAN
+    # прежние режимы «ручной» и «авто-правки» — это «авто»
+    assert load({"GIGACREW_MODE": "manual"}) is PermissionMode.AUTO
+    assert load({"GIGACREW_MODE": "edits"}) is PermissionMode.AUTO
     # --mode сильнее окружения
-    assert load({"GIGACREW_MODE": "plan"}, mode=PermissionMode.ACCEPT_EDITS) is (
-        PermissionMode.ACCEPT_EDITS
-    )
+    assert load({"GIGACREW_MODE": "plan"}, mode=PermissionMode.AUTO) is PermissionMode.AUTO
     with pytest.raises(ConfigError, match="GIGACREW_MODE"):
-        load({"GIGACREW_MODE": "auto"})
+        load({"GIGACREW_MODE": "yolo"})
+
+
+def test_reviewer_model(tmp_path):
+    def load(env):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).reviewer_model
+
+    assert load({}) is None
+    assert load({"GIGACREW_REVIEWER_MODEL": "  "}) is None
+    assert load({"GIGACREW_REVIEWER_MODEL": " Reviewer-Max "}) == "Reviewer-Max"
 
 
 def test_compaction_settings(tmp_path):

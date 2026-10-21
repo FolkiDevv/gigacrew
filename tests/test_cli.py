@@ -108,6 +108,42 @@ def test_model_and_clear_commands(cli_env, capsys):
     assert len(agent.conversation) == 0
 
 
+def test_permissions_command_lists_forgets_and_shows_log(tmp_path, capsys):
+    from gigacrew.agent.decisions import DecisionMemory
+    from gigacrew.safety import classify
+
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    ui = Console(no_color=True)
+    agent = Agent(ScriptedProvider(), build_default_registry(), cfg, ui, decisions=memory)
+    commands = default_commands()
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands)
+    commands.dispatch("/permissions", ctx)
+    assert "сохранённых разрешений нет" in _out(capsys)
+    memory.approve(classify("pytest -q", root=tmp_path))
+    memory.record(
+        {
+            "command": "pip install x",
+            "cwd": ".",
+            "key": "pip install x",
+            "decision": "no",
+            "source": "user",
+            "feedback": "не надо",
+        }
+    )
+    commands.dispatch("/permissions", ctx)
+    out = _out(capsys)
+    assert "1. «pytest» с проверенными аргументами" in out and "approvals.json" in out
+    commands.dispatch("/permissions log", ctx)
+    assert "нет: pip install x — «не надо»" in _out(capsys)
+    commands.dispatch("/permissions forget 1", ctx)
+    assert "разрешение удалено" in _out(capsys) and memory.rules == []
+    commands.dispatch("/permissions forget 5", ctx)
+    assert "нет разрешения №5" in _out(capsys)
+    commands.dispatch("/permissions bogus", ctx)
+    assert "использование" in _out(capsys)
+
+
 # ------------------------------- REPL ------------------------------- #
 def _reader(*items):
     queue = list(items)
@@ -851,14 +887,16 @@ def test_mode_command(cli_env, capsys):
     agent, _, commands, ctx, _ = cli_env
     assert commands.dispatch("/mode", ctx) is True
     out = _out(capsys)
-    assert "режим: ручной" in out and "plan — план" in out and "Shift+Tab" in out
+    assert "режим: авто" in out and "plan — план" in out and "Shift+Tab" in out
+    assert "модель чата" in out  # кто проверяет команды
     commands.dispatch("/mode plan", ctx)
     assert agent.mode is PermissionMode.PLAN
     assert "режим: план" in _out(capsys)
-    commands.dispatch("/mode EDITS", ctx)
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
-    commands.dispatch("/mode auto", ctx)
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    commands.dispatch("/mode EDITS", ctx)  # прежнее имя — это «авто»
+    assert agent.mode is PermissionMode.AUTO
+    commands.dispatch("/mode plan", ctx)
+    commands.dispatch("/mode yolo", ctx)
+    assert agent.mode is PermissionMode.PLAN
     assert "неизвестный режим" in _out(capsys)
 
 
@@ -888,12 +926,12 @@ def test_repl_shows_mode_and_wires_shift_tab(cli_env, capsys):
     esc = FakeEsc()
     assert run_repl(agent, ui, commands, read_input=_reader("/exit"), interrupt=esc) == 0
     out = _out(capsys)
-    assert "режим" in out and "ручной" in out and "Shift+Tab" in out  # баннер
+    assert "режим" in out and "авто" in out and "Shift+Tab" in out  # баннер
     # Shift+Tab во время хода — смена режима агента и подсказка в индикаторе
     esc.on_backtab()
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
-    assert status_of(agent).mode is PermissionMode.ACCEPT_EDITS
-    assert "авто-правки (Shift+Tab)" in ui._turn_hint()
+    assert agent.mode is PermissionMode.PLAN
+    assert status_of(agent).mode is PermissionMode.PLAN
+    assert "план (Shift+Tab)" in ui._turn_hint()
 
 
 def test_oneshot_mode_flag_and_env(tmp_path, oneshot, monkeypatch):
@@ -904,7 +942,51 @@ def test_oneshot_mode_flag_and_env(tmp_path, oneshot, monkeypatch):
     assert _main(tmp_path, "-p", "x", "--no-save") == 0
     assert all("# Plan mode" in r["messages"][0].content for r in provider.requests)
     with pytest.raises(SystemExit):
-        _main(tmp_path, "--mode", "auto", "-p", "x")
+        _main(tmp_path, "--mode", "yolo", "-p", "x")
+
+
+def test_startup_warns_about_missing_reviewer_model(tmp_path, oneshot, capsys, monkeypatch):
+    script = tmp_path / "build.sh"
+    script.write_text("#!/bin/sh\necho built\n")
+    script.chmod(0o755)
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "./build.sh"}), text_turn("готово")],
+        summaries=[text_turn('{"allow": true, "reason": "сборка"}')],
+    )
+    monkeypatch.setattr(provider, "list_models", lambda: ["M-default", "Reviewer-Max"])
+    oneshot(provider)
+    monkeypatch.setenv("GIGACREW_REVIEWER_MODEL", "nope")
+    assert _main(tmp_path, "-p", "собери", "--no-save") == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "модели «nope» (GIGACREW_REVIEWER_MODEL) нет — модель-рецензент отключена" in out
+    assert "больше команд будут требовать ручного подтверждения" in out
+    # рецензента нет — команда ушла пользователю (без терминала ответа нет)
+    assert provider.summary_requests == [] and "built" not in out
+
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "./build.sh"}), text_turn("готово")],
+        summaries=[text_turn('{"allow": true, "reason": "сборка"}')],
+    )
+    monkeypatch.setattr(provider, "list_models", lambda: ["M-default", "Reviewer-Max"])
+    oneshot(provider)
+    monkeypatch.setenv("GIGACREW_REVIEWER_MODEL", "reviewer-max")
+    assert _main(tmp_path, "-p", "собери", "--no-save") == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "GIGACREW_REVIEWER_MODEL" not in out and "рецензент (Reviewer-Max) разрешил" in out
+    assert "built" in out
+    assert provider.summary_requests[0]["model"] == "Reviewer-Max"
+
+
+def test_mode_command_warns_when_reviewer_is_disabled(cli_env, capsys):
+    from gigacrew.agent.reviewer import Reviewer
+
+    agent, _, commands, ctx, _ = cli_env
+    agent._reviewer = Reviewer("nope", disabled="модели «nope» (GIGACREW_REVIEWER_MODEL) нет")
+    commands.dispatch("/mode plan", ctx)
+    assert "отключена" not in _out(capsys)
+    commands.dispatch("/mode auto", ctx)
+    out = " ".join(_out(capsys).split())
+    assert "режим: авто" in out and "модель-рецензент отключена" in out
 
 
 def test_oneshot_plan_without_approver_ends_with_plan(tmp_path, oneshot, capsys, monkeypatch):

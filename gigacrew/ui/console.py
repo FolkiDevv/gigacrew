@@ -44,7 +44,9 @@ from gigacrew.agent.events import (
     AgentEvents,
     Approval,
     CompactResult,
+    ConfirmResult,
     NoticeLevel,
+    Review,
     SubagentInfo,
     ToolCallInfo,
     TurnStats,
@@ -92,8 +94,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _SKIPPED_RE = re.compile(rf"^{SKIPPED_MARK} пропущено .*$", re.MULTILINE)
 _REFRESH_PER_SECOND = 2 / SPINNER_INTERVAL  # два обновления на кадр — ровный шаг ракеты
 _MODE_COLORS = {
-    PermissionMode.MANUAL: MUTED,
-    PermissionMode.ACCEPT_EDITS: WARN,
+    PermissionMode.AUTO: WARN,
     PermissionMode.PLAN: BRAND,
 }
 
@@ -101,6 +102,37 @@ _MODE_COLORS = {
 def sanitize(text: str) -> str:
     """Убирает управляющие символы (кроме переводов строк и табуляции)."""
     return _CONTROL_RE.sub("", text.replace("\r\n", "\n"))
+
+
+# Невидимые символы: управляющие, смена направления текста, нулевой ширины. В команде,
+# которую подтверждает пользователь, их нельзя убирать молча — она выполнится с ними.
+_INVISIBLE_RE = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
+)
+# Многострочная команда длиннее — с номерами строк.
+_NUMBER_LINES_FROM = 4
+
+
+def visible_text(text: str, *, numbered: bool | None = None) -> Text:
+    """Текст как есть, но с видимыми невидимыми символами (``⟨U+202E⟩``) и, у длинного
+    многострочного, номерами строк. Ничего не обрезается: длинные строки переносятся."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    if numbered is None:
+        numbered = len(lines) >= _NUMBER_LINES_FROM
+    width = len(str(len(lines)))
+    out = Text(overflow="fold")
+    for i, line in enumerate(lines, 1):
+        if numbered:
+            out.append(f"{i:>{width}} │ ", style=MUTED)
+        pos = 0
+        for m in _INVISIBLE_RE.finditer(line):
+            out.append(line[pos : m.start()])
+            out.append(f"⟨U+{ord(m.group()):04X}⟩", style=f"bold {DANGER}")
+            pos = m.end()
+        out.append(line[pos:])
+        if i < len(lines):
+            out.append("\n")
+    return out
 
 
 class _LiveView:
@@ -462,6 +494,17 @@ class Console(AgentEvents):
             line.append(sanitize(call.summary), style=ACCENT)
         self._c.print(line)
 
+    def on_review_start(self, call: ToolCallInfo) -> None:
+        self._start_live(_LiveView("рецензент проверяет команду", hint=self._turn_hint))
+
+    def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
+        self.stop_live()
+        if review is not None and review.allowed:
+            line = Text("  ")
+            line.append(f"{ICON_OK} ", style=OK)
+            line.append(sanitize(review.approval), style=MUTED)
+            self._c.print(line)
+
     def on_tool_start(self, call: ToolCallInfo) -> None:
         self._start_live(_LiveView("выполняется", hint=self._turn_hint))
 
@@ -512,6 +555,39 @@ class Console(AgentEvents):
                 expand=False,
             )
         )
+
+    def _exact_block(self, preview: Display) -> bool:
+        """Превью того, что выполнится: целиком, без обрезки и молча удалённых символов.
+
+        Возвращает True, если оно не помещается на экран (тогда предлагается просмотрщик).
+        """
+        text = preview.text.rstrip("\n")
+        lines = text.split("\n")
+        title = preview.title or "превью"
+        if len(lines) >= _NUMBER_LINES_FROM:
+            n = len(lines)
+            title += f" · {n} {plural(n, 'строка', 'строки', 'строк')}"
+        self._print_above_live(
+            Panel(
+                visible_text(text),
+                title=Text(title, style=MUTED),
+                title_align="left",
+                box=ROUNDED,
+                border_style=MUTED,
+                padding=(0, 1),
+                expand=False,
+            )
+        )
+        width = max(self._c.size.width - 4, 20)
+        height = sum(max(1, -(-len(line) // width)) for line in lines)
+        return height > max(self._c.size.height - 8, 10)
+
+    def _page(self, preview: Display) -> None:
+        """Показать превью в просмотрщике (less и т.п.) — длинную команду целиком."""
+        body = visible_text(preview.text.rstrip("\n"), numbered=True)
+        with self._input_guard(), self._c.pager(styles=True):
+            self._c.print(Text(preview.title or "превью", style=MUTED))
+            self._c.print(body)
 
     def output_block(self, text: str, *, title: str = "вывод") -> None:
         if not text.strip():
@@ -630,31 +706,56 @@ class Console(AgentEvents):
         self._c.print(Text("  " + "  ·  ".join(parts), style=MUTED))
 
     # -------------------------- подтверждения --------------------------- #
-    def confirm(self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool) -> Approval:
+    def confirm(
+        self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
+    ) -> ConfirmResult:
         self.stop_live()  # превью печатается до вопроса — область уже не нужна
+        long_preview = False
         if preview and preview.text.strip():
             if preview.kind == "diff":
                 self.diff(preview.text, title=preview.title or None)
             else:
-                self.output_block(preview.text, title=preview.title or "превью")
+                long_preview = self._exact_block(preview)
+        if call.purpose:
+            self._c.print(Text(f"  зачем (со слов модели): {sanitize(call.purpose)}", style=MUTED))
+        if call.reason:
+            self._c.print(Text(f"  почему спрашиваю: {sanitize(call.reason)}", style=MUTED))
+        if call.review:
+            self._c.print(Text(f"  {sanitize(call.review)}", style=MUTED))
+        if call.history:
+            self._c.print(Text(f"  {sanitize(call.history)}", style=MUTED))
         edit = call.kind is ToolKind.EDIT
         action = "Применить" if edit else "Выполнить"
-        target = f" ({sanitize(call.summary)})" if call.summary else ""
+        summary = sanitize(call.summary).strip()
+        if "\n" in summary:  # многострочная команда целиком — в превью выше
+            summary = summary.split("\n", 1)[0].rstrip() + " …"
+        target = f" ({summary})" if summary else ""
         always = None
         if not dangerous:  # опасное «навсегда» не разрешается
-            always = (
-                "правки файлов без вопросов до конца сессии (режим «авто-правки»)"
-                if edit
-                else "не спрашивать этот вызов до конца сессии"
+            if call.remember:
+                always = sanitize(call.remember)
+            else:
+                always = "не спрашивать этот вызов до конца сессии"
+        question = f"{action} {call.name}{target}?"
+        while True:
+            raw = self._question_raw(
+                question, dangerous=dangerous, always=always, feedback=True, view=long_preview
             )
-        answer = self._question(
-            f"{action} {call.name}{target}?", dangerous=dangerous, always=always
-        )
+            if raw is None:
+                return ConfirmResult(Approval.NO, answered=False)
+            answer = raw.strip().lower()
+            if preview is not None and answer in _VIEW:
+                self._page(preview)  # и спросить снова
+                continue
+            break
         if answer in _YES:
-            return Approval.YES
+            return ConfirmResult(Approval.YES)
         if always is not None and answer in _ALWAYS:
-            return Approval.ALWAYS
-        return Approval.NO
+            return ConfirmResult(Approval.ALWAYS)
+        if not answer or answer in _NO:
+            return ConfirmResult(Approval.NO)
+        # Свой ответ вместо y/n — отказ с объяснением: его получит модель.
+        return ConfirmResult(Approval.NO, feedback=raw.strip())
 
     def ask(self, question: str, *, dangerous: bool = False) -> bool:
         """Вопрос да/нет. Ctrl+C/Ctrl+D — «нет»."""
@@ -662,21 +763,39 @@ class Console(AgentEvents):
 
     def _question(self, question: str, *, dangerous: bool, always: str | None = None) -> str:
         """Ответ на вопрос (в нижнем регистре); Ctrl+C/Ctrl+D — пустой."""
+        raw = self._question_raw(question, dangerous=dangerous, always=always)
+        return "" if raw is None else raw.strip().lower()
+
+    def _question_raw(
+        self,
+        question: str,
+        *,
+        dangerous: bool,
+        always: str | None = None,
+        feedback: bool = False,
+        view: bool = False,
+    ) -> str | None:
+        """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода)."""
         self.stop_live()
         color = DANGER if dangerous else WARN
         if always is not None:
             self._c.print(Text(f"  a — {always}", style=MUTED))
+        if view:
+            self._c.print(Text("  v — открыть целиком в просмотрщике", style=MUTED))
+        if feedback:
+            self._c.print(Text("  или напишите, что сделать вместо этого", style=MUTED))
         prompt = Text("  ")
         prompt.append("⚠ ОПАСНО: " if dangerous else "? ", style=f"bold {color}")
         prompt.append(question, style="bold")
-        prompt.append(" [y/N/a] " if always is not None else " [y/N] ", style=MUTED)
+        keys = "y/N" + ("/a" if always is not None else "") + ("/v" if view else "")
+        prompt.append(f" [{keys}] ", style=MUTED)
         try:
             with self._input_guard():
                 answer = self._c.input(prompt)
         except (EOFError, KeyboardInterrupt):
             self._c.print()
-            return ""
-        return answer.strip().lower()
+            return None
+        return answer
 
     # ---------------------------- вопросы агента ---------------------------- #
     def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
@@ -849,7 +968,9 @@ class Console(AgentEvents):
 
 
 _YES = ("y", "yes", "д", "да")
-_ALWAYS = ("a", "always", "в", "всегда")
+_NO = ("n", "no", "н", "нет", "т")  # н, т — клавиши y и n в русской раскладке: не «да»
+_ALWAYS = ("a", "always", "в", "всегда", "ф")  # ф — клавиша a в русской раскладке
+_VIEW = ("v", "view", "м", "показать")  # м — клавиша v в русской раскладке
 
 
 def _stdin_is_terminal() -> bool:

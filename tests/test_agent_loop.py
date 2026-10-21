@@ -32,7 +32,7 @@ from gigacrew.llm.base import LLMError
 from gigacrew.llm.types import Message, Usage
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolRegistry, ToolResult, build_default_registry
-from gigacrew.tools.plan import APPROVE_EDITS
+from gigacrew.tools.plan import APPROVE
 from gigacrew.tools.questions import Answer, QuestionsUnavailable
 from gigacrew.tools.task import EXPLORE
 
@@ -702,7 +702,7 @@ def test_plan_mode_stops_model_that_keeps_editing(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_accept_edits_applies_edits_without_asking(tmp_path):
+def test_auto_mode_applies_edits_without_asking(tmp_path):
     tool = FakeTool(kind=ToolKind.EDIT)
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
@@ -712,14 +712,15 @@ def test_accept_edits_applies_edits_without_asking(tmp_path):
         events=events,
         registry=_registry_with(tool),
         auto_approve=False,
-        mode=PermissionMode.ACCEPT_EDITS,
+        mode=PermissionMode.AUTO,
     )
     agent.run_turn("поправь")
     assert tool.runs == 1 and events.confirms == []
 
 
 @pytest.mark.parametrize("kind", [ToolKind.COMMAND, ToolKind.OTHER])
-def test_accept_edits_still_asks_for_the_rest(tmp_path, kind):
+def test_auto_mode_still_asks_for_the_rest(tmp_path, kind):
+    # команда без вердикта классификатора рецензенту не отдаётся
     tool = FakeTool(kind=kind)
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
@@ -729,7 +730,7 @@ def test_accept_edits_still_asks_for_the_rest(tmp_path, kind):
         events=events,
         registry=_registry_with(tool),
         auto_approve=False,
-        mode=PermissionMode.ACCEPT_EDITS,
+        mode=PermissionMode.AUTO,
     )
     agent.run_turn("x")
     assert tool.runs == 0 and len(events.confirms) == 1
@@ -740,20 +741,20 @@ def test_plan_rules_are_sent_only_in_plan_mode(tmp_path):
     provider = ScriptedProvider([text_turn("план"), text_turn("OK"), text_turn("готово")])
     agent = _agent(provider, tmp_path, mode=PermissionMode.PLAN)
     agent.run_turn("спланируй")
-    agent.set_mode(PermissionMode.MANUAL)
+    agent.set_mode(PermissionMode.AUTO)
     agent.run_turn("делай")
-    planning, check, manual = _system_prompts(provider)
+    planning, check, auto = _system_prompts(provider)
     assert "# Plan mode" in planning and "# Plan mode" in check
-    assert "# Plan mode" not in manual
+    assert "# Plan mode" not in auto
 
 
 def test_mode_survives_reset_and_cycles(tmp_path):
     agent = _agent(ScriptedProvider(), tmp_path)
-    assert agent.mode is PermissionMode.MANUAL
-    assert agent.cycle_mode() is PermissionMode.ACCEPT_EDITS
+    assert agent.mode is PermissionMode.AUTO
+    assert agent.cycle_mode() is PermissionMode.PLAN
     agent.reset()
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
-    assert [agent.cycle_mode(), agent.cycle_mode()] == [PermissionMode.PLAN, PermissionMode.MANUAL]
+    assert agent.mode is PermissionMode.PLAN
+    assert [agent.cycle_mode(), agent.cycle_mode()] == [PermissionMode.AUTO, PermissionMode.PLAN]
 
 
 PLAN_REL = ".gigacode/plans/chat1.md"
@@ -774,10 +775,10 @@ def test_approved_plan_switches_mode_within_the_turn(tmp_path):
             text_turn("готово"),
         ]
     )
-    events = RecordingEvents(confirm_answer=False, answers=[Answer((APPROVE_EDITS,))])
+    events = RecordingEvents(confirm_answer=False, answers=[Answer((APPROVE,))])
     agent = _planning_agent(provider, tmp_path, events)
     assert agent.run_turn("спланируй и сделай") == "готово"
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert agent.mode is PermissionMode.AUTO
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
     assert events.confirms == []  # ни план в режиме плана, ни правка после одобрения
     (question,) = events.questions[0]
@@ -837,10 +838,10 @@ def test_plan_left_in_text_is_shown_and_approved(tmp_path):
             text_turn("готово"),
         ]
     )
-    events = _PlanAnswers([Answer((APPROVE_EDITS,))])
+    events = _PlanAnswers([Answer((APPROVE,))])
     agent = _planning_agent(provider, tmp_path, events)
     assert agent.run_turn("спланируй и сделай") == "готово"
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert agent.mode is PermissionMode.AUTO
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
     (question,) = events.questions[0]
     assert question.body.startswith("# План\n1. создать a.txt")
@@ -1045,7 +1046,7 @@ def test_cut_self_check_reply_is_retried(tmp_path):
     assert stats.self_checks == 1 and stats.cut_retries == 1 and len(events.questions) == 1
 
 
-@pytest.mark.parametrize("mode", [PermissionMode.MANUAL, PermissionMode.ACCEPT_EDITS])
+@pytest.mark.parametrize("mode", [PermissionMode.AUTO])
 def test_no_self_check_outside_plan_mode(tmp_path, mode):
     provider = ScriptedProvider([text_turn("ответ на вопрос")])
     events = RecordingEvents()
@@ -1511,32 +1512,121 @@ class _ApprovingEvents(RecordingEvents):
         return self._answers.pop(0)
 
 
-def test_always_for_edit_switches_to_accept_edits(tmp_path):
-    from gigacrew.agent.events import Approval
-
-    writes = [tool_turn("write_file", {"path": f"f{i}.txt", "content": "x"}) for i in range(2)]
-    provider = ScriptedProvider([*writes, text_turn("ок")])
-    events = _ApprovingEvents([Approval.ALWAYS])
-    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
-    agent.run_turn("x")
-    assert len(events.confirms) == 1  # вторая правка — уже без вопроса
-    assert agent.mode is PermissionMode.ACCEPT_EDITS
-    assert (tmp_path / "f1.txt").exists()
-    assert any("авто-правки" in text for _, text in events.notices)
+def _script(tmp_path: Path, name: str = "build.sh") -> str:
+    path = tmp_path / name
+    path.write_text("#!/bin/sh\necho built\n")
+    path.chmod(0o755)
+    return f"./{name}"
 
 
 def test_always_for_command_allows_only_the_same_call(tmp_path):
     from gigacrew.agent.events import Approval
 
-    echo = tool_turn("run_shell", {"command": "echo 1"})
-    other = tool_turn("run_shell", {"command": "echo 2"})
-    provider = ScriptedProvider([echo, text_turn("ок"), echo, other, text_turn("ок")])
+    script = _script(tmp_path)
+    run = tool_turn("run_shell", {"command": f"{script} one"})
+    other = tool_turn("run_shell", {"command": f"{script} two"})
+    provider = ScriptedProvider([run, text_turn("ок"), run, other, text_turn("ок")])
     events = _ApprovingEvents([Approval.ALWAYS, Approval.YES])
     agent = _agent(provider, tmp_path, events=events, auto_approve=False)
     agent.run_turn("x")
     agent.run_turn("ещё")  # разрешение действует и в следующих ходах
-    assert [call.summary for call, _, _ in events.confirms] == ["echo 1", "echo 2"]
-    assert agent.mode is PermissionMode.MANUAL
+    assert [call.summary for call, _, _ in events.confirms] == [f"{script} one", f"{script} two"]
+    assert agent.mode is PermissionMode.AUTO
+    assert "запомнится" in events.confirms[0][0].remember  # вопрос говорит, что запомнится
+    assert any("разрешено сохранённым правилом" in text for _, text in events.notices)
+
+
+def test_read_only_commands_run_without_asking(tmp_path):
+    (tmp_path / "a.txt").write_text("hello\n")
+    calls = [tool_turn("run_shell", {"command": c}) for c in ("ls", "cat a.txt | wc -l")]
+    provider = ScriptedProvider([*calls, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("x")
+    assert events.confirms == []
+    outputs = _function_results(agent)
+    assert "a.txt" in outputs[0] and "1" in outputs[1]
+
+
+def test_safe_commands_can_be_turned_off(tmp_path):
+    provider = ScriptedProvider([tool_turn("run_shell", {"command": "ls"}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False, safe_commands=False)
+    agent.run_turn("x")
+    assert len(events.confirms) == 1
+
+
+def test_confirm_shows_reason_and_feedback_reaches_model(tmp_path):
+    from gigacrew.agent.events import Approval, ConfirmResult
+
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "pip install requests"}), text_turn("ок")]
+    )
+    events = _ApprovingEvents([ConfirmResult(Approval.NO, feedback="используй uv add")])
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("x")
+    call, _, dangerous = events.confirms[0]
+    assert "сеть" in call.reason and not dangerous
+    results = _function_results(agent)
+    assert "REJECTED" in results[0] and "используй uv add" in results[0]
+
+
+def test_plan_mode_blocks_known_changing_commands(tmp_path):
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "touch new.txt"}), text_turn("ок")]
+    )
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False, mode=PermissionMode.PLAN)
+    agent.run_turn("x")
+    assert events.confirms == []
+    assert not (tmp_path / "new.txt").exists()
+
+
+def test_auto_mode_runs_commands_that_only_edit_files(tmp_path):
+    (tmp_path / "a.txt").write_text("old\n")
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "sed -i 's/old/new/' a.txt"}), text_turn("ок")]
+    )
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("x")
+    assert events.confirms == []
+    assert (tmp_path / "a.txt").read_text() == "new\n"
+
+
+def test_saved_approval_survives_new_session(tmp_path):
+    from gigacrew.agent.decisions import DecisionMemory
+    from gigacrew.agent.events import Approval
+
+    script = _script(tmp_path)
+    home = tmp_path / "home"
+    memory, _ = DecisionMemory.load(tmp_path, base=home)
+    run = tool_turn("run_shell", {"command": script})
+    events = _ApprovingEvents([Approval.ALWAYS])
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    Agent(
+        ScriptedProvider([run, text_turn("ок")]),
+        build_default_registry(),
+        cfg,
+        events,
+        decisions=memory,
+    ).run_turn("x")
+    assert len(events.confirms) == 1
+    # новая сессия: память читается заново с диска
+    memory2, warning = DecisionMemory.load(tmp_path, base=home)
+    assert warning is None and len(memory2.rules) == 1
+    events2 = RecordingEvents(confirm_answer=False)
+    Agent(
+        ScriptedProvider([run, text_turn("ок")]),
+        build_default_registry(),
+        cfg,
+        events2,
+        decisions=memory2,
+    ).run_turn("x")
+    assert events2.confirms == []
+    journal = (memory2.journal_path).read_text().splitlines()
+    assert any('"decision": "always"' in line for line in journal)
+    assert any('"event": "outcome"' in line for line in journal)
 
 
 def test_yes_flag_still_asks_for_dangerous_commands(tmp_path):

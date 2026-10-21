@@ -18,6 +18,7 @@ from gigacrew.agent.hooks import HookResult, HookRunner, PromptBlocked
 from gigacrew.agent.loop import (
     HOOK_BLOCKED_NOTE,
     MAX_STOP_HOOK_BLOCKS,
+    PLAN_BLOCKED_NOTE,
     STOP_HOOK_NOTE,
     Agent,
 )
@@ -76,22 +77,27 @@ def _function_results(agent: Agent) -> list[str]:
 @pytest.mark.parametrize(
     ("mode", "risk", "kind", "auto", "hook", "expected"),
     [
-        (PermissionMode.MANUAL, RiskLevel.WRITE, ToolKind.EDIT, False, "allow", Decision.ALLOW),
+        (PermissionMode.AUTO, RiskLevel.WRITE, ToolKind.OTHER, False, "allow", Decision.ALLOW),
+        # allow снимает и рецензента изменяющих команд
+        (PermissionMode.AUTO, RiskLevel.WRITE, ToolKind.COMMAND, False, "allow", Decision.ALLOW),
         # опасное хук не разрешает молча — как -y без --yes-all
         (
-            PermissionMode.MANUAL,
+            PermissionMode.AUTO,
             RiskLevel.DANGEROUS,
             ToolKind.COMMAND,
             False,
             "allow",
             Decision.ASK,
         ),
-        (PermissionMode.MANUAL, RiskLevel.SAFE, ToolKind.OTHER, False, "ask", Decision.ASK),
-        (PermissionMode.MANUAL, RiskLevel.WRITE, ToolKind.EDIT, True, "ask", Decision.ASK),
+        (PermissionMode.AUTO, RiskLevel.SAFE, ToolKind.OTHER, False, "ask", Decision.ASK),
+        (PermissionMode.AUTO, RiskLevel.WRITE, ToolKind.EDIT, True, "ask", Decision.ASK),
+        # ask — решает пользователь, а не рецензент
+        (PermissionMode.AUTO, RiskLevel.WRITE, ToolKind.COMMAND, False, "ask", Decision.ASK),
         # запрет режима плана хук не снимает
         (PermissionMode.PLAN, RiskLevel.WRITE, ToolKind.EDIT, False, "allow", Decision.BLOCK),
         (PermissionMode.PLAN, RiskLevel.WRITE, ToolKind.EDIT, False, "ask", Decision.BLOCK),
-        (PermissionMode.MANUAL, RiskLevel.WRITE, ToolKind.EDIT, False, None, Decision.ASK),
+        (PermissionMode.AUTO, RiskLevel.WRITE, ToolKind.OTHER, False, None, Decision.ASK),
+        (PermissionMode.AUTO, RiskLevel.WRITE, ToolKind.COMMAND, False, None, Decision.REVIEW),
     ],
 )
 def test_decide_with_hook(mode, risk, kind, auto, hook, expected):
@@ -101,7 +107,7 @@ def test_decide_with_hook(mode, risk, kind, auto, hook, expected):
 def test_decide_hook_keeps_read_only_block():
     assert (
         decide(
-            PermissionMode.MANUAL,
+            PermissionMode.AUTO,
             RiskLevel.WRITE,
             ToolKind.COMMAND,
             auto_approve=True,
@@ -129,7 +135,7 @@ def test_pre_tool_use_deny_blocks_call(tmp_path):
     assert payload["tool_name"] == "fake_write" and payload["tool_input"] == {"path": "a"}
     assert payload["session_id"] == agent.chat_id
     assert payload["transcript_path"].endswith(f"{agent.chat_id}.json")
-    assert payload["permission_mode"] == "manual" and payload["cwd"] == str(tmp_path.resolve())
+    assert payload["permission_mode"] == "auto" and payload["cwd"] == str(tmp_path.resolve())
 
 
 def test_pre_tool_use_denials_are_not_a_failure_series(tmp_path):
@@ -142,7 +148,7 @@ def test_pre_tool_use_denials_are_not_a_failure_series(tmp_path):
 
 
 def test_pre_tool_use_allow_skips_confirmation(tmp_path):
-    tool = FakeTool(kind=ToolKind.EDIT)
+    tool = FakeTool()  # не правка и не команда: в режиме «авто» спрашивается
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="allow")})
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents()
@@ -162,6 +168,61 @@ def test_pre_tool_use_ask_confirms_every_time(tmp_path):
     agent.run_turn("пиши")
     # «всегда» не запоминается: хук требует спрашивать каждый раз
     assert len(events.confirms) == 2 and tool.runs == 2
+
+
+# PreToolUse и команды: рецензент режима «авто» и запрет режима плана
+shell_only = pytest.mark.skipif(os.name != "posix", reason="классификатор команд — для /bin/sh")
+REVIEWER_DENY = '{"allow": false, "reason": "об этом не просили"}'
+
+
+def _shell_agent(provider, tmp_path: Path, hooks: HookRunner, *, events, mode=PermissionMode.AUTO):
+    script = tmp_path / "build.sh"
+    script.write_text("#!/bin/sh\necho built\n")
+    script.chmod(0o755)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="M-chat", mode=mode)
+    return Agent(provider, build_default_registry(), cfg, events, hooks=hooks)
+
+
+@shell_only
+def test_pre_tool_use_allow_skips_reviewer(tmp_path):
+    hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="allow")})
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "./build.sh"}), text_turn("ок")],
+        summaries=[text_turn(REVIEWER_DENY)],
+    )
+    events = RecordingEvents(confirm_answer=False)
+    agent = _shell_agent(provider, tmp_path, hooks, events=events)
+    agent.run_turn("собери")
+    assert provider.summary_requests == [] and events.confirms == []
+    assert "built" in _function_results(agent)[0]
+
+
+@shell_only
+def test_pre_tool_use_ask_goes_to_user_not_reviewer(tmp_path):
+    hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="ask")})
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "./build.sh"}), text_turn("ок")],
+        summaries=[text_turn('{"allow": true, "reason": "можно"}')],
+    )
+    events = RecordingEvents(confirm_answer=True)
+    agent = _shell_agent(provider, tmp_path, hooks, events=events)
+    agent.run_turn("собери")
+    assert provider.summary_requests == []
+    ((call, _, _),) = events.confirms
+    assert "хук PreToolUse требует подтверждения" in call.reason
+
+
+@shell_only
+def test_pre_tool_use_allow_keeps_plan_mode_block(tmp_path):
+    hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="allow")})
+    provider = ScriptedProvider(
+        [tool_turn("run_shell", {"command": "mkdir newdir"}), text_turn("ок")]
+    )
+    events = RecordingEvents(confirm_answer=True)
+    agent = _shell_agent(provider, tmp_path, hooks, events=events, mode=PermissionMode.PLAN)
+    agent.run_turn("создай каталог")
+    assert not (tmp_path / "newdir").exists() and events.confirms == []
+    assert _function_results(agent)[0] == PLAN_BLOCKED_NOTE
 
 
 def test_notification_before_confirmation(tmp_path):

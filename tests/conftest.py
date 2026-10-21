@@ -77,6 +77,7 @@ def oneshot(tmp_path, monkeypatch):
         "GIGACREW_CONTEXT_TOKENS",
         "GIGACREW_SAVE_CHATS",
         "GIGACREW_MODE",
+        "GIGACREW_REVIEWER_MODEL",
         "GIGACREW_AUTO_COMPACT",
         "GIGACREW_COMPACT_THRESHOLD",
         "GIGACREW_AUTO_MEASURE",

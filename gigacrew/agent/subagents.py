@@ -20,7 +20,9 @@ from gigacrew.agent.events import (
     AgentEvents,
     Approval,
     CompactResult,
+    ConfirmResult,
     NoticeLevel,
+    Review,
     SubagentInfo,
     ToolCallInfo,
     TurnStats,
@@ -51,6 +53,12 @@ SUBAGENT_USER_STOP_NOTE = (
 READ_ONLY_BLOCKED_NOTE = (
     "Not executed: you are a research-only subagent, any changes are forbidden. Do not "
     "try to make them: describe the needed changes in the final report."
+)
+READ_ONLY_SHELL_NOTE = (
+    "Not executed: here run_shell runs only commands verified as read-only inside the "
+    "project (ls, cat, grep, rg, git status/log/diff, Python one-liners that only read); "
+    "this one is not: {reason}. Use read_file, search_content and git instead, or put the "
+    "command in the final report for the main agent."
 )
 SUBAGENT_PLAN_BLOCKED_NOTE = (
     "Not executed: plan mode is on, changes are forbidden. Do not try to make them: "
@@ -130,8 +138,16 @@ class SubagentEvents(AgentEvents):
 
     def confirm(
         self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
-    ) -> bool | Approval:
+    ) -> bool | Approval | ConfirmResult:
         return self._parent.confirm(call, preview, dangerous=dangerous)
+
+    def on_review_start(self, call: ToolCallInfo) -> None:
+        self._activity("рецензент проверяет команду")
+
+    def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
+        # Не передаётся как есть: интерфейс остановил бы индикатор суб-агента.
+        if review is not None and review.allowed:
+            self._parent.on_notice(f"{self._info.name}: {review.approval}")
 
     def on_tool_start(self, call: ToolCallInfo) -> None:
         self._activity(call.name)

@@ -32,8 +32,10 @@ from pathlib import Path
 
 from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
+from gigacrew.agent.decisions import DecisionMemory
 from gigacrew.agent.hooks import PromptBlocked
 from gigacrew.agent.loop import Agent
+from gigacrew.agent.reviewer import check_reviewer
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
 from gigacrew.cli.hooks import hook_session, install_request_hook, load_hooks
 from gigacrew.cli.models import (
@@ -48,7 +50,7 @@ from gigacrew.llm.api import ApiProvider
 from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.llm.gigacode import GigaCodeProvider
 from gigacrew.llm.model_windows import ModelWindows
-from gigacrew.permissions import PermissionMode
+from gigacrew.permissions import PermissionMode, parse_mode
 from gigacrew.project.skills import SkillCatalog
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import build_default_registry
@@ -73,7 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-y",
         "--yes",
         action="store_true",
-        help="Авто-подтверждение операций, кроме опасных (rm -rf, git reset --hard…)",
+        help="Авто-подтверждение операций, кроме опасных (rm -rf, git reset --hard, "
+        "секреты, файлы вне проекта…)",
     )
     p.add_argument(
         "--yes-all",
@@ -82,9 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mode",
-        choices=[mode.value for mode in PermissionMode],
-        help="Начальный режим: manual — всё с подтверждением, edits — правки файлов "
-        "без вопросов, plan — только исследование и план (Shift+Tab — сменить)",
+        type=_mode_arg,
+        metavar="{" + ",".join(mode.value for mode in PermissionMode) + "}",
+        help="Начальный режим: auto (по умолчанию) — правки файлов без вопросов, "
+        "изменяющие команды проверяет модель-рецензент (GIGACREW_REVIEWER_MODEL, по "
+        "умолчанию — модель чата), сомнительные и опасные — с подтверждением; plan — "
+        "только исследование и план (Shift+Tab — сменить). Команды, которые только "
+        "читают, — без вопросов",
     )
     chat = p.add_mutually_exclusive_group()
     chat.add_argument(
@@ -105,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-save",
         action="store_true",
-        help="Не сохранять чат в .gigacode/chats/",
+        help="Не сохранять чат в .gigacode/chats/ и журнал решений о командах",
     )
     p.add_argument(
         "--trust-hooks",
@@ -130,6 +137,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version=f"gigacrew {__version__}")
     return p
+
+
+def _mode_arg(text: str) -> PermissionMode:
+    """``--mode``: режим по имени (прежние ``manual``/``edits`` — это ``auto``)."""
+    try:
+        return parse_mode(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def _make_provider(config: Config) -> LLMProvider:
@@ -234,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             auto_approve=args.yes,
             yes_all=args.yes_all,
-            mode=PermissionMode(args.mode) if args.mode else None,
+            mode=args.mode,
             stream=not args.no_stream,
             save_chats=not args.no_save,
         )
@@ -304,7 +319,24 @@ def main(argv: list[str] | None = None) -> int:
                 "не задана модель: укажите GIGACREW_MODEL или --model (список — --list-models)"
             )
             return EXIT_ERROR
-        agent = Agent(provider, build_default_registry(), config, ui, windows=windows, hooks=hooks)
+        decisions, warning = DecisionMemory.load(
+            config.project_root, remember=config.remember_approvals, log=config.save_chats
+        )
+        if warning:
+            ui.warn(warning)
+        reviewer, warning = check_reviewer(provider, config.reviewer_model)
+        if warning:
+            ui.warn(warning)
+        agent = Agent(
+            provider,
+            build_default_registry(),
+            config,
+            ui,
+            windows=windows,
+            decisions=decisions,
+            reviewer=reviewer,
+            hooks=hooks,
+        )
         store = ChatStore(agent.workspace)
         chats = ChatRecorder(store, enabled=config.save_chats)
         agent.chat_id = chats.chat_id  # файл плана назван по id чата

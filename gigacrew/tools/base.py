@@ -27,10 +27,12 @@ from gigacrew.errors import ToolError
 from gigacrew.llm.types import ToolSpec
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.workspace import Workspace
+from gigacrew.safety.levels import Verdict
 from gigacrew.security import RiskLevel
 from gigacrew.tools.questions import AskUser
 
 __all__ = [
+    "Assessment",
     "Display",
     "PlanFile",
     "Tool",
@@ -79,6 +81,8 @@ class ToolContext:
     запуск суб-агента (инструмент ``task``): ``(агент, описание, задача) → отчёт``;
     None — запускать некому (в том числе у самого суб-агента: без вложенности).
     ``plan`` — файл плана чата (None — плана нет: суб-агент, тесты инструментов).
+    ``classify_commands`` — команды, которые классификатор признал «только чтение»,
+    выполняются без вопроса (``GIGACREW_SAFE_COMMANDS``).
     """
 
     workspace: Workspace
@@ -88,6 +92,7 @@ class ToolContext:
     semantic: bool = True
     run_subagent: Callable[[str, str, str], ToolResult] | None = None
     plan: PlanFile | None = None
+    classify_commands: bool = True
 
     @property
     def root(self) -> Path:
@@ -107,6 +112,23 @@ class Display:
     title: str = ""
 
 
+@dataclass(frozen=True)
+class Assessment:
+    """Оценка вызова перед выполнением: уровень риска и подробности для вопроса.
+
+    ``reason`` — почему (показывается пользователю при подтверждении); ``kind`` — вид
+    вызова для режимов, если он зависит от аргументов (команда, которая только правит
+    файлы проекта, — как правка: в режиме «авто» не спрашивается); ``verdict`` —
+    оценка команды оболочки (для памяти решений и журнала).
+    """
+
+    risk: RiskLevel
+    reason: str = ""
+    kind: ToolKind | None = None
+    verdict: Verdict | None = None
+    purpose: str = ""  # зачем вызов, со слов модели
+
+
 @dataclass
 class ToolResult:
     """Результат выполнения инструмента."""
@@ -122,6 +144,7 @@ class ToolResult:
     # ≥ WRITE; инструмент с риском ниже ставит, если изменения сделал не он сам
     # (суб-агент правил файлы): для ограничителя зацикливания это изменение.
     changed: bool = False
+    exit_code: int | None = None  # код возврата команды (для журнала решений)
 
     def as_function_content(self) -> str:
         if self.ok:
@@ -181,8 +204,9 @@ class Tool[P: BaseModel](ABC):
     description: str = ""
     Params: type[BaseModel] = BaseModel
     # Вид инструмента для режимов разрешений (permissions.decide): правки файлов
-    # (EDIT) применяются без вопроса в режиме авто-правок, команды (COMMAND)
-    # разрешены в режиме плана; остальное изменяющее в плане заблокировано.
+    # (EDIT) применяются без вопроса в режиме «авто», команды (COMMAND) в нём смотрит
+    # модель-рецензент и они разрешены в режиме плана; остальное изменяющее в плане
+    # заблокировано.
     kind: ToolKind = ToolKind.OTHER
 
     # ------------------------------------------------------------------ #
@@ -224,6 +248,14 @@ class Tool[P: BaseModel](ABC):
     def risk(self, params: BaseModel, ctx: ToolContext) -> RiskLevel:  # noqa: ARG002
         """Уровень риска по умолчанию. Переопределяется инструментами."""
         return RiskLevel.SAFE
+
+    def assess(self, params: BaseModel, ctx: ToolContext) -> Assessment:
+        """Оценка вызова для решения «выполнить / спросить / заблокировать».
+
+        По умолчанию — только уровень риска (:meth:`risk`); инструменты с подробной
+        оценкой (run_shell) переопределяют.
+        """
+        return Assessment(self.risk(params, ctx))
 
     def preview(self, params: BaseModel, ctx: ToolContext) -> Display | None:  # noqa: ARG002
         """Что показать перед подтверждением (дифф, команда). None — нечего показывать.

@@ -24,24 +24,14 @@ from gigacrew.permissions import PermissionMode
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.questions import Question, QuestionOption, QuestionsUnavailable
 
-APPROVE_EDITS = "Да, правки без вопросов"
-APPROVE_MANUAL = "Да, с подтверждением"
-_APPROVALS = {
-    APPROVE_EDITS: PermissionMode.ACCEPT_EDITS,
-    APPROVE_MANUAL: PermissionMode.MANUAL,
-}
+APPROVE = "Да, выполнять"
+_APPROVALS = {APPROVE: PermissionMode.AUTO}
 PLAN_QUESTION = Question(
     text="Выполнить этот план?",
     header="План",
     options=(
         QuestionOption(
-            APPROVE_EDITS,
-            f"Режим «{PermissionMode.ACCEPT_EDITS.label}»: "
-            f"{PermissionMode.ACCEPT_EDITS.description}",
-        ),
-        QuestionOption(
-            APPROVE_MANUAL,
-            f"Режим «{PermissionMode.MANUAL.label}»: {PermissionMode.MANUAL.description}",
+            APPROVE, f"Режим «{PermissionMode.AUTO.label}»: {PermissionMode.AUTO.description}"
         ),
     ),
 )

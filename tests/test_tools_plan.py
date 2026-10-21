@@ -8,8 +8,7 @@ from gigacrew.permissions import PermissionMode
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import PlanFile, ToolContext, ToolError
 from gigacrew.tools.plan import (
-    APPROVE_EDITS,
-    APPROVE_MANUAL,
+    APPROVE,
     DECLINED_NOTE,
     NO_APPROVER_NOTE,
     ExitPlanModeTool,
@@ -65,12 +64,9 @@ def _run(tmp_path, session: _Session, plan: str | None = PLAN):
     return tool.run(tool.parse({}), session.context(tmp_path))
 
 
-@pytest.mark.parametrize(
-    ("label", "mode"),
-    [(APPROVE_EDITS, PermissionMode.ACCEPT_EDITS), (APPROVE_MANUAL, PermissionMode.MANUAL)],
-)
-def test_approval_switches_mode(tmp_path, label, mode):
-    session = _Session([Answer((label,))])
+def test_approval_switches_mode(tmp_path):
+    mode = PermissionMode.AUTO
+    session = _Session([Answer((APPROVE,))])
     result = _run(tmp_path, session)
     assert session.mode is mode
     assert result.ok and "одобрил план" in result.content and mode.label in result.content
@@ -79,7 +75,7 @@ def test_approval_switches_mode(tmp_path, label, mode):
     (question,) = session.asked[0]
     assert question.body.startswith(PLAN) and PLAN_REL in question.body
     assert question.header == "План"
-    assert [o.label for o in question.options] == [APPROVE_EDITS, APPROVE_MANUAL]
+    assert [o.label for o in question.options] == [APPROVE]
     assert not session.plan.dirty
 
 
@@ -113,7 +109,7 @@ def test_nobody_to_approve(tmp_path, session):
 @pytest.mark.parametrize(
     ("answers", "outcome", "continues"),
     [
-        ([Answer((APPROVE_EDITS,))], "approved", True),
+        ([Answer((APPROVE,))], "approved", True),
         ([Answer(custom="ещё тесты")], "revise", True),
         (None, "declined", False),
         (QuestionsUnavailable(), "no_approver", False),
@@ -135,7 +131,7 @@ def test_review_outcomes(tmp_path, answers, outcome, continues):
 def test_review_of_missing_plan_shows_nothing(tmp_path, plan):
     if plan is not None:
         _write_plan(tmp_path, plan)
-    session = _Session([Answer((APPROVE_EDITS,))])
+    session = _Session([Answer((APPROVE,))])
     shown: list[bool] = []
     context = session.context(tmp_path)
     with pytest.raises(ToolError):
@@ -144,7 +140,7 @@ def test_review_of_missing_plan_shows_nothing(tmp_path, plan):
 
 
 def test_outside_plan_mode_is_an_error(tmp_path):
-    session = _Session([Answer((APPROVE_EDITS,))], mode=PermissionMode.MANUAL)
+    session = _Session([Answer((APPROVE,))], mode=PermissionMode.AUTO)
     with pytest.raises(ToolError, match="не активен"):
         _run(tmp_path, session)
     assert session.asked == []
@@ -158,7 +154,7 @@ def test_without_agent_is_an_error(tmp_path):
 
 @pytest.mark.parametrize("plan", [None, "  \n "])
 def test_missing_or_empty_plan_file_is_an_error(tmp_path, plan):
-    session = _Session([Answer((APPROVE_EDITS,))])
+    session = _Session([Answer((APPROVE,))])
     with pytest.raises(ToolError, match="План не записан") as e:
         _run(tmp_path, session, plan=plan)
     assert PLAN_REL in str(e.value) and "write_file" in str(e.value)
@@ -168,7 +164,7 @@ def test_missing_or_empty_plan_file_is_an_error(tmp_path, plan):
 def test_plan_argument_is_ignored(tmp_path):
     """Старая привычка модели передавать план в аргументе — не ошибка: план из файла."""
     _write_plan(tmp_path)
-    session = _Session([Answer((APPROVE_EDITS,))])
+    session = _Session([Answer((APPROVE,))])
     tool = ExitPlanModeTool()
     tool.run(tool.parse({"plan": "другой план"}), session.context(tmp_path))
     (question,) = session.asked[0]

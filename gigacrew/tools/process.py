@@ -35,14 +35,35 @@ _PIPE_GRACE_SECONDS = 1.0
 _CAPTURE_LIMIT = 200_000
 
 
+# Переменные, меняющие поведение оболочки команды: CDPATH уводит `cd src` из проекта,
+# ENV и BASH_ENV — файлы, которые sh/bash исполнят перед командой.
+SHELL_ENV_DROP = ("CDPATH", "ENV", "BASH_ENV")
+# Настройки git для всех команд агента: неявный bare-репозиторий (файлы HEAD, config,
+# objects/ в каталоге проекта) не распознаётся, fsmonitor-хук не запускается.
+GIT_SAFE_CONFIG = (("safe.bareRepository", "explicit"), ("core.fsmonitor", "false"))
+
+
 def subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """Окружение для дочернего процесса: без секретов и без интерактива."""
     source = os.environ if environ is None else environ
-    env = {k: v for k, v in source.items() if not k.upper().startswith(SECRET_ENV_PREFIXES)}
+    env = {
+        k: v
+        for k, v in source.items()
+        if not k.upper().startswith(SECRET_ENV_PREFIXES) and k not in SHELL_ENV_DROP
+    }
     env["GIT_TERMINAL_PROMPT"] = "0"  # не спрашивать логин/пароль
     env["GIT_EDITOR"] = "true"  # не открывать редактор (commit без -m)
     env["GIT_PAGER"] = "cat"
     env["PAGER"] = "cat"
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        count = 0
+    for key, value in GIT_SAFE_CONFIG:
+        env[f"GIT_CONFIG_KEY_{count}"] = key
+        env[f"GIT_CONFIG_VALUE_{count}"] = value
+        count += 1
+    env["GIT_CONFIG_COUNT"] = str(count)
     return env
 
 

@@ -45,8 +45,8 @@ EXPLORE = SubagentSpec(
     name="explore",
     description=(
         "codebase research, read-only: search, code navigation, reading files, git "
-        "status/diff/log. Returns a digest with paths and line numbers. For a research "
-        "question prefer the explore tool"
+        "status/diff/log, read-only shell commands. Returns a digest with paths and line "
+        "numbers. For a research question prefer the explore tool"
     ),
     tools=frozenset(
         {
@@ -62,6 +62,7 @@ EXPLORE = SubagentSpec(
             "repo_map",
             "skill",
             "git",  # изменяющие подкоманды блокирует read_only
+            "run_shell",  # только команды, признанные классификатором «только чтение»
         }
     ),
     read_only=True,

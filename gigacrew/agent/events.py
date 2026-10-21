@@ -27,11 +27,23 @@ NoticeLevel = Literal["info", "warn", "error"]
 
 @dataclass(frozen=True)
 class ToolCallInfo:
-    """Вызов инструмента в том виде, в каком его показывают пользователю."""
+    """Вызов инструмента в том виде, в каком его показывают пользователю.
+
+    Для подтверждения агент дополняет: ``reason`` — почему спрашивает (вердикт
+    классификатора команд), ``remember`` — что запомнит ответ «всегда» (пусто — формулировка
+    интерфейса по умолчанию), ``history`` — как пользователь отвечал на такое раньше,
+    ``purpose`` — зачем вызов, со слов модели (показывается как её слова, не как факт),
+    ``review`` — что сказала модель-рецензент (почему передала решение пользователю).
+    """
 
     name: str
     summary: str = ""
     kind: ToolKind = ToolKind.OTHER  # правка файлов, команда или прочее (для формулировок)
+    reason: str = ""
+    remember: str = ""
+    history: str = ""
+    purpose: str = ""  # зачем вызов — со слов модели (параметр description)
+    review: str = ""  # мнение модели-рецензента (режим «авто»)
 
 
 class Approval(Enum):
@@ -39,9 +51,23 @@ class Approval(Enum):
 
     NO = "no"
     YES = "yes"
-    # Да, и не спрашивать до конца сессии: для правок файлов — режим авто-правок,
-    # для прочего — этот же вызов (те же аргументы).
+    # Да, и не спрашивать: для команд — сохранённое для проекта разрешение, для прочего —
+    # этот же вызов до конца сессии.
     ALWAYS = "always"
+
+
+@dataclass(frozen=True)
+class ConfirmResult:
+    """Ответ на подтверждение с подробностями.
+
+    ``feedback`` — что пользователь написал вместо «да/нет» (это отказ; текст получит
+    модель). ``answered`` — False, если ответа не было (Ctrl+C, конец ввода, нет
+    терминала): такой отказ не считается выбором пользователя.
+    """
+
+    approval: Approval
+    feedback: str = ""
+    answered: bool = True
 
 
 @dataclass
@@ -83,6 +109,27 @@ class CompactResult:
 
 
 @dataclass(frozen=True)
+class Review:
+    """Ответ модели-рецензента на изменяющую команду (режим «авто»).
+
+    ``allowed`` — команду можно выполнить без вопроса; иначе решает пользователь.
+    ``failed`` — рецензент не дал ответа (ошибка API, неразборчивый ответ): ``reason`` —
+    описание сбоя.
+    """
+
+    model: str
+    allowed: bool
+    reason: str = ""
+    failed: bool = False
+
+    @property
+    def approval(self) -> str:
+        """Строка о разрешении для пользователя: какая модель разрешила и почему."""
+        text = f"рецензент ({self.model}) разрешил"
+        return f"{text}: {self.reason}" if self.reason else text
+
+
+@dataclass(frozen=True)
 class SubagentInfo:
     """Запущенный суб-агент: тип (``explore``) и краткое описание задачи для UI."""
 
@@ -116,13 +163,21 @@ class AgentEvents:
 
     def confirm(
         self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
-    ) -> bool | Approval:
+    ) -> bool | Approval | ConfirmResult:
         """Спросить пользователя, выполнять ли изменяющую/опасную операцию.
 
         ``True``/``False`` — да/нет; :attr:`Approval.ALWAYS` — да и не спрашивать
-        такое до конца сессии (для опасных операций не предлагается).
+        такое снова (что именно запомнится — ``call.remember``; для опасных операций не
+        предлагается); :class:`ConfirmResult` — то же с текстом пользователя.
         """
         return False
+
+    def on_review_start(self, call: ToolCallInfo) -> None:
+        """Модель-рецензент проверяет команду (режим «авто»)."""
+
+    def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
+        """Проверка закончилась (вызывается всегда). None — прервана; при отказе или
+        сбое дальше придёт ``confirm`` с ``call.review``."""
 
     def on_tool_start(self, call: ToolCallInfo) -> None:
         """Инструмент запущен (после подтверждения, если оно требовалось)."""
