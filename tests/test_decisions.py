@@ -125,7 +125,7 @@ def test_always_does_not_save_rules_that_never_match(root, home, command):
         "frobnicate --all",
         "source .venv/bin/activate && pytest -q",
         "touch a && touch b",
-        "TOKEN=x ./build.sh",
+        "LANG=C ./build.sh",
     ],
 )
 def test_offered_rule_matches_the_same_command(root, home, command):
@@ -269,11 +269,68 @@ def test_in_memory_only():
         ("git clone https://user:pa55@host/repo", "git clone https://user:***@host/repo"),
         ("curl -H 'Authorization: Bearer abc.def' x", "curl -H 'Authorization: Bearer ***' x"),
         ("tool --password hunter2 --x", "tool --password ***** --x".replace("*****", "***")),
+        ("tool --password=hunter2 x", "tool --password=*** x"),
+        ("gh --access-token abc x", "gh --access-token *** x"),
+        ("x --auth-token=abc --client-secret s", "x --auth-token=*** --client-secret ***"),
+        ("mysql -u root -phunter2 -e 'select 1'", "mysql -u root -p*** -e 'select 1'"),
+        ("mysqldump -uroot -p'pa ss' db", "mysqldump -uroot -p*** db"),
+        ("curl -u bob:hunter2 http://x", "curl -u bob:*** http://x"),
+        ("curl --user 'bob:hunter2' http://x", "curl --user 'bob:***' http://x"),
+        ("sshpass -p hunter2 ssh host", "sshpass -p *** ssh host"),
+        ("curl -H 'X-Api-Key: k123' x", "curl -H 'X-Api-Key: ***' x"),
+        ('curl -H "X-Auth-Token:t123" x', 'curl -H "X-Auth-Token:***" x'),
+        (
+            """curl -d '{"api_key": "k123", "n": 1}' x""",
+            """curl -d '{"api_key": "***", "n": 1}' x""",
+        ),
+        ("http POST x token:=abc", "http POST x token:=***"),
+        (
+            "echo ghp_" + "a1" * 18 + " | gh auth login --with-token",
+            "echo *** | gh auth login --with-token",
+        ),
         ("ls -la", "ls -la"),
+        ("git push -u origin main", "git push -u origin main"),
+        ("sort -u keys.txt", "sort -u keys.txt"),
+        ("pytest -p no:cacheprovider", "pytest -p no:cacheprovider"),
     ],
 )
 def test_redact(text, expected):
     assert redact(text) == expected
+
+
+def test_outcome_error_is_redacted(root, home):
+    mem = memory(root, home)
+    mem.outcome("id1", ok=False, error="ошибка: TOKEN=abc123 не подошёл")
+    assert "abc123" not in mem.journal_path.read_text()
+
+
+def test_feedback_and_description_are_redacted(root, home):
+    mem = memory(root, home)
+    mem.record(
+        {
+            "command": "x",
+            "cwd": ".",
+            "key": "x",
+            "decision": "no",
+            "source": "user",
+            "feedback": "используй TOKEN=fb_secret",
+            "description": "деплой с API_KEY=desc_secret",
+        }
+    )
+    text = mem.journal_path.read_text()
+    assert "fb_secret" not in text and "desc_secret" not in text
+    assert "TOKEN=***" in text and "API_KEY=***" in text
+
+
+@pytest.mark.parametrize(
+    "command", ["TOKEN=hunter2 ./build.sh", "./build.sh --password hunter2 > log.txt"]
+)
+def test_command_with_secret_is_not_saved_as_rule(root, home, command):
+    # approvals.json не журнал: секрет из правила не вырезать — правило не сохраняется.
+    mem = memory(root, home)
+    v = verdict(command, root)
+    assert mem.offer(v) == "" and mem.approve(v) == []
+    assert not mem.approvals_path.exists()
 
 
 def _worktree(main: Path, wt: Path, name: str = "wt") -> None:

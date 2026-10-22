@@ -14,8 +14,11 @@
   написал вместо «да/нет»), в каком каталоге и режиме, чем кончилось выполнение. Также
   команды, выполненные без вопроса (только чтение, сохранённое правило). Это данные для
   будущей модели-классификатора и история для подсказок «раньше вы разрешали».
-  Секреты (``TOKEN=…``, пароли в URL, заголовки авторизации) вырезаются; файл доступен
-  только владельцу. Журнал отключается вместе с сохранением чатов (``--no-save``).
+  Секреты (``TOKEN=…``, пароли в URL и флагах, заголовки авторизации — см. :func:`redact`)
+  вырезаются из каждой записи; файл доступен только владельцу. Журнал отключается вместе
+  с сохранением чатов (``--no-save``).
+
+Команда с секретом в ``approvals.json`` не сохраняется: «всегда» для неё — до конца сессии.
 """
 
 from __future__ import annotations
@@ -128,15 +131,44 @@ _SECRET_ASSIGN = re.compile(
 )
 _URL_CREDS = re.compile(r"(\b[a-z][a-z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@", re.IGNORECASE)
 _AUTH_HEADER = re.compile(r"(authorization:\s*(?:bearer|basic|token)?\s*)[^\s'\"]+", re.I)
-_FLAG_SECRET = re.compile(r"(--(?:password|token|secret|api-key|apikey)[=\s]+)(\S+)", re.I)
+# --password, --access-token, --client-secret, --api-key…
+_FLAG_SECRET = re.compile(r"(--[\w-]*(?:password|passwd|token|secret|api-?key)[=\s]+)(\S+)", re.I)
+_SECRET_NAME = r"[\w-]*(?:key|token|secret|password|passwd)"
+# Значение в кавычках целиком или слово.
+_VALUE = r"('[^']*'|\"[^\"]*\"|[^\s'\"]+)"
+# mysql -phunter2 (пароль слитно с -p); sshpass -p hunter2
+_MYSQL_PASS = re.compile(r"(\b(?:mysql\w*|mariadb\w*)\b[^|;&\n]*?\s-p)" + _VALUE)
+_SSHPASS = re.compile(r"(\bsshpass\b[^|;&\n]*?\s-p\s*)" + _VALUE)
+# curl -u user:pass, --user=user:pass
+_USER_PASS = re.compile(r"(\s(?:-u\s*|--user(?:=|\s+))['\"]?)([^\s:'\"]+):([^\s'\"]+)")
+# httpie: token:=…
+_HTTPIE_JSON = re.compile(rf"(\b{_SECRET_NAME}[\w-]*:=)(\S+)", re.I)
+# заголовки и YAML: X-Api-Key: …, api_token: …
+_HEADER = re.compile(rf"(\b{_SECRET_NAME}:[ \t]*)([^\s'\"=][^\s'\"]*)", re.I)
+# JSON: "api_key": "…"
+_JSON_FIELD = re.compile(rf"(\"{_SECRET_NAME}\"\s*:\s*\")[^\"]*(\")", re.I)
+# Узнаваемые токены сервисов (GitHub, GitLab, Slack, OpenAI, AWS)
+_KNOWN_TOKEN = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|glpat-[\w-]{20,}"
+    r"|xox[abprs]-[\w-]{10,}|sk-[\w-]{20,}|AKIA[0-9A-Z]{16})\b"
+)
 
 
 def redact(text: str) -> str:
-    """Убрать из команды похожее на секреты: ``TOKEN=…``, пароль в URL, авторизацию."""
+    """Убрать из команды похожее на секреты: ``TOKEN=…``, пароли в URL и флагах
+    (``--password``, ``mysql -p…``, ``curl -u user:pass``), заголовки авторизации и
+    ключей, поля JSON с ключами, узнаваемые токены сервисов."""
     text = _SECRET_ASSIGN.sub(lambda m: f"{m.group(1)}=***", text)
     text = _URL_CREDS.sub(lambda m: f"{m.group(1)}{m.group(2)}:***@", text)
     text = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}***", text)
-    return _FLAG_SECRET.sub(lambda m: f"{m.group(1)}***", text)
+    text = _FLAG_SECRET.sub(lambda m: f"{m.group(1)}***", text)
+    text = _MYSQL_PASS.sub(lambda m: f"{m.group(1)}***", text)
+    text = _SSHPASS.sub(lambda m: f"{m.group(1)}***", text)
+    text = _USER_PASS.sub(lambda m: f"{m.group(1)}{m.group(2)}:***", text)
+    text = _HTTPIE_JSON.sub(lambda m: f"{m.group(1)}***", text)
+    text = _HEADER.sub(lambda m: f"{m.group(1)}***", text)
+    text = _JSON_FIELD.sub(lambda m: f"{m.group(1)}***{m.group(2)}", text)
+    return _KNOWN_TOKEN.sub("***", text)
 
 
 # --------------------------------------------------------------------------- #
@@ -274,6 +306,9 @@ class DecisionMemory:
         # с условием или перенаправлением, активация venv без программы, частей больше
         # предела), не предлагаются: иначе «всегда» обещает то, чего не будет.
         if verdict is None or not rules or DecisionMemory(rules=rules).match(verdict) is None:
+            return []
+        # Правило — команда как есть: секрет из него не вырезать, и на диск оно не идёт.
+        if any(r.kind != "program" and redact(r.value) != r.value for r in rules):
             return []
         return rules
 
@@ -434,6 +469,8 @@ class DecisionMemory:
     def outcome(self, entry_id: str, **fields: Any) -> None:
         if not self.log or self.journal_path is None:
             return
+        # Текст ошибки может цитировать команду.
+        fields = {k: redact(v) if isinstance(v, str) else v for k, v in fields.items()}
         self._append({"id": entry_id, "ts": _now(), "event": "outcome", **fields})
 
     def history(self, key: tuple[str, str]) -> tuple[int, int]:
