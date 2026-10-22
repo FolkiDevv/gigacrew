@@ -1890,6 +1890,57 @@ def test_yes_flag_still_asks_for_dangerous_commands(tmp_path):
     assert events.confirms == []
 
 
+# Непроверенная команда (уровень None), которую регэксп опасного не узнаёт.
+UNVERIFIED_TOUCH = "for f in made.txt; do touch $f; done"
+
+
+def test_yes_flag_does_not_vouch_for_unverified_commands(tmp_path):
+    run = tool_turn("run_shell", {"command": UNVERIFIED_TOUCH})
+    provider = ScriptedProvider([run, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events).run_turn("x")  # auto_approve=True
+    # как без -y: сначала рецензент (его ответ не разобран), затем пользователь
+    assert len(provider.summary_requests) == 1
+    [(call, _, dangerous)] = events.confirms
+    assert call.reason.startswith("не удалось проверить:") and not dangerous
+    assert not (tmp_path / "made.txt").exists()
+    # --yes-all — явное «выполнять всё»
+    provider = ScriptedProvider([run, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events, yes_all=True).run_turn("x")
+    assert events.confirms == [] and provider.summary_requests == []
+    assert (tmp_path / "made.txt").exists()
+
+
+@pytest.mark.parametrize("mode", [PermissionMode.AUTO, PermissionMode.PLAN])
+def test_hook_allow_does_not_vouch_for_unverified_commands(tmp_path, mode):
+    from test_agent_hooks import FakeHooks
+
+    from gigacrew.agent.hooks import HookResult
+    from gigacrew.project.settings import HookEvent
+
+    hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="allow")})
+    provider = ScriptedProvider([tool_turn("run_shell", {"command": UNVERIFIED_TOUCH})])
+    events = RecordingEvents(confirm_answer=False)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, mode=mode)
+    agent = Agent(provider, build_default_registry(), cfg, events, hooks=hooks)
+    agent.run_turn("x")
+    assert len(events.confirms) == 1
+    assert not (tmp_path / "made.txt").exists()
+
+
+def test_over_long_command_is_dangerous_even_with_yes(tmp_path):
+    # Длиннее предела классификатор команду не разбирает; регэксп по ней не ручается.
+    command = "touch made.txt  # " + "x" * 10_000
+    provider = ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events).run_turn("x")  # auto_approve=True
+    [(call, _, dangerous)] = events.confirms
+    assert dangerous and call.remember == ""
+    assert call.reason == "не удалось проверить: слишком длинная команда"
+    assert not (tmp_path / "made.txt").exists()
+
+
 # ------------------------------ оборванный ответ ---------------------------- #
 @pytest.mark.parametrize("reason", ["length", "incomplete"])
 def test_cut_reply_is_retried_with_note_at_the_tail(tmp_path, reason):
