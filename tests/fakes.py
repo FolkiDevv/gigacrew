@@ -87,6 +87,7 @@ class WindowProvider(ScriptedProvider):
         status: int | None = 422,
         error: BaseException | None = None,
         overhead: int = 5,
+        truncate: bool = False,
     ):
         super().__init__(turns)
         self.window = window
@@ -95,12 +96,17 @@ class WindowProvider(ScriptedProvider):
         self.status = status
         self.error = error
         self.overhead = overhead  # служебные токены сообщения
+        self.truncate = truncate  # сервер молча обрезает запрос до окна, а не отказывает
         self.measured: list[tuple[str | None, int]] = []
+        self.sent_chars: list[int] = []  # длина текста каждой пробы
 
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
         if self.error is not None:
             raise self.error
+        self.sent_chars.append(len(text))
         tokens = int(len(text) / self.chars_per_token) + self.overhead
+        if self.truncate:
+            tokens = min(tokens, self.window - 1)
         self.measured.append((model, tokens))
         if tokens + 1 > self.window:
             detail = (

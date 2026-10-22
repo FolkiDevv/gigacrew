@@ -80,6 +80,19 @@ def test_calibration_failure_aborts():
         probe_context_window(WindowProvider(32_768, error=LLMError("нет модели")), "M")
 
 
+@pytest.mark.parametrize("window", [8_192, 32_768])
+def test_server_that_truncates_silently_stops_the_probe(window):
+    """Сервер молча обрезает запрос до окна и считает обрезанное: prompt_tokens не растёт
+    вслед за текстом. Доверься замер ему — соотношение символов и токенов росло бы
+    с каждой пробой, и пробы раздувались бы в геометрической прогрессии."""
+    provider = WindowProvider(window, truncate=True)
+    with pytest.raises(LLMError, match="обрезает") as e:
+        probe_context_window(provider, "M")
+    assert str(window - 1) in str(e.value)
+    assert len(provider.sent_chars) == 2  # калибровка и первая же большая проба
+    assert max(provider.sent_chars) <= MAX_CONTEXT_WINDOW * 4
+
+
 # ------------------------------ хранилище ------------------------------ #
 def test_store_round_trip_and_merge(tmp_path):
     path = tmp_path / ".gigacode" / "models.json"

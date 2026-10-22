@@ -30,6 +30,9 @@ MAX_CONTEXT_WINDOW = 262_144  # 256K — больше окна у доступн
 CALIBRATION_TOKENS = 1_000
 MAX_PROBES = 40
 _INITIAL_CHARS_PER_TOKEN = 3.0
+# Проба после калибровки, по данным API меньше этой доли целевого размера, — сервер обрезал
+# запрос, а не промахнулась оценка.
+_TRUNCATED_SHARE = 0.5
 
 # Типовые размеры окон (в токенах), проверяются сверху вниз.
 STANDARD_WINDOWS = tuple(
@@ -154,6 +157,14 @@ def probe_context_window(
                 on_step(ProbeStep(target, ok=False, status=e.status))
             return False
         billed += prompt_tokens + 1
+        if lo and prompt_tokens < target * _TRUNCATED_SHARE:
+            # После калибровки соотношение промахивается на десятки процентов, не вдвое:
+            # сервер молча обрезал запрос. Доверься замер ему — соотношение росло бы с каждой
+            # пробой, а пробы раздувались бы в геометрической прогрессии.
+            raise LLMError(
+                f"сервер учёл {prompt_tokens} токенов из ~{target} отправленных — похоже, "
+                "он молча обрезает запрос; окно так не замерить"
+            )
         chars_per_token = len(text) / prompt_tokens
         lo = max(lo, prompt_tokens)
         passed.add(target)
