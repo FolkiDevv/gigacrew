@@ -87,6 +87,18 @@ def error_body(resp: httpx.Response) -> str:
     return text if len(text) <= ERROR_BODY_CHARS else text[:ERROR_BODY_CHARS] + "…"
 
 
+def connection_error(exc: httpx.HTTPError) -> str:
+    """Текст ошибки транспорта для пользователя. Запрос, отвергнутый до отправки
+    (``LocalProtocolError``), — без текста исключения: h11 цитирует в нём значение
+    заголовка, а это ключ или токен."""
+    if isinstance(exc, httpx.LocalProtocolError):
+        return (
+            "Ошибка соединения с API: запрос отвергнут до отправки (недопустимый заголовок "
+            "или тело запроса)"
+        )
+    return f"Ошибка соединения с API: {exc}"
+
+
 def raise_if_cert_rejected(exc: BaseException) -> None:
     """Сетевая ошибка из-за того, что сертификат сервера не прошёл проверку TLS, —
     :class:`ApiError` с подсказкой сразу: повтор тут не поможет."""
@@ -386,7 +398,7 @@ class HttpProvider(LLMProvider):
                     delay = min(delay * 2, 8.0)
                 continue
             except httpx.HTTPError as e:
-                raise ApiError(f"Ошибка соединения с API: {e}") from e
+                raise ApiError(connection_error(e)) from e
 
             if resp.status_code == 429:
                 if limit.wait(resp):
@@ -662,7 +674,7 @@ class HttpProvider(LLMProvider):
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)
             except httpx.HTTPError as e:
-                raise ApiError(f"Ошибка соединения с API: {e}") from e
+                raise ApiError(connection_error(e)) from e
 
         raise ApiError(
             f"Сетевая ошибка при потоковом обращении к API (после "

@@ -298,6 +298,109 @@ def test_auth_without_token_wrapped():
     p.close()
 
 
+# ------------------------------ секреты в ошибках ------------------------------ #
+SECRET_KEY = "U0VDUkVULUtFWQ=="
+
+
+def _secret_provider(handler, access_key: str = SECRET_KEY) -> ApiProvider:
+    cfg = Config(access_key=access_key, auth_url=AUTH_URL, base_url=BASE_URL, model="M")
+    return ApiProvider(cfg, transport=httpx.MockTransport(handler))
+
+
+def _h11_like(request: httpx.Request):
+    """Как h11 отвергает недопустимое значение заголовка: значение — в тексте ошибки."""
+    raise httpx.LocalProtocolError(
+        f"Illegal header value {request.headers['Authorization'].encode()!r}"
+    )
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_rejected_header_does_not_leak_the_token(streaming):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return httpx.Response(200, json={"access_token": "SECRET-TOKEN"})
+        _h11_like(request)
+
+    p = _secret_provider(handler)
+    with pytest.raises(ApiError, match="Ошибка соединения") as e:
+        (p.stream if streaming else p.complete)(_msgs())
+    assert "SECRET" not in str(e.value)
+    p.close()
+
+
+def test_rejected_auth_header_does_not_leak_the_key():
+    p = _secret_provider(_h11_like)
+    with pytest.raises(ApiError, match="Ошибка соединения") as e:
+        p.complete(_msgs())
+    assert SECRET_KEY not in str(e.value)
+    p.close()
+
+
+@pytest.mark.parametrize("tail", [" ", "\r", "\r\n", "\n"])
+def test_access_key_whitespace_is_trimmed(tail):
+    """Ключ из файла с CRLF (``$(cat key.txt)``) или с пробелом в .env — без хвоста."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            seen.append(request.headers["Authorization"])
+            return _auth_response()
+        return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+    p = _secret_provider(handler, access_key=SECRET_KEY + tail)
+    assert p.complete(_msgs()).message.content == "ok"
+    assert seen == [f"Basic {SECRET_KEY}"]
+    p.close()
+
+
+@pytest.mark.parametrize("key", ["U0VD\x00UkVU", "U0VD UkVU", "ключ-U0VD"])
+def test_malformed_access_key_is_refused_without_echo(key):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _auth_response()
+
+    p = _secret_provider(handler, access_key=key)
+    with pytest.raises(ApiError, match="GIGACREW_ACCESS_KEY") as e:
+        p.complete(_msgs())
+    assert "U0VD" not in str(e.value) and requests == []
+    p.close()
+
+
+def test_oauth_reply_without_access_token_is_not_echoed():
+    """Токен под другим именем поля не печатается: в ошибке — только имена полей."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return httpx.Response(200, json={"accessToken": "SECRET-TOKEN", "expires": 1})
+        return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+    p = _secret_provider(handler)
+    with pytest.raises(ApiError, match="access_token") as e:
+        p.complete(_msgs())
+    assert "SECRET" not in str(e.value)
+    assert "accessToken" in str(e.value)  # имя поля подскажет, в чём дело
+    p.close()
+
+
+@pytest.mark.parametrize("token", [42, ["t"], {"value": "SECRET-TOKEN"}, "SECRET TOKEN\r"])
+def test_malformed_access_token_is_refused_without_echo(token):
+    chat: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return httpx.Response(200, json={"access_token": token})
+        chat.append(request)
+        return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+    p = _secret_provider(handler)
+    with pytest.raises(ApiError, match="access_token") as e:
+        p.complete(_msgs())
+    assert "SECRET" not in str(e.value) and chat == []
+    p.close()
+
+
 def test_list_models_http_error_wrapped():
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == AUTH_URL:

@@ -50,6 +50,9 @@ __all__ = ["ApiError", "ApiProvider", "chat_url"]
 
 
 _VERSION_SUFFIX = re.compile(r"/v\d+$")
+# Ключ и токен — значение заголовка: только видимые символы ASCII. Иначе httpx/h11
+# отвергнет заголовок, и в тексте ошибки окажется сам секрет.
+_CREDENTIAL = re.compile(r"[!-~]+")
 
 
 def chat_url(base_url: str) -> str:
@@ -205,11 +208,18 @@ class ApiProvider(HttpProvider):
         if not force and self._token and time.time() < self._token_exp - 30:
             return self._token
 
+        # Хвост ключа из файла с CRLF (``$(cat key.txt)``) или пробел в .env — не часть ключа.
+        key = (self._cfg.access_key or "").strip()
+        if not _CREDENTIAL.fullmatch(key):
+            raise ApiError(
+                "GIGACREW_ACCESS_KEY содержит пробелы, управляющие или не-ASCII символы — "
+                "проверьте ключ (значение не показывается)"
+            )
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
             "RqUID": str(uuid.uuid4()),
-            "Authorization": f"Basic {self._cfg.access_key}",
+            "Authorization": f"Basic {key}",
         }
         resp = self._request_with_retry(
             lambda: self._client.post(
@@ -227,8 +237,12 @@ class ApiProvider(HttpProvider):
 
         data = self._json(resp)
         token = data.get("access_token")
+        # Значения ответа не показываются: токен мог прийти под другим именем поля.
         if not token:
-            raise ApiError(f"В ответе OAuth нет access_token: {str(data)[:500]}")
+            fields = ", ".join(sorted(str(name) for name in data))[:ERROR_BODY_CHARS]
+            raise ApiError(f"В ответе OAuth нет access_token (поля ответа: {fields or 'нет'})")
+        if not isinstance(token, str) or not _CREDENTIAL.fullmatch(token):
+            raise ApiError("access_token в ответе OAuth — не строка из видимых символов ASCII")
         self._token = token
         # expires_at приходит в миллисекундах unix-времени; если нет — живём 25 мин.
         exp_ms = data.get("expires_at")
