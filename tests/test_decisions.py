@@ -91,6 +91,64 @@ def test_dangerous_is_never_remembered_or_matched(root, home):
     assert mem.match(verdict("touch x && rm -rf build", root)) is None
 
 
+def _venv(root: Path) -> None:
+    (root / ".venv" / "bin").mkdir(parents=True)
+    (root / ".venv" / "bin" / "activate").write_text("")
+    (root / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "frobnicate > out.txt",  # непроверенная и по частям не сверить
+        "if pytest; then echo ok; fi",
+        "source .venv/bin/activate && touch x",  # активация venv — только с программой
+        ". .venv/bin/activate && ./build.sh --release",
+        " && ".join(f"touch {name}" for name in "abcdef"),  # частей больше предела
+    ],
+)
+def test_always_does_not_save_rules_that_never_match(root, home, command):
+    # Такое правило match() не применит: «всегда» — только до конца сессии (в агенте).
+    _venv(root)
+    mem = memory(root, home)
+    v = verdict(command, root)
+    assert mem.offer(v) == "" and mem.approve(v) == [] and mem.rules == []
+    assert mem.approvals_path is not None and not mem.approvals_path.exists()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest -q",
+        "pytest > log.txt",
+        "./build.sh --release",
+        "frobnicate --all",
+        "source .venv/bin/activate && pytest -q",
+        "touch a && touch b",
+        "TOKEN=x ./build.sh",
+    ],
+)
+def test_offered_rule_matches_the_same_command(root, home, command):
+    _venv(root)
+    mem = memory(root, home)
+    v = verdict(command, root)
+    assert mem.offer(v) != ""
+    assert mem.approve(v) and mem.match(v) is not None
+    assert memory(root, home).match(v) is not None  # и после перечитывания с диска
+
+
+def test_rules_are_bound_to_working_directory_for_every_kind(root, home):
+    script = root / "frontend" / "build.sh"  # другой скрипт с тем же именем
+    script.write_text("#!/bin/sh\necho frontend\n")
+    script.chmod(0o755)
+    mem = memory(root, home)
+    for command in ("./build.sh --release", "pytest > log.txt"):  # точная и целиком
+        mem.approve(verdict(command, root))
+        assert mem.match(verdict(command, root)) is not None, command
+        assert mem.match(verdict(command, root, cwd="frontend")) is None, command
+        assert mem.match(verdict(f"cd frontend && {command}", root)) is None, command
+
+
 def test_plan_mode_applies_only_non_changing_rules(root, home):
     mem = memory(root, home)
     mem.approve(verdict("pytest", root))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -1765,6 +1766,54 @@ def test_always_for_command_allows_only_the_same_call(tmp_path):
     assert any("разрешено сохранённым правилом" in text for _, text in events.notices)
 
 
+def test_always_for_other_tools_lasts_the_session(tmp_path):
+    from gigacrew.agent.events import Approval
+
+    tool = FakeTool()
+    same = tool_turn("fake_write", {"path": "a"})
+    other = tool_turn("fake_write", {"path": "b"})
+    provider = ScriptedProvider([same, text_turn("ок"), same, other, text_turn("ок")])
+    events = _ApprovingEvents([Approval.ALWAYS, Approval.YES])
+    agent = _agent(
+        provider, tmp_path, events=events, registry=_registry_with(tool), auto_approve=False
+    )
+    agent.run_turn("x")
+    agent.run_turn("ещё")
+    assert [call.summary for call, _, _ in events.confirms] == ["a", "b"]  # другие аргументы
+    assert tool.runs == 3
+    assert any("больше не требует подтверждения" in text for _, text in events.notices)
+
+
+def test_always_for_unverified_command_is_session_only_and_not_in_plan_mode(tmp_path):
+    from gigacrew.agent.decisions import DecisionMemory
+    from gigacrew.agent.events import Approval
+    from gigacrew.agent.reviewer import Reviewer
+
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    run = tool_turn("run_shell", {"command": "frobnicate --all > out.txt"})
+    provider = ScriptedProvider([run, text_turn("ок")] * 3)
+    events = _ApprovingEvents([Approval.ALWAYS, Approval.NO])
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    agent = Agent(
+        provider,
+        build_default_registry(),
+        cfg,
+        events,
+        decisions=memory,
+        reviewer=Reviewer(disabled="выключен"),
+    )
+    agent.run_turn("x")
+    # правило по частям не сверить: «всегда» не обещает проекта и не сохраняется
+    assert events.confirms[0][0].remember == "" and memory.rules == []
+    agent.run_turn("ещё")
+    assert len(events.confirms) == 1  # до конца сессии — без вопроса
+    (tmp_path / "out.txt").unlink()
+    agent.set_mode(PermissionMode.PLAN)
+    agent.run_turn("в плане")
+    # в плане «всегда» сессии непроверенную команду не разрешает: она пишет в файл
+    assert len(events.confirms) == 2 and not (tmp_path / "out.txt").exists()
+
+
 def test_read_only_commands_run_without_asking(tmp_path):
     (tmp_path / "a.txt").write_text("hello\n")
     calls = [tool_turn("run_shell", {"command": c}) for c in ("ls", "cat a.txt | wc -l")]
@@ -1888,6 +1937,56 @@ def test_yes_flag_still_asks_for_dangerous_commands(tmp_path):
     events = RecordingEvents(confirm_answer=False)
     _agent(provider, tmp_path, events=events, yes_all=True).run_turn("почисти")
     assert events.confirms == []
+
+
+class _DangerTool(FakeTool):
+    def risk(self, params, ctx):
+        from gigacrew.security import RiskLevel
+
+        return RiskLevel.DANGEROUS
+
+
+def test_always_for_dangerous_call_is_a_one_time_yes(tmp_path):
+    # Интерфейс «всегда» для опасного не предлагает; если ответ всё же пришёл — это «да»
+    # один раз: вызов выполняется, а модель не слышит, что пользователь отказал.
+    from gigacrew.agent.events import Approval
+
+    tool = _DangerTool()
+    call = tool_turn("fake_write", {})
+    provider = ScriptedProvider([call, text_turn("ок"), call, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=Approval.ALWAYS)
+    agent = _agent(
+        provider, tmp_path, events=events, registry=_registry_with(tool), auto_approve=False
+    )
+    agent.run_turn("x")
+    agent.run_turn("ещё")
+    assert [dangerous for _, _, dangerous in events.confirms] == [True, True]
+    assert tool.runs == 2 and _function_results(agent) == ["ok", "ok"]
+    assert not any("подтверждения" in text for _, text in events.notices)
+
+
+def test_always_for_dangerous_command_is_never_remembered(tmp_path):
+    from gigacrew.agent.decisions import DecisionMemory
+    from gigacrew.agent.events import Approval
+
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    rm = tool_turn("run_shell", {"command": "rm -rf build"})
+    provider = ScriptedProvider([rm, text_turn("ок"), rm, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=Approval.ALWAYS)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    agent = Agent(provider, build_default_registry(), cfg, events, decisions=memory)
+    for turn in ("почисти", "ещё раз"):
+        (tmp_path / "build").mkdir()
+        agent.run_turn(turn)
+        assert not (tmp_path / "build").exists()
+    assert [dangerous for _, _, dangerous in events.confirms] == [True, True]
+    assert memory.rules == []
+    decisions = [
+        json.loads(line)["decision"]
+        for line in memory.journal_path.read_text().splitlines()
+        if '"event": "decision"' in line
+    ]
+    assert decisions == ["yes", "yes"]
 
 
 # Непроверенная команда (уровень None), которую регэксп опасного не узнаёт.

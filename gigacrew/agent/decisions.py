@@ -252,6 +252,15 @@ class DecisionMemory:
         return added
 
     def _candidates(self, verdict: Verdict | None) -> list[Rule]:
+        rules = self._proposed(verdict)
+        # Правила, которые match() к этой же команде не применит (непроверенная команда
+        # с условием или перенаправлением, активация venv без программы, частей больше
+        # предела), не предлагаются: иначе «всегда» обещает то, чего не будет.
+        if verdict is None or not rules or DecisionMemory(rules=rules).match(verdict) is None:
+            return []
+        return rules
+
+    def _proposed(self, verdict: Verdict | None) -> list[Rule]:
         if verdict is None or verdict.level is CommandLevel.DANGER:
             return []
         now = _now()

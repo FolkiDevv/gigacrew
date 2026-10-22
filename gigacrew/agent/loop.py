@@ -1467,7 +1467,14 @@ class Agent:
                 if rule is not None:
                     decision, source = Decision.ALLOW, f"rule:{rule.id}"
                     self._events.on_notice(f"разрешено сохранённым правилом: {rule.describe()}")
-            if decision in asking and key in self._session_allowed and pre.decision != "ask":
+            if (
+                decision in asking
+                and key in self._session_allowed
+                and pre.decision != "ask"
+                and risk < RiskLevel.DANGEROUS
+                # план, как и сохранённые правила, не разрешает непроверенную команду
+                and not (self.mode is PermissionMode.PLAN and unverified)
+            ):
                 decision, source = Decision.ALLOW, "session"  # «всегда» до конца сессии
             if decision is Decision.REVIEW:
                 decision, review, review_note = self._review_command(call, params, verdict, check)
@@ -1531,8 +1538,9 @@ class Agent:
                     f"gigacrew ждёт подтверждения: {name} {call.summary}".strip(),
                 )
                 answer = _confirm_result(self._events.confirm(asked, preview, dangerous=dangerous))
-                if answer.approval is Approval.ALWAYS and pre.decision == "ask":
-                    # Хук спрашивает каждый раз — «всегда» не запомнить.
+                if answer.approval is Approval.ALWAYS and (pre.decision == "ask" or dangerous):
+                    # «Всегда» не запомнить — значит, «да» один раз: хук спрашивает каждый
+                    # раз, опасное не запоминается (интерфейс «всегда» для него не предлагает).
                     answer = replace(answer, approval=Approval.YES)
                 if verdict is not None:
                     journal = self._journal_start(
@@ -1545,7 +1553,7 @@ class Agent:
                         source="user",
                         review=review,
                     )
-                if answer.approval is Approval.ALWAYS and not dangerous:
+                if answer.approval is Approval.ALWAYS:
                     self._allow_always(asked, key, verdict)
                 elif answer.approval is not Approval.YES:
                     model_text = REJECTED_NOTE
