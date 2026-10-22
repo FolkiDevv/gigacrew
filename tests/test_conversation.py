@@ -480,3 +480,30 @@ def test_guard_rejection_is_neutral_and_remembered():
     assert guard.failure_warning() is not None  # серия у предела — запрос с предупреждением
     stop = guard.after_tool(other, FAIL)  # ...и не сбрасывает её
     assert stop is not None and stop.kind == "tool_failures"
+
+
+def test_lone_surrogates_are_replaced_on_the_way_into_history():
+    # Имя файла с байтами не в UTF-8 Python декодирует в суррогаты (\udcee); такой текст
+    # нельзя закодировать в UTF-8 — ни запрос к модели, ни сохранение чата.
+    from gigacrew.agent.conversation import clean_text
+
+    name = b"\xee\xf2\xf7.txt".decode("utf-8", "surrogateescape")
+    assert clean_text(name) == "���.txt"
+    assert clean_text("обычный текст") == "обычный текст"
+    conv = Conversation()
+    conv.add_user(f"открой {name}")
+    conv.add_assistant(
+        Message(
+            role="assistant",
+            content="смотрю \ud800",
+            reasoning="думаю \udfff",
+            function_calls=[FunctionCall(name="read_file", arguments={"path": [name]})],
+        )
+    )
+    conv.add_function_result("list_dir", f"{name}\nb.txt")
+    for m in conv.messages:
+        m.model_dump_json().encode("utf-8")  # не UnicodeEncodeError
+    assert conv.messages[0].content == "открой ���.txt"
+    assert conv.messages[1].content == "смотрю �"
+    assert conv.messages[1].function_calls[0].arguments == {"path": ["���.txt"]}
+    assert conv.messages[2].content == "���.txt\nb.txt"

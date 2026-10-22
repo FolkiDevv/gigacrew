@@ -1249,3 +1249,26 @@ def test_oneshot_resume_picker_needs_keyboard(tmp_path, oneshot, capsys, monkeyp
     assert _main(tmp_path, "-r", "-p", "новый") == 0
     assert _history(provider) == [("user", "новый")]  # чат не выбран из pipe
     assert "выбрать чат можно только с клавиатуры" in _flat(capsys)
+
+
+def test_repl_turn_and_autosave_with_file_name_not_in_utf8(repl_env, capsys):
+    import json
+    import os
+
+    # Имя из архива в cp1251: Python декодирует его в одиночные суррогаты. Ни запрос к
+    # модели (httpx кодирует тело в UTF-8), ни сохранение чата не должны на этом падать.
+    agent, ui, commands, ctx, provider = repl_env
+    root = os.fsencode(agent.workspace.root)
+    with open(root + b"/\xee\xf2\xf7\xb8\xf2.txt", "wb") as f:
+        f.write(b"x")
+    provider._turns = [tool_turn("list_dir", {"path": "."}), text_turn("готово")]
+    read = _reader("что в проекте?", "/exit")
+    assert run_repl(agent, ui, commands, read_input=read, chats=ctx.chats) == 0
+    for request in provider.requests:
+        for message in request["messages"]:
+            json.dumps(message.model_dump(), ensure_ascii=False).encode("utf-8")
+    assert "�����.txt" in provider.requests[0]["messages"][0].content
+    assert "�����.txt" in provider.requests[-1]["messages"][-1].content
+    (chat,) = ctx.chats.store.recent()
+    assert chat.requests == 1 and chat.preview == "готово"
+    assert "не сохранён" not in _out(capsys)

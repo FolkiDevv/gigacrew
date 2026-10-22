@@ -161,7 +161,9 @@ class ChatStore:
         # mkstemp создаёт файл с правами 0600 в том же каталоге — os.replace атомарен.
         fd, tmp = tempfile.mkstemp(prefix=f".{chat_id}.", suffix=".tmp", dir=self.directory)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            # backslashreplace: одиночный суррогат (имя файла не в UTF-8), если он всё же
+            # попал в диалог, пишется экранированным «\udcee» — это корректный JSON.
+            with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
                 json.dump(data, f, ensure_ascii=False)
             os.replace(tmp, path)
         except BaseException:
@@ -299,7 +301,7 @@ class ChatRecorder:
             info = self.store.save(
                 self._chat_id, conversation, model=model, created_at=self._created_at
             )
-        except OSError as e:
+        except (OSError, ValueError) as e:  # ValueError — в том числе UnicodeEncodeError
             self.enabled = False
             return f"чат не сохранён, автосохранение отключено: {e}"
         self._created_at = info.created_at

@@ -259,3 +259,34 @@ def test_recorder_write_error_warns_once(store, monkeypatch):
     assert warning and "только чтение" in warning
     assert rec.enabled is False
     assert rec.save(_conv()) is None
+
+
+# ------------------- имена файлов не в UTF-8 (одиночные суррогаты) ------------------- #
+_CP1251_NAME = b"\xee\xf2\xf7\xb8\xf2.txt".decode("utf-8", "surrogateescape")  # «отчёт.txt»
+
+
+def test_save_survives_lone_surrogates(store):
+    # Диалог, собранный в обход Conversation.add_* (например, из старого файла), с
+    # одиночными суррогатами: запись не падает, чат читается.
+    conv = Conversation(
+        [
+            Message(role="user", content=f"открой {_CP1251_NAME}"),
+            Message(role="assistant", content="ок \ud800"),
+        ]
+    )
+    info = store.save("a1", conv)
+    assert info.title.startswith("открой ")
+    loaded = store.load("a1").conversation
+    assert [m.role for m in loaded.messages] == ["user", "assistant"]
+
+
+def test_recorder_serialization_error_warns_once(store, monkeypatch):
+    rec = ChatRecorder(store)
+
+    def boom(*a, **kw):
+        raise UnicodeEncodeError("utf-8", "\udcee", 0, 1, "surrogates not allowed")
+
+    monkeypatch.setattr(store, "save", boom)
+    warning = rec.save(_conv())
+    assert warning and "surrogates not allowed" in warning
+    assert rec.enabled is False and rec.save(_conv()) is None

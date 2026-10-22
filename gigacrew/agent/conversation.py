@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +24,51 @@ INTERRUPTED_NOTE = "Execution was interrupted by the user (Ctrl+C). No result."
 # пользователя: по ней блок отрезается при показе запроса (заголовок чата, продолжение).
 HOOK_CONTEXT_HEADER = "Context from the user's UserPromptSubmit hooks:"
 _HOOK_CONTEXT_TAIL = f"\n\n<system-reminder>\n{HOOK_CONTEXT_HEADER}\n"
+
+
+# Одиночные суррогаты: в Python так декодируются байты не в UTF-8 в именах файлов
+# (архив из cp1251: «\udcee…»), а из JSON приходят экранированные «\ud800».
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def clean_text(text: str) -> str:
+    """Текст без одиночных суррогатов — каждый заменяется на U+FFFD.
+
+    Такой текст нельзя закодировать в UTF-8: одно имя файла в истории или системном
+    промпте ломало бы каждый запрос к модели и сохранение чата.
+    """
+    return _SURROGATE_RE.sub("\ufffd", text) if _SURROGATE_RE.search(text) else text
+
+
+def _clean_value(value: Any) -> Any:
+    """Аргументы вызова инструмента — без одиночных суррогатов (вложенно)."""
+    if isinstance(value, str):
+        return clean_text(value)
+    if isinstance(value, dict):
+        return {clean_text(str(k)): _clean_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean_value(v) for v in value]
+    return value
+
+
+def _clean_message(message: Message) -> Message:
+    """Сообщение без одиночных суррогатов (то же сообщение, если их нет)."""
+    calls = [
+        call.model_copy(update={"arguments": _clean_value(call.arguments)})
+        for call in message.function_calls
+    ]
+    update: dict[str, Any] = {}
+    if any(
+        new.arguments != old.arguments
+        for new, old in zip(calls, message.function_calls, strict=True)
+    ):
+        update["function_calls"] = calls
+    for key in ("content", "reasoning"):
+        text = getattr(message, key)
+        cleaned = clean_text(text)
+        if cleaned is not text:
+            update[key] = cleaned
+    return message.model_copy(update=update) if update else message
 
 
 def request_text(content: str) -> str:
@@ -118,12 +164,14 @@ class Conversation:
             raise ValueError("граница сжатия не может приходиться на результат инструмента")
 
     # ------------------------------------------------------------------ #
+    # Всё, что попадает в историю, — без одиночных суррогатов (:func:`clean_text`):
+    # имена файлов из вывода инструментов, запросы, ответы модели.
     def add_user(self, text: str, *, meta: bool = False) -> None:
         """Запрос пользователя; ``meta`` — служебное сообщение harness'а (см. :class:`Message`)."""
-        self._messages.append(Message(role="user", content=text, meta=meta))
+        self._messages.append(Message(role="user", content=clean_text(text), meta=meta))
 
     def add_assistant(self, message: Message, usage: Usage | None = None) -> None:
-        self._messages.append(message)
+        self._messages.append(_clean_message(message))
         if usage is not None:
             self._last_usage = usage
 
@@ -133,7 +181,9 @@ class Conversation:
         if call_id is None:
             pending = self.pending_calls()
             call_id = pending[0].id if pending else None
-        self._messages.append(Message(role="function", name=name, content=content, call_id=call_id))
+        self._messages.append(
+            Message(role="function", name=name, content=clean_text(content), call_id=call_id)
+        )
 
     # ------------------------------------------------------------------ #
     def pending_calls(self) -> list[FunctionCall]:
@@ -195,7 +245,8 @@ class Conversation:
         version = data.get("version")
         if version not in cls._READABLE_VERSIONS:
             raise ValueError(f"Неподдерживаемая версия формата диалога: {version!r}")
-        messages = [Message.model_validate(m) for m in data.get("messages") or []]
+        # Файл чата — тоже вход истории: «\udcee» в JSON читается одиночным суррогатом.
+        messages = [_clean_message(Message.model_validate(m)) for m in data.get("messages") or []]
         usage = data.get("last_usage")
         raw = data.get("summary")
         summary = None
@@ -205,7 +256,7 @@ class Conversation:
             text, upto = raw.get("text"), raw.get("upto")
             if not isinstance(text, str) or not isinstance(upto, int) or isinstance(upto, bool):
                 raise ValueError("поле summary: ожидаются text (строка) и upto (число)")
-            summary = Summary(text=text, upto=upto)
+            summary = Summary(text=clean_text(text), upto=upto)
         return cls(
             messages,
             last_usage=Usage.model_validate(usage) if usage else None,
