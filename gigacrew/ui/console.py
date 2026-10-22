@@ -33,6 +33,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -142,11 +143,44 @@ class _SafeConsole(RichConsole):
         )
 
 
-# Невидимые символы: управляющие, смена направления текста, нулевой ширины. В команде,
-# которую подтверждает пользователь, их нельзя убирать молча — она выполнится с ними.
-_INVISIBLE_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏‪-‮⁠-⁤⁦-⁩﻿]")
+# Невидимые символы: управляющие, смена направления текста, нулевой ширины и прочие
+# невидимые. В команде или правке, которую подтверждает пользователь, их нельзя ни
+# убирать молча, ни печатать как есть — выполнится или запишется текст с ними.
+# Кандидаты — всё, кроме печатного ASCII, \n и \t; невидимые среди них — по категории
+# Юникода (управляющие, форматирующие — в том числе смена направления, теги —,
+# разделители строк и абзацев, половинки суррогатных пар) и по свойству
+# Default_Ignorable_Code_Point (мягкий перенос, заполнители хангыля, селекторы вариантов).
+_INVISIBLE_CANDIDATE_RE = re.compile(r"[^\t\n\x20-\x7e]")
+_INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+_IGNORABLE_RE = re.compile(
+    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￸\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+)
+_INVISIBLE_MARK_RE = re.compile(r"⟨U\+[0-9A-F]{4,6}⟩")
 # Многострочная команда длиннее — с номерами строк.
 _NUMBER_LINES_FROM = 4
+
+
+def _invisible(text: str) -> Iterator[re.Match[str]]:
+    """Невидимые символы строки по порядку."""
+    for m in _INVISIBLE_CANDIDATE_RE.finditer(text):
+        char = m.group()
+        if unicodedata.category(char) in _INVISIBLE_CATEGORIES or _IGNORABLE_RE.match(char):
+            yield m
+
+
+def _mark(char: str) -> str:
+    return f"⟨U+{ord(char):04X}⟩"
+
+
+def mark_invisible(text: str) -> str:
+    """Текст с видимыми невидимыми символами (``⟨U+202E⟩``); ``\\r\\n`` — как ``\\n``."""
+    text = text.replace("\r\n", "\n")
+    out, pos = [], 0
+    for m in _invisible(text):
+        out += [text[pos : m.start()], _mark(m.group())]
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def visible_text(text: str, *, numbered: bool | None = None, palette: Palette = MINT) -> Text:
@@ -161,9 +195,9 @@ def visible_text(text: str, *, numbered: bool | None = None, palette: Palette = 
         if numbered:
             out.append(f"{i:>{width}} │ ", style=palette.dim)
         pos = 0
-        for m in _INVISIBLE_RE.finditer(line):
+        for m in _invisible(line):
             out.append(line[pos : m.start()])
-            out.append(f"⟨U+{ord(m.group()):04X}⟩", style=f"bold {palette.danger}")
+            out.append(_mark(m.group()), style=f"bold {palette.danger}")
             pos = m.end()
         out.append(line[pos:])
         if i < len(lines):
@@ -1213,15 +1247,14 @@ class Console(AgentEvents):
         return ConfirmResult(Approval.NO, feedback=raw.strip())
 
     def _diff_panel(self, preview: Display) -> Panel:
-        syntax = Syntax(
-            sanitize(preview.text).rstrip(),
-            "diff",
-            theme="ansi_dark",
-            background_color="default",
-            word_wrap=True,
-        )
+        # Невидимые символы правки — видимыми (как в команде), с подсветкой диффа.
+        code = mark_invisible(preview.text).rstrip()
+        body = Syntax(code, "diff", theme="ansi_dark", background_color="default").highlight(code)
+        body.rstrip()
+        body.no_wrap, body.overflow = False, "fold"  # длинные строки — переносом
+        body.highlight_regex(_INVISIBLE_MARK_RE, f"bold {self._p.danger}")
         return Panel(
-            syntax,
+            body,
             title=Text(preview.title or "изменения", style=self._p.fg),
             title_align="left",
             box=ROUNDED,

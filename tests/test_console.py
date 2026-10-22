@@ -777,3 +777,46 @@ def test_control_characters_stripped_in_live_terminal_but_own_codes_kept():
     out = buf.getvalue()
     assert "\x1b]0;owned" not in out and "\x07" not in out
     assert "\x1b[" in out  # свои последовательности Rich (цвет, курсор) — на месте
+
+
+# ------------------- невидимые символы в том, что подтверждается ------------------- #
+@pytest.mark.parametrize(
+    "char",
+    [
+        "​",  # нулевой ширины
+        "‍",  # соединитель нулевой ширины
+        "‏",  # RLM
+        "؜",  # ARABIC LETTER MARK — тоже управляет направлением текста
+        "­",  # мягкий перенос
+        "ᅟ",  # заполнитель хангыля
+        "ㅤ",
+        "️",  # селектор варианта
+        "\U000e0041",  # символ-тег
+        " ",  # разделитель строк
+    ],
+)
+def test_confirm_marks_every_invisible_character_in_command(char):
+    from gigacrew.permissions import ToolKind
+
+    ui, buf = _console()
+    ui._c.input = lambda prompt: "n"
+    call = ToolCallInfo("run_shell", "rm", ToolKind.COMMAND)
+    ui.confirm(call, Display(f"$ rm{char} -rf x"), dangerous=True)
+    out = buf.getvalue()
+    assert f"$ rm⟨U+{ord(char):04X}⟩ -rf x" in out and char not in out
+
+
+def test_confirm_marks_invisible_characters_in_diff():
+    from gigacrew.permissions import ToolKind
+
+    ui, buf = _console()
+    ui._c.input = lambda prompt: "n"
+    diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-ok = 1\n+# ‮; rm -rf ~ ‬\x01\n"
+    ui.confirm(
+        ToolCallInfo("edit_file", "x.py", ToolKind.EDIT),
+        Display(diff, "diff", "x.py"),
+        dangerous=False,
+    )
+    out = buf.getvalue()
+    assert "+# ⟨U+202E⟩; rm -rf ~ ⟨U+202C⟩⟨U+0001⟩" in out  # и управляющие — не молча
+    assert "‮" not in out and "-ok = 1" in out
