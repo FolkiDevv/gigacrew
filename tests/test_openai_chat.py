@@ -305,6 +305,37 @@ def test_repeated_name_and_repeated_arguments_are_not_glued():
     assert call.arguments == {"path": "a", "content": "x\ny"}
 
 
+def test_new_call_on_a_reused_index_is_not_merged_into_the_old_one():
+    """Сервер даёт каждому параллельному вызову index 0: новый id с именем — новый вызов,
+    иначе второй вызов молча пропал бы (его аргументы приклеились бы к первому)."""
+    turn, _ = _consume(
+        _sse(
+            _delta(tool_calls=[_call(0, id="call_A", name="read_file", args='{"path": "a.py"}')]),
+            _delta(tool_calls=[_call(0, id="call_B", name="run_shell", args='{"command": ')]),
+            _delta(tool_calls=[_call(0, args='"pytest -q"}')]),  # продолжение — к последнему
+            _delta("tool_calls"),
+        )
+    )
+    assert [(c.id, c.name, c.arguments) for c in turn.message.function_calls] == [
+        ("call_A", "read_file", {"path": "a.py"}),
+        ("call_B", "run_shell", {"command": "pytest -q"}),
+    ]
+
+
+def test_fresh_id_without_a_name_continues_the_call():
+    """Сервер, который шлёт новый id в каждом куске одного вызова, не дробит его."""
+    turn, _ = _consume(
+        _sse(
+            _delta(tool_calls=[_call(0, id="c1", name="read_file", args='{"path": ')]),
+            _delta(tool_calls=[_call(0, id="c2", args='"a.py"}')]),
+            _delta("tool_calls"),
+        )
+    )
+    assert [(c.id, c.name, c.arguments) for c in turn.message.function_calls] == [
+        ("c1", "read_file", {"path": "a.py"})
+    ]
+
+
 def test_whole_call_in_one_chunk_and_object_arguments():
     turn, _ = _consume(
         _sse(

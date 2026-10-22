@@ -300,13 +300,19 @@ class ChunkBuilder:
         return None
 
     def _add_call(self, raw: Mapping[str, Any]) -> None:
-        """Кусок вызова: по ``index``; без него — новый вызов при новом id, иначе к последнему."""
+        """Кусок вызова: по ``index``; без него — новый вызов при новом id, иначе к последнему.
+
+        Тот же ``index`` с другим id и именем — тоже новый вызов: некоторые серверы дают
+        index 0 каждому параллельному вызову, и второй иначе приклеился бы к первому.
+        """
         index = raw.get("index")
         call_id = str(raw["id"]) if raw.get("id") else ""
+        function = raw.get("function")
+        named = isinstance(function, Mapping) and bool(function.get("name"))
         parts: _CallParts | None = None
         if isinstance(index, int) and not isinstance(index, bool):
             parts = self._by_index.get(index)
-            if parts is None:
+            if parts is None or (named and call_id and parts.id and parts.id != call_id):
                 parts = self._by_index[index] = self._new_call()
         elif call_id:
             parts = next((p for p in self._calls if p.id == call_id), None)
@@ -318,7 +324,6 @@ class ChunkBuilder:
             parts = self._new_call()
         if call_id and not parts.id:
             parts.id = call_id
-        function = raw.get("function")
         if not isinstance(function, Mapping):
             return
         name = function.get("name")
