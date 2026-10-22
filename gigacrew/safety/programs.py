@@ -3713,6 +3713,44 @@ def _unwrap(name: str, args: list[Word]) -> list[Word] | None:
     return rest
 
 
+def _env_options(args: list[Word]) -> list[Word] | None:
+    """Аргументы env после её опций (присваивания и команда); None — опция не проверена.
+
+    env разбирает опции через getopt и останавливается на первом не-флаге: в группе
+    ``-iu NAME`` буква ``u`` берёт значение — остаток слова или следующее слово, и команда
+    начинается позже. ``-C`` (каталог), ``-S`` (разбиение строки на команду), ``-a``
+    (подмена argv[0]), BSD ``-P`` (свой PATH) и незнакомые опции — «не знаю».
+    """
+    rest = list(args)
+    while rest and rest[0].static and rest[0].value.startswith("-"):
+        v = rest[0].value
+        rest = rest[1:]
+        if v == "--":
+            break
+        if v == "-":  # то же, что -i
+            continue
+        if v.startswith("--"):
+            if v in ("--ignore-environment", "--null", "--debug"):
+                continue
+            if v.startswith("--unset="):
+                continue
+            if v == "--unset" and rest:
+                rest = rest[1:]
+                continue
+            return None  # --chdir, --split-string, сигналы, сокращения
+        for k, ch in enumerate(v[1:], 1):
+            if ch in "i0v":
+                continue
+            if ch == "u":
+                if k + 1 == len(v):  # значение — следующее слово
+                    if not rest:
+                        return None
+                    rest = rest[1:]
+                break
+            return None
+    return rest
+
+
 def classify_simple(cmd: Command, env: Env) -> Part:
     """Оценка простой команды (без перенаправлений — они у вызывающего)."""
     reading_env = True
@@ -3798,18 +3836,15 @@ def _dispatch(
             return _read(f"{prog}")
         return classify(Command(argv=inner, cwd=env.cwd, stdin=cmd.stdin, redirects=cmd.redirects))
     if prog == "env":
-        rest = list(args)
+        rest = _env_options(args)
+        if rest is None:
+            return _unknown("env: опция меняет каталог, программу или разбор команды")
         assigns: list[tuple[str, Word]] = []
-        while rest and rest[0].static and (rest[0].value.startswith("-") or "=" in rest[0].value):
-            v = rest[0].value
-            if v in ("-S", "--split-string", "-C", "--chdir") or v.startswith(("--chdir", "-C")):
-                return _unknown(f"env {v}")
-            if v in ("-u", "--unset") and len(rest) > 1:
-                rest = rest[2:]
-                continue
-            if "=" in v and not v.startswith("-"):
-                n, _, val = v.partition("=")
-                assigns.append((n, Word(val)))
+        while (
+            rest and rest[0].static and "=" in rest[0].value and not rest[0].value.startswith("-")
+        ):
+            n, _, val = rest[0].value.partition("=")
+            assigns.append((n, Word(val)))
             rest = rest[1:]
         if not rest:
             return _unknown("env без команды выводит всё окружение (там бывают секреты)")

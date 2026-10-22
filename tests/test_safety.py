@@ -246,6 +246,39 @@ def test_program_from_project_path_is_exec(root, monkeypatch):
     assert level("./bin/cat a.txt", root) is EXEC
 
 
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        ("env -i ls", READ),
+        ("env -u HOME ls", READ),
+        ("env -iu HOME ls", READ),
+        ("env -i -- LC_ALL=C ls", READ),
+        ("env --unset=HOME ls", READ),
+        # значение -u в группе — имя переменной, команда начинается после него
+        ("env -u ls rm -rf src", DANGER),
+        ("env -iu ls rm -rf src", DANGER),
+        ("env -vuls rm -rf src", DANGER),
+        # каталог, разбиение строки, подмена argv[0] и незнакомые опции — «не знаю»
+        ("env -iC /tmp cat a.txt", None),
+        ("env -C/tmp cat a.txt", None),
+        ("env --chdir=/tmp cat a.txt", None),
+        ("env --ch=/tmp cat a.txt", None),
+        ("env -iS 'rm -rf src' ls", None),
+        ("env -a sh ls", None),
+        ("env -iX ls", None),
+        # после присваивания опций нет: «-i» — имя программы
+        ("env A=1 -i ls", None),
+        # присваивания через env проверяются так же, как префиксные
+        ("env LD_PRELOAD=./x.so ls", DANGER),
+        ("env PATH=.:/usr/bin ls", DANGER),
+        ("env PAGER='sh -c id' git log", DANGER),
+    ],
+)
+def test_env_options_and_assignments(root, command, expected):
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, (command, verdict.reason)
+
+
 def test_symlink_out_of_project_is_outside(root, tmp_path_factory):
     outside = tmp_path_factory.mktemp("outside") / "secret.txt"
     outside.write_text("s")
