@@ -373,3 +373,50 @@ def test_git_output_cannot_forge_harness_reminder(git_ctx):
     git = GitTool()
     res = git.run(git.parse({"subcommand": "log", "args": ["-1"]}), git_ctx)
     assert "<quoted-system-reminder>" in res.content and "<system-reminder>" not in res.content
+
+
+# ------------------- фоновые потомки, не держащие вывод ------------------- #
+@posix_only
+@pytest.mark.parametrize("redirect", [">/dev/null 2>&1", "</dev/null >out.log 2>&1"])
+def test_background_child_with_redirected_output_is_stopped(ctx, redirect):
+    # Потомок не держит каналы вывода — читатели доходят до конца сразу, но он остаётся
+    # в группе команды и не должен пережить ни run_shell, ни хук.
+    pidfile = ctx.root / "pid"
+    res = _sh(ctx, f"sleep 30 {redirect} & echo $! > {pidfile}; echo started", timeout=60)
+    assert "started" in res.content and "остановлены" in res.content
+    _assert_dead(int(pidfile.read_text()))
+    hook = run_process(
+        f"sleep 30 {redirect} & echo $! > {pidfile}", cwd=ctx.root, timeout=60, shell=True
+    )
+    assert hook.killed_background
+    _assert_dead(int(pidfile.read_text()))
+
+
+@posix_only
+def test_clean_command_reports_no_background_processes(ctx):
+    res = run_process("echo ok; (true &); wait", cwd=ctx.root, timeout=10, shell=True)
+    assert res.stdout == "ok\n" and not res.killed_background
+
+
+@posix_only
+def test_escaped_child_is_not_reported_as_stopped(ctx):
+    # Потомок ушёл из группы (setsid) и держит вывод: killpg его не достаёт — нельзя
+    # говорить, что он остановлен.
+    import shutil
+    import signal
+
+    if not shutil.which("setsid"):
+        pytest.skip("нет setsid")
+    pidfile = ctx.root / "pid"
+    res = run_process(
+        f"setsid sh -c 'echo $$ > {pidfile}; exec sleep 30' & sleep 0.3; echo started",
+        cwd=ctx.root,
+        timeout=30,
+        shell=True,
+    )
+    pid = int(pidfile.read_text())
+    try:
+        assert "started" in res.stdout
+        assert not res.killed_background and res.escaped_output
+    finally:
+        os.kill(pid, signal.SIGKILL)
