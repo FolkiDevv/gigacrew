@@ -107,6 +107,28 @@ def test_json_block_cannot_block_session_start(tmp_path):
     assert [level for level, _ in events.notices] == ["warn"] and "нельзя" in events.notices[0][1]
 
 
+@pytest.mark.parametrize("event", [HookEvent.SUBAGENT_STOP, HookEvent.USER_PROMPT_SUBMIT])
+def test_json_block_blocks_and_stops_other_hooks(tmp_path, event):
+    # JSON {"decision": "block"} — как код 2: не только у Stop.
+    marker = tmp_path / "second-ran"
+    first = _script(tmp_path, "print(json.dumps({'decision': 'block', 'reason': 'рано'}))", "a.py")
+    second = _script(tmp_path, f"open({str(marker)!r}, 'w')", "b.py")
+    result, events = _run(_runner(event, first, second), event, tmp_path)
+    assert result.blocked and result.reason == "рано"
+    assert not marker.exists() and events.notices == []
+
+
+def test_json_block_of_post_tool_use_is_feedback_of_every_hook(tmp_path):
+    # У PostToolUse блокировка — замечание модели: идут все хуки, причины складываются.
+    lint = _script(tmp_path, "print(json.dumps({'decision': 'block', 'reason': 'E501'}))", "a.py")
+    other = _script(tmp_path, "print(json.dumps({'decision': 'block'}))", "b.py")
+    result, events = _run(
+        _runner(HookEvent.POST_TOOL_USE, lint, other), HookEvent.POST_TOOL_USE, tmp_path
+    )
+    assert result.blocked and result.reason == f"E501\n\n{NO_REASON}"
+    assert events.notices == []
+
+
 def test_post_tool_use_collects_feedback_of_every_hook(tmp_path):
     # Линтер с кодом 2 не отменяет форматтер после него; модели — замечания всех хуков.
     marker = tmp_path / "formatter-ran"
