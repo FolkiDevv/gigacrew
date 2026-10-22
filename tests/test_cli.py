@@ -1417,3 +1417,42 @@ def test_hooks_reload_honours_hook_trust(tmp_path, capsys):
     ctx = CommandContext(agent=agent, ui=ui, commands=commands, trust_hooks=True)
     commands.dispatch("/hooks reload", ctx)
     assert agent.hooks.has(HookEvent.PRE_TOOL_USE, "run_shell")
+
+
+def test_save_chat_moves_plan_when_chat_is_saved_under_new_id():
+    """Файл чата изменила другая сессия — диалог сохранён новым чатом; план этой сессии
+    должен переехать к нему (Agent.continue_as), а предупреждение — дойти до пользователя."""
+    from gigacrew.cli.commands import save_chat
+
+    class Recorder:
+        chat_id = "old"
+
+        def save(self, conversation, *, model=""):
+            self.chat_id = "new"
+            return "сохранён отдельным чатом new"
+
+    class FakeAgent:
+        chat_id = "old"
+        conversation = None
+        model = "M"
+        moved: list[str] = []
+
+        def continue_as(self, chat_id):
+            self.moved.append(chat_id)
+
+    class UI:
+        warnings: list[str] = []
+
+        def warn(self, text):
+            self.warnings.append(text)
+
+    agent, ui = FakeAgent(), UI()
+    save_chat(Recorder(), agent, ui)
+    assert agent.moved == ["new"]
+    assert ui.warnings == ["сохранён отдельным чатом new"]
+
+    agent.moved.clear()
+    same = Recorder()
+    same.save = lambda conversation, *, model="": None
+    save_chat(same, agent, ui)
+    assert agent.moved == []

@@ -39,6 +39,16 @@ from gigacrew.project.skills import COMMAND_NAME_PATTERN, SkillCatalog
 from gigacrew.ui.console import Console
 
 
+def save_chat(chats: ChatRecorder, agent: Agent, ui: Console) -> None:
+    """Сохранить чат. Если файл чата изменила другая сессия, диалог сохраняется новым
+    чатом — тогда и план этой сессии переезжает к нему (:meth:`Agent.continue_as`)."""
+    warning = chats.save(agent.conversation, model=agent.model)
+    if chats.chat_id != agent.chat_id:
+        agent.continue_as(chats.chat_id)
+    if warning:
+        ui.warn(warning)
+
+
 @dataclass
 class CommandContext:
     agent: Agent
@@ -184,9 +194,7 @@ def _model(ctx: CommandContext, arg: str) -> bool:
     ctx.ui.info(f"модель теперь: {arg} (применится со следующего запроса)")
     ensure_context_window(agent, ctx.ui, interrupt=ctx.interrupt, declined=ctx.declined_windows)
     if ctx.chats is not None:  # модель — часть чата: сохраняем, не дожидаясь хода
-        warning = ctx.chats.save(agent.conversation, model=agent.model)
-        if warning:
-            ctx.ui.warn(warning)
+        save_chat(ctx.chats, agent, ctx.ui)
     return True
 
 
@@ -335,9 +343,7 @@ def _compact(ctx: CommandContext, arg: str) -> bool:
         ctx.ui.info("сжимать нечего: история пуста или уже сжата")
         return True
     if ctx.chats is not None:  # краткое содержание — часть чата: сохраняем сразу
-        warning = ctx.chats.save(agent.conversation, model=agent.model)
-        if warning:
-            ctx.ui.warn(warning)
+        save_chat(ctx.chats, agent, ctx.ui)
     return True
 
 

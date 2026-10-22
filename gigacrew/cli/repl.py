@@ -22,6 +22,7 @@ from gigacrew.cli.commands import (
     expand_skill,
     is_repl_command,
     mode_choices,
+    save_chat,
 )
 from gigacrew.cli.hooks import hook_session
 from gigacrew.cli.indexing import ensure_index
@@ -58,9 +59,7 @@ def autosave(chats: ChatRecorder | None, agent: Agent, ui: Console) -> None:
     """Сохранить чат после хода. Ход к этому моменту уже согласован (``repair``)."""
     if chats is None:
         return
-    warning = chats.save(agent.conversation, model=agent.model)
-    if warning:
-        ui.warn(warning)
+    save_chat(chats, agent, ui)
 
 
 def esc_interrupt_for(
