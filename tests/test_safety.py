@@ -436,6 +436,116 @@ def test_git_reads_and_changes(repo):
     assert level("git config --global user.name x", repo) is DANGER
 
 
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        # настройки, запускающие программы, — на один запуск и постоянно
+        ("git -c core.pager='sh -c id' log", DANGER),
+        ("git -c alias.x='!id' x", DANGER),
+        ('git -c "$X" log', DANGER),
+        ("git -c user.name=x log", None),
+        ("git config core.hooksPath /tmp/hooks", DANGER),
+        ("git config alias.x '!id'", DANGER),
+        ("git config diff.x.textconv cat", DANGER),
+        ("git config credential.helper store", DANGER),
+        ("git config user.name x", WRITE),
+        ("git config user.name", READ),
+        # каталоги и глобальные флаги
+        ("git -C /tmp status", None),
+        ("git -C .. log", None),
+        ("git --git-dir=/tmp/x/.git log -p", None),
+        ("git --exec-path=/tmp/x status", None),
+        ("git --work-tree=/ status", None),
+        ("git --no-pager log", READ),
+        # запись файлов: внутри проекта — WRITE, снаружи и в .git — DANGER
+        ("git log --output=/tmp/x", DANGER),
+        ("git diff --output=.git/hooks/pre-commit", DANGER),
+        ("git log --output=x.txt", WRITE),
+        ("git archive -o /tmp/src.zip HEAD", DANGER),
+        ("git archive -o out.zip HEAD", WRITE),
+        ("git format-patch --output-directory=/tmp/x HEAD~1", DANGER),
+        ("git format-patch -o /tmp/x HEAD~1", DANGER),
+        ("git format-patch -o patches HEAD~1", WRITE),
+        ("git bundle create /tmp/x.bundle HEAD", DANGER),
+        ("git bundle create x.bundle HEAD", WRITE),
+        ("git grep -o hello", READ),
+        # чтение файлов вне репозитория (diff — и без --no-index)
+        ("git diff --no-index a.txt ~/.ssh/id_rsa", DANGER),
+        ("git diff --no-index a.txt /etc/passwd", None),
+        ("git diff --no-index a.txt b.txt", READ),
+        ("git diff ../outside.txt /dev/null", None),
+        ("git diff ~/.ssh/id_rsa /dev/null", DANGER),
+        ("git diff HEAD~1 -- src", READ),
+        ("git grep --no-index KEY ~/.ssh", DANGER),
+        ("git grep KEY", READ),
+        # запуск команд
+        ("git rebase -x 'rm -rf ~' main", None),
+        ("git rebase -ix 'rm -rf ~' main", None),
+        ("git rebase main", WRITE),
+        ("git submodule foreach 'rm -rf ~'", None),
+        ("git submodule update --init", WRITE),
+        ("git bisect run ./x.sh", None),
+        # необратимые изменения
+        ("git remote set-url origin https://x/y.git", DANGER),
+        ("git remote add up https://x", DANGER),
+        ("git remote -v", READ),
+        ("git stash drop", DANGER),
+        ("git stash clear", DANGER),
+        ("git stash list", READ),
+        ("git stash", WRITE),
+        ("git restore .", DANGER),
+        ("git restore src/main.py", DANGER),
+        ("git restore --staged a.txt", WRITE),
+        ("git checkout .", DANGER),
+        ("git checkout src/main.py", DANGER),
+        ("git checkout feature", WRITE),
+        ("git checkout -B feature", DANGER),
+        ("git checkout -b feature", WRITE),
+        ("git switch -f main", DANGER),
+        ("git switch --discard-changes main", DANGER),
+        ("git switch -C main", DANGER),
+        ("git switch main", WRITE),
+        ("git branch -D x", DANGER),
+        ("git branch -d -f x", DANGER),
+        ("git branch -df x", DANGER),
+        ("git branch --delete --force x", DANGER),
+        ("git branch --force x HEAD~3", DANGER),
+        ("git branch -d x", WRITE),
+        ("git branch x", WRITE),
+        ("git branch", READ),
+        ("git tag -d v1", DANGER),
+        ("git tag v1", WRITE),
+        ("git push --force-with-lease", DANGER),
+        ("git push --mirror", DANGER),
+        ("git push --prune", DANGER),
+        ("git push origin :old", DANGER),
+        ("git push origin +main", DANGER),
+        ("git push --delete origin x", DANGER),
+        ("git gc --prune=now", DANGER),
+        ("git gc", WRITE),
+        ("git reflog expire --all", DANGER),
+        ("git reflog", READ),
+        ("git worktree remove x", DANGER),
+        ("git filter-branch --all", DANGER),
+    ],
+)
+def test_git_levels(repo, command, expected):
+    verdict = classify(command, root=repo)
+    assert verdict.level is expected, (command, verdict.reason)
+
+
+def test_git_in_nested_bare_repository_asks(repo):
+    subprocess.run(["git", "init", "-q", "--bare", "pkg.git"], cwd=repo, check=True)
+    assert level("git -C pkg.git log", repo) is None
+    assert level("git log", repo) is READ
+
+
+def test_git_read_when_repo_config_cannot_be_checked(repo, monkeypatch):
+    assert level("git status", repo) is READ
+    monkeypatch.setattr("gigacrew.safety.gitconfig.repo_config_runs_programs", lambda *a, **k: None)
+    assert level("git status", repo) is None
+
+
 def test_git_read_with_program_in_repo_config_asks(repo):
     subprocess.run(["git", "config", "diff.evil.textconv", "sh -c id"], cwd=repo, check=True)
     assert level("git diff", repo) is None

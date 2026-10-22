@@ -3038,7 +3038,11 @@ def _git(env: Env, args: list[Word]) -> Part:
         return _unknown(f"git {sub} {hit.value}: сокращённый флаг")
     for v in values:
         name = v.split("=", 1)[0]
-        if name in ("--output", "-o") and sub not in ("worktree",):
+        if (
+            name in ("--output", "-o")
+            and sub not in ("worktree", "grep")  # у git grep -o — «только совпадения»
+            or (name == "--output-directory" and sub == "format-patch")
+        ):
             target = [Word(v.split("=", 1)[1])] if "=" in v else []
             if not target:
                 idx = values.index(v)
@@ -3055,9 +3059,11 @@ def _git(env: Env, args: list[Word]) -> Part:
         ) or (name.startswith("--exec-path") or name in ("--git-dir", "--work-tree")):
             return _unknown(f"git {sub} {name}: запуск программ")
     if sub in _GIT_READ:
-        if sub == "diff" and "--no-index" in fl:
+        # git diff с путём вне репозитория сравнивает файлы как --no-index (`git diff
+        # ~/.ssh/id_rsa /dev/null`), поэтому пути проверяются и без флага.
+        if sub == "diff" or (sub == "grep" and "--no-index" in fl):
             paths = [Word(v) for v in values if not v.startswith("-")]
-            bad = _check_read(env, paths, "git diff --no-index")
+            bad = _check_read(env, paths if sub == "diff" else paths[1:], f"git {sub}")
             if bad is not None:
                 return bad
         if sub == "fsck" and any(v.startswith("--lost-found") for v in values):
@@ -3071,8 +3077,10 @@ def _git(env: Env, args: list[Word]) -> Part:
 def _git_change(env: Env, sub: str, rest: list[Word], values: list[str], fl: set[str]) -> Part:
     positional = [v for v in values if not v.startswith("-")]
     if sub == "branch":
-        if _has(fl, "-D", "--delete") and _has(fl, "-D", "--force", "-f") or "-D" in values:
+        if _has(fl, "-D") or _has(fl, "-d", "--delete") and _has(fl, "--force", "-f"):
             return _danger("git branch -D: удаление ветки без проверки слияния")
+        if _has(fl, "-f", "--force", "-M", "-C"):  # перезапись существующей ветки
+            return _danger("git branch -f: перезапись ветки")
         if _has(
             fl,
             "-d",
@@ -3186,7 +3194,7 @@ def _git_change(env: Env, sub: str, rest: list[Word], values: list[str], fl: set
             and sub == "restore"
             or ("--" in values and sub == "checkout")
             or (sub == "restore" and not _has(fl, "--staged", "-S") and positional)
-            or (sub == "checkout" and _has(fl, "-f", "--force"))
+            or (sub == "checkout" and _has(fl, "-f", "--force", "-B"))
         ):
             return _danger(f"git {sub}: незакоммиченные правки будут потеряны")
         if sub == "checkout" and positional and any((env.dir / p).exists() for p in positional):
@@ -3261,6 +3269,14 @@ def _git_change(env: Env, sub: str, rest: list[Word], values: list[str], fl: set
         if positional[:1] == ["run"]:
             return _unknown("git bisect run: запуск команд")
         return _write("git bisect")
+    if sub == "submodule" and "foreach" in positional:
+        return _unknown("git submodule foreach: запуск команд")
+    if sub == "rebase" and _has(fl, "-x", "--exec"):
+        return _unknown("git rebase -x: запуск команд")
+    if sub == "switch" and _has(fl, "-f", "--force", "--discard-changes", "-C", "--force-create"):
+        return _danger("git switch -f/-C: незакоммиченные правки или ветка будут потеряны")
+    if sub == "bundle" and positional[:1] == ["create"]:
+        return _check_write(env, [Word(p) for p in positional[1:2]], "git bundle create")
     if sub in ("fetch", "pull", "clone", "submodule", "lfs", "ls-remote"):
         if sub == "clone":
             dest = [Word(p) for p in positional[1:2]]
