@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -200,3 +201,223 @@ def test_cd_followed_by_newline_is_not_a_working_directory(root):
     only = classify("cd src", root=root)
     assert only.cwd == "src" and only.command == ""
     assert classify("cd src\n", root=root).cwd == "src"
+
+
+def test_problems_make_command_not_composable(root):
+    """Фон и циклы — не части для сверки: разрешение `pytest` не распространяется на
+    `pytest &` и цикл (T1-S14)."""
+    from gigacrew.agent.decisions import DecisionMemory
+
+    memory = DecisionMemory()
+    assert memory.approve(classify("pytest", root=root))
+    for command in ("pytest &", "while true; do pytest; done"):
+        verdict = classify(command, root=root)
+        assert verdict.level is None and verdict.composable is False, command
+        assert memory.match(verdict) is None, command
+
+
+# ----------------------- невидимые символы -------------------------- #
+@pytest.mark.parametrize(
+    "ch", ["\r", "\x0b", "\x0c", "\x7f", "\x9b", "\u2066", "\u2067", "\u2069", "\ufeff"]
+)
+def test_control_and_bidi_characters_are_danger(root, ch):
+    """Возврат каретки, C1, изоляция направления (Trojan Source), BOM (T1-S17, T1-S18)."""
+    assert classify(f"echo ok{ch}x", root=root).level is DANGER
+    assert classify(f"cat a.txt {ch}", root=root).level is DANGER
+
+
+def test_invisible_chars_lists_code_points():
+    from gigacrew.safety import invisible_chars
+
+    assert invisible_chars("a\tb\nc") == []
+    assert invisible_chars("a\u202eb\u202e") == ["U+202E"]
+    assert invisible_chars("x\u2067y\u2069") == ["U+2067", "U+2069"]
+
+
+# -------------------------- перенаправления ------------------------- #
+@pytest.fixture
+def repo(root: Path) -> Path:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    return root
+
+
+@pytest.mark.parametrize("op", [">", ">>", ">|", "&>", "&>>", ">&"])
+def test_output_redirect_operators_write(repo, op):
+    """Каждый оператор вывода в файл — запись: в проекте WRITE, снаружи и в .git — DANGER
+    (T1-S4, T1-S5)."""
+    assert level(f"echo x {op} out.txt", repo) is WRITE
+    assert level(f"echo x {op} ~/.bashrc", repo) is DANGER
+    assert level(f"echo x {op} ../outside.txt", repo) is DANGER
+    assert level(f"echo x {op} .git/config", repo) is DANGER
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["ls >&2", "ls 2>&1", "ls 1>&2", "ls > /dev/null 2>&1", "ls 2>/dev/null"],
+)
+def test_descriptor_duplication_is_not_a_write(root, command):
+    verdict = classify(command, root=root)
+    assert verdict.level is READ and verdict.composable, verdict.reason
+
+
+def test_read_redirect_paths_are_checked(root):
+    """`<` — чтение файла: те же проверки пути, что у аргументов cat (T1-S3)."""
+    (root / ".env").write_text("T=1\n")
+    assert level("cat < a.txt", root) is READ
+    assert level("cat < ~/.ssh/id_rsa", root) is DANGER
+    assert level("cat < ../outside.txt", root) is None
+    assert level("cat < .env", root) is None
+    assert level("wc -l < $FILE", root) is None
+
+
+# ------------------------ конструкции оболочки ----------------------- #
+def test_unknown_statement_types_fail_closed(root):
+    """Незнакомый правилам разбора оператор — проблема, а не пустая команда (T1-S6)."""
+    assert level("for ((i=0;i<1;i++)); do rm -rf src; done", root) is not READ
+    verdict = classify("for ((i=0;i<1;i++)); do ls; done", root=root)
+    assert verdict.level is None and not verdict.composable, verdict.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["ls )", "ls 'x", "echo $(ls", "if true; then ls", "cat a.txt; )", "(ls", "(cat a.txt"],
+)
+def test_syntax_errors_fail_closed(root, command):
+    """Неразобранная команда — «не знаю» и не сверяется по частям (T1-S21, T1-U8)."""
+    verdict = classify(command, root=root)
+    assert verdict.level is None and not verdict.composable, verdict.reason
+
+
+def test_ansi_c_string_is_dynamic(root):
+    """`$'…'` dash и bash понимают по-разному: путь неизвестен (T1-S15)."""
+    assert level(r"cat $'\x2e\x2e/outside.txt'", root) is None
+    assert level("cat $'a.txt'", root) is not READ
+
+
+def test_backticks_in_heredoc_make_body_dynamic(root):
+    """Тело heredoc с `…` или $ без кавычек у разделителя — не статичное: интерпретатор
+    получит результат подстановки (T1-S16)."""
+    from gigacrew.safety import bash as shell
+
+    for command, static in [
+        ("cat <<EOF\n`id`\nEOF", False),
+        ("cat <<EOF\nplain $\nEOF", False),
+        ("cat <<'EOF'\n`id`\nEOF", True),
+        ("cat <<EOF\nplain\nEOF", True),
+    ]:
+        script = shell.parse(command, root=root)
+        assert script is not None
+        doc = script.commands[0].heredoc
+        assert doc is not None and doc.body_static is static, command
+    assert level("python3 <<EOF\nprint('`touch pwned`')\nEOF", root) is not READ
+
+
+# ------------------------------ пути -------------------------------- #
+def test_globs_take_the_worst_match(root):
+    """Шаблон — худшее из совпадений: ключ среди файлов делает `cat *` не чтением
+    (T1-S10, T1-U10)."""
+    assert level("cat *.txt", root) is READ
+    (root / "id_rsa").write_text("k")
+    (root / "k.pem").write_text("k")
+    assert level("cat *", root) is None
+    assert level("cat *.pem", root) is None
+    assert level("cat ~/.ssh/id_*", root) is DANGER
+    assert level("cat /etc/*.conf", root) is None
+
+
+def test_too_many_glob_matches_is_unknown(root, monkeypatch):
+    monkeypatch.setattr("gigacrew.safety.paths.MAX_GLOB_MATCHES", 1)
+    assert level("cat *.txt", root) is None
+
+
+@pytest.mark.parametrize("command", ["cat /proc/self/environ", "strings /proc/1/environ"])
+def test_process_environment_is_secret_outside(root, command):
+    """Окружение процессов — секреты вне проекта: DANGER, не просто «снаружи» (T1-S19)."""
+    assert level(command, root) is DANGER
+
+
+def test_recursive_read_sees_symlinked_directories_out_of_project(root):
+    """Каталог-ссылка за пределы проекта (не на секреты) — grep -R пойдёт по ней (T1-S7)."""
+    assert level("grep -Rn hello .", root) is READ
+    (root / "src" / "home").symlink_to(Path.home())
+    assert level("grep -Rn hello .", root) is None
+    assert level("grep -rn hello src", root) is None
+    assert level("grep -rn hello tests", root) is READ
+
+
+def test_recursive_read_sees_nested_secret_dirs(root):
+    """.ssh, .aws… в глубине дерева — секреты, даже с безобидными именами файлов (T1-S8)."""
+    (root / "x" / ".ssh").mkdir(parents=True)
+    (root / "x" / ".ssh" / "known").write_text("k")
+    assert level("grep -rn hello .", root) is None
+    assert level("grep -rn hello src", root) is READ
+
+
+def test_recursive_read_sees_credentials_in_git_remote(repo):
+    """Токен в адресе удалённого репозитория (.git/config) — секрет (T1-S9)."""
+    assert level("grep -rn hello .", repo) is READ
+    url = "https://u:tok123@example.com/r.git"
+    subprocess.run(["git", "remote", "add", "origin", url], cwd=repo, check=True)
+    assert level("grep -rn hello .", repo) is None
+    assert level("grep -rn hello src", repo) is READ
+
+
+def test_secret_walk_overflow_counts_as_secret(root):
+    """Дерево больше лимита — считаем, что секреты в нём есть (T1-S20)."""
+    from gigacrew.safety.paths import has_escaping_links, has_secrets_under
+
+    d = root / "big"
+    (d / "z").mkdir(parents=True)
+    for i in range(10):
+        (d / f"f{i}.txt").write_text("x")
+    assert has_secrets_under(d, root) is False
+    assert has_secrets_under(d, root, limit=5) is True
+    assert has_escaping_links(d, root, limit=5) is True
+
+
+# ------------------------------- git -------------------------------- #
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("core.fsmonitor", "./fsmon.sh"),
+        ("filter.x.clean", "sh -c id"),
+        ("filter.x.smudge", "sh -c id"),
+        ("filter.x.process", "sh -c id"),
+        ("diff.external", "sh -c id"),
+        ("diff.x.command", "sh -c id"),
+        ("diff.x.textconv", "sh -c id"),
+        ("gpg.program", "sh -c id"),
+        ("gpg.ssh.program", "sh -c id"),
+    ],
+)
+def test_git_read_with_program_in_repo_config_asks(repo, key, value):
+    """Чтение git — READ, только пока настройки репозитория не запускают программ
+    (T1-S11, T1-S12)."""
+    from gigacrew.safety.gitconfig import repo_config_runs_programs
+
+    assert level("git status", repo) is READ
+    subprocess.run(["git", "config", key, value], cwd=repo, check=True)
+    assert repo_config_runs_programs(repo) is True
+    assert level("git status", repo) is None
+    assert level("env -i git status", repo) is None
+
+
+def test_git_fsmonitor_disabled_and_global_config_are_fine(repo):
+    """core.fsmonitor=false ничего не запускает; глобальные настройки — пользователя,
+    их не проверяем (HOME в тестах — временный)."""
+    from gigacrew.safety.gitconfig import repo_config_runs_programs
+
+    subprocess.run(["git", "config", "core.fsmonitor", "false"], cwd=repo, check=True)
+    assert repo_config_runs_programs(repo) is False
+    assert level("git status", repo) is READ
+    subprocess.run(["git", "config", "--global", "diff.external", "x"], cwd=repo, check=True)
+    assert repo_config_runs_programs(repo) is False
+
+
+def test_git_config_that_cannot_be_read_is_unknown(repo):
+    """git не прочитал настройки — неизвестно, что запустится (T1-S13)."""
+    from gigacrew.safety.gitconfig import repo_config_runs_programs
+
+    (repo / ".git" / "config").write_text("[core\n broken")
+    assert repo_config_runs_programs(repo) is None
+    assert level("git status", repo) is None
