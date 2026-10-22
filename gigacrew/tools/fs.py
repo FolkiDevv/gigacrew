@@ -16,8 +16,9 @@ from pydantic import BaseModel, Field
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.files import GIT_DIR_NAME, glob_match, is_git_internal, walk_files
 from gigacrew.project.workspace import DATA_DIR_NAME
-from gigacrew.security import RiskLevel, resolve_in_root
-from gigacrew.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
+from gigacrew.safety.paths import Scope, scope_of_path
+from gigacrew.security import RiskLevel, SandboxError, resolve_in_root
+from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
 
 # Жёсткий предел размера читаемого файла (дальше — только search_content).
 MAX_READ_BYTES = 20_000_000
@@ -33,6 +34,52 @@ def _rel(ctx: ToolContext, path: Path) -> str:
         return str(path.relative_to(ctx.root))
     except ValueError:
         return str(path)
+
+
+# --------------------------------------------------------------------------- #
+# Файлы с секретами
+# --------------------------------------------------------------------------- #
+# Из .env gigacrew берёт свои настройки (config.load_environment): ключ доступа, адреса
+# API, проверку TLS. Правка без вопроса увела бы ключ и запросы на чужой адрес при
+# следующем запуске — поэтому её подтверждает пользователь всегда, даже с -y.
+CONFIG_FILE_NAME = ".env"
+SECRET_READ_NOTE = (
+    "Файл с секретами (ключи, пароли, токены) инструменты не читают: {path}. Если его "
+    "содержимое действительно нужно, спросите пользователя или прочитайте его через "
+    "run_shell — такая команда требует подтверждения."
+)
+_SECRET_SCOPES = (Scope.SECRET, Scope.SECRET_OUTSIDE, Scope.DYNAMIC)
+
+
+def is_secret_target(root: Path, path: Path) -> bool:
+    """Файл с ключами или учётными данными — по тому же правилу, что у классификатора
+    команд (``cat .env`` там — непроверенная команда): ``.env*``, ``*.pem``, ``id_rsa``,
+    ``.npmrc``, ``credentials.json``, всё в ``.ssh/``, ``.aws/``… Симлинк проверяется и
+    по цели; путь, который не раскрыть, считается секретом."""
+    return scope_of_path(path, root) in _SECRET_SCOPES
+
+
+def _write_assessment(ctx: ToolContext, path: str) -> Assessment:
+    """Оценка записи в ``path``: план — без риска, настройки gigacrew (.env) — как опасная
+    операция (``-y`` и хук не снимают вопрос), другие секреты — с вопросом в режиме «авто»
+    (вид OTHER: правка без вопроса — только для обычных файлов проекта)."""
+    if _is_plan_file(ctx, path):
+        return Assessment(RiskLevel.SAFE)  # план — данные агента: в любом режиме без вопроса
+    try:
+        p = resolve_in_root(ctx.root, path)
+    except SandboxError:
+        return Assessment(RiskLevel.WRITE)  # откажет сама запись
+    if p.name.casefold() == CONFIG_FILE_NAME:
+        return Assessment(
+            RiskLevel.DANGEROUS,
+            reason=f"{_rel(ctx, p)} — настройки gigacrew: ключ доступа, адреса API, проверка TLS",
+            kind=ToolKind.OTHER,
+        )
+    if is_secret_target(ctx.root, p):
+        return Assessment(
+            RiskLevel.WRITE, reason=f"файл с секретами ({_rel(ctx, p)})", kind=ToolKind.OTHER
+        )
+    return Assessment(RiskLevel.WRITE)
 
 
 # --------------------------------------------------------------------------- #
@@ -491,6 +538,8 @@ class ReadFileTool(Tool):
             raise ToolError(f"Это директория, а не файл: {params.path}")
         if not p.is_file():  # FIFO/сокет/устройство — чтение может заблокироваться
             raise ToolError(f"Не обычный файл (FIFO, сокет или устройство): {params.path}")
+        if is_secret_target(ctx.root, p):
+            raise ToolError(SECRET_READ_NOTE.format(path=params.path))
         if p.stat().st_size > MAX_READ_BYTES:
             raise ToolError(
                 f"Файл слишком большой (>{MAX_READ_BYTES} байт). Используйте search_content."
@@ -583,9 +632,11 @@ class WriteFileTool(Tool):
     Params = WriteFileParams
     kind = ToolKind.EDIT
 
+    def assess(self, params: WriteFileParams, ctx: ToolContext) -> Assessment:
+        return _write_assessment(ctx, params.path)
+
     def risk(self, params: WriteFileParams, ctx: ToolContext) -> RiskLevel:
-        # План — данные агента, а не проект: пишется в любом режиме без вопроса.
-        return RiskLevel.SAFE if _is_plan_file(ctx, params.path) else RiskLevel.WRITE
+        return self.assess(params, ctx).risk
 
     def _prepare(
         self, params: WriteFileParams, ctx: ToolContext
@@ -654,8 +705,11 @@ class EditFileTool(Tool):
     Params = EditFileParams
     kind = ToolKind.EDIT
 
+    def assess(self, params: EditFileParams, ctx: ToolContext) -> Assessment:
+        return _write_assessment(ctx, params.path)
+
     def risk(self, params: EditFileParams, ctx: ToolContext) -> RiskLevel:
-        return RiskLevel.SAFE if _is_plan_file(ctx, params.path) else RiskLevel.WRITE
+        return self.assess(params, ctx).risk
 
     def _compute(self, params: EditFileParams, ctx: ToolContext):
         p = _writable_path(ctx, params.path)
@@ -716,10 +770,14 @@ class EditFileTool(Tool):
                 new = old[: match.start] + replacement + old[match.end :]
                 return p, file, new, 1
 
-        # Не найдено — даём модели контекст файла, чтобы скопировать точно.
+        # Не найдено — даём модели контекст файла, чтобы скопировать точно. Файл с
+        # секретами не показываем: ошибка превью уходит модели до вопроса пользователю.
+        missing = "old_string не найден в файле (ни точно, ни с поправкой на пробелы)."
+        if is_secret_target(ctx.root, p):
+            raise ToolError(f"{missing} Это файл с секретами — его содержимое не показывается.")
         raise ToolError(
-            "old_string не найден в файле (ни точно, ни с поправкой на пробелы). "
-            "Скопируйте фрагмент дословно из содержимого ниже:\n\n" + _numbered_excerpt(old)
+            f"{missing} Скопируйте фрагмент дословно из содержимого ниже:\n\n"
+            + _numbered_excerpt(old)
         )
 
     def preview(self, params: EditFileParams, ctx: ToolContext) -> Display | None:

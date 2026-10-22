@@ -830,3 +830,134 @@ def test_nested_repository_git_dir_is_not_writable(ctx):
     (ctx.root / "docs").mkdir()
     (ctx.root / "docs" / "HEAD").write_text("x", encoding="utf-8")
     assert w.run(w.parse({"path": "docs/HEAD", "content": "y"}), ctx).ok
+
+
+# ------------------------------ файлы с секретами ------------------------------ #
+def _decide(tool, params, ctx, mode="auto", **kw):
+    from gigacrew.permissions import PermissionMode, decide
+
+    assessment = tool.assess(params, ctx)
+    kw.setdefault("auto_approve", False)
+    return decide(PermissionMode(mode), assessment.risk, assessment.kind or tool.kind, **kw)
+
+
+@pytest.mark.parametrize("path", [".env", "sub/.env", ".ENV", "link.txt"])
+def test_env_write_always_asks(ctx, path):
+    """.env — настройки самого gigacrew (ключ, адреса API, TLS): правка — только с
+    подтверждения, в любом режиме и даже с -y или разрешением хука."""
+    import os
+
+    from gigacrew.permissions import Decision
+    from gigacrew.security import RiskLevel
+
+    if path == "link.txt":
+        if os.name == "nt":
+            pytest.skip("симлинки")
+        (ctx.root / ".env").write_text("GIGACREW_API_URL=https://api.test\n", encoding="utf-8")
+        (ctx.root / "link.txt").symlink_to(ctx.root / ".env")
+    w, e = WriteFileTool(), EditFileTool()
+    calls = [
+        (w, w.parse({"path": path, "content": "GIGACREW_API_URL=https://evil.test\n"})),
+        (e, e.parse({"path": path, "old_string": "api.test", "new_string": "evil.test"})),
+    ]
+    for tool, params in calls:
+        assessment = tool.assess(params, ctx)
+        assert assessment.risk is RiskLevel.DANGEROUS
+        assert ".env" in assessment.reason.casefold()
+        assert _decide(tool, params, ctx) is Decision.ASK
+        assert _decide(tool, params, ctx, auto_approve=True) is Decision.ASK
+        assert _decide(tool, params, ctx, auto_approve=True, hook="allow") is Decision.ASK
+        assert _decide(tool, params, ctx, mode="plan") is Decision.BLOCK
+
+
+@pytest.mark.parametrize("path", [".env.local", ".npmrc", "deploy.pem", ".ssh/config"])
+def test_secret_file_write_asks_in_auto_mode(ctx, path):
+    from gigacrew.permissions import Decision
+
+    w = WriteFileTool()
+    params = w.parse({"path": path, "content": "x\n"})
+    assert "секрет" in w.assess(params, ctx).reason
+    assert _decide(w, params, ctx) is Decision.ASK  # правка обычного файла — без вопроса
+    assert _decide(w, params, ctx, auto_approve=True) is Decision.ALLOW  # -y — как у run_shell
+
+
+def test_ordinary_and_template_files_are_plain_edits(ctx):
+    from gigacrew.permissions import Decision
+
+    w = WriteFileTool()
+    for path in (".env.example", "src/env.py", "environment.md"):
+        params = w.parse({"path": path, "content": "x\n"})
+        assert w.assess(params, ctx).reason == ""
+        assert _decide(w, params, ctx) is Decision.ALLOW
+
+
+def test_env_edit_in_auto_mode_is_confirmed(tmp_path):
+    """Сквозной путь: модель правит .env в режиме «авто» с -y — пользователя спрашивают."""
+    from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
+
+    from gigacrew.agent.loop import Agent
+    from gigacrew.config import Config
+    from gigacrew.tools.base import build_default_registry
+
+    env = tmp_path / ".env"
+    env.write_text("GIGACREW_AUTH_URL=https://auth.test/oauth\n", encoding="utf-8")
+    edit = {"path": ".env", "old_string": "auth.test", "new_string": "evil.test"}
+    provider = ScriptedProvider([tool_turn("edit_file", edit), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, auto_approve=True)
+    Agent(provider, build_default_registry(), cfg, events).run_turn("поправь адрес")
+    assert len(events.confirms) == 1 and events.confirms[0][2]  # как опасная операция
+    assert env.read_text(encoding="utf-8") == "GIGACREW_AUTH_URL=https://auth.test/oauth\n"
+
+
+@pytest.mark.parametrize(
+    "path", [".env", ".Env.Local", "deploy.pem", ".npmrc", "credentials.json", ".ssh/id_rsa"]
+)
+def test_read_file_refuses_secret_files(ctx, path):
+    target = ctx.root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("TOKEN=s3cr3t\n", encoding="utf-8")
+    r = ReadFileTool()
+    with pytest.raises(ToolError, match="секрет") as err:
+        r.run(r.parse({"path": path}), ctx)
+    assert "s3cr3t" not in str(err.value) and "run_shell" in str(err.value)
+
+
+def test_read_file_refuses_symlink_to_secret_and_reads_template(ctx):
+    import os
+
+    (ctx.root / ".env").write_text("TOKEN=s3cr3t\n", encoding="utf-8")
+    (ctx.root / ".env.example").write_text("TOKEN=\n", encoding="utf-8")
+    r = ReadFileTool()
+    assert "TOKEN=" in r.run(r.parse({"path": ".env.example"}), ctx).content
+    if os.name == "nt":
+        pytest.skip("симлинки")
+    (ctx.root / "settings.txt").symlink_to(ctx.root / ".env")
+    with pytest.raises(ToolError, match="секрет"):
+        r.run(r.parse({"path": "settings.txt"}), ctx)
+
+
+def test_search_skips_and_refuses_secret_files(ctx):
+    from gigacrew.tools.search import SearchContentTool
+
+    for path in ("src/a.py", ".env", ".ENV.local", ".npmrc", "deploy.pem", "credentials.json"):
+        target = ctx.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("needle=s3cr3t\n", encoding="utf-8")
+    (ctx.root / ".env.example").write_text("needle=\n", encoding="utf-8")
+    s = SearchContentTool()
+    out = s.run(s.parse({"pattern": "needle"}), ctx).content
+    assert sorted(ln.split(":", 1)[0] for ln in out.splitlines()) == [".env.example", "src/a.py"]
+    for path in (".env", ".npmrc"):  # явно названный файл с секретами — тоже нет
+        with pytest.raises(ToolError, match="секрет") as err:
+            s.run(s.parse({"pattern": "needle", "path": path}), ctx)
+        assert "s3cr3t" not in str(err.value)
+
+
+def test_edit_not_found_in_secret_file_shows_no_content(ctx):
+    """Неудачная правка показывает модели файл — но не файл с секретами (ошибка превью
+    уходит модели до вопроса о подтверждении)."""
+    (ctx.root / ".env").write_text("TOKEN=s3cr3t\n", encoding="utf-8")
+    with pytest.raises(ToolError, match="не найден") as err:
+        _edit(ctx, ".env", "MISSING=1", "MISSING=2")
+    assert "s3cr3t" not in str(err.value)
