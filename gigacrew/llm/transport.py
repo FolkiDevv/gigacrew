@@ -581,15 +581,16 @@ class HttpProvider(LLMProvider):
         возвращает финальный AssistantTurn (идентичный complete()).
 
         Повтор при сетевом сбое выполняется, только пока пользователю не отдан
-        ни один кусок текста — иначе он увидел бы ответ дважды. Авторизация после 401
-        обновляется перед следующей попыткой, когда ответ уже закрыт.
+        ни один кусок текста — иначе он увидел бы ответ дважды; без ``on_delta`` (ответ
+        целиком — рецензент, сжатие) показывать некому, и обрыв повторяется всегда.
+        Авторизация после 401 обновляется перед следующей попыткой, когда ответ уже закрыт.
         """
-        sink = on_delta or (lambda _s: None)
         state = {"emitted": False}
 
         def emit(piece: str) -> None:
-            state["emitted"] = True
-            sink(piece)
+            if on_delta is not None:
+                state["emitted"] = True
+                on_delta(piece)
 
         name = model or self.model
         payload = self._payload(

@@ -512,6 +512,40 @@ def test_complete_goes_through_the_stream(tmp_path):
     assert backend.chat_bodies[0]["stream"] is True
 
 
+class _BrokenStream(httpx.SyncByteStream):
+    """Тело ответа: кусок текста, потом обрыв соединения."""
+
+    def __iter__(self):
+        yield _sse({"choices": [{"index": 0, "delta": {"content": "Сводка, часть 1"}}]})
+        raise httpx.ReadError("connection reset")
+
+
+def _broken() -> httpx.Response:
+    return httpx.Response(
+        200, headers={"content-type": "text/event-stream"}, stream=_BrokenStream()
+    )
+
+
+def test_complete_is_retried_after_a_drop_mid_answer(tmp_path):
+    """complete() (рецензент, сжатие) ничего не показывает: обрыв после первого куска —
+    обычный транзиентный сбой, повтор не дублирует вывод."""
+    backend = Backend(chat=[_broken(), _text("сводка целиком")])
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    assert provider.complete(_msgs()).message.content == "сводка целиком"
+    assert backend.count(CHAT) == 2
+
+
+def test_stream_shown_text_is_not_retried_after_a_drop(tmp_path):
+    backend = Backend(chat=[_broken(), _text("второй раз")])
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    deltas: list[str] = []
+    with pytest.raises(ApiError, match="Сетевой сбой во время потоковой передачи"):
+        provider.stream(_msgs(), on_delta=deltas.append)
+    assert deltas == ["Сводка, часть 1"] and backend.count(CHAT) == 1
+
+
 def test_model_without_stream_gets_a_whole_answer(tmp_path):
     whole = httpx.Response(
         200,
