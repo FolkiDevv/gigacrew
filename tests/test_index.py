@@ -234,6 +234,21 @@ def test_symlinks_to_secrets_and_excluded_files_are_not_indexed(index, project):
     assert index.find_symbols("vendored")[1] == 0
 
 
+def test_secret_files_are_not_indexed_by_the_shell_rule(index, project, tmp_path_factory):
+    # Секреты — по правилу read_file и классификатора команд, а не только .env*.
+    _make(project, "deploy/credentials.json", '{"TOKEN_A": 1}\n')
+    _make(project, "config/secrets.yaml", "TOKEN_B: 1\n")
+    _make(project, ".aws/settings.py", "TOKEN_C = 1\n")
+    _make(project, "certs/server.key", "TOKEN_D = 1\n")
+    outside = tmp_path_factory.mktemp("home") / ".aws"
+    _make(outside, "conf.py", "TOKEN_E = 1\n")
+    if os.name != "nt":
+        (project / "conf.py").symlink_to(outside / "conf.py")
+    index.refresh()
+    assert index.find_symbols("TOKEN")[1] == 0
+    assert _paths(index) == ["README.md", "app/agent.py", "app/events.py", "web/store.ts"]
+
+
 # ------------------------- использования и импорты ------------------------- #
 @pytest.fixture
 def refs_project(tmp_path):

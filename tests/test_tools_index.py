@@ -116,12 +116,17 @@ def test_file_outline_groups_large_directories(ctx, monkeypatch):
 
 def test_file_outline_errors(ctx):
     _make(ctx.root, ".env", "KEY=1\n")
+    for rel in ("credentials.json", "keys/id_rsa", ".ssh/config.py"):
+        _make(ctx.root, rel, "KEY = 1\n")
     _make(ctx.root, ".gitignore", "build.py\n")
     _make(ctx.root, "build.py", "def x():\n    pass\n")
     (ctx.root / "blob.bin").write_bytes(b"\0\1\2")
     for path, needle in [
         ("missing.py", "не найден"),
         (".env", "секрет"),
+        ("credentials.json", "секрет"),
+        ("keys/id_rsa", "секрет"),
+        (".ssh/config.py", "секрет"),
         ("build.py", "исключён"),
         ("blob.bin", "Бинарный"),
         ("../outside.py", "за пределы"),

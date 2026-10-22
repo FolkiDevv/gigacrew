@@ -26,6 +26,30 @@ def test_all_tool_schemas_are_api_compatible():
             assert prop["type"] != "null", where
 
 
+_FORBIDDEN_KEYS = ("anyOf", "oneOf", "allOf", "$ref", "$defs", "title", "default")
+
+
+def _walk_schema(schema: dict, where: str) -> None:
+    """Каждый уровень схемы (свойства, элементы массивов): без union-типов, ссылок и
+    служебных ключей; у объекта — type object и required только из его свойств."""
+    for key in _FORBIDDEN_KEYS:
+        assert key not in schema, f"{where}: остался {key}"
+    assert "type" in schema and schema["type"] != "null", f"{where}: нет одиночного type"
+    if "properties" in schema:
+        assert schema["type"] == "object", where
+        props = schema["properties"]
+        assert set(schema.get("required", [])) <= set(props), f"{where}: required вне properties"
+        for name, prop in props.items():
+            _walk_schema(prop, f"{where}.{name}")
+    if isinstance(schema.get("items"), dict):
+        _walk_schema(schema["items"], f"{where}[]")
+
+
+def test_all_tool_schemas_are_normalized_at_every_depth():
+    for spec in build_default_registry().specs():
+        _walk_schema(spec.parameters, spec.name)
+
+
 def test_optional_field_collapsed_to_type():
     reg = build_default_registry()
     read = reg.get("read_file")

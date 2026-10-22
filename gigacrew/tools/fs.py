@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.files import GIT_DIR_NAME, glob_match, is_git_internal, walk_files
 from gigacrew.project.workspace import DATA_DIR_NAME
-from gigacrew.safety.paths import Scope, scope_of_path
+from gigacrew.safety.paths import is_secret_target
 from gigacrew.security import RiskLevel, SandboxError, resolve_in_root
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
 
@@ -48,15 +48,6 @@ SECRET_READ_NOTE = (
     "содержимое действительно нужно, спросите пользователя или прочитайте его через "
     "run_shell — такая команда требует подтверждения."
 )
-_SECRET_SCOPES = (Scope.SECRET, Scope.SECRET_OUTSIDE, Scope.DYNAMIC)
-
-
-def is_secret_target(root: Path, path: Path) -> bool:
-    """Файл с ключами или учётными данными — по тому же правилу, что у классификатора
-    команд (``cat .env`` там — непроверенная команда): ``.env*``, ``*.pem``, ``id_rsa``,
-    ``.npmrc``, ``credentials.json``, всё в ``.ssh/``, ``.aws/``… Симлинк проверяется и
-    по цели; путь, который не раскрыть, считается секретом."""
-    return scope_of_path(path, root) in _SECRET_SCOPES
 
 
 def _write_assessment(ctx: ToolContext, path: str) -> Assessment:

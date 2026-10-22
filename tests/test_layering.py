@@ -88,6 +88,35 @@ def test_core_does_not_load_ui_transitively():
     assert json.loads(out.stdout) == []
 
 
+def test_every_module_imports_first():
+    """Каждый модуль импортируется первым, без уже загруженных модулей gigacrew: цикл
+    импортов (``safety.bash`` → ``project`` → ``project.index`` → ``safety.paths`` →
+    ``safety.bash``) ломает только тот порядок, где цикл начат с его середины."""
+    modules = []
+    for path in sorted(PKG.rglob("*.py")):
+        rel = path.relative_to(PKG.parent).with_suffix("")
+        parts = rel.parts[:-1] if rel.name == "__init__" else rel.parts
+        if parts[-1] != "__main__":
+            modules.append(".".join(parts))
+    code = (
+        "import importlib, json, sys, traceback\n"
+        "bad = []\n"
+        f"for name in {modules!r}:\n"
+        "    for m in [m for m in sys.modules if m.split('.')[0] == 'gigacrew']:\n"
+        "        del sys.modules[m]\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except Exception as e:\n"
+        "        bad.append(f'{name}: {e}')\n"
+        "print(json.dumps(bad))\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(PKG.parent)}
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True
+    )
+    assert json.loads(out.stdout) == []
+
+
 def test_tree_sitter_is_imported_only_by_treesitter_module():
     """API tree-sitter ломается между версиями — он загружается в одном месте."""
     offenders = []

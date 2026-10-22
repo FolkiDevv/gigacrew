@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from fakes import CatalogueProvider, ScriptedProvider, WindowProvider, text_turn, tool_turn
 
@@ -244,6 +246,30 @@ def test_repl_survives_errors_in_turn(cli_env, capsys, monkeypatch):
 
 # ---------------------------- one-shot e2e ---------------------------- #
 # Фикстура oneshot — в conftest.py (нужна и тестам хуков).
+@pytest.fixture
+def _user_settings(monkeypatch):
+    """Настройки gigacrew из окружения пользователя — до фикстуры oneshot."""
+    for name, value in (
+        ("GIGACREW_REASONING", "turn"),
+        ("GIGACREW_SAFE_COMMANDS", "0"),
+        ("GIGACREW_SUBAGENT_MAX_STEPS", "1"),
+        ("GIGACREW_VERIFY_SSL", "0"),
+        ("GIGACREW_SOMETHING_NEW", "1"),
+        ("GIGACODE_HOME", "/nonexistent"),
+    ):
+        monkeypatch.setenv(name, value)
+
+
+def test_oneshot_clears_every_user_setting(_user_settings, oneshot):
+    left = sorted(n for n in os.environ if n.startswith(("GIGACREW_", "GIGACODE_")))
+    assert left == [
+        "GIGACREW_ACCESS_KEY",
+        "GIGACREW_API_URL",
+        "GIGACREW_AUTH_URL",
+        "GIGACREW_MODEL",
+    ]
+
+
 def test_oneshot_end_to_end(tmp_path, oneshot, capsys):
     (tmp_path / "hello.txt").write_text("привет из файла", encoding="utf-8")
     provider = ScriptedProvider(

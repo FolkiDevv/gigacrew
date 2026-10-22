@@ -50,7 +50,9 @@ class Env:
     root: Path
     cwd: str = "."
     environ: Mapping[str, str] = field(default_factory=dict)
-    assigned: frozenset[str] = frozenset()  # переменные, присвоенные раньше в команде
+    # Переменные, которым команда раньше сама присвоила постоянное значение
+    # (bash.Command.assigned): это не секреты из окружения.
+    assigned: frozenset[str] = frozenset()
     depth: int = 0  # вложенность sh -c
     # Оценка вложенной команды оболочки (sh -c "…", тело heredoc для bash).
     nested: Callable[[str, Env], Part] | None = None
@@ -746,7 +748,7 @@ def _check_vars(env: Env, args: list[Word], what: str) -> Part | None:
         if not a.vars:
             return _unknown(f"{what}: аргумент известен только при выполнении ({a.raw})")
         for name in a.vars:
-            if name not in SAFE_VARS and name not in env.assigned:
+            if name not in SAFE_VARS and not (name in env.assigned and name in a.plain):
                 return _unknown(f"{what}: переменная ${name} (может быть секретом)")
     return None
 

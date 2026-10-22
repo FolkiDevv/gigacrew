@@ -32,7 +32,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from gigacrew.project.files import glob_match, is_excluded, is_secret_path, walk_files
+from gigacrew.project.files import glob_match, is_excluded, walk_files
 from gigacrew.project.symbols import Symbol, extract, language_of, module_parts
 from gigacrew.project.workspace import Workspace
 
@@ -389,6 +389,10 @@ class ProjectIndex:
         ``progress`` получает число просмотренных файлов. Прерывание (в т.ч. Ctrl+C)
         откатывает только незафиксированную пачку изменений.
         """
+        # Импорт здесь: safety.bash загружает gigacrew.project (treesitter), а с ним и
+        # этот модуль — импорт на уровне модуля замкнул бы цикл.
+        from gigacrew.safety.paths import is_secret_entry
+
         started = time.monotonic()
         db = self._db
         base = self.root if base is None else base
@@ -412,7 +416,8 @@ class ProjectIndex:
                 with db:
                     self._set_meta("complete", "0")
             for path in self._candidates(base):
-                if is_secret_path(path):
+                # Секреты — по правилу read_file и классификатора команд (не только .env).
+                if is_secret_entry(self.root, path):
                     continue
                 # симлинк на исключённое (.gitignore, служебные каталоги) — тоже мимо
                 if path.is_symlink() and is_excluded(self.root, path.resolve()):
