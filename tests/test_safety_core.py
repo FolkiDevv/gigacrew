@@ -188,3 +188,15 @@ def test_edits_only_requires_every_part_and_every_redirect_to_be_an_edit(root):
     assert danger.level is DANGER and not danger.edits_only
     unknown = classify("sed -i 's/a/b/' a.txt > $OUT", root=root)
     assert unknown.level is None and not unknown.edits_only
+
+
+def test_cd_followed_by_newline_is_not_a_working_directory(root):
+    """Перевод строки после cd — как «;»: следующая команда выполнится и там, где cd
+    не сработал (T1-U7)."""
+    for sep in ("; ", "\n"):
+        verdict = classify(f"cd src{sep}cat ../a.txt", root=root)
+        assert verdict.cwd == "." and verdict.level is None, verdict.reason
+    assert classify("cd src && cat ../a.txt", root=root).level is READ
+    only = classify("cd src", root=root)
+    assert only.cwd == "src" and only.command == ""
+    assert classify("cd src\n", root=root).cwd == "src"

@@ -305,9 +305,11 @@ class _Walker:
         items: list[tuple[object, str]] = []  # (узел, разделитель после него)
         self._flatten(nodes, items)
         leading = leading_cd
-        for node, sep in items:
-            # Только «cd X && …»: после «;» команда выполнится и там, где cd не сработал.
-            if leading and _is_cd(node) and sep in ("&&", ""):
+        for i, (node, sep) in enumerate(items):
+            # Только «cd X && …» (или cd в конце): после «;» и перевода строки (у него
+            # нет лексемы, разделитель пуст) команда выполнится и там, где cd не сработал.
+            last = i == len(items) - 1
+            if leading and _is_cd(node) and (sep == "&&" or (sep == "" and last)):
                 target = self._cd_target(node, cwd)
                 if target is not None:
                     cwd = target
