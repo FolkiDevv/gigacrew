@@ -1007,7 +1007,7 @@ def _check_list(target: _Path, ctx: _Ctx, what: str) -> None:
 
 
 def _check_write(target: _Path, ctx: _Ctx, what: str, *, recursive: bool = False) -> None:
-    from gigacrew.safety.paths import is_git_internal
+    from gigacrew.safety.paths import is_data_path, is_git_internal
 
     if recursive:
         ctx.flag(Level.DANGER, f"{what}: рекурсивное изменение")
@@ -1019,6 +1019,8 @@ def _check_write(target: _Path, ctx: _Ctx, what: str, *, recursive: bool = False
         ctx.flag(Level.DANGER, f"{what}: запись вне проекта")
     elif is_git_internal(target.static.resolve(), ctx.root):
         ctx.flag(Level.DANGER, f"{what}: служебные файлы git")
+    elif is_data_path(target.static.resolve(), ctx.root):
+        ctx.flag(Level.DANGER, f"{what}: служебная папка gigacrew")  # как запись из shell
     else:
         ctx.flag(Level.WRITE, what)
 

@@ -249,6 +249,25 @@ def test_os_writers_keyword_arguments(root, code, expected):
     assert result.level is expected, result.reason
 
 
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        # .gigacode/ — чаты, планы и скиллы агента: как и в shell, запись туда — DANGER
+        ("open('.gigacode/skills/x.md', 'w').write('x')", DANGER),
+        ("from pathlib import Path; Path('.gigacode/plans/p.md').write_text('x')", DANGER),
+        ("import os; os.remove('.gigacode/chats/c.json')", DANGER),
+        ("import shutil; shutil.copy('a.txt', '.GIGACODE/skills/x.md')", DANGER),
+        ("open('pkg/.gigacode', 'w').write('x')", WRITE),
+        ("print(open('.gigacode/plans/p.md').read())", READ),
+    ],
+)
+def test_writes_into_gigacode_data(root, code, expected):
+    (root / ".gigacode" / "plans").mkdir(parents=True)
+    (root / ".gigacode" / "plans" / "p.md").write_text("plan")
+    result = analyze(code, root=root)
+    assert result.level is expected, result.reason
+
+
 def test_secret_files_ask(root):
     (root / ".env").write_text("TOKEN=1\n")
     assert analyze("print(open('.env').read())", root=root).level is None
