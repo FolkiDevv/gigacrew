@@ -7,7 +7,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fakes import FakeTool, RecordingEvents, ScriptedProvider, cut_turn, text_turn, tool_turn
+from fakes import (
+    FakeTool,
+    RecordingEvents,
+    ScriptedProvider,
+    cut_turn,
+    text_turn,
+    tool_turn,
+    tools_turn,
+)
 
 import gigacrew.agent.loop as loop
 from gigacrew.agent.events import TurnStats
@@ -53,10 +61,18 @@ def _results(messages) -> list[str]:
 
 
 def _assert_well_formed(messages):
-    for i, m in enumerate(messages):
-        if m.role == "function":
-            prev = messages[i - 1]
-            assert prev.role == "assistant" and prev.function_calls
+    """На каждый вызов — ровно один результат (то же имя и id), сразу после вызовов."""
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        assert m.role != "function", f"результат без вызова: {i}"
+        i += 1
+        calls = m.function_calls if m.role == "assistant" else []
+        results = messages[i : i + len(calls)]
+        assert [(r.role, r.name, r.call_id) for r in results] == [
+            ("function", c.name, c.id) for c in calls
+        ]
+        i += len(calls)
 
 
 def _kinds(events) -> list[str]:
@@ -493,6 +509,58 @@ def test_ctrl_c_in_subagent_stops_turn_and_keeps_trail(tmp_path):
     assert "interrupted by the user (Ctrl+C)" in note and "Changed files: b.txt" in note
     kinds = _kinds(events)
     assert "subagent_end" in kinds and kinds[-1] == "tool_end"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        tool_turn("explore", {"question": "где foo?"}),
+        _task("explore", "где foo?"),
+        tools_turn([("explore", {"question": "где foo?"}), ("explore", {"question": "а bar?"})]),
+    ],
+)
+def test_ctrl_c_in_subagent_answers_the_call_that_started_it(tmp_path, call):
+    # Результат — под именем и id того вызова (explore или task), что запустил суб-агента.
+    (tmp_path / "a.py").write_text("def foo(): ...\n")
+    provider = ScriptedProvider(
+        [call, tool_turn("read_file", {"path": "a.py"}), KeyboardInterrupt()]
+    )
+    agent = _agent(provider, tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    messages = agent.conversation.messages
+    _assert_well_formed(messages)
+    assert agent.conversation.pending_calls() == []
+    assert "interrupted by the user (Ctrl+C)" in _results(messages)[0]
+
+
+def test_subagent_decisions_are_journaled_under_the_chat(tmp_path):
+    import json
+
+    from gigacrew.agent.decisions import DecisionMemory
+
+    script = tmp_path / "build.sh"
+    script.write_text("#!/bin/sh\necho built\n")
+    script.chmod(0o755)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    provider = ScriptedProvider(
+        [
+            _task("general", "собери"),
+            tool_turn("run_shell", {"command": "./build.sh"}),
+            text_turn("собрано"),
+            text_turn("готово"),
+        ]
+    )
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, yes_all=True)
+    agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents(), decisions=memory)
+    agent.chat_id = "chat-1"
+    agent.run_turn("собери проект")
+    [entry] = [
+        json.loads(line)
+        for line in memory.journal_path.read_text().splitlines()
+        if '"event": "decision"' in line
+    ]
+    assert (entry["agent"], entry["chat"]) == ("general", "chat-1")
 
 
 def test_llm_error_in_subagent_reported_to_model(tmp_path):

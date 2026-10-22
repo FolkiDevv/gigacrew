@@ -545,6 +545,11 @@ class Agent:
             self._plan.path = self._plan_path(value)
             self._plan.dirty = False
 
+    @property
+    def _session_chat_id(self) -> str:
+        """Id чата для хуков и журнала решений: у суб-агента своего чата нет — основного."""
+        return self._parent.chat_id if self._parent is not None else self._chat_id
+
     def _plan_path(self, chat_id: str) -> Path:
         return self._workspace.plans_dir / f"{chat_id}.md"
 
@@ -623,7 +628,7 @@ class Agent:
         """
         if not self._hooks.has(event, target):
             return HookResult()
-        chat_id = self._parent.chat_id if self._parent is not None else self._chat_id
+        chat_id = self._session_chat_id
         payload = {
             "session_id": chat_id,
             "transcript_path": str(self._workspace.chats_dir / f"{chat_id}.json"),
@@ -1683,7 +1688,11 @@ class Agent:
             if child._stop_level >= 2:  # повторный Esc: оборвать суб-агента, ход идёт дальше
                 return aborted_report(spec, events.trail)
             # Ctrl+C: ход останавливается, но модель узнает, что успел сделать суб-агент.
-            self._conversation.add_function_result("task", interrupted_note(spec, events.trail))
+            # Ответ — тому вызову (task или explore), что его запустил: он первый без ответа.
+            pending = self._conversation.pending_calls()
+            self._conversation.add_function_result(
+                pending[0].name if pending else "task", interrupted_note(spec, events.trail)
+            )
             raise
         finally:
             with self._stop_lock:
@@ -1840,7 +1849,7 @@ class Agent:
                     "risk": risk.name,
                     "mode": self.mode.value,
                     "agent": self._subagent.name if self._subagent is not None else "main",
-                    "chat": self._chat_id,
+                    "chat": self._session_chat_id,
                     "model": self._model,
                     "decision": decision,
                     "source": source or "auto",
