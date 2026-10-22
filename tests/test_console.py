@@ -697,3 +697,83 @@ def test_prompt_toolkit_color_depth_follows_rich(monkeypatch):
         monkeypatch.setattr(colors, "color_system", lambda s=system: s)
         assert colors.prompt_color_depth(False) == depth
     assert colors.prompt_color_depth(True) == ColorDepth.MONOCHROME
+
+
+# --------------- управляющие символы: все пути вывода в терминал --------------- #
+_ESC = "x\x1b[2K\x1b[1A\x1b]0;owned\x07\x9bевил"
+
+
+def _sink_tool_name(ui):
+    _step(ui, ToolCallInfo(f"read{_ESC}", "a.py"), ToolResult(content="", summary="ok"))
+    ui.on_turn_end(TurnStats(steps=1))
+
+
+def _sink_diff_title(ui):
+    from gigacrew.permissions import ToolKind
+
+    ui._c.input = lambda prompt: "n"
+    preview = Display("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n", "diff", f"a{_ESC}.py")
+    ui.confirm(ToolCallInfo("edit_file", "a.py", ToolKind.EDIT), preview, dangerous=False)
+
+
+def _sink_exact_title(ui):
+    from gigacrew.permissions import ToolKind
+
+    ui._c.input = lambda prompt: "n"
+    preview = Display("$ make\nmake test", title=f"команда · {_ESC}")
+    ui.confirm(ToolCallInfo("run_shell", "make", ToolKind.COMMAND), preview, dangerous=False)
+
+
+def _sink_purpose(ui):
+    from gigacrew.permissions import ToolKind
+
+    ui._c.input = lambda prompt: "n"
+    call = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND, purpose=_ESC)
+    ui.confirm(call, None, dangerous=True)
+
+
+def _sink_plain_question(ui):
+    ui._c.input = lambda prompt: "1"
+    question = Question(f"Q{_ESC}?", (QuestionOption(f"A{_ESC}", f"d{_ESC}"), QuestionOption("B")))
+    ui._ask_plain(question, 1, 1)
+
+
+def _sink_help(ui):
+    ui.help([("/deploy [аргументы]", f"скилл · {_ESC}")])
+
+
+def _sink_messages(ui):
+    ui.info(f"последние решения: {_ESC}")
+    ui.warn(_ESC)
+    ui.on_notice(_ESC, level="warn")
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        _sink_tool_name,
+        _sink_diff_title,
+        _sink_exact_title,
+        _sink_purpose,
+        _sink_plain_question,
+        _sink_help,
+        _sink_messages,
+    ],
+)
+def test_control_characters_never_reach_terminal(sink):
+    # Rich (Text) не убирает ESC и C1: очистка — в одной точке на весь вывод консоли.
+    ui, buf = _console()
+    sink(ui)
+    out = buf.getvalue()
+    assert "x[2K[1A]0;owned" in out and "евил" in out  # текст виден, без управляющих
+    assert "\x1b" not in out and "\x07" not in out and "\x9b" not in out
+
+
+def test_control_characters_stripped_in_live_terminal_but_own_codes_kept():
+    ui, buf = _live_console()
+    ui.on_tool_call(ToolCallInfo(f"read{_ESC}", "a.py", read_only=True))
+    ui.on_tool_start(ToolCallInfo(f"read{_ESC}", "a.py", read_only=True))
+    ui.stop_live()
+    out = buf.getvalue()
+    assert "\x1b]0;owned" not in out and "\x07" not in out
+    assert "\x1b[" in out  # свои последовательности Rich (цвет, курсор) — на месте

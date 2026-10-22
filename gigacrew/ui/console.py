@@ -33,7 +33,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import IO
@@ -119,6 +119,27 @@ RESUME_CALLS = 5
 def sanitize(text: str) -> str:
     """Убирает управляющие символы (кроме переводов строк и табуляции)."""
     return _CONTROL_RE.sub("", text.replace("\r\n", "\n"))
+
+
+class _SafeConsole(RichConsole):
+    """Консоль Rich, которая не пропускает в терминал управляющие символы из текста.
+
+    Rich (``Text``) убирает лишь BEL/BS/VT/FF/CR, а ESC и C1 оставляет. Очистка на
+    месте каждой печати то и дело забывалась (имя инструмента от модели, заголовок
+    превью, описание скилла), поэтому здесь — одна точка на весь вывод: из текста
+    сегментов убирается всё, кроме ``\\n`` и ``\\t``. Свои последовательности Rich
+    (цвет — в стилях, курсор живой области — в сегментах ``control``) не трогаются.
+    Через неё же идёт и просмотрщик (``pager``). Старая консоль Windows печатает в
+    обход неё, но ESC-последовательности она и не исполняет.
+    """
+
+    def _render_buffer(self, buffer: Iterable[Segment]) -> str:
+        return super()._render_buffer(
+            Segment(_CONTROL_RE.sub("", s.text), s.style)
+            if s.control is None and _CONTROL_RE.search(s.text)
+            else s
+            for s in buffer
+        )
 
 
 # Невидимые символы: управляющие, смена направления текста, нулевой ширины. В команде,
@@ -326,7 +347,7 @@ class Console(AgentEvents):
         width: int | None = None,
         auto_refresh: bool = True,
     ):
-        self._c = RichConsole(
+        self._c = _SafeConsole(
             no_color=no_color,
             highlight=False,
             emoji=False,
