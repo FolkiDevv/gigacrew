@@ -923,6 +923,29 @@ _DASH_BUILTINS = frozenset(
 
 
 _TREE_VALUED = ("-o", "-L", "-P", "-I", "-H", "-T")
+_DIFF_VALUED = (
+    "-x",
+    "--exclude",
+    "-X",
+    "--exclude-from",
+    "-I",
+    "--ignore-matching-lines",
+    "-F",
+    "--show-function-line",
+    "-S",
+    "--starting-file",
+    "-U",
+    "-C",
+    "-W",
+    "--width",
+    "-D",
+    "--ifdef",
+    "--label",
+    "--tabsize",
+    "--horizon-lines",
+    "--from-file",
+    "--to-file",
+)
 # util-linux column (у BSD column — подмножество).
 _COLUMN_VALUED = tuple(f"-{ch}" for ch in "CcEHilNnOopRrSsTW") + (
     "--columns",
@@ -974,10 +997,49 @@ def _simple_read(env: Env, name: str, args: list[Word]) -> Part:
     if name in ("column",):
         # -t — таблица, без значения (раньше съедал имя файла: `column -t файл`).
         pos = _split(_without_values(args, *_COLUMN_VALUED))[1]
+    # Флаги, значения которых — файлы: их читают так же, как позиционные.
+    if _abbrev(args, "--files0-from"):
+        return _unknown(f"{name} --files0-from: файлы по списку из файла")
+    read_values: list[Word] = []
     if name == "du":
-        pos = _split(_without_values(args, "-d", "--max-depth", "-t", "--threshold"))[1]
+        rest, found = _options(
+            args,
+            (
+                "-d",
+                "--max-depth",
+                "-t",
+                "--threshold",
+                "-B",
+                "--block-size",
+                "-X",
+                "--exclude-from",
+            ),
+        )
+        pos = _split(rest)[1]
+        read_values = [w for n, w in found if n in ("-X", "--exclude-from")]
+    if name == "diff":
+        rest, found = _options(args, _DIFF_VALUED)
+        flags, pos = _split(rest)
+        read_values = [
+            w for n, w in found if n in ("--from-file", "--to-file", "-X", "--exclude-from")
+        ]
+        if _has(_flagset(flags), "-r", "-R", "--recursive"):  # содержимое всех файлов дерева
+            bad = _check_read(env, read_values, name) or _check_recursive(env, pos, "diff -r")
+            return bad if bad is not None else _read("diff -r: сравнение каталогов")
+    if name == "file":
+        rest, found = _options(args, ("-m", "--magic-file", "-f", "--files-from", "-F"))
+        if any(n in ("-f", "--files-from") for n, _ in found):
+            return _unknown("file -f: файлы по списку из файла")
+        pos = _split(rest)[1]
+        read_values = [w for n, w in found if n in ("-m", "--magic-file")]
+    if name in ("bat", "batcat") and _abbrev(args, "--pager"):
+        return _unknown(f"{name} --pager: запускает программу")
     listing = name in ("ls", "dir", "vdir", "du", "stat", "tree", "exa", "eza", "lsd")
-    bad = _check_read(env, pos, name, content=not listing) or _check_vars(env, args, name)
+    bad = (
+        _check_read(env, read_values, name)
+        or _check_read(env, pos, name, content=not listing)
+        or _check_vars(env, args, name)
+    )
     if bad is not None:
         return bad
     return _read(f"{name}: чтение")
@@ -986,12 +1048,28 @@ def _simple_read(env: Env, name: str, args: list[Word]) -> Part:
 def _no_files(env: Env, name: str, args: list[Word]) -> Part:
     flags, pos = _split(args)
     fl = _flagset(flags)
-    if name == "date" and (
-        _has(fl, "-s")
-        or _abbrev(args, "--set", "--file")
-        or any(p.static and p.value[:1].isdigit() for p in pos)
-    ):
-        return _unknown("date может установить системное время")
+    if name == "date":
+        rest, found = _options(
+            args, ("-d", "--date", "-f", "--file", "-r", "--reference", "-s", "--set")
+        )
+        if (
+            any(n in ("-s", "--set") for n, _ in found)
+            or _abbrev(args, "--set", "--file")
+            or any(p.static and p.value[:1].isdigit() for p in _split(rest)[1])
+        ):
+            return _unknown("date может установить системное время")
+        # date -f ФАЙЛ печатает строки, которые не разобрала, — содержимое файла
+        bad = _check_read(env, [w for n, w in found if n in ("-f", "--file")], "date -f")
+        if bad is not None:
+            return bad
+    if name == "dmesg":  # -F ФАЙЛ: вывод файла вместо буфера ядра
+        bad = _check_read(env, _values(args, "-F", "--file"), "dmesg -F")
+        if bad is not None:
+            return bad
+    if name == "dircolors":  # печатает разобранный файл (и его строки в ошибках)
+        bad = _check_read(env, pos, name)
+        if bad is not None:
+            return bad
     if name == "printenv" and not pos:
         return _unknown("printenv без аргументов выводит всё окружение (там бывают секреты)")
     if name == "printenv":

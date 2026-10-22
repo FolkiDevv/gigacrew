@@ -362,6 +362,39 @@ def test_option_values_are_parsed_like_getopt(root, command, expected):
     assert verdict.level is expected, (command, verdict.reason)
 
 
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        # значения флагов, которые читают файлы, проверяются как пути
+        ("date -f ~/.ssh/id_rsa", DANGER),
+        ("date -f /etc/shadow", None),
+        ("date -f a.txt", READ),
+        ("date -d 2020-01-01", READ),  # только показ даты
+        ("date -s 'next monday'", None),
+        ("date --set=tomorrow", None),
+        ("date +%Y", READ),
+        ("diff --from-file=/etc/shadow a.txt", None),
+        ("diff --from-file=b.txt a.txt", READ),
+        ("diff -u a.txt b.txt", READ),
+        ("du -X /etc/shadow .", None),
+        ("du -sh src", READ),
+        ("file -m /etc/shadow a.txt", None),
+        ("file a.txt", READ),
+        ("dmesg -F ~/.ssh/id_rsa", DANGER),
+        ("dircolors ~/.ssh/id_rsa", DANGER),
+        # файлы по списку из файла — вне проверки путей
+        ("wc --files0-from=list a.txt", None),
+        ("du --files0-from=list", None),
+        ("file -f list.txt", None),
+        ("bat --pager='sh -c id' --paging=always a.txt", None),
+        ("bat a.txt", READ),
+    ],
+)
+def test_file_reading_flag_values_are_checked(root, command, expected):
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, (command, verdict.reason)
+
+
 def test_symlink_out_of_project_is_outside(root, tmp_path_factory):
     outside = tmp_path_factory.mktemp("outside") / "secret.txt"
     outside.write_text("s")
@@ -371,12 +404,14 @@ def test_symlink_out_of_project_is_outside(root, tmp_path_factory):
 
 def test_recursive_read_with_secrets_asks(root):
     assert level("grep -rn hello .", root) is READ
+    assert level("diff -rN src .", root) is READ
     (root / ".env").write_text("TOKEN=1\n")
     assert level("grep -rn hello .", root) is None
     assert level("rg -n hello", root) is READ  # rg пропускает скрытые файлы
     assert level("rg -n --hidden hello", root) is None
     assert level("find . -type f -exec cat {} +", root) is None
     assert level("grep -d recurse hello .", root) is None
+    assert level("diff -rN src .", root) is None  # diff -r печатает содержимое .env
     assert level("tar -cf - src", root) is READ
     assert level("tar -cf - .", root) is None  # каталог в архив — читается целиком
 
