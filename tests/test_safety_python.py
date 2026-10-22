@@ -125,6 +125,9 @@ def test_risky_code(root, code, expected):
         ("import shlex; shlex.os.getcwd()", READ),
         ("import codecs; codecs.builtins.eval", DANGER),
         ("from codecs import builtins", DANGER),
+        ("import reprlib; print(reprlib.builtins)", DANGER),
+        ("import sysconfig; print(sysconfig.threading)", None),
+        ("from sysconfig import threading", None),
         ("import importlib.metadata as m; m.zipfile.ZipFile('x.zip', 'w')", None),
         ("import configparser; configparser.io.FileIO('/etc/x', 'w')", None),
         # имена модулей, которые здесь функции и классы, — не модули
@@ -290,6 +293,126 @@ def test_sys_path_changes(root, code, expected):
     assert result.level is expected, result.reason
 
 
+# Каждую строку ловит одно правило: в test_risky_code уровень часто даёт другое, раньше
+# (rmtree, os.system, __builtins__), и само правило там не проверяется.
+_DANGER_METHOD_NAMES = (
+    "system popen spawnl spawnle spawnlp spawnv spawnve spawnvp execl execle execlp execlpe "
+    "execv execve execvp execvpe fork forkpty kill killpg urlopen putenv unsetenv chroot "
+    "setuid setgid symlink link rmtree extractall startfile run_module run_path"
+).split()
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        # режимы открытия: w, a, x, + — запись; позиционно и mode=; неизвестный — «не знаю»
+        ("open('a.txt', 'r+').write('x')", WRITE),
+        ("open('a.txt', 'rb+').write(b'x')", WRITE),
+        ("open('new.txt', 'x').write('x')", WRITE),
+        ("open('a.txt', 'wb').write(b'x')", WRITE),
+        ("open('a.txt', mode='w').write('x')", WRITE),
+        ("open('/tmp/x', mode='a').write('x')", DANGER),
+        ("m = 'w'\nopen('a.txt', m).write('x')", None),
+        ("import io; io.open('a.txt', 'w')", WRITE),
+        ("import io; io.open('/tmp/x', mode='x')", DANGER),
+        ("import codecs; codecs.open('a.txt', 'r+')", WRITE),
+        ("import codecs; codecs.open('/tmp/x', mode='w')", DANGER),
+        ("from pathlib import Path; Path('a.txt').open('a')", WRITE),
+        ("from pathlib import Path; Path('/tmp/x').open(mode='r+')", DANGER),
+        ("def f():\n    return 1\nf().open('r+')", None),
+        # путь, известный только при выполнении, — не обычная запись в проект
+        ("import sys\nopen(sys.argv[1], 'w').write('x')", None),
+        # функции записи os/shutil
+        ("import shutil; shutil.move('a.txt', 'b.txt')", WRITE),
+        ("import shutil; shutil.move('a.txt', '/tmp/x')", DANGER),
+        ("import shutil; shutil.copytree('pkg', 'pkg2')", DANGER),
+        ("import shutil; shutil.copy('.env', 'b.txt')", None),
+        ("import os; os.rename('a.txt', '/tmp/x')", DANGER),
+        ("import os; os.removedirs('pkg/sub')", DANGER),
+        ("from pathlib import Path; Path('lnk').symlink_to('/etc')", WRITE),
+        ("def f():\n    return 1\nprint(f().read_text())", None),
+        # методы процессов — у любого объекта
+        *((f"def f(o):\n    o.{name}()", DANGER) for name in _DANGER_METHOD_NAMES),
+        # внутренности интерпретатора без __dunder__
+        ("print('{a.x}'.format_map({'a': 1}))", DANGER),
+        ("def g():\n    yield\nprint(g().gi_frame.f_globals)", DANGER),
+        ("import string; string.Formatter().vformat('{0.x}', (1,), {})", DANGER),
+        ("import sys; sys._getframe()", DANGER),
+        ("print('{0[x]}'.format({'x': 1}))", DANGER),
+        # динамический код — каждое имя отдельно
+        ("import os; getattr(os, 'sys' + 'tem')('id')", DANGER),
+        ("c = compile('1', 'x', 'eval')", DANGER),
+        ("class A:\n    pass\nsetattr(A, 'x', 1)", DANGER),
+        ("print(vars())", DANGER),
+        ("print(globals())", DANGER),
+        # модули
+        ("import marshal; marshal.loads(b'')", DANGER),
+        ("import requests.sessions", DANGER),
+        ("import http.cookies", DANGER),
+        ("from .json import loads", EXEC),
+        ("from . import mod", EXEC),
+        ("from os import *", None),
+        ("from glob import *", READ),
+        ("foo()", None),
+        ("import importlib.metadata\nimportlib._bootstrap", None),
+        # изменение модуля и окружения
+        ("import json; json.loads = print", DANGER),
+        ("import os; os.environ['X'] = '1'", DANGER),
+        ("import os; del os.environ['X']", DANGER),
+        ("def f(o):\n    return o.environ['TOKEN']", DANGER),
+        # обход: шаблон и root_dir glob, каталог вне проекта
+        ("import glob; print(glob.glob('*', root_dir='/etc'))", None),
+        ("import glob; print(list(glob.iglob('/etc/*')))", None),
+        ("import glob; print(glob.glob(p))", None),
+        ("import os; print(os.listdir('/etc'))", None),
+        # алгебра путей: .parent, '..' справа, переменная с Path(...)
+        ("from pathlib import Path; (Path.cwd().parent / 'x').write_text('a')", DANGER),
+        ("from pathlib import Path; (Path.cwd() / '..' / 'x').write_text('a')", DANGER),
+        ("from pathlib import Path\np = Path('/tmp/x')\np.write_text('x')", DANGER),
+        (
+            "from pathlib import Path\nfor p in Path('pkg').iterdir():\n    print(list(p.glob('../*')))",
+            None,
+        ),
+        (
+            "import os\nfor root, dirs, files in os.walk('pkg'):\n"
+            "    print(open(os.path.join(root, '..', 'x')).read())",
+            None,
+        ),
+        (
+            "import os\nfor f in os.listdir('.'):\n    print(open(os.path.join('/etc', f)).read())",
+            None,
+        ),
+    ],
+)
+def test_each_guard_alone(root, code, expected):
+    result = analyze(code, root=root)
+    assert result.level is expected, result.reason
+
+
+def test_source_limits(root):
+    assert analyze("#" * (256 * 1024 + 1), root=root).level is None
+    assert analyze("print(1)\x00", root=root).level is None
+
+
+def test_walks_see_links_and_secrets(root, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside")
+    (outside / "secret.txt").write_text("s")
+    # запись через ссылку наружу — запись вне проекта
+    (root / "link").symlink_to(outside)
+    assert analyze("open('link/x', 'w').write('x')", root=root).level is DANGER
+    # обход прочитает и файл по ссылке наружу
+    (root / "notes").mkdir()
+    (root / "notes" / "out.txt").symlink_to(outside / "secret.txt")
+    code = (
+        "from pathlib import Path\nfor p in Path('notes').rglob('*.txt'):\n    print(p.read_text())"
+    )
+    assert analyze(code, root=root).level is None
+    # имена из os.listdir('pkg') открываются относительно каталога запуска, а там .env
+    (root / ".env").write_text("TOKEN=1\n")
+    code = "import os\nfor f in os.listdir('pkg'):\n    print(open(f).read())"
+    assert analyze(code, root=root).level is None
+
+
 def test_secret_files_ask(root):
     (root / ".env").write_text("TOKEN=1\n")
     assert analyze("print(open('.env').read())", root=root).level is None
@@ -308,6 +431,27 @@ def test_stdlib_shadowing_in_run_directory(root):
     assert analyze("import sys; print(1)", root=root).level is EXEC
     # -I и -P не добавляют каталог запуска в sys.path
     assert classify("python3 -I -c 'print(1)'", root=root).level is READ
+
+
+def test_stdlib_shadowing_by_packages_script_dir_and_pythonpath(root):
+    (root / "json").mkdir()
+    assert shadowed_stdlib(root) is None  # каталог без __init__.py — не пакет
+    (root / "json" / "__init__.py").write_text("")
+    assert shadowed_stdlib(root) == "json"
+    sub = root / "sub"
+    sub.mkdir()
+    (sub / "csv.cpython-313-x86_64-linux-gnu.so").write_text("")
+    assert shadowed_stdlib(sub) == "csv.cpython-313-x86_64-linux-gnu.so"
+    # затенение ищется в каталоге скрипта, а не запуска, и в каталогах PYTHONPATH
+    clean = root / "clean"
+    clean.mkdir()
+    (clean / "s.py").write_text("print(1)")
+    assert analyze("print(1)", root=root, script=clean / "s.py").level is READ
+    assert analyze("print(1)", root=root, cwd="clean", script=sub / "s.py").level is EXEC
+    src = root / "src"
+    src.mkdir()
+    (src / "re.py").write_text("")
+    assert analyze("print(1)", root=root, cwd="clean", path_dirs=(src,)).level is EXEC
 
 
 @pytest.mark.parametrize(
