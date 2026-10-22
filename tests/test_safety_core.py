@@ -74,3 +74,34 @@ def test_backticks_tree_sitter_leaves_unparsed_are_not_read(root, command):
 )
 def test_backticks_that_are_not_substitutions_stay_read(root, command):
     assert level(command, root) is READ
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cat <<< "$GITHUB_TOKEN"',
+        "tr a-z A-Z <<< $API_KEY",
+        "cat <<EOF\n$GITHUB_TOKEN\nEOF",
+        "wc -c <<EOF\ntoken=${AWS_SECRET_ACCESS_KEY}\nEOF",
+        "cat <<EOF | head -1\n$OPENAI_API_KEY\nEOF",
+    ],
+)
+def test_variables_in_heredoc_body_are_checked_like_arguments(root, command):
+    """Тело heredoc/herestring программа выведет, как echo — аргумент: переменная из
+    окружения может быть секретом."""
+    assert level('echo "$GITHUB_TOKEN"', root) is None
+    verdict = classify(command, root=root)
+    assert verdict.level is None and not verdict.composable, verdict.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<EOF\n$HOME $1 ${PWD}\nEOF",
+        'cat <<< "$HOME"',
+        "cat <<'EOF'\n$GITHUB_TOKEN\nEOF",  # разделитель в кавычках: подстановок нет
+        "cat <<EOF\nprice \\$GITHUB_TOKEN\nEOF",  # \$ — просто знак доллара
+    ],
+)
+def test_heredoc_body_without_secret_variables_stays_read(root, command):
+    assert level(command, root) is READ

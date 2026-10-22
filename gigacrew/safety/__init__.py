@@ -110,6 +110,13 @@ def _classify(
         part = replace(programs.classify_simple(cmd, env), text=_text_of(cmd))
         parts.append(part)
         for r in cmd.redirects:
+            if r.body is not None and r.body_vars:
+                # Тело heredoc/herestring программа получит на stdin и, как правило,
+                # выведет: переменные в нём — как в аргументах echo.
+                body = bash.Word(r.body, static=False, vars=r.body_vars)
+                bad = programs._check_vars(env, [body], "текст на stdin")
+                if bad is not None:
+                    writes.append(bad)
             if r.writes and r.target is not None:
                 if r.target.static and r.target.value in (
                     "/dev/null",

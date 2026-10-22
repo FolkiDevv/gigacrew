@@ -124,13 +124,15 @@ class Word:
 @dataclass(frozen=True)
 class Redirect:
     """Перенаправление. ``target`` — файл (``>``, ``>>``, ``<``, ``&>``); у heredoc и
-    herestring — ``body`` (``body_static`` — без подстановок)."""
+    herestring — ``body`` (``body_static`` — без подстановок, ``body_vars`` —
+    раскрываемые в нём переменные)."""
 
     op: str
     target: Word | None = None
     fd_dup: bool = False  # >&2, 2>&1 — дублирование дескриптора, не файл
     body: str | None = None
     body_static: bool = True
+    body_vars: tuple[str, ...] = ()
 
     @property
     def writes(self) -> bool:
@@ -534,7 +536,10 @@ class _Walker:
             return Redirect(op), []
         first = self.word(words[0])
         if node.type == "herestring_redirect":
-            return Redirect(op, body=first.value, body_static=first.static), words[1:]
+            redirect = Redirect(
+                op, body=first.value, body_static=first.static, body_vars=first.vars
+            )
+            return redirect, words[1:]
         if op in (">&", "<&") and first.static and (first.value.isdigit() or first.value == "-"):
             return Redirect(op, first, fd_dup=True), words[1:]
         if op == "<>":
@@ -545,6 +550,7 @@ class _Walker:
         quoted = False
         body = ""
         static = True
+        names: list[str] = []
         extra: list = []
         for c in node.children:
             if c.type == "heredoc_start":
@@ -552,7 +558,7 @@ class _Walker:
             elif c.type == "heredoc_body":
                 body = _text(c)
                 if not quoted:
-                    dynamic, _ = self.scan(c)
+                    dynamic, names = self.scan(c)
                     # `…` и $… в теле без кавычек у разделителя раскрываются оболочкой.
                     static = not dynamic and not re.search(r"(?<!\\)[`$]", body)
             elif c.type in ("<<", "<<-", "heredoc_end", "heredoc_content"):
@@ -561,7 +567,7 @@ class _Walker:
                 extra.append(c)
         if not quoted:
             body = _unescape_heredoc(body)
-        return Redirect("<<", body=body, body_static=static), extra
+        return Redirect("<<", body=body, body_static=static, body_vars=tuple(names)), extra
 
     def command(
         self, node, *, cwd: str, substituted: bool, extra: list[Redirect] | None = None
