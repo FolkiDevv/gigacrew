@@ -46,7 +46,7 @@ from fakes import RecordingEvents
 
 from gigacrew.agent.context_window import CHARS_PER_TOKEN
 from gigacrew.agent.loop import PLAN_BLOCKED_NOTE, REJECTED_NOTE, SELF_CHECK_NOTE, Agent
-from gigacrew.agent.prompts import SUBAGENT_PROMPT
+from gigacrew.agent.prompts import REVIEWER_PROMPT, SUBAGENT_PROMPT
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMProvider
 from gigacrew.llm.model_windows import ModelWindows
@@ -711,10 +711,13 @@ class RecordingProvider(LLMProvider):
     ) -> None:
         system = messages[0].content if messages and messages[0].role == "system" else ""
         usage = turn.usage
+        # Без инструментов идут и сжатие контекста, и рецензент команд — различаются промптом.
+        reviewer = tools is None and system == REVIEWER_PROMPT
         self.calls.append(
             {
                 "subagent": system.startswith(_SUBAGENT_MARK),
-                "summary": tools is None,  # сжатие контекста
+                "summary": tools is None and not reviewer,  # сжатие контекста
+                "reviewer": reviewer,
                 "messages": len(messages),
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,
@@ -1028,19 +1031,26 @@ def _targets(call: FunctionCall, root: Path, target: Path | None) -> bool:
 
 
 def well_formed(messages: Sequence[Message]) -> bool:
-    """Каждый вызов инструмента получил ровно один результат, и результат — после вызова."""
-    pending = 0
+    """Каждый вызов инструмента получил ровно один результат, сразу после своего хода
+    (без сообщений между ними — на такую историю API отвечает 422); результат с id — того
+    вызова, у которого этот id."""
+    pending: list[str | None] = []  # id вызовов хода, ещё без результата
     for message in messages:
         if message.role == "function":
-            if pending == 0:
+            if not pending:
                 return False
-            pending -= 1
+            if message.call_id is not None and None not in pending:
+                if message.call_id not in pending:
+                    return False
+                pending.remove(message.call_id)
+            else:
+                pending.pop(0)
             continue
         if pending:
             return False
         if message.role == "assistant":
-            pending = len(message.function_calls)
-    return pending == 0
+            pending = [call.id for call in message.function_calls]
+    return not pending
 
 
 def _metrics(
@@ -1076,7 +1086,9 @@ def _metrics(
             for rel, text in scenario.files_expect.items()
         )
     subagents = [info for kind, info in user.events if kind == "subagent_start"]
-    main_requests = [c for c in recorder.calls if not c["subagent"] and not c["summary"]]
+    main_requests = [
+        c for c in recorder.calls if not (c["subagent"] or c["summary"] or c["reviewer"])
+    ]
     return {
         # план
         "plan_shown": len(user.plans),
@@ -1132,6 +1144,7 @@ def _metrics(
         "requests": len(recorder.calls),
         "requests_subagent": sum(1 for c in recorder.calls if c["subagent"]),
         "summaries": sum(1 for c in recorder.calls if c["summary"]),
+        "reviews": sum(1 for c in recorder.calls if c["reviewer"]),
         "prompt_tokens": sum(c["prompt_tokens"] for c in recorder.calls),
         "completion_tokens": sum(c["completion_tokens"] for c in recorder.calls),
         "cached_tokens": sum(c["cached_tokens"] for c in recorder.calls),
