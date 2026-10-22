@@ -791,7 +791,10 @@ def test_child_environment_drops_shell_hooks_and_adds_git_safety(monkeypatch):
     assert env["GIT_CONFIG_COUNT"] == "3" and env["GIT_CONFIG_KEY_0"] == "user.name"
     assert env["GIT_CONFIG_KEY_1"] == "safe.bareRepository"
     assert env["GIT_CONFIG_VALUE_2"] == "false"
-    assert os.environ.get("CDPATH") is None or True
+    # окружение самого процесса не меняется
+    monkeypatch.setenv("CDPATH", "/x")
+    assert "CDPATH" not in subprocess_env()
+    assert os.environ["CDPATH"] == "/x"
 
 
 @pytest.mark.parametrize(
@@ -1023,3 +1026,130 @@ def test_npm_format_script_edits_files(root):
     verdict = classify("npm run format", root=root)
     assert verdict.level is WRITE and verdict.edits_only and verdict.signatures == ()
     assert classify("npm run lint", root=root).signatures == ("npm run lint",)
+
+
+# ------------- точные уровни правил (обе стороны каждого) ------------- #
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        # sed: правка на месте и в группе флагов, запуск команд
+        ("sed -Ei 's/a/b/' a.txt", WRITE),
+        ("sed -ni 's/a/b/p' a.txt", WRITE),
+        ("sed -i 's/a/b/' a.txt", WRITE),
+        ("sed -n 's/a/b/p' a.txt", READ),
+        ("sed 's/a/b/2g' a.txt", READ),
+        ("sed 's/.*/id/e' a.txt", DANGER),
+        ("sed -n '1e id' a.txt", DANGER),
+        ("sed 's/a/b/w out.txt' a.txt", None),
+        # awk: запуск команд — опасно, чтение файлов из программы — «не знаю»
+        ("awk 'BEGIN{system(\"id\")}'", DANGER),
+        ("awk '{print $1 | \"sh\"}' a.txt", DANGER),
+        ("awk 'BEGIN{\"id\" | getline x; print x}'", DANGER),
+        ("awk 'BEGIN{while((getline l < \".env\")>0) print l}'", None),
+        ("awk 'BEGIN{getline l < \"/etc/shadow\"; print l}'", None),
+        ('awk \'$1 == "x" || $2 == "y"\' a.txt', READ),
+        # less: «+!» и «+|» запускают оболочку
+        ("less +'!id' a.txt", DANGER),
+        ("less '+|id' a.txt", DANGER),
+        ("less +G a.txt", None),
+        ("less a.txt", READ),
+        ("vim -c ':!id' -c ':q' a.txt", DANGER),
+        ("vim +'!id' a.txt", DANGER),
+        ("vim a.txt", None),
+        # yq: правка на месте
+        ("yq -i '.a=1' a.txt", WRITE),
+        ("yq -Pi '.a=1' a.txt", WRITE),
+        ("yq '.a' a.txt", READ),
+        # grep: файл после -e/-f проверяется, -R — рекурсивно
+        ("grep -e x ~/.ssh/id_rsa", DANGER),
+        ("grep -e hello a.txt", READ),
+        ("grep -f a.txt ~/.ssh/id_rsa", DANGER),
+        ("rg --hostname-bin=./x hello", None),
+        ("rg -z hello", None),
+        # tar: программы
+        ("tar -I ./x -tf a.tar", DANGER),
+        ("tar --use-compress-program=./x -xf a.tar", DANGER),
+        # служебная папка gigacrew и устройства
+        ("cp a.txt .gigacode/settings.json", DANGER),
+        ("echo {} > .gigacode/settings.local.json", DANGER),
+        ("mv src /dev/null", DANGER),
+        ("cp a.txt /dev/null", DANGER),
+        ("ls 2>/dev/null", READ),
+        # find: удаление и запуск
+        ("find . -delete", DANGER),
+        ("find / -name '*.log' -delete", DANGER),
+        ("find . -exec rm ~/.bashrc {} +", DANGER),
+        ("find . -name '*.pyc' -exec rm {} +", WRITE),
+        ("find . -fprint /tmp/x", DANGER),
+        ("fd -x rm", None),
+        # xargs: имена из stdin или файла
+        ("ls | xargs rm", DANGER),
+        ("xargs -a a.txt rm", DANGER),
+        ("xargs -a ~/.ssh/id_rsa cat", DANGER),
+        ("xargs -a a.txt cat", None),
+        # dd: запись проверяется раньше источника
+        ("dd if=/dev/zero of=/dev/sda", DANGER),
+        ("dd if=~/.ssh/id_rsa of=out.bin", DANGER),
+        ("dd if=a.txt of=out.bin", WRITE),
+        ("dd if=a.txt", READ),
+        # оболочки: код известен при выполнении, команды через stdin
+        ('sh -c "$X"', DANGER),
+        ('bash -c "$(cat a.txt)"', DANGER),
+        ("bash -lc 'rm -rf ~'", DANGER),
+        ("bash -xc 'touch x'", WRITE),
+        ("sh -ec 'ls'", READ),
+        ("base64 -d a.txt | bash", DANGER),
+        ("printf 'ls' | sh", DANGER),
+        ("bash -n x.sh", READ),
+        ("bash /tmp/x.sh", None),
+        ("bash deploy.sh", DANGER),
+        ("source /tmp/x.sh", None),
+        (". ~/.bashrc", None),
+        # сеть, контейнеры, базы, облака
+        ("rsync -a . host:/srv", DANGER),
+        ("rsync -a src/ backup/", WRITE),
+        ("docker run -v /var/run/docker.sock:/var/run/docker.sock app", DANGER),
+        ("docker run -v ~/.ssh:/k alpine", DANGER),
+        ('sqlite3 app.db "select 1; drop table users"', DANGER),
+        ('sqlite3 app.db "select * from t"', READ),
+        ("aws s3 rm s3://b --recursive", DANGER),
+        ("gcloud compute instances delete vm1", DANGER),
+        ("aws s3 ls", None),
+    ],
+)
+def test_rule_levels(root, command, expected):
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, (command, verdict.reason)
+
+
+def test_recursive_reads_follow_secrets_and_links(root, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside") / "secret.txt"
+    outside.write_text("s")
+    assert level("grep -R hello .", root) is READ
+    assert level("find . -type f | xargs cat", root) is READ
+    assert level("fd -x cat", root) is READ
+    (root / "src" / "lnk").symlink_to(outside)
+    assert level("find src -type f -exec cat {} +", root) is None
+    assert level("find src -type f | xargs cat", root) is None
+    assert level("fd -x cat", root) is None
+    (root / "src" / "lnk").unlink()
+    (root / ".env").write_text("TOKEN=1\n")
+    assert level("grep -R hello .", root) is None
+    assert level("grep --directories=recurse x .", root) is None
+    assert level("rg -uu x", root) is None
+    assert level("find . -type f | xargs cat", root) is None
+    assert level("fd -x cat", root) is None
+    assert level("grep -e TOKEN .env", root) is None
+
+
+def test_source_project_venv_activate_is_prelude(root):
+    venv = root / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (venv / "bin" / "activate").write_text("# activate\n")
+    (root / "scripts").mkdir()
+    (root / "scripts" / "activate").write_text("echo hi\n")
+    real = classify("source .venv/bin/activate && pytest", root=root)
+    assert real.parts[0].prelude and real.parts[0].signature == "venv-activate"
+    fake = classify("source scripts/activate && pytest", root=root)
+    assert not fake.parts[0].prelude and fake.parts[0].signature is None

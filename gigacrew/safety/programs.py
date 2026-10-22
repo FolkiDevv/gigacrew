@@ -1471,9 +1471,18 @@ _XARGS_FLAGS = frozenset({"-0", "--null", "-r", "--no-run-if-empty", "-t", "--ve
 
 def _xargs(env: Env, cmd: Command, args: list[Word], classify: Callable[[Command], Part]) -> Part:
     i = 0
+    lists: list[Word] = []  # -a ФАЙЛ: аргументы из файла, а не со stdin
     while i < len(args) and args[i].static and args[i].value.startswith("-"):
         v = args[i].value
         name = v.split("=", 1)[0]
+        if v in ("-a", "--arg-file") and i + 1 < len(args):
+            lists.append(args[i + 1])
+            i += 2
+            continue
+        if name == "--arg-file" or (v.startswith("-a") and len(v) > 2):
+            lists.append(Word(v.split("=", 1)[1] if "=" in v else v[2:], v))
+            i += 1
+            continue
         if v in _XARGS_VALUES and i + 1 < len(args):
             i += 2
             continue
@@ -1487,19 +1496,26 @@ def _xargs(env: Env, cmd: Command, args: list[Word], classify: Callable[[Command
             continue
         return _unknown(f"xargs {v}: флаг не проверен")
     inner = args[i:] or [Word("echo")]
+    bad = _check_read(env, lists, "xargs -a")
+    if bad is not None:
+        return bad
     if inner[0].value in ("echo", "printf") and len(inner) == 1:
         return _read("xargs echo")
     # Аргументы приходят со stdin. Если это пути из find/fd по проекту — они начинаются с
     # каталога поиска и не похожи на флаги; иначе известны только при выполнении.
     source = cmd.stdin
     from_find = (
-        source is not None
+        not lists
+        and source is not None
         and source.name is not None
         and source.name.value in ("find", "fd", "fdfind")
         and classify(source).level is CommandLevel.READ
     )
     placeholder = _FOUND if from_find else Word("{}", "{}", static=False)
     sub = classify(Command(argv=[*inner, placeholder], cwd=env.cwd))
+    if not from_find and inner[0].static and inner[0].value == "rm":
+        # имена известны только при выполнении — как rm по шаблону
+        return _danger("xargs rm: удаление файлов по списку, известному при выполнении")
     if sub.level is CommandLevel.READ:
         if not from_find:
             return _unknown("xargs: аргументы приходят со stdin (известны только при выполнении)")
@@ -1522,6 +1538,20 @@ _SED_SAFE = re.compile(
 
 def _sed_script_safe(script: str) -> bool:
     return all(_SED_SAFE.match(part) for part in re.split(r";|\n", script) if part.strip())
+
+
+_SED_ADDR = r"^\s*(\d+|\$|/[^/]*/)?(\s*,\s*(\d+|\$|/[^/]*/))?\s*"
+
+
+def _sed_runs_commands(script: str) -> bool:
+    """Команда `e` (`1e id`) или флаг `e` у замены (`s/.*/id/e`) — запуск оболочки."""
+    for part in re.split(r";|\n", script):
+        if re.match(_SED_ADDR + r"e(\s|$)", part):
+            return True
+        m = re.match(_SED_ADDR + r"s(.)(?:(?!\4).)*\4(?:(?!\4).)*\4([a-zA-Z0-9]*)", part)
+        if m is not None and "e" in m.group(5).split("w", 1)[0]:
+            return True
+    return False
 
 
 def _sed(env: Env, args: list[Word]) -> Part:
@@ -1547,6 +1577,8 @@ def _sed(env: Env, args: list[Word]) -> Part:
             return _unknown("sed без скрипта")
         scripts, pos = [pos[0]], pos[1:]
     for s in scripts:
+        if s.static and _sed_runs_commands(s.value):
+            return _danger("sed e: скрипт запускает команды оболочки")
         if not s.static or not _sed_script_safe(s.value):
             return _unknown("sed: скрипт с командами, которые не проверены (w, e, r…)")
     if in_place:
@@ -1564,6 +1596,8 @@ def _sed(env: Env, args: list[Word]) -> Part:
 # ARGV/ARGC: программа подменила бы входные файлы (`ARGV[1] = ".env"`) мимо проверки путей.
 _AWK_UNSAFE = re.compile(r"system|getline|close|fflush|ENVIRON|PROCINFO|ARGV|ARGC|@load|@include")
 _AWK_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Запуск команд: system(), вывод в команду (`print | "sh"`), ввод из неё (`"id" | getline`).
+_AWK_COMMANDS = re.compile(r'\bsystem\s*\(|\|&|(?<!\|)\|(?!\|)\s*"|"\s*\|(?!\|)')
 
 
 def _awk_redirects(program: str) -> bool:
@@ -1639,6 +1673,8 @@ def _awk(env: Env, args: list[Word]) -> Part:
     if not pos:
         return _unknown("awk без программы")
     program = pos[0]
+    if program.static and _AWK_COMMANDS.search(program.value):
+        return _danger("awk: программа запускает команды оболочки")
     if not program.static or _AWK_UNSAFE.search(program.value) or _awk_redirects(program.value):
         return _unknown("awk: программа с вызовом команд, записью или окружением")
     operands = [p for p in pos[1:] if p.static and "=" in p.value]  # var=значение
@@ -1791,6 +1827,8 @@ def _less(env: Env, name: str, args: list[Word]) -> Part:
     for a in args:
         if not a.static:
             continue
+        if a.value.startswith("+") and ("!" in a.value or "|" in a.value):
+            return _danger(f"{name} {a.value}: запуск команды оболочки")
         if a.value.startswith("+") or a.value.split("=", 1)[0] in (
             "-o",
             "-O",
@@ -2174,12 +2212,14 @@ def _patch(env: Env, args: list[Word]) -> Part:
 def _dd(env: Env, args: list[Word]) -> Part:
     src = [Word(a.value[3:], a.raw, a.static, a.glob) for a in args if a.value.startswith("if=")]
     dst = [Word(a.value[3:], a.raw, a.static, a.glob) for a in args if a.value.startswith("of=")]
+    # Запись — первой: `dd if=/dev/zero of=/dev/sda` опасна, каким бы ни был источник.
+    written = _check_write(env, dst, "dd of=", edits=False) if dst else None
+    if written is not None and written.level is CommandLevel.DANGER:
+        return written
     bad = _check_read(env, src, "dd")
     if bad is not None:
         return bad
-    if dst:
-        return _check_write(env, dst, "dd of=", edits=False)
-    return _read("dd: в stdout")
+    return written if written is not None else _read("dd: в stdout")
 
 
 # --------------------------------------------------------------------------- #
@@ -4452,6 +4492,8 @@ def _dispatch(
             return _read("ulimit: просмотр лимитов")
         if prog == "umask" and not args:
             return _read("umask")
+        if prog in ("vim", "vi", "nvim", "ex") and _editor_shell_command(args):
+            return _danger(f"{prog}: команда редактора запускает оболочку (:!)")
         return _unknown(f"{prog}: интерактивная или меняющая оболочку команда")
     if prog in _READ_FILES:
         return _simple_read(env, prog, args)
@@ -4828,6 +4870,21 @@ def _dispatch(
                     return _read(f"{prog}: запрос на чтение")
         return _db(env, prog, args)
     return _unknown(f"{prog}: программа не известна классификатору")
+
+
+def _editor_shell_command(args: list[Word]) -> bool:
+    """vim -c ':!cmd', --cmd, +':!cmd' или system(): команда оболочки при запуске."""
+    for i, a in enumerate(args):
+        if not a.static:
+            continue
+        command = None
+        if a.value.startswith("+"):
+            command = a.value[1:]
+        elif a.value in ("-c", "--cmd") and i + 1 < len(args):
+            command = args[i + 1].value
+        if command is not None and re.search(r"!|\bsystem\s*\(|\bterm", command):
+            return True
+    return False
 
 
 def _deno(env: Env, args: list[Word]) -> Part:
