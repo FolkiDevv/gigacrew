@@ -45,10 +45,7 @@ def classify(
     """
     root = Path(root).resolve()
     cwd = cwd or "."
-    if not _is_posix():
-        return Verdict(None, "классификатор работает только с /bin/sh", cwd, command.strip())
-    if len(command) > MAX_COMMAND:
-        return Verdict(None, "слишком длинная команда", cwd, command.strip())
+    # Невидимые символы — до всех отказов «не знаю»: длинный хвост не должен их прятать.
     hidden = invisible_chars(command)
     if hidden:
         return Verdict(
@@ -58,6 +55,10 @@ def classify(
             cwd,
             command.strip(),
         )
+    if not _is_posix():
+        return Verdict(None, "классификатор работает только с /bin/sh", cwd, command.strip())
+    if len(command) > MAX_COMMAND:
+        return Verdict(None, "слишком длинная команда", cwd, command.strip())
     env = environ if environ is not None else os.environ
     return _classify(command, root=root, cwd=cwd, environ=env, depth=0)
 
