@@ -1420,6 +1420,74 @@ def test_chat_id_names_the_plan_file(tmp_path):
     assert agent.chat_id not in ("a1", "b2")
 
 
+needs_flock = pytest.mark.skipif(os.name != "posix", reason="блокировка плана — через flock")
+
+
+def _resumed_planner(tmp_path, turns, events=None) -> Agent:
+    """Сессия, продолжившая чат chat1 (как `gigacrew -c`): пишет план в режиме плана."""
+    agent = _agent(ScriptedProvider(turns), tmp_path, events=events, mode=PermissionMode.PLAN)
+    agent.reset(chat_id="chat1")
+    return agent
+
+
+@needs_flock
+def test_two_sessions_of_one_chat_do_not_clobber_the_plan(tmp_path):
+    plans = tmp_path / ".gigacode" / "plans"
+    plans.mkdir(parents=True)
+    (plans / "chat1.md").write_text("# План чата", encoding="utf-8")
+    a = _resumed_planner(
+        tmp_path,
+        [tool_turn("write_file", {"path": PLAN_REL, "content": "# План A"}), text_turn("A")],
+    )
+    events = RecordingEvents()
+    b = _resumed_planner(
+        tmp_path,
+        [
+            tool_turn("write_file", {"path": PLAN_REL, "content": "# План B"}),
+            text_turn("B"),
+        ],
+        events,
+    )
+    a.run_turn("план")
+    b.run_turn("план")
+    # Файл плана чата пишет A; запись B не прошла, а его план переехал в новый файл
+    # с планом, каким B видел его при продолжении чата.
+    assert (plans / "chat1.md").read_text(encoding="utf-8") == "# План A"
+    assert b.plan_path != a.plan_path and b.plan_path.parent == plans.resolve()
+    assert b.plan_path.read_text(encoding="utf-8") == "# План чата"
+    moved = b.plan_path.relative_to(tmp_path.resolve()).as_posix()
+    assert moved in _function_results(b)[0] and PLAN_REL in _function_results(b)[0]
+    assert any(level == "warn" and moved in text for level, text in events.notices)
+    assert b.chat_id == "chat1"  # чат тот же: id для хуков и журнала не меняется
+    # Запись в новый файл плана — без помех.
+    b._provider = ScriptedProvider(
+        [tool_turn("write_file", {"path": moved, "content": "# План B"}), text_turn("B")]
+    )
+    b.run_turn("ещё раз")
+    assert b.plan_path.read_text(encoding="utf-8") == "# План B"
+    assert (plans / "chat1.md").read_text(encoding="utf-8") == "# План A"
+
+
+@needs_flock
+def test_plan_follows_the_chat_forked_by_the_recorder(tmp_path):
+    a = _resumed_planner(
+        tmp_path,
+        [tool_turn("write_file", {"path": PLAN_REL, "content": "# План A"}), text_turn("A")],
+    )
+    a.run_turn("план")
+    a.continue_as("chat2")  # другая сессия изменила файл чата — запись ушла в новый чат
+    assert a.chat_id == "chat2" and a.plan_path.name == "chat2.md"
+    assert a.plan_path.read_text(encoding="utf-8") == "# План A"
+    # Прежний файл плана свободен: его продолжает другая сессия.
+    b = _resumed_planner(
+        tmp_path,
+        [tool_turn("write_file", {"path": PLAN_REL, "content": "# План B"}), text_turn("B")],
+    )
+    b.run_turn("план")
+    assert b.plan_path.name == "chat1.md"
+    assert b.plan_path.read_text(encoding="utf-8") == "# План B"
+
+
 # ------------------------------ рассуждения ------------------------------ #
 def _thinking(turn, reasoning: str):
     turn.message.reasoning = reasoning
