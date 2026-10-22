@@ -465,6 +465,59 @@ def test_git_diff_does_not_run_external_diff(git_repo):
     assert "-one" in res.content and "+two" in res.content
 
 
+def _project_with_submodule(base, *, filter_program=None):
+    """Проект с подмодулем libs/lib; программа фильтра — только в настройках подмодуля."""
+    from gigacrew.project.workspace import Workspace
+    from gigacrew.tools.base import ToolContext
+
+    def git(cwd, *args):
+        ident = ["-c", "user.email=t@t.t", "-c", "user.name=t", "-c", "protocol.file.allow=always"]
+        subprocess.run(["git", *ident, *args], cwd=cwd, check=True, capture_output=True)
+
+    lib = base / "lib"
+    lib.mkdir()
+    git(lib, "init", "-q")
+    (lib / "data.txt").write_text("v1\n", encoding="utf-8")
+    (lib / ".gitattributes").write_text("*.txt filter=x\n", encoding="utf-8")
+    git(lib, "add", ".")
+    git(lib, "commit", "-qm", "i")
+    root = base / "proj"
+    root.mkdir()
+    git(root, "init", "-q")
+    git(root, "submodule", "add", "-q", str(lib), "libs/lib")
+    git(root, "commit", "-qm", "s")
+    if filter_program is not None:
+        git(root / "libs" / "lib", "config", "filter.x.clean", str(filter_program))
+    (root / "libs" / "lib" / "data.txt").write_text("v2\n", encoding="utf-8")
+    return ToolContext(workspace=Workspace(root))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
+def test_git_status_with_program_in_submodule_config_is_not_safe(tmp_path):
+    """`git status` заходит в подмодули и запускает фильтры из .git/modules/<имя>/config."""
+    from gigacrew.safety.gitconfig import repo_config_runs_programs
+
+    script, marker = _marker_script(tmp_path, "clean")
+    ctx = _project_with_submodule(tmp_path, filter_program=script)
+    subprocess.run(["git", "status"], cwd=ctx.root, check=True, capture_output=True)
+    assert marker.exists()  # голый git программу из настроек подмодуля запускает
+    assert repo_config_runs_programs(ctx.root) is True
+    assert repo_config_runs_programs(ctx.root / "libs") is True  # и из подкаталога
+    g = GitTool()
+    assert g.risk(g.parse({"subcommand": "status"}), ctx) is RiskLevel.WRITE
+    sh = RunShellTool()  # тот же признак у классификатора run_shell
+    assert sh.risk(sh.parse({"command": "git status"}), ctx) is not RiskLevel.SAFE
+
+
+def test_git_status_with_clean_submodule_stays_safe(tmp_path):
+    from gigacrew.safety.gitconfig import repo_config_runs_programs
+
+    ctx = _project_with_submodule(tmp_path)
+    assert repo_config_runs_programs(ctx.root) is False
+    g = GitTool()
+    assert g.risk(g.parse({"subcommand": "status"}), ctx) is RiskLevel.SAFE
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
 def test_git_ignores_implicit_bare_repository(ctx):
     """HEAD/config/objects обычными файлами в проекте не делают его bare-репозиторием."""
