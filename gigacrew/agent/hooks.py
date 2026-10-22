@@ -7,7 +7,8 @@ gigacrew запускает на событиях агента.
 * 0 — успех; stdout-объект разбирается как JSON (решение, контекст для модели),
   простой текст становится контекстом только у UserPromptSubmit и SessionStart;
 * 2 — блокировка: действие не выполняется (или ход продолжается — у Stop), причина
-  берётся из stderr;
+  берётся из stderr; у PostToolUse это замечание модели, а у событий, где блокировать
+  нечего (SessionStart, SessionEnd, PreCompact, Notification), — предупреждение;
 * прочие коды, таймаут, ошибка запуска — предупреждение пользователю, работа идёт дальше.
 
 Ядро не зависит от UI: предупреждения и индикатор долгих хуков идут через
@@ -32,6 +33,19 @@ HOOK_OUTPUT_LIMIT = 10_000
 # Простой текст в stdout — контекст для модели только у этих событий: иначе вывод вроде
 # «1 file reformatted» уходил бы модели после каждой правки.
 CONTEXT_EVENTS = frozenset({HookEvent.USER_PROMPT_SUBMIT, HookEvent.SESSION_START})
+# Здесь блокировка (код 2, decision "block", deny) действует — и первая останавливает
+# остальные хуки события. У PostToolUse это замечание модели: идут все хуки (линтер не
+# отменяет форматтер), замечания складываются. У остальных событий блокировать нечего:
+# код 2 — предупреждение, как прочие коды, остальные хуки идут.
+BLOCKING_EVENTS = frozenset(
+    {
+        HookEvent.PRE_REQUEST,
+        HookEvent.PRE_TOOL_USE,
+        HookEvent.USER_PROMPT_SUBMIT,
+        HookEvent.STOP,
+        HookEvent.SUBAGENT_STOP,
+    }
+)
 # Эти хуки идут на каждом вызове инструмента — без индикатора, иначе он мигал бы.
 QUIET_EVENTS = frozenset(
     {
@@ -70,8 +84,9 @@ class HookRunner:
     """Запуск хуков события и сведение их ответов в один :class:`HookResult`.
 
     Хуки события идут по очереди (порядок — как в настройках); первая блокировка
-    останавливает остальные. ``deny`` важнее ``ask``, ``ask`` — важнее ``allow``;
-    контексты склеиваются.
+    останавливает остальные там, где она действует (:data:`BLOCKING_EVENTS`).
+    ``deny`` важнее ``ask``, ``ask`` — важнее ``allow``; контексты и замечания
+    PostToolUse склеиваются.
     """
 
     def __init__(self, settings: HookSettings | None = None):
@@ -99,7 +114,7 @@ class HookRunner:
             proc = self._run_one(event, hook, data, cwd, env, events)
             if proc is not None:
                 self._apply(event, hook, proc, result, events)
-            if result.blocked:
+            if result.blocked and event in BLOCKING_EVENTS:
                 break
         return result
 
@@ -119,7 +134,7 @@ class HookRunner:
             proc = run_process(
                 hook.command, cwd=cwd, timeout=hook.timeout, shell=True, input=data, extra_env=env
             )
-        except OSError as e:
+        except (OSError, ValueError) as e:  # ValueError: NUL или суррогат в команде
             events.on_notice(
                 f"хук {event} не запустился ({short_command(hook.command)}): {e}", level="warn"
             )
@@ -144,9 +159,9 @@ class HookRunner:
         result: HookResult,
         events: AgentEvents,
     ) -> None:
-        if proc.returncode == BLOCK_EXIT_CODE:
-            result.blocked = True
-            result.reason = _clip(proc.stderr.strip()) or NO_REASON
+        blockable = event in BLOCKING_EVENTS or event is HookEvent.POST_TOOL_USE
+        if proc.returncode == BLOCK_EXIT_CODE and blockable:
+            self._block(event, hook, _clip(proc.stderr.strip()) or NO_REASON, result, events)
             return
         if proc.returncode != 0:
             detail = _first_line(proc.stderr) or _first_line(proc.stdout)
@@ -161,14 +176,51 @@ class HookRunner:
             return
         data = _json_object(out)
         if data is None:
+            if out.startswith("{"):
+                self._unparsed(event, hook, result, events)
             if event in CONTEXT_EVENTS:
                 result.context.append(_clip(out))
             return
-        self._apply_json(event, data, result, events)
+        self._apply_json(event, hook, data, result, events)
 
     @staticmethod
+    def _unparsed(
+        event: HookEvent, hook: HookCommand, result: HookResult, events: AgentEvents
+    ) -> None:
+        """stdout похож на JSON, но не разбирается (лишняя строка, обрезка): решение хука
+        потеряно. Молча продолжить — значит, разрешить то, что хук, возможно, запретил:
+        предупреждаем, а вызов инструмента — подтверждает пользователь."""
+        note = "вывод похож на JSON, но не разобран — ответ хука пропущен"
+        if event is HookEvent.PRE_TOOL_USE:
+            note = "вывод похож на JSON, но не разобран — вызов подтвердите сами"
+            result.decision = "ask"
+        events.on_notice(f"хук {event} ({short_command(hook.command)}): {note}", level="warn")
+
+    @staticmethod
+    def _block(
+        event: HookEvent, hook: HookCommand, reason: str, result: HookResult, events: AgentEvents
+    ) -> None:
+        """Блокировка по ответу хука — там, где ей есть что блокировать (см.
+        :data:`BLOCKING_EVENTS`); у остальных событий — предупреждение пользователю."""
+        if event in BLOCKING_EVENTS:
+            result.blocked, result.reason = True, reason
+        elif event is HookEvent.POST_TOOL_USE:  # замечания всех хуков — модели
+            result.blocked = True
+            result.reason = _clip(f"{result.reason}\n\n{reason}" if result.reason else reason)
+        else:
+            events.on_notice(
+                f"хук {event} ({short_command(hook.command)}): блокировать нечего — "
+                f"{_first_line(reason)}",
+                level="warn",
+            )
+
     def _apply_json(
-        event: HookEvent, data: dict[str, Any], result: HookResult, events: AgentEvents
+        self,
+        event: HookEvent,
+        hook: HookCommand,
+        data: dict[str, Any],
+        result: HookResult,
+        events: AgentEvents,
     ) -> None:
         message = _text(data.get("systemMessage"))
         if message:
@@ -183,16 +235,14 @@ class HookRunner:
             if permission is None:  # прежний формат: decision approve/block
                 permission = {"approve": "allow", "block": "deny"}.get(decision)
             if permission == "deny":
-                result.blocked = True
-                result.reason = _text(specific.get("permissionDecisionReason")) or reason
-                result.reason = _clip(result.reason) or NO_REASON
+                reason = _text(specific.get("permissionDecisionReason")) or reason
+                self._block(event, hook, _clip(reason) or NO_REASON, result, events)
             elif permission == "ask":
                 result.decision = "ask"
             elif permission == "allow" and result.decision is None:
                 result.decision = "allow"
         elif decision == "block":
-            result.blocked = True
-            result.reason = _clip(reason) or NO_REASON
+            self._block(event, hook, _clip(reason) or NO_REASON, result, events)
         context = _text(specific.get("additionalContext"))
         if context:
             result.context.append(_clip(context))

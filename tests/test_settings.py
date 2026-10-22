@@ -155,6 +155,25 @@ def test_bad_entries_warn_and_skip(tmp_path, content, fragment):
     assert [h.command for h in settings.commands(HookEvent.STOP)] == ["echo ok"]
 
 
+@pytest.mark.parametrize("command", ["echo hi\u0000", "echo \ud800"], ids=["nul", "surrogate"])
+def test_command_that_cannot_run_is_skipped(tmp_path, command):
+    ws = Workspace(tmp_path)
+    data = json.dumps(_hooks("Stop", command))  # \u0000 и \ud800 — как в файле
+    _write(ws.settings_file, data)
+    _write(ws.local_settings_file, _hooks("Stop", "echo ok"))
+    settings, warnings = load_settings(ws)
+    assert [h.command for h in settings.commands(HookEvent.STOP)] == ["echo ok"]
+    assert len(warnings) == 1 and "hooks[0]" in warnings[0] and "command" in warnings[0]
+
+
+def test_deeply_nested_settings_file_is_skipped(tmp_path):
+    ws = Workspace(tmp_path)
+    _write(ws.settings_file, "[" * 200_000 + "]" * 200_000)
+    settings, warnings = load_settings(ws)
+    assert settings == HookSettings()
+    assert len(warnings) == 1 and "не удалось прочитать" in warnings[0]
+
+
 def test_disable_all_hooks(tmp_path):
     ws = Workspace(tmp_path)
     _write(ws.settings_file, _hooks("Stop", "echo"))

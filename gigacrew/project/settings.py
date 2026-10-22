@@ -154,7 +154,8 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             continue
-        except (OSError, UnicodeDecodeError, ValueError) as e:
+        # RecursionError — глубоко вложенный JSON ([[[…]]]) из репозитория: не повод падать.
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError) as e:
             warnings.append(f"не удалось прочитать {path}: {e} — файл пропущен")
             continue
         if not isinstance(data, dict):
@@ -238,6 +239,10 @@ def _parse_command(raw: Any, where: str, warnings: list[str]) -> HookCommand | N
     if not isinstance(command, str) or not command.strip():
         warnings.append(f"{where}: command — ожидается непустая строка")
         return None
+    # json.loads пропускает \u0000 и одиночные суррогаты — такую команду не запустить.
+    if "\0" in command or _has_surrogate(command):
+        warnings.append(f"{where}: command — NUL или неверный символ Unicode, пропущено")
+        return None
     timeout = raw.get("timeout", DEFAULT_HOOK_TIMEOUT)
     # json.loads пропускает NaN, Infinity и 1e400 — int() на них упал бы. Огромное целое
     # (10**400) isfinite не переводит во float — оно доходит до ограничения сверху.
@@ -255,6 +260,14 @@ def _parse_command(raw: Any, where: str, warnings: list[str]) -> HookCommand | N
             f"взято {clamped}"
         )
     return HookCommand(command, clamped)
+
+
+def _has_surrogate(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------- #
@@ -337,7 +350,7 @@ class TrustStore:
         """(отпечаток хуков пользователя, отпечатки проектов)."""
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError):
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
             return "", {}
         if not isinstance(data, dict) or data.get("version") != TRUST_FORMAT_VERSION:
             return "", {}
