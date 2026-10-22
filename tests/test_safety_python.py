@@ -226,6 +226,29 @@ def test_move_and_copy_destination(root, code, expected):
     assert result.level is expected, result.reason
 
 
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        # пути в функциях os/shutil — и позиционные, и именованные
+        ("import os; os.rename('a.txt', dst='/tmp/x')", DANGER),
+        ("import os; os.rename('a.txt', dst='b.txt')", WRITE),
+        ("import shutil; shutil.copy('a.txt', dst='/tmp/x')", DANGER),
+        ("import shutil; shutil.move(src='a.txt', dst='/tmp/x')", DANGER),
+        ("import os; os.remove(path='/etc/hosts')", DANGER),
+        ("import os; os.makedirs(name='/tmp/d', exist_ok=True)", DANGER),
+        ("import os; os.remove('a.txt', dir_fd=None)", WRITE),
+        # путь относительно открытого каталога, *args, **kwargs — известны при выполнении
+        ("import os; os.remove('a.txt', dir_fd=fd)", None),
+        ("import os; os.rename('a.txt', 'b.txt', dst_dir_fd=3)", None),
+        ("import os; a = ['a.txt', '/tmp/x']; os.rename(*a)", None),
+        ("import shutil; kw = {'dst': '/tmp/x'}; shutil.copy('a.txt', **kw)", None),
+    ],
+)
+def test_os_writers_keyword_arguments(root, code, expected):
+    result = analyze(code, root=root)
+    assert result.level is expected, result.reason
+
+
 def test_secret_files_ask(root):
     (root / ".env").write_text("TOKEN=1\n")
     assert analyze("print(open('.env').read())", root=root).level is None

@@ -1229,15 +1229,21 @@ def _check_module_function(full: str, node: ast.Call, ctx: _Ctx) -> None:
         ctx.flag(Level.DANGER, f"{full}()")
         return
     if module in ("os", "shutil") and attr in _FILE_WRITERS | _RECURSIVE:
-        target = _path_of(node.args[0], ctx) if node.args else _UNKNOWN_PATH
+        src = _call_arg(node, 0, "path", "name", "src")
+        target = _path_of(src, ctx) if src is not None else _UNKNOWN_PATH
         _check_write(target, ctx, f"{full}()", recursive=attr in _RECURSIVE)
-        if (
-            attr in ("rename", "replace", "copy", "copy2", "copyfile", "move")
-            and len(node.args) > 1
-        ):
-            _check_write(_path_of(node.args[1], ctx), ctx, f"{full}()")
+        if attr in ("rename", "replace", "copy", "copy2", "copyfile", "move"):
+            dst = _call_arg(node, 1, "dst")
+            if dst is not None:
+                _check_write(_path_of(dst, ctx), ctx, f"{full}()")
             if attr.startswith("copy"):
                 _check_read(target, ctx, f"{full}()")
+        if any(
+            kw.arg in ("dir_fd", "src_dir_fd", "dst_dir_fd")
+            and not (isinstance(kw.value, ast.Constant) and kw.value.value is None)
+            for kw in node.keywords
+        ):
+            ctx.flag(None, f"{full}(): путь относительно открытого каталога")
         return
     if module == "os" and attr in ("listdir", "scandir", "walk"):
         target = _path_of(node.args[0], ctx) if node.args else _Path(static=ctx.cwd)
