@@ -325,7 +325,7 @@ def test_env_options_and_assignments(root, command, expected):
         # флаги без значения не съедают следующий аргумент
         ("column -t ~/.ssh/id_rsa", DANGER),
         ("column -t a.txt", READ),
-        ("jq --tab . /etc/shadow", None),
+        ("jq --tab . /etc/hosts", None),
         ("jq --tab . package.json", READ),
         ("grep --color x ~/.ssh/id_rsa", DANGER),
         ("grep --color=always hello a.txt", READ),
@@ -367,18 +367,18 @@ def test_option_values_are_parsed_like_getopt(root, command, expected):
     [
         # значения флагов, которые читают файлы, проверяются как пути
         ("date -f ~/.ssh/id_rsa", DANGER),
-        ("date -f /etc/shadow", None),
+        ("date -f /etc/hosts", None),
         ("date -f a.txt", READ),
         ("date -d 2020-01-01", READ),  # только показ даты
         ("date -s 'next monday'", None),
         ("date --set=tomorrow", None),
         ("date +%Y", READ),
-        ("diff --from-file=/etc/shadow a.txt", None),
+        ("diff --from-file=/etc/hosts a.txt", None),
         ("diff --from-file=b.txt a.txt", READ),
         ("diff -u a.txt b.txt", READ),
-        ("du -X /etc/shadow .", None),
+        ("du -X /etc/hosts .", None),
         ("du -sh src", READ),
-        ("file -m /etc/shadow a.txt", None),
+        ("file -m /etc/hosts a.txt", None),
         ("file a.txt", READ),
         ("dmesg -F ~/.ssh/id_rsa", DANGER),
         ("dircolors ~/.ssh/id_rsa", DANGER),
@@ -493,7 +493,7 @@ def test_git_reads_and_changes(repo):
         ("git log --no-ext-diff -p", READ),
         # файлы, которые читаются по значению флага
         ("git blame --contents ~/.ssh/id_rsa a.txt", DANGER),
-        ("git blame --contents=/etc/shadow a.txt", None),
+        ("git blame --contents=/etc/hosts a.txt", None),
         ("git blame --contents b.txt a.txt", READ),
         ("git grep -f ~/.ssh/id_rsa", DANGER),
         ("git grep -f a.txt", READ),

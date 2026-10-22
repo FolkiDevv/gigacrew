@@ -40,7 +40,6 @@ CORPORA = [pytest.param(CORPUS, id="corpus"), pytest.param(HOLDOUT, id="holdout"
 KNOWN_GAPS: dict[str, CommandLevel | None] = {
     # programs.py: dd проверяет if= раньше of= и возвращает «чтение вне проекта»,
     # не дойдя до записи в устройство (of=/dev/sda должно быть DANGER)
-    "dd if=/dev/zero of=/dev/sda": None,
     "dd if=/dev/urandom of=data.bin bs=1G count=50": None,
     # programs.py: секреты внутри проекта и в окружении — «не знаю», а не DANGER
     "cat .env": None,
@@ -52,12 +51,7 @@ KNOWN_GAPS: dict[str, CommandLevel | None] = {
     'grep -r "API_KEY" ~/': None,
     "zip -r /tmp/all.zip ~": None,
     # programs.py: опасные действия «читающих» программ распознаны, но оценены «не знаю»
-    "less +'!rm -rf ~' README.md": None,
-    "awk 'BEGIN {system(\"rm -rf ~\")}'": None,
-    "sed -n '1e rm -rf ~' file.txt": None,
-    "vim -c ':!rm -rf ~' -c ':q'": None,
     "watch -n1 'rm -rf tmp'": None,
-    "xargs -a list.txt rm": None,
     "find . -name \"*.py\" | xargs sed -i 's/import/#import/'": None,
     "git branch -D $(git branch --merged)": None,
     # programs.py: код в командной строке других языков не анализируется
