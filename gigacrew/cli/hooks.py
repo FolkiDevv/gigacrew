@@ -174,9 +174,10 @@ def describe_hooks(settings: HookSettings) -> str:
     files = ", ".join(SOURCE_LABELS.values())
     if settings.disabled:
         return f"хуки выключены (disableAllHooks); настройки: {files}"
+    note = "; хуки проекта выключены (disableAllHooks)" if settings.project_disabled else ""
     if not settings.groups:
-        return f"хуков нет; настройки: {files}"
-    return f"хуки (настройки: {files}):\n{describe_groups(settings.groups)}"
+        return f"хуков нет{note}; настройки: {files}"
+    return f"хуки (настройки: {files}{note}):\n{describe_groups(settings.groups)}"
 
 
 def _session_hook(ui: Console, event: HookEvent, run: Callable[[], None]) -> None:

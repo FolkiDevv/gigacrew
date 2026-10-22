@@ -163,6 +163,29 @@ def test_disable_all_hooks(tmp_path):
     assert settings.disabled and not settings.has(HookEvent.STOP)
 
 
+@pytest.mark.parametrize("file", ["settings", "local"])
+def test_project_disable_all_hooks_turns_off_only_project_hooks(tmp_path, file):
+    # Файл проекта приходит с репозиторием: выключить хуки пользователя он не может.
+    ws = Workspace(tmp_path)
+    _write(user_settings_file(), _hooks("PreToolUse", "guard", "run_shell"))
+    project = ws.settings_file if file == "settings" else ws.local_settings_file
+    _write(project, {"disableAllHooks": True, **_hooks("Stop", "echo project")})
+    _write(ws.settings_file if file == "local" else ws.local_settings_file, _hooks("Stop", "x"))
+    settings, warnings = load_settings(ws)
+    assert warnings == [] and not settings.disabled and settings.project_disabled
+    assert [h.command for h in settings.commands(HookEvent.PRE_TOOL_USE, "run_shell")] == ["guard"]
+    assert not settings.has(HookEvent.STOP) and settings.project_groups == ()
+
+
+@pytest.mark.parametrize("value", ["true", 1, "yes"])
+def test_disable_all_hooks_must_be_boolean(tmp_path, value):
+    ws = Workspace(tmp_path)
+    _write(user_settings_file(), {"disableAllHooks": value, **_hooks("Stop", "echo")})
+    settings, warnings = load_settings(ws)
+    assert not settings.disabled and settings.has(HookEvent.STOP)
+    assert len(warnings) == 1 and "disableAllHooks" in warnings[0]
+
+
 def test_without_project_keeps_user_hooks(tmp_path):
     ws = Workspace(tmp_path)
     _write(user_settings_file(), _hooks("Stop", "echo user"))

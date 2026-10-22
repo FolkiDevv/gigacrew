@@ -17,7 +17,7 @@ import gigacrew.cli.app as app
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore
 from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import CommandContext, default_commands
-from gigacrew.cli.hooks import load_hooks
+from gigacrew.cli.hooks import describe_hooks, load_hooks
 from gigacrew.cli.repl import run_repl
 from gigacrew.config import Config
 from gigacrew.llm.gigacode import GigaCodeProvider
@@ -307,6 +307,34 @@ def test_unconfirmed_hooks_of_every_owner_are_skipped(tmp_path, monkeypatch, own
     monkeypatch.setattr(ui, "ask", lambda q, dangerous=False: False)
     runner = load_hooks(ws, ui, interactive=interactive)
     assert runner.settings.commands(HookEvent.STOP) == []
+
+
+def test_disabled_hooks_ask_nothing(tmp_path, monkeypatch):
+    ws = Workspace(tmp_path)
+    _write(ws.settings_file, _logging_hooks(tmp_path))
+    _write(user_settings_file(), {"disableAllHooks": True})
+    ui = Console(no_color=True)
+    asked: list[str] = []
+    monkeypatch.setattr(ui, "ask", lambda q, dangerous=False: asked.append(q) or True)
+    runner = load_hooks(ws, ui, interactive=True)
+    assert asked == [] and not runner.has(HookEvent.STOP)
+    assert describe_hooks(runner.settings).startswith("хуки выключены (disableAllHooks)")
+
+
+def test_project_cannot_disable_trusted_user_hooks(tmp_path, monkeypatch):
+    ws = Workspace(tmp_path)
+    _write(
+        user_settings_file(),
+        {"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "guard"}]}]}},
+    )
+    _trust_user_hooks(tmp_path)
+    _write(ws.settings_file, {"disableAllHooks": True})
+    ui = Console(no_color=True)
+    monkeypatch.setattr(ui, "ask", lambda q, dangerous=False: pytest.fail(q))
+    runner = load_hooks(ws, ui, interactive=True)
+    assert runner.has(HookEvent.PRE_TOOL_USE, "run_shell")
+    text = describe_hooks(runner.settings)
+    assert "хуки проекта выключены" in text and "guard" in text
 
 
 # ------------------------------- REPL ------------------------------- #
