@@ -504,3 +504,33 @@ def test_mtls_verification_loads_trust_anchors(tmp_path, monkeypatch):
     )
     context = cfg.build_ssl_verify()
     assert context.verify_mode == ssl.CERT_REQUIRED and len(context.get_ca_certs()) == 1
+
+
+# ------------------------- проверка TLS у API v2 ------------------------- #
+def test_api_verifies_tls_by_default(tmp_path, _certifi_roots):
+    """Ключ OAuth и Bearer-токен не уходят на непроверенный сервер: проверка TLS у API v2
+    включена и без GIGACREW_CA_BUNDLE — стандартными корнями."""
+    import ssl
+
+    assert Config().verify_ssl  # и у конфигурации, собранной вручную
+    cfg = Config.load(project_root=tmp_path, environ={"GIGACREW_ACCESS_KEY": "k"}, cwd=tmp_path)
+    assert cfg.verify_ssl
+    context = cfg.build_ssl_verify()
+    assert isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname and context.get_ca_certs()  # стандартные корни на месте
+    env = {"GIGACREW_ACCESS_KEY": "k", "GIGACREW_VERIFY_SSL": "0"}  # явный отказ — работает
+    cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+    assert not cfg.verify_ssl and cfg.build_ssl_verify() is False
+
+
+def test_mtls_verifies_server_by_default(tmp_path, _certifi_roots):
+    import ssl
+
+    cert, key = _self_signed(tmp_path)
+    env = {"GIGACREW_CERT": str(cert), "GIGACREW_KEY": str(key)}
+    context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
+    assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+    assert context.get_ca_certs()
+    env["GIGACREW_VERIFY_SSL"] = "0"
+    context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
+    assert context.verify_mode == ssl.CERT_NONE

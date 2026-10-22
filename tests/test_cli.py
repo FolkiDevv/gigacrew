@@ -604,17 +604,40 @@ def test_repl_does_not_index_outside_git_repo(cli_env, capsys):
     assert "индекс проекта: 1 файл, 1 определение" in _out(capsys)
 
 
-def test_repl_warns_when_tls_verification_is_off(tmp_path, capsys):
+def test_tls_warning_only_when_verification_is_turned_off():
+    """Проверка TLS включена по умолчанию; выключили (GIGACREW_VERIFY_SSL=0) — предупреждение
+    у всех схем, и у mTLS тоже: ключа нет, но запросы и код уходят подменённому серверу."""
     from dataclasses import replace
 
-    from gigacrew.cli.repl import TLS_OFF_WARNING
+    oauth, backend = Config(access_key="x"), Config(provider="gigacode")
+    mtls = Config(cert="c.pem", key="k.pem")
+    for cfg in (oauth, backend, mtls):
+        assert app.tls_warning(cfg) is None
+        text = app.tls_warning(replace(cfg, verify_ssl=False))
+        assert text and "GIGACREW_VERIFY_SSL=0" in text and "GIGACREW_CA_BUNDLE" in text
+    assert "токен" in app.tls_warning(replace(oauth, verify_ssl=False))
+    assert "запросы" in app.tls_warning(replace(mtls, verify_ssl=False))
 
-    agent, ui, ctx, _ = _measure_env(tmp_path, auto_approve=True)
-    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
-    assert " ".join(TLS_OFF_WARNING.split()[:4]) in _out(capsys)
-    agent._cfg = replace(agent.config, verify_ssl=True)
-    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
-    assert "TLS" not in _out(capsys)
+
+@pytest.mark.parametrize("mode", [["-p", "x"], ["--list-models"]])
+def test_tls_warning_comes_before_the_first_request(tmp_path, oneshot, monkeypatch, capsys, mode):
+    """Предупреждение — до подключения во всех режимах, а не только в REPL после баннера:
+    ключ уходит уже при подключении, проверке рецензента и в -p."""
+    provider = ScriptedProvider([text_turn("ok")])
+    printed_before_connect = []
+    monkeypatch.setattr(
+        provider, "connect", lambda: printed_before_connect.append(capsys.readouterr().out)
+    )
+    oneshot(provider)
+    monkeypatch.setenv("GIGACREW_VERIFY_SSL", "0")
+    assert _main(tmp_path, *mode) == 0
+    assert "проверка TLS-сертификата сервера выключена" in " ".join(
+        printed_before_connect[0].split()
+    )
+    monkeypatch.delenv("GIGACREW_VERIFY_SSL")
+    printed_before_connect.clear()
+    assert _main(tmp_path, *mode) == 0
+    assert "TLS" not in printed_before_connect[0] + capsys.readouterr().out
 
 
 def test_repl_without_index_on_start(cli_env):
@@ -1205,15 +1228,6 @@ def test_repl_connects_before_each_turn(tmp_path, capsys):
     assert provider.connects == 2
     assert "вход не подтверждён" in _flat(capsys)
     assert len(provider.requests) == 1  # первый запрос не ушёл: вход не удался
-
-
-def test_repl_warns_about_tls_for_the_backend_token(tmp_path, capsys):
-    from dataclasses import replace
-
-    agent, ui, ctx = _catalogue_env(tmp_path, CatalogueProvider(), auto_approve=True)
-    agent._cfg = replace(agent.config, provider="gigacode", access_key=None)
-    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
-    assert "ключ или токен можно перехватить" in _flat(capsys)
 
 
 @pytest.mark.parametrize("piped", ["a\nещё данные\n", "y\n", "да\n"])

@@ -40,10 +40,6 @@ BANNER_HINTS = (
     ("/resume", "чаты"),
     ("/clear", "новый чат"),
 )
-TLS_OFF_WARNING = (
-    "проверка TLS-сертификата сервера API выключена — ключ или токен можно перехватить "
-    "подменой сервера; задайте GIGACREW_CA_BUNDLE (корневой сертификат сервера, PEM)"
-)
 
 
 def status_of(agent: Agent) -> StatusInfo:
@@ -144,9 +140,6 @@ def run_repl(
         auto_approve=agent.config.auto_approve,
         mode=agent.mode,
     )
-    cfg = agent.config
-    if cfg.auth_mode in ("oauth", "cli_token") and not cfg.verify_ssl:
-        ui.warn(TLS_OFF_WARNING)
     if resumed is not None:
         ui.chat_resumed(resumed, agent.conversation.messages, agent.call_info)
     # Ввод не принимается, пока строится индекс (Esc/Ctrl+C — отменить построение).

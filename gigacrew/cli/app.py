@@ -153,6 +153,18 @@ def _make_provider(config: Config) -> LLMProvider:
     return ApiProvider(config)
 
 
+def tls_warning(config: Config) -> str | None:
+    """Предупреждение о выключенной проверке TLS (только явный GIGACREW_VERIFY_SSL=0)."""
+    if config.verify_ssl:
+        return None
+    what = "запросы и код проекта" if config.auth_mode == "mtls" else "ключ или токен"
+    return (
+        f"проверка TLS-сертификата сервера выключена (GIGACREW_VERIFY_SSL=0) — {what} можно "
+        "перехватить подменой сервера; если корень сертификата сервера не в стандартном "
+        "хранилище, задайте GIGACREW_CA_BUNDLE (PEM) вместо отключения проверки"
+    )
+
+
 def _not_in_catalogue(model: str, known: list[str]) -> str:
     return f"модели {model} нет в каталоге бэкенда; доступны: {', '.join(known)}"
 
@@ -268,6 +280,10 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as e:
         ui.error(str(e))
         return EXIT_ERROR
+    # До первого запроса и во всех режимах: ключ уходит уже при подключении.
+    warning = tls_warning(config)
+    if warning:
+        ui.warn(warning)
 
     try:
         provider = _make_provider(config)

@@ -213,12 +213,12 @@ class Config:
     model: str = ""
     auth_url: str | None = None
     base_url: str = ""
-    # Проверка TLS-сертификата сервера. По умолчанию (Config.load) включена у бэкенда
-    # GigaCode — токен принадлежит официальному CLI, который сервер проверяет, — и у
-    # API v2 при заданном ca_bundle.
-    verify_ssl: bool = False
-    # Корневой сертификат для проверки сервера; задан — проверка TLS включена
-    # по умолчанию. У бэкенда GigaCode — в дополнение к стандартным корням.
+    # Проверка TLS-сертификата сервера: включена по умолчанию у всех провайдеров — без неё
+    # ключ, токен и сам код ушли бы любому, кто подменит сервер. Выключает только явный
+    # GIGACREW_VERIFY_SSL=0.
+    verify_ssl: bool = True
+    # Корневой сертификат для проверки сервера, чей корень не в стандартном хранилище.
+    # У API v2 — вместо стандартных корней, у бэкенда GigaCode — в дополнение к ним.
     ca_bundle: str | None = None
     # User-Agent всех запросов к бэкенду GigaCode; значения по умолчанию тоже нет.
     user_agent: str | None = None
@@ -323,9 +323,7 @@ class Config:
             model=model or env.get("GIGACREW_MODEL") or "",
             auth_url=env.get("GIGACREW_AUTH_URL") or None,
             base_url=base_url.rstrip("/"),
-            verify_ssl=_env_bool(
-                env, "GIGACREW_VERIFY_SSL", ca_bundle is not None or provider == "gigacode"
-            ),
+            verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", True),
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             user_agent=_env_header(env, "GIGACREW_USER_AGENT"),
             gigacode_home=env.get("GIGACODE_HOME") or None,
@@ -385,16 +383,16 @@ class Config:
         """Значение для httpx ``verify=``.
 
         Для mTLS строит SSL-контекст с клиентским сертификатом (cert+key); файлы
-        проверяются на существование и загружаемость. Для OAuth — флаг проверки
-        TLS-сертификата сервера (verify_ssl) или контекст с ``ca_bundle``. Для бэкенда
+        проверяются на существование и загружаемость. Для OAuth — контекст проверки
+        сервера (:meth:`_server_ssl_context`) или False (GIGACREW_VERIFY_SSL=0). Для бэкенда
         GigaCode — контекст с корнями официального CLI (:meth:`_gigacode_ssl_context`).
         """
         if self.auth_mode != "mtls":
-            if self.provider == "gigacode" and self.verify_ssl:
+            if not self.verify_ssl:
+                return False
+            if self.provider == "gigacode":
                 return self._gigacode_ssl_context()
-            if self.verify_ssl and self.ca_bundle:
-                return ssl.create_default_context(cafile=self.ca_bundle)
-            return self.verify_ssl
+            return self._server_ssl_context()
 
         cert_path = Path(self.cert)  # type: ignore[arg-type]
         key_path = Path(self.key)  # type: ignore[arg-type]
@@ -403,21 +401,32 @@ class Config:
         if not key_path.is_file():
             raise FileNotFoundError(f"Приватный ключ не найден: {key_path}")
 
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        if not self.verify_ssl:
-            # Например, самоподписанный серверный сертификат.
+        if self.verify_ssl:
+            context = self._server_ssl_context()
+        else:
+            # Явный GIGACREW_VERIFY_SSL=0 — например, самоподписанный серверный сертификат.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-        elif self.ca_bundle:
-            context.load_verify_locations(cafile=self.ca_bundle)
-        else:
-            # Голый SSLContext не знает ни одного корневого сертификата: без этого
-            # проверка сервера с GIGACREW_VERIFY_SSL=1 не проходила бы никогда.
-            context.load_default_certs()
         try:
             context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
         except ssl.SSLError as e:
             raise RuntimeError(f"Не удалось загрузить клиентский сертификат: {e}") from e
+        return context
+
+    def _server_ssl_context(self) -> ssl.SSLContext:
+        """Проверка сервера API v2: корни из ``ca_bundle``, если он задан, иначе
+        стандартные — как у httpx (certifi или SSL_CERT_FILE/SSL_CERT_DIR) и системное
+        хранилище (туда ставят корпоративные корни)."""
+        if self.ca_bundle:
+            try:
+                return ssl.create_default_context(cafile=self.ca_bundle)
+            except (OSError, ssl.SSLError) as e:
+                raise RuntimeError(
+                    f"не удалось загрузить GIGACREW_CA_BUNDLE {self.ca_bundle}: {e}"
+                ) from e
+        context = httpx.create_ssl_context()
+        context.load_default_certs()
         return context
 
     def _gigacode_ssl_context(self) -> ssl.SSLContext:
