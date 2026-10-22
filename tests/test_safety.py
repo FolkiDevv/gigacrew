@@ -279,6 +279,75 @@ def test_env_options_and_assignments(root, command, expected):
     assert verdict.level is expected, (command, verdict.reason)
 
 
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        # значение флага в группе коротких (`-uo FILE`) — как в getopt
+        ("sort -uo .git/x a.txt", DANGER),
+        ("sort -uox.txt a.txt", WRITE),
+        ("sort -ox.txt a.txt", WRITE),
+        ("sort -o.git/hooks/pre-commit a.txt", DANGER),
+        ("sort -u a.txt", READ),
+        ("cp -ft .git/hooks a.txt", DANGER),
+        ("cp -t /etc a.txt", DANGER),
+        ("mv --target-directory=/etc a.txt", DANGER),
+        ("cp -f a.txt c.txt", WRITE),
+        ("tar -xC /tmp -f a.tar", DANGER),
+        ("tar xfC a.tar /tmp", DANGER),  # старая запись: значения букв — следующие слова
+        ("tar -xzf a.tar", WRITE),
+        ("tar -tf a.tar", READ),
+        ("tar -tf a.tar -I ./x", DANGER),
+        ("tar -xf a.tar -I ./x", DANGER),
+        ("tar -cf - -T a.txt", DANGER),  # список файлов, как --files-from
+        ("tar -cf - -C /etc shadow", None),  # файлы после -C — от его каталога
+        ("tar -cf - src", READ),
+        ("tree -ao /tmp/x .", DANGER),
+        ("tree -ao out.txt .", WRITE),
+        ("tree -o out.txt", WRITE),
+        ("tree -o /tmp/x", DANGER),
+        ("tree -o", None),  # куда пишет — не найдено: не «правка»
+        ("tree -Lo 2 out.txt", None),
+        ("tree -L 2 src", READ),
+        # флаги без значения не съедают следующий аргумент
+        ("column -t ~/.ssh/id_rsa", DANGER),
+        ("column -t a.txt", READ),
+        ("jq --tab . /etc/shadow", None),
+        ("jq --tab . package.json", READ),
+        ("grep --color x ~/.ssh/id_rsa", DANGER),
+        ("grep --color=always hello a.txt", READ),
+        ("touch -a /etc/x a.txt", DANGER),
+        ("touch -a a.txt", WRITE),
+        ("dos2unix -n ~/.ssh/id_rsa out.txt", DANGER),
+        ("xxd -ps ~/.ssh/id_rsa", DANGER),  # у xxd свой разбор: -ps — один флаг
+        ("xxd -ps a.txt", READ),
+        # флаги с двумя значениями
+        ("jq -n --arg v x env", None),
+        ("jq -n --arg v x '$v'", READ),
+        # каталог назначения -t
+        ("install -t /usr/local/bin a.txt", DANGER),
+        ("install -m 755 a.txt bin/x", WRITE),
+        ("ln -s -t /etc a.txt", DANGER),
+        ("ln -s a.txt b.txt", WRITE),
+        # опасные флаги внутри группы
+        ("rg -iz hello", None),
+        ("rg -i hello", READ),
+        ("fd -Hx rm", None),
+        ("fd -e py -X rm -rf", DANGER),
+        ("fd -e py -x wc -l", READ),
+        ("docker run -itv /var/run/docker.sock:/s alpine", DANGER),
+        ("split --filter='sh -c id' a.txt", None),
+        # patch пишет файл из аргументов, -o и -r
+        ("patch /etc/passwd a.txt", DANGER),
+        ("patch -o /tmp/out -i a.txt", DANGER),
+        ("patch -p1 -i a.txt", WRITE),
+        ("patch --dry-run -p1 -i a.txt", READ),
+    ],
+)
+def test_option_values_are_parsed_like_getopt(root, command, expected):
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, (command, verdict.reason)
+
+
 def test_symlink_out_of_project_is_outside(root, tmp_path_factory):
     outside = tmp_path_factory.mktemp("outside") / "secret.txt"
     outside.write_text("s")
@@ -293,6 +362,9 @@ def test_recursive_read_with_secrets_asks(root):
     assert level("rg -n hello", root) is READ  # rg пропускает скрытые файлы
     assert level("rg -n --hidden hello", root) is None
     assert level("find . -type f -exec cat {} +", root) is None
+    assert level("grep -d recurse hello .", root) is None
+    assert level("tar -cf - src", root) is READ
+    assert level("tar -cf - .", root) is None  # каталог в архив — читается целиком
 
 
 # ------------------------------- git -------------------------------- #

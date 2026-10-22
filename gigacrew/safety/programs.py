@@ -18,7 +18,7 @@ import json
 import os
 import re
 import shutil
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -139,40 +139,69 @@ def _has(flags: set[str], *names: str) -> bool:
     return any(n in flags for n in names)
 
 
-def _values(args: list[Word], *names: str) -> list[Word]:
-    """Значения флагов ``--name=V``, ``--name V``, ``-n V``, ``-nV``."""
-    out: list[Word] = []
-    for i, a in enumerate(args):
+def _options(
+    args: list[Word], valued: Collection[str], *, clusters: bool = True
+) -> tuple[list[Word], list[tuple[str, Word]]]:
+    """Разбор флагов со значением, как в getopt: (аргументы без них, [(флаг, значение)]).
+
+    ``valued`` — все флаги программы, которые берут значение: ``--name=V``, ``--name V``,
+    ``-n V``, ``-nV``. В группе коротких (``-uo FILE``, ``-uoFILE``) буквы до первой
+    со значением — флаги без значения (остаются словом ``-u``), значение — остаток слова
+    или следующее слово. После ``--`` флагов нет. ``clusters=False`` — для программ со
+    своим разбором (xxd: ``-ps`` — один флаг): только точные слова и ``-nV``.
+    """
+    kept: list[Word] = []
+    found: list[tuple[str, Word]] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
         v = a.value
-        for n in names:
-            if v == n and i + 1 < len(args):
-                out.append(args[i + 1])
-            elif n.startswith("--") and v.startswith(n + "="):
-                out.append(Word(v[len(n) + 1 :], v, a.static, a.glob))
-            elif (
-                not n.startswith("--")
-                and len(n) == 2
-                and v.startswith(n)
-                and len(v) > 2
-                and not v.startswith("--")
-            ):
-                out.append(Word(v[2:], v, a.static, a.glob))
-    return out
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        if not a.static or not v.startswith("-") or v == "-":
+            kept.append(a)
+        elif v == "--":
+            kept.extend(args[i:])
+            break
+        elif v in valued:
+            if nxt is not None:
+                found.append((v, nxt))
+            i += 2
+            continue
+        elif v.startswith("--"):
+            name, eq, value = v.partition("=")
+            if eq and name in valued:
+                found.append((name, Word(value, a.raw, a.static, a.glob)))
+            else:
+                kept.append(a)
+        else:
+            letters = range(1, len(v) if clusters else 2)
+            k = next((k for k in letters if "-" + v[k] in valued), None)
+            if k is None:
+                kept.append(a)
+            else:
+                if k > 1:
+                    kept.append(Word(v[:k], a.raw, a.static, a.glob))
+                if k + 1 < len(v):
+                    found.append(("-" + v[k], Word(v[k + 1 :], a.raw, a.static, a.glob)))
+                else:
+                    if nxt is not None:
+                        found.append(("-" + v[k], nxt))
+                    i += 2
+                    continue
+        i += 1
+    return kept, found
 
 
-def _without_values(args: list[Word], *names: str) -> list[Word]:
-    """Аргументы без флагов из ``names`` и их значений (``-n 5`` → убрано)."""
-    out: list[Word] = []
-    skip = False
-    for a in args:
-        if skip:
-            skip = False
-            continue
-        if a.static and a.value in names:
-            skip = True
-            continue
-        out.append(a)
-    return out
+def _values(args: list[Word], *names: str, valued: Collection[str] = ()) -> list[Word]:
+    """Значения флагов ``names``; ``valued`` — остальные флаги программы со значением
+    (чтобы в ``-ko FILE`` не принять значение ``-k`` за значение ``-o``)."""
+    _, found = _options(args, {*names, *valued})
+    return [w for n, w in found if n in names]
+
+
+def _without_values(args: list[Word], *names: str, clusters: bool = True) -> list[Word]:
+    """Аргументы без флагов из ``names`` и их значений (``-n 5``, ``-qn5`` → ``-q``)."""
+    return _options(args, names, clusters=clusters)[0]
 
 
 def _subcommand(args: list[Word]) -> tuple[str, list[Word]]:
@@ -294,6 +323,8 @@ def _check_write(env: Env, words: list[Word], what: str, *, edits: bool = True) 
             result.append(_write(f"{what}: файл с секретами ({w.raw})"))
             continue
         result.append(_write(what, edits=edits))
+    if not words:  # куда пишет — не разобрали (`tree -o` без значения): не «правка»
+        return _unknown(f"{what}: файл записи не найден в аргументах")
     if not result:
         return _write(what, edits=edits)
     return _combine(*result)
@@ -891,11 +922,40 @@ _DASH_BUILTINS = frozenset(
 )
 
 
+_TREE_VALUED = ("-o", "-L", "-P", "-I", "-H", "-T")
+# util-linux column (у BSD column — подмножество).
+_COLUMN_VALUED = tuple(f"-{ch}" for ch in "CcEHilNnOopRrSsTW") + (
+    "--columns",
+    "--separator",
+    "--output-separator",
+    "--table-columns",
+    "--table-name",
+    "--table-order",
+    "--table-right",
+    "--table-hide",
+    "--table-truncate",
+    "--table-noextreme",
+    "--table-wrap",
+    "--tree",
+    "--tree-id",
+    "--tree-parent",
+    "--output-width",
+)
+
+
 def _simple_read(env: Env, name: str, args: list[Word]) -> Part:
     flags, pos = _split(args)
     fl = _flagset(flags)
-    if name in ("tree",) and _has(fl, "-o"):
-        return _check_write(env, _values(args, "-o"), "tree -o")
+    if name == "tree":
+        # tree берёт значения букв группы из следующих слов по порядку (`-Lo 2 out`), а не
+        # из остатка слова: совпадает с getopt, только если буква со значением — последняя.
+        for f in flags:
+            v = f.value
+            if not v.startswith("--") and any("-" + ch in _TREE_VALUED for ch in v[1:-1]):
+                return _unknown(f"tree {v}: значения флагов в группе не разобрать")
+        if _has(fl, "-o"):
+            return _check_write(env, _values(args, "-o", valued=_TREE_VALUED), "tree -o")
+        pos = _split(_without_values(args, *_TREE_VALUED))[1]
     if name == "file" and _has(fl, "-C", "--compile"):
         return _unknown("file -C пишет файл")
     if name in ("head", "tail"):
@@ -912,7 +972,8 @@ def _simple_read(env: Env, name: str, args: list[Word]) -> Part:
             _without_values(args, "-d", "-f", "-b", "-c", "--delimiter", "--output-delimiter")
         )[1]
     if name in ("column",):
-        pos = _split(_without_values(args, "-s", "-t", "-c", "-o", "-N", "-R", "-H"))[1]
+        # -t — таблица, без значения (раньше съедал имя файла: `column -t файл`).
+        pos = _split(_without_values(args, *_COLUMN_VALUED))[1]
     if name == "du":
         pos = _split(_without_values(args, "-d", "--max-depth", "-t", "--threshold"))[1]
     listing = name in ("ls", "dir", "vdir", "du", "stat", "tree", "exa", "eza", "lsd")
@@ -1026,6 +1087,35 @@ _FOUND = Word(".", "{}")
 # --------------------------------------------------------------------------- #
 # Поиск: grep, rg, find, fd, xargs
 # --------------------------------------------------------------------------- #
+# Флаги grep со значением. --color — без: значение только через «=» (`--color=always`),
+# иначе следующее слово — образец, и первый файл не проверялся бы.
+_GREP_VALUED = (
+    "-e",
+    "--regexp",
+    "-f",
+    "--file",
+    "-m",
+    "--max-count",
+    "-A",
+    "-B",
+    "-C",
+    "--context",
+    "--after-context",
+    "--before-context",
+    "--label",
+    "-d",
+    "--directories",
+    "-D",
+    "--devices",
+    "--binary-files",
+    "--include",
+    "--exclude",
+    "--exclude-dir",
+    "--exclude-from",
+    "--include-from",
+)
+
+
 def _grep(env: Env, name: str, args: list[Word]) -> Part:
     hit = _abbrev_only(
         args,
@@ -1045,50 +1135,17 @@ def _grep(env: Env, name: str, args: list[Word]) -> Part:
     )
     if hit is not None:
         return _unknown(f"{name} {hit.value}: сокращённый флаг")
-    pattern_flags = ("-e", "--regexp", "-f", "--file")
-    files_from = _values(args, "-f", "--file")
-    rest = _without_values(
-        args,
-        "-e",
-        "--regexp",
-        "-f",
-        "--file",
-        "-m",
-        "--max-count",
-        "-A",
-        "-B",
-        "-C",
-        "--context",
-        "--after-context",
-        "--before-context",
-        "--label",
-        "--color",
-        "--colour",
-        "-d",
-        "--directories",
-        "-D",
-        "--devices",
-        "--binary-files",
-        "--include",
-        "--exclude",
-        "--exclude-dir",
-        "--exclude-from",
-        "--include-from",
-    )
+    rest, found = _options(args, _GREP_VALUED)
     flags, pos = _split(rest)
     fl = _flagset(flags)
-    has_pattern_flag = any(
-        a.static
-        and (a.value in pattern_flags or a.value.startswith(("--regexp=", "--file=")))
-        or (a.static and re.match(r"^-[a-zA-Z]*e.", a.value))
-        for a in args
-    )
+    has_pattern_flag = any(n in ("-e", "--regexp", "-f", "--file") for n, _ in found)
     paths = pos if has_pattern_flag else pos[1:]
-    bad = _check_read(env, files_from + _values(args, "--exclude-from", "--include-from"), name)
+    lists = [w for n, w in found if n in ("-f", "--file", "--exclude-from", "--include-from")]
+    bad = _check_read(env, lists, name)
     if bad is not None:
         return bad
     recursive = _has(fl, "-r", "-R", "--recursive", "--dereference-recursive") or any(
-        a.value in ("--directories=recurse", "-drecurse") for a in args if a.static
+        n in ("-d", "--directories") and w.value == "recurse" for n, w in found
     )
     if recursive:
         bad = _check_recursive(
@@ -1150,24 +1207,19 @@ def _rg(env: Env, name: str, args: list[Word]) -> Part:
         "--field-context-separator",
         "--context-separator",
     )
-    files_from = _values(args, "-f", "--file", "--ignore-file")
-    rest = _without_values(args, *value_flags)
+    rest, found = _options(args, value_flags)
     flags, pos = _split(rest)
     fl = _flagset(flags)
-    has_pattern = any(
-        a.static
-        and (
-            a.value in ("-e", "--regexp", "-f", "--file")
-            or a.value.startswith(("--regexp=", "--file="))
-        )
-        for a in args
-    )
+    if _has(fl, "-z"):  # в группе: `-iz`
+        return _unknown(f"{name} -z: запускает внешние программы")
+    has_pattern = any(n in ("-e", "--regexp", "-f", "--file") for n, _ in found)
     listing = _has(fl, "--files", "--type-list")
     paths = pos if (has_pattern or listing) else pos[1:]
+    files_from = [w for n, w in found if n in ("-f", "--file", "--ignore-file")]
     bad = _check_read(env, files_from, name)
     if bad is not None:
         return bad
-    unrestricted = sum(f.value.count("u") for f in flags if re.fullmatch(r"-u+", f.value))
+    unrestricted = sum(f.value.count("u") for f in flags if re.fullmatch(r"-[a-zA-Z.]+", f.value))
     hidden = _has(fl, "--hidden", "-.") or unrestricted >= 2
     follow = _has(fl, "-L", "--follow")
     if listing:
@@ -1240,45 +1292,82 @@ def _find(env: Env, name: str, args: list[Word], classify: Callable[[Command], P
     return _combine(_read("find: поиск файлов"), *parts)
 
 
+_FD_VALUED = (
+    "-e",
+    "--extension",
+    "-t",
+    "--type",
+    "-E",
+    "--exclude",
+    "-d",
+    "--max-depth",
+    "--min-depth",
+    "-S",
+    "--size",
+    "--changed-within",
+    "--changed-before",
+    "-j",
+    "--threads",
+    "--color",
+    "-c",
+    "--base-directory",
+    "--search-path",
+)
+
+
+def _fd_exec(args: list[Word]) -> int | None:
+    """Индекс слова с -x/-X (дальше — команда); -1 — в группе после x есть ещё буквы."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        v = a.value
+        if not a.static or not v.startswith("-") or v == "-":
+            i += 1
+            continue
+        if v == "--":
+            return None
+        if v in ("-x", "--exec", "-X", "--exec-batch"):
+            return i
+        if v.startswith(("--exec=", "--exec-batch=")):
+            return -1
+        if v in _FD_VALUED:
+            i += 2
+            continue
+        if not v.startswith("--"):
+            for k, ch in enumerate(v[1:], 1):
+                if ch in "xX":
+                    return i if k == len(v) - 1 else -1
+                if "-" + ch in _FD_VALUED:
+                    i += 1 if k + 1 < len(v) else 2
+                    break
+            else:
+                i += 1
+            continue
+        i += 1
+    return None
+
+
 def _fd(env: Env, name: str, args: list[Word], classify: Callable[[Command], Part]) -> Part:
-    for i, a in enumerate(args):
-        if a.static and a.value in ("-x", "--exec", "-X", "--exec-batch"):
-            inner = [
-                _FOUND if w.value == "{}" else w
-                for w in args[i + 1 :]
-                if not (w.static and w.value == ";")
-            ]
-            if not inner:
-                return _unknown("fd --exec без команды")
-            sub = classify(Command(argv=inner, cwd=env.cwd))
-            if sub.level is not CommandLevel.READ:
-                return sub if sub.level is not None else _unknown(f"fd --exec: {sub.reason}")
-            rec = _check_recursive(env, [], "fd --exec")
-            return rec if rec is not None else _read("fd --exec: чтение найденных файлов")
-    rest = _without_values(
-        args,
-        "-e",
-        "--extension",
-        "-t",
-        "--type",
-        "-E",
-        "--exclude",
-        "-d",
-        "--max-depth",
-        "--min-depth",
-        "-S",
-        "--size",
-        "--changed-within",
-        "--changed-before",
-        "-j",
-        "--threads",
-        "--color",
-        "-c",
-        "--base-directory",
-        "--search-path",
-    )
+    at = _fd_exec(args)
+    if at == -1:
+        return _unknown(f"{name}: --exec в группе флагов не разобрать")
+    if at is not None:
+        inner = [
+            _FOUND if w.value == "{}" else w
+            for w in args[at + 1 :]
+            if not (w.static and w.value == ";")
+        ]
+        if not inner:
+            return _unknown("fd --exec без команды")
+        sub = classify(Command(argv=inner, cwd=env.cwd))
+        if sub.level is not CommandLevel.READ:
+            return sub if sub.level is not None else _unknown(f"fd --exec: {sub.reason}")
+        rec = _check_recursive(env, [], "fd --exec")
+        return rec if rec is not None else _read("fd --exec: чтение найденных файлов")
+    rest, found = _options(args, _FD_VALUED)
     _, pos = _split(rest)
-    bad = _check_read(env, pos[1:] + _values(args, "--base-directory", "--search-path"), name)
+    dirs = [w for n, w in found if n in ("--base-directory", "--search-path")]
+    bad = _check_read(env, pos[1:] + dirs, name)
     return bad if bad is not None else _read(f"{name}: поиск файлов")
 
 
@@ -1365,8 +1454,8 @@ def _sed(env: Env, args: list[Word]) -> Part:
         )
     ):
         return _unknown("sed -f: скрипт из файла")
-    scripts = _values(args, "-e", "--expression")
-    rest = _without_values(args, "-e", "--expression", "-l", "--line-length")
+    rest, found = _options(args, ("-e", "--expression", "-l", "--line-length"))
+    scripts = [w for n, w in found if n in ("-e", "--expression")]
     flags, pos = _split(rest)
     fl = _flagset(flags)
     in_place = any(
@@ -1459,7 +1548,8 @@ _AWK_OPTION = re.compile(r"-[Fv].+|--(field-separator|assign)=.*")
 
 
 def _awk(env: Env, args: list[Word]) -> Part:
-    rest = _without_values(args, "-F", "-v", "--assign", "--field-separator")
+    rest, found = _options(args, ("-F", "-v", "--assign", "--field-separator"))
+    given = [w for n, w in found if n in ("-v", "--assign")]
     flags, pos = _split(rest)
     for flag in flags:
         if not _AWK_OPTION.fullmatch(flag.value):
@@ -1472,27 +1562,44 @@ def _awk(env: Env, args: list[Word]) -> Part:
     if not program.static or _AWK_UNSAFE.search(program.value) or _awk_redirects(program.value):
         return _unknown("awk: программа с вызовом команд, записью или окружением")
     operands = [p for p in pos[1:] if p.static and "=" in p.value]  # var=значение
-    assigns = [*_values(args, "-v", "--assign"), *operands]
+    assigns = [*given, *operands]
     if any(_AWK_UNSAFE.search(a.value.partition("=")[0]) for a in assigns if a.static):
         return _unknown("awk: присваивание ARGV, ARGC или переменным окружения")
     files = [p for p in pos[1:] if p not in operands]
-    bad = _check_read(env, files, "awk") or _check_vars(env, _values(args, "-v", "--assign"), "awk")
+    bad = _check_read(env, files, "awk") or _check_vars(env, given, "awk")
     return bad if bad is not None else _read("awk: обработка текста")
 
 
 def _jq(env: Env, name: str, args: list[Word]) -> Part:
-    if name == "yq" and any(
-        a.static and a.value in ("-i", "--inplace") or a.value.startswith("--inplace") for a in args
+    if name == "yq" and (
+        _has(_flagset(_split(args)[0]), "-i", "--inplace")
+        or any(a.static and a.value.startswith("--inplace") for a in args)
     ):
         _, pos = _split(args)
         return _check_write(env, pos[1:], "yq -i")
-    files = _values(args, "--rawfile", "--slurpfile", "-f", "--from-file")
-    rest = _without_values(args, "--arg", "--argjson", "--indent", "-L", "--tab")
-    rest = [a for a in rest if not (a.static and a.value in ("--rawfile", "--slurpfile"))]
-    flags, pos = _split(rest)
-    if "--args" in _flagset(flags) or "--jsonargs" in _flagset(flags):
+    # --arg/--argjson/--rawfile/--slurpfile берут два слова (имя и значение или файл):
+    # иначе значение приняли бы за выражение, а настоящее выражение — за файл.
+    kept: list[Word] = []
+    files: list[Word] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.static and a.value == "--":
+            kept.extend(args[i:])
+            break
+        if a.static and a.value in ("--arg", "--argjson", "--rawfile", "--slurpfile"):
+            if a.value in ("--rawfile", "--slurpfile"):
+                files.extend(args[i + 2 : i + 3])
+            i += 3
+            continue
+        kept.append(a)
+        i += 1
+    flags, pos = _split(_without_values(kept, "--indent", "-L", "--library-path"))
+    fl = _flagset(flags)
+    if _has(fl, "--args", "--jsonargs"):
         return _unknown(f"{name} --args")
-    has_file_program = bool(_values(args, "-f", "--from-file"))
+    # -f: выражение — из файла, это первый позиционный (все позиционные — файлы).
+    has_file_program = _has(fl, "-f", "--from-file")
     program = None if has_file_program else (pos[0] if pos else None)
     if program is not None and (
         not program.static
@@ -1513,21 +1620,26 @@ def _sort(env: Env, args: list[Word]) -> Part:
         return _unknown("sort: флаг запускает программу или читает файлы по списку")
     if _abbrev_only(args, "--output"):
         return _unknown("sort: сокращённый --output")
-    out = _values(args, "-o", "--output")
-    rest = _without_values(
+    rest, found = _options(
         args,
-        "-o",
-        "--output",
-        "-k",
-        "--key",
-        "-t",
-        "--field-separator",
-        "-S",
-        "--buffer-size",
-        "-T",
-        "--temporary-directory",
-        "--parallel",
+        (
+            "-o",
+            "--output",
+            "-k",
+            "--key",
+            "-t",
+            "--field-separator",
+            "-S",
+            "--buffer-size",
+            "-T",
+            "--temporary-directory",
+            "--parallel",
+            "--batch-size",
+            "--sort",
+            "-y",
+        ),
     )
+    out = [w for n, w in found if n in ("-o", "--output")]
     _, pos = _split(rest)
     bad = _check_read(env, pos, "sort")
     if bad is not None:
@@ -1549,8 +1661,21 @@ def _uniq(env: Env, args: list[Word]) -> Part:
 
 
 def _xxd(env: Env, args: list[Word]) -> Part:
+    # У xxd свой разбор: `-ps` — один флаг (-p), а не -p с -s и значением.
     rest = _without_values(
-        args, "-c", "-g", "-l", "-o", "-s", "-n", "-C", "-cols", "-len", "-seek", "-name"
+        args,
+        "-c",
+        "-g",
+        "-l",
+        "-o",
+        "-s",
+        "-n",
+        "-C",
+        "-cols",
+        "-len",
+        "-seek",
+        "-name",
+        clusters=False,
     )
     _, pos = _split(rest)
     bad = _check_read(env, pos[:1], "xxd")
@@ -1564,10 +1689,12 @@ def _xxd(env: Env, args: list[Word]) -> Part:
 def _base64(env: Env, args: list[Word]) -> Part:
     if _abbrev_only(args, "--output", "--input"):
         return _unknown("base64: сокращённый флаг")
-    out = _values(args, "-o", "--output")
-    rest = _without_values(args, "-o", "--output", "-w", "--wrap", "-b", "--break", "-i", "--input")
+    rest, found = _options(
+        args, ("-o", "--output", "-w", "--wrap", "-b", "--break", "-i", "--input")
+    )
+    out = [w for n, w in found if n in ("-o", "--output")]
     _, pos = _split(rest)
-    bad = _check_read(env, pos + _values(args, "-i", "--input"), "base64")
+    bad = _check_read(env, pos + [w for n, w in found if n in ("-i", "--input")], "base64")
     if bad is not None:
         return bad
     return _check_write(env, out, "base64 -o") if out else _read("base64")
@@ -1617,8 +1744,8 @@ def _rm(env: Env, args: list[Word]) -> Part:
 
 
 def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
-    target_dir = _values(args, "-t", "--target-directory")
-    rest = _without_values(args, "-t", "--target-directory", "-S", "--suffix")
+    rest, found = _options(args, ("-t", "--target-directory", "-S", "--suffix"))
+    target_dir = [w for n, w in found if n in ("-t", "--target-directory")]
     flags, pos = _split(rest)
     if not pos:
         return _unknown(f"{name} без файлов")
@@ -1640,53 +1767,79 @@ def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
     return _check_write(env, dest, name)
 
 
+# Флаги со значением у каждой программы: общий список сдвигал бы позиционные (у touch
+# -a и -m — без значения, а `touch -a /etc/x a.txt` проверил бы только a.txt).
+_WRITE_VALUED: dict[str, tuple[str, ...]] = {
+    "mkdir": ("-m", "--mode"),
+    "mkfifo": ("-m", "--mode"),
+    "touch": ("-r", "--reference", "-d", "--date", "-t"),
+    "truncate": ("-s", "--size", "-r", "--reference"),
+    "install": (
+        "-m",
+        "--mode",
+        "-o",
+        "--owner",
+        "-g",
+        "--group",
+        "-S",
+        "--suffix",
+        "-t",
+        "--target-directory",
+    ),
+    # -n (новый файл: `dos2unix -n ВХОД ВЫХОД`) — без значения: оба файла проверяются.
+    "dos2unix": ("-c", "--convmode"),
+    "unix2dos": ("-c", "--convmode"),
+    "fallocate": ("-l", "--length", "-o", "--offset"),
+    "split": (
+        "-a",
+        "--suffix-length",
+        "-b",
+        "--bytes",
+        "-C",
+        "--line-bytes",
+        "-l",
+        "--lines",
+        "-n",
+        "--number",
+        "-t",
+        "--separator",
+        "--additional-suffix",
+    ),
+    "csplit": ("-f", "--prefix", "-b", "--suffix-format", "-n", "--digits"),
+}
+
+
 def _simple_write(env: Env, name: str, args: list[Word]) -> Part:
-    flags, pos = _split(
-        _without_values(
-            args,
-            "-m",
-            "--mode",
-            "-s",
-            "--size",
-            "-l",
-            "--length",
-            "-o",
-            "--offset",
-            "-n",
-            "-b",
-            "-t",
-            "-g",
-            "-o",
-            "--owner",
-            "--group",
-            "-a",
-            "-r",
-        )
-    )
-    if name == "touch" and any(
-        a.static and a.value in ("-r", "--reference", "-d", "-t") for a in args
-    ):
-        pass
+    if name in ("split", "install") and _abbrev(args, "--filter", "--strip-program"):
+        return _unknown(f"{name}: флаг запускает программу")
+    rest, found = _options(args, _WRITE_VALUED.get(name, ()))
+    flags, pos = _split(rest)
     if not pos:
         return _unknown(f"{name} без аргументов")
-    return _check_write(
-        env,
-        pos,
-        name,
-        edits=name in ("mkdir", "touch", "ln", "install", "dos2unix", "unix2dos", "truncate"),
-    )
+    edits = name in ("mkdir", "touch", "ln", "install", "dos2unix", "unix2dos", "truncate")
+    target_dir = [w for n, w in found if n in ("-t", "--target-directory")]
+    if name == "install" and target_dir:  # install -t КАТАЛОГ файлы… — копирование, как cp -t
+        bad = _check_read(env, pos, name)
+        if bad is not None:
+            return bad if bad.level is not None else _unknown(f"install: {bad.reason}")
+        return _check_write(env, target_dir, name, edits=edits)
+    return _check_write(env, pos, name, edits=edits)
 
 
 def _ln(env: Env, args: list[Word]) -> Part:
-    flags, pos = _split(_without_values(args, "-t", "--target-directory", "-S", "--suffix"))
+    rest, found = _options(args, ("-t", "--target-directory", "-S", "--suffix"))
+    flags, pos = _split(rest)
     if not pos:
         return _unknown("ln без аргументов")
+    target_dir = [w for n, w in found if n in ("-t", "--target-directory")]
     # Ссылка на файл вне проекта превратит его в «файл проекта» для следующих команд.
-    target = pos[0]
-    s = scope(target, root=env.root, cwd=env.cwd)
-    if s not in (Scope.INSIDE,):
-        return _danger(f"ln: ссылка на {target.raw} — вне проекта или секреты")
-    return _check_write(env, pos[1:] or [Word(Path(target.value).name)], "ln", edits=True)
+    for target in pos if target_dir else pos[:1]:
+        s = scope(target, root=env.root, cwd=env.cwd)
+        if s not in (Scope.INSIDE,):
+            return _danger(f"ln: ссылка на {target.raw} — вне проекта или секреты")
+    if target_dir:  # ln -t КАТАЛОГ цели… — ссылки создаются в КАТАЛОГЕ
+        return _check_write(env, target_dir, "ln", edits=True)
+    return _check_write(env, pos[1:] or [Word(Path(pos[0].value).name)], "ln", edits=True)
 
 
 def _chmod(env: Env, args: list[Word]) -> Part:
@@ -1700,6 +1853,78 @@ def _chmod(env: Env, args: list[Word]) -> Part:
     if not mode or re.search(r"[st]|777|[0-7]?[0-7][0-7][2367]$|o\+w|a\+w|^[1-7][0-7]{3}$", mode):
         return _danger(f"chmod {mode}: права для всех или setuid")
     return _check_write(env, pos[1:], "chmod")
+
+
+# Флаги tar со значением (короткие — как в getopt GNU tar).
+_TAR_VALUED = (
+    "-f",
+    "--file",
+    "-C",
+    "--directory",
+    "-b",
+    "--blocking-factor",
+    "-g",
+    "--listed-incremental",
+    "-H",
+    "--format",
+    "-I",
+    "--use-compress-program",
+    "-F",
+    "--info-script",
+    "--new-volume-script",
+    "-K",
+    "--starting-file",
+    "-L",
+    "--tape-length",
+    "-N",
+    "--newer",
+    "--after-date",
+    "-T",
+    "--files-from",
+    "-V",
+    "--label",
+    "-X",
+    "--exclude-from",
+    "--exclude",
+    "--transform",
+    "--xform",
+    "--owner",
+    "--group",
+    "--mode",
+    "--mtime",
+    "--suffix",
+)
+# Значения — программа (-I, -F), списки файлов вне проверки путей (-T, -X) или файл
+# снимка, который tar перепишет (-g).
+_TAR_DANGER_VALUED = frozenset(
+    {
+        "-I",
+        "--use-compress-program",
+        "-F",
+        "--info-script",
+        "--new-volume-script",
+        "-T",
+        "--files-from",
+        "-X",
+        "--exclude-from",
+        "-g",
+        "--listed-incremental",
+    }
+)
+
+
+def _tar_old_style(args: list[Word]) -> list[Word]:
+    """``tar czf out.tgz src`` → ``-c -z -f out.tgz src``: буквы первого слова без «-»;
+    значения букв со значением — следующие слова по порядку (``tar xfC a.tar dir``)."""
+    if not args or not args[0].static or not args[0].value.isalpha():
+        return args
+    out: list[Word] = []
+    rest = list(args[1:])
+    for ch in args[0].value:
+        out.append(Word("-" + ch, args[0].raw))
+        if "-" + ch in _TAR_VALUED and rest:
+            out.append(rest.pop(0))
+    return out + rest
 
 
 def _tar(env: Env, args: list[Word]) -> Part:
@@ -1728,38 +1953,34 @@ def _tar(env: Env, args: list[Word]) -> Part:
             a.value,
         ):
             return _danger(f"tar {a.value}: запуск программы")
-        if a.static and a.value in ("-I", "-F", "-P", "--absolute-names"):
-            return _danger(f"tar {a.value}")
-    first = args[0].value if args and args[0].static else ""
-    letters = first.lstrip("-")
-    long = {a.value for a in args if a.static and a.value.startswith("--")}
-    archive = _values(args, "-f", "--file")
-    if not archive and letters and "f" in letters and not first.startswith("--"):
-        # tar czf out.tar.gz src — архив сразу после букв
-        idx = 1
-        archive = args[idx : idx + 1]
-    directory = _values(args, "-C", "--directory")
-    _, pos = _split(_without_values(args, "-f", "--file", "-C", "--directory"))
-    mode_x = "x" in letters or "--extract" in long or "--get" in long
-    mode_c = (
-        "c" in letters
-        or "r" in letters
-        or "u" in letters
-        or "--create" in long
-        or "--append" in long
-    )
-    if "t" in letters or "--list" in long:
+    rest, found = _options(_tar_old_style(args), _TAR_VALUED)
+    flags, pos = _split(rest)
+    fl = _flagset(flags)
+    for n, _ in found:
+        if n in _TAR_DANGER_VALUED:
+            return _danger(f"tar {n}: запуск программы или файлы по списку")
+    if _has(fl, "-P", "--absolute-names"):
+        return _danger("tar -P: пути от корня")
+    archive = [w for n, w in found if n in ("-f", "--file")]
+    directory = [w for n, w in found if n in ("-C", "--directory")]
+    if _has(fl, "-t", "--list"):
         bad = _check_read(env, archive, "tar -t")
         return bad if bad is not None else _read("tar: список файлов архива")
-    if mode_x:
+    if _has(fl, "-x", "--extract", "--get"):
         bad = _check_read(env, archive, "tar -x")
         if bad is not None:
             return bad
         return _check_write(env, directory or [Word(".")], "tar -x: распаковка", edits=False)
-    if mode_c:
-        bad = _check_read(env, [p for p in pos if p not in archive], "tar -c")
+    if _has(fl, "-c", "-r", "-u", "-A", "--create", "--append", "--update", "--concatenate"):
+        # Каталоги читаются целиком (как grep -r), файлы после -C — от его каталога.
+        bad = _check_read(env, directory, "tar -C")
         if bad is not None:
             return bad
+        for d in [Word("."), *directory]:
+            rel = os.path.relpath((env.dir / d.value).resolve(), env.root)
+            bad = _check_recursive(replace(env, cwd=rel), pos, "tar -c")
+            if bad is not None:
+                return bad
         target = [a for a in archive if a.value != "-"]
         return _check_write(env, target, "tar -c: архив") if target else _read("tar -c в stdout")
     return _unknown("tar: режим не распознан")
@@ -1776,7 +1997,10 @@ def _zip_family(env: Env, name: str, args: list[Word]) -> Part:
         if bad is not None:
             return bad
         return _check_write(
-            env, _values(args, "-d") or [Word(".")], "unzip: распаковка", edits=False
+            env,
+            _values(args, "-d", valued=("-P",)) or [Word(".")],
+            "unzip: распаковка",
+            edits=False,
         )
     if name == "zip":
         if _has(fl, "-T", "-TT", "--test", "--unzip-command"):
@@ -1796,6 +2020,56 @@ def _zip_family(env: Env, name: str, args: list[Word]) -> Part:
     if not pos:
         return _read(f"{name}: stdin → stdout")
     return _check_write(env, pos, f"{name}: сжатие на месте", edits=False)
+
+
+_PATCH_VALUED = (
+    "-i",
+    "--input",
+    "-d",
+    "--directory",
+    "-o",
+    "--output",
+    "-r",
+    "--reject-file",
+    "-p",
+    "--strip",
+    "-F",
+    "--fuzz",
+    "-D",
+    "--ifdef",
+    "-B",
+    "--prefix",
+    "-Y",
+    "--basename-prefix",
+    "-z",
+    "--suffix",
+    "-V",
+    "--version-control",
+    "-g",
+    "--get",
+    "--quoting-style",
+)
+
+
+def _patch(env: Env, args: list[Word]) -> Part:
+    """patch: файл правки читается; пишутся файлы в каталоге -d, -o и -r (отклонённые)."""
+    rest, found = _options(args, _PATCH_VALUED)
+    flags, pos = _split(rest)
+    fl = _flagset(flags)
+    inputs = [w for n, w in found if n in ("-i", "--input")]
+    bad = _check_read(env, inputs + pos[1:], "patch")
+    if bad is not None:
+        return bad
+    if any(n in ("-B", "--prefix", "-Y", "--basename-prefix") for n, _ in found):
+        return _unknown("patch -B/-Y: каталог резервных копий")
+    if _has(fl, "--dry-run", "-C", "--check"):
+        return _read("patch --dry-run")
+    outputs = [
+        w for n, w in found if n in ("-o", "--output", "-r", "--reject-file") and w.value != "-"
+    ]
+    dirs = [w for n, w in found if n in ("-d", "--directory")]
+    written = [*(dirs or [Word(".")]), *outputs, *pos[:1]]
+    return _check_write(env, written, "patch: правка файлов", edits=True)
 
 
 def _dd(env: Env, args: list[Word]) -> Part:
@@ -2226,26 +2500,28 @@ def _go(env: Env, args: list[Word]) -> Part:
 
 
 def _make(env: Env, args: list[Word]) -> Part:
-    dirs = _values(args, "-C", "--directory")
-    makefiles = _values(args, "-f", "--file", "--makefile")
+    rest, found = _options(
+        args,
+        (
+            "-C",
+            "--directory",
+            "-f",
+            "--file",
+            "--makefile",
+            "-j",
+            "--jobs",
+            "-l",
+            "--load-average",
+            "-o",
+            "-W",
+            "-I",
+        ),
+    )
+    dirs = [w for n, w in found if n in ("-C", "--directory")]
+    makefiles = [w for n, w in found if n in ("-f", "--file", "--makefile")]
     bad = _check_read(env, dirs + makefiles, "make")
     if bad is not None:
         return bad
-    rest = _without_values(
-        args,
-        "-C",
-        "--directory",
-        "-f",
-        "--file",
-        "--makefile",
-        "-j",
-        "--jobs",
-        "-l",
-        "--load-average",
-        "-o",
-        "-W",
-        "-I",
-    )
     flags, pos = _split(rest)
     targets = [p.value for p in pos if p.static and "=" not in p.value]
     if any(not p.static for p in pos):
@@ -3499,6 +3775,10 @@ def _gh(name: str, args: list[Word], words: list[str]) -> Part:
     return _unknown(f"{name} {group} {action}: обращение к серверу".strip())
 
 
+# Короткие флаги docker run со значением: в группе `-itv /:/h` значение берёт последняя.
+_DOCKER_VALUED = ("-e", "-p", "-w", "-u", "-l", "-h", "-m", "-c", "--name", "--env")
+
+
 def _docker(env: Env, name: str, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
     if sub == "compose" or name in ("docker-compose", "podman-compose"):
@@ -3577,7 +3857,7 @@ def _docker(env: Env, name: str, args: list[Word]) -> Part:
                 or a.value.startswith("/:")
             )
         ]
-        vols = _values(rest, "-v", "--volume")
+        vols = _values(rest, "-v", "--volume", valued=_DOCKER_VALUED)
         if risky or any(
             v.value.startswith(("/", "~")) and not v.value.startswith(str(env.root)) for v in vols
         ):
@@ -4018,19 +4298,11 @@ def _dispatch(
         "unlink",
     ):
         if prog == "patch":
-            inputs = _values(args, "-i", "--input")
-            bad = _check_read(env, inputs, "patch")
-            if bad is not None:
-                return bad
-            if any(a.static and a.value in ("--dry-run", "-C", "--check") for a in args):
-                return _read("patch --dry-run")
-            dirs = _values(args, "-d", "--directory")
-            return _check_write(env, dirs or [Word(".")], "patch: правка файлов", edits=True)
+            return _patch(env, args)
         if prog == "iconv":
-            out = _values(args, "-o", "--output")
-            _, pos = _split(
-                _without_values(args, "-f", "-t", "--from-code", "--to-code", "-o", "--output")
-            )
+            rest, found = _options(args, ("-f", "-t", "--from-code", "--to-code", "-o", "--output"))
+            out = [w for n, w in found if n in ("-o", "--output")]
+            _, pos = _split(rest)
             bad = _check_read(env, pos, "iconv")
             if bad is not None:
                 return bad
