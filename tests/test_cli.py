@@ -726,6 +726,19 @@ def test_test_context_reports_failed_save(tmp_path, oneshot, capsys, monkeypatch
     assert "не сохранён" in out and "записано в" not in out
 
 
+@pytest.mark.parametrize("flag", ["-p", "--prompt", "--test-context"])
+@pytest.mark.parametrize("value", ["", "  "])
+def test_empty_prompt_or_model_is_an_error(tmp_path, oneshot, capsys, flag, value):
+    # -p "$TASK" с пустой переменной — ошибка, а не REPL, который в CI сразу выходит с 0
+    provider = WindowProvider(8_192, [text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, f"{flag}={value}") == 1
+    out = _flat(capsys)
+    shown = "-p" if flag == "--prompt" else flag
+    assert f"{shown}: пустое значение" in out and "gigacrew>" not in out
+    assert provider.requests == [] and provider.measured == []
+
+
 def test_oneshot_does_not_measure_unknown_window(tmp_path, oneshot, capsys, monkeypatch):
     """Замер оплачивается — в -p (в том числе в CI) он не делается, только подсказка."""
     provider = WindowProvider(8_192, [text_turn("ok")])
