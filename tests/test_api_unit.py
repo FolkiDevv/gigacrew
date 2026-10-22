@@ -215,6 +215,41 @@ def test_object_result_passed_as_is():
     assert ApiProvider._result_object('{"a": 1}') == {"a": 1}
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"loss": NaN}',
+        '{"max": Infinity, "min": -Infinity}',
+        '{"big": 1e400}',
+        '{"nested": {"items": [1, NaN]}}',
+    ],
+)
+def test_result_with_non_finite_numbers_is_text(content):
+    """json.loads принимает NaN/Infinity, а тело запроса — строгий JSON (httpx отверг бы его
+    ValueError, и сообщение сломало бы каждый следующий запрос чата): такой результат — текст."""
+    result = ApiProvider._result_object(content)
+    assert result == {"result": content}
+    json.dumps(result, allow_nan=False)  # тело запроса собирается
+
+
+def test_arguments_with_non_finite_numbers_are_dropped():
+    """Вызов из ответа уходит обратно в истории: NaN в аргументах сломал бы каждый запрос."""
+    data = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"function_call": {"id": "c1", "name": "f", "arguments": '{"x": NaN}'}},
+                    {"function_call": {"id": "c2", "name": "g", "arguments": {"y": float("inf")}}},
+                    {"function_call": {"id": "c3", "name": "h", "arguments": {"z": 1.5}}},
+                ],
+            }
+        ]
+    }
+    calls = ApiProvider._parse_response(data).message.function_calls
+    assert [(c.name, c.arguments) for c in calls] == [("f", {}), ("g", {}), ("h", {"z": 1.5})]
+
+
 # ------------------------------ ответ ------------------------------ #
 def test_parse_response_with_reasoning_text_and_parallel_calls():
     """Ответ с живого API (curl): рассуждения, текст и два вызова."""

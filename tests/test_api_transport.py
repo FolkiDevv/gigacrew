@@ -7,6 +7,7 @@ ApiError (иначе они роняют REPL).
 from __future__ import annotations
 
 import json
+import math
 import ssl
 import time
 
@@ -241,6 +242,37 @@ def test_non_retryable_transport_errors_wrapped(exc):
         p.complete(_msgs())
     with pytest.raises(ApiError):
         p.stream(_msgs())
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_result_with_nan_does_not_break_the_chat(streaming):
+    """Результат вызова — JSON-объект с NaN (файл, записанный json.dump): запрос уходит,
+    результат — текстом, а не ValueError до отправки на каждом следующем ходе."""
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        bodies.append(json.loads(request.content))
+        if streaming:
+            return httpx.Response(200, content=_done("ok"))
+        return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+    history = [
+        Message(role="user", content="покажи метрики"),
+        Message(
+            role="assistant",
+            function_calls=[FunctionCall(name="skill", arguments={}, id="c1")],
+            state_id="S",
+        ),
+        Message(role="function", name="skill", content='{"loss": NaN}', call_id="c1"),
+    ]
+    p = _provider(handler)
+    assert (p.stream if streaming else p.complete)(history).message.content == "ok"
+    (body,) = bodies
+    result = body["messages"][-1]["content"][0]["function_result"]["result"]
+    assert result == {"result": '{"loss": NaN}'}
     p.close()
 
 
@@ -524,6 +556,38 @@ def test_error_body_is_clipped():
 def test_negative_retry_after_does_not_crash():
     resp = httpx.Response(429, headers={"Retry-After": "-5"})
     assert ApiProvider._retry_after(resp, 1.0) == 0.0
+
+
+@pytest.mark.parametrize("header", ["nan", "NaN", "inf", "-inf", "1e400"])
+@pytest.mark.parametrize("status", [429, 503])
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_non_finite_retry_after_is_ignored(monkeypatch, header, status, streaming):
+    """Retry-After: nan — не ValueError из time.sleep, а обычная пауза по умолчанию."""
+    pauses: list[float] = []
+
+    def strict_sleep(seconds: float) -> None:
+        if not math.isfinite(seconds):  # как настоящий time.sleep
+            raise ValueError("Invalid value NaN (not a number)")
+        pauses.append(seconds)
+
+    calls = {"chat": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        calls["chat"] += 1
+        if calls["chat"] == 1:
+            return httpx.Response(status, headers={"Retry-After": header}, text="busy")
+        if streaming:
+            return httpx.Response(200, content=_done("ok"))
+        return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+    p = _provider(handler)
+    monkeypatch.setattr(api.time, "sleep", strict_sleep)
+    assert (p.stream if streaming else p.complete)(_msgs()).message.content == "ok"
+    assert pauses == [5.0 if status == 429 else 1.0]  # пауза по умолчанию
+    assert calls["chat"] == 2
+    p.close()
 
 
 # ------------------------------ лимит запросов (429) ------------------------------ #

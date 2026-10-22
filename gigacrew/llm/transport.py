@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import ssl
 import time
 from abc import abstractmethod
@@ -135,9 +136,12 @@ def retry_after(resp: httpx.Response, default: float) -> float:
     ra = resp.headers.get("Retry-After")
     if ra:
         try:
-            return max(min(float(ra), 30.0), 0.0)  # отрицательное — ValueError в sleep
+            value = float(ra)
         except ValueError:
-            pass
+            return default
+        # nan и бесконечность — ValueError в sleep (nan проходит и через min/max).
+        if math.isfinite(value):
+            return max(min(value, 30.0), 0.0)  # отрицательное — ValueError в sleep
     return default
 
 

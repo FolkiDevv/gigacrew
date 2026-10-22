@@ -57,6 +57,16 @@ def chat_url(base_url: str) -> str:
     return _VERSION_SUFFIX.sub("/v2", base_url.rstrip("/")) + "/chat/completions"
 
 
+def _strict_json(value: Any) -> bool:
+    """Сериализуется ли значение строгим JSON. ``json.loads`` (и ``resp.json()``) принимают
+    NaN и Infinity, а тело запроса httpx собирает без них — ValueError до отправки."""
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _build_function_call(raw: Any) -> FunctionCall | None:
     if not isinstance(raw, Mapping) or not raw.get("name"):
         return None
@@ -67,12 +77,11 @@ def _build_function_call(raw: Any) -> FunctionCall | None:
             args = json.loads(args) if args.strip() else {}
         except json.JSONDecodeError:
             args = {}
+    # Вызов уходит обратно в истории: NaN в аргументах ломал бы каждый следующий запрос.
+    if not isinstance(args, dict) or not _strict_json(args):
+        args = {}
     call_id = raw.get("id")
-    return FunctionCall(
-        name=raw["name"],
-        arguments=args if isinstance(args, dict) else {},
-        id=str(call_id) if call_id else None,
-    )
+    return FunctionCall(name=raw["name"], arguments=args, id=str(call_id) if call_id else None)
 
 
 def _has_reasoning(payload: Mapping[str, Any]) -> bool:
@@ -254,13 +263,14 @@ class ApiProvider(HttpProvider):
         Объект передаётся как есть, всё остальное — текст, но и голые JSON-значения
         (``42``, ``true``, ``[]`` — например, листинг из одного файла ``1``) —
         заворачивается в ``{"result": ...}``: отвергнутое API сообщение осталось бы
-        в истории и ломало бы каждый следующий запрос этого чата."""
+        в истории и ломало бы каждый следующий запрос этого чата. Объект с NaN или
+        Infinity — тоже текст: строгим JSON тело запроса с ним не собрать."""
         text = content or ""
         try:
             value = json.loads(text)
         except ValueError:
             value = None
-        return value if isinstance(value, dict) else {"result": text}
+        return value if isinstance(value, dict) and _strict_json(value) else {"result": text}
 
     @staticmethod
     def _assistant_payload(msg: Message) -> dict[str, Any]:
