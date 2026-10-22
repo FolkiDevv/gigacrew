@@ -3936,10 +3936,12 @@ def _program(env: Env, word: Word) -> tuple[str, Part | None]:
     value = word.value
     if "/" not in value:
         return value, None
-    if value.startswith(_SYSTEM_DIRS) and value.count("/") >= 2:
-        name = value.rsplit("/", 1)[-1]
-        return name, None
+    if value.startswith("~"):  # оболочка раскроет в домашний каталог — вне проекта
+        return value, _unknown(f"{value}: программа вне проекта")
     lexical = Path(os.path.normpath(env.dir / value if not value.startswith("/") else value))
+    # Системный каталог — после нормализации: `/usr/bin/../../проект/ls` — файл проекта.
+    if str(lexical).startswith(_SYSTEM_DIRS) and not _inside(env, lexical):
+        return lexical.name, None
     if lexical == env.root or env.root in lexical.parents:
         venv = _venv_root(lexical.parent) if lexical.parent.name in ("bin", "Scripts") else None
         if venv is not None:

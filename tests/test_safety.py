@@ -246,6 +246,20 @@ def test_program_from_project_path_is_exec(root, monkeypatch):
     assert level("./bin/cat a.txt", root) is EXEC
 
 
+def test_program_path_is_normalized_before_trusting_system_dir(root):
+    (root / "sub").mkdir()
+    fake = root / "sub" / "ls"
+    fake.write_text("#!/bin/sh\nid\n")
+    fake.chmod(0o755)
+    assert level("/usr/bin/cat a.txt", root) is READ
+    # путь начинается с системного каталога, но ведёт в файлы проекта
+    climb = "/usr/bin/" + "../" * 2 + str(root).lstrip("/") + "/sub/ls"
+    assert level(climb, root) is EXEC
+    assert level("/usr/bin/../../tmp/x/cat a.txt", root) is None
+    assert level("/tmp/x/cat a.txt", root) is None  # программа вне проекта
+    assert level("~/bin/ls", root) is None  # оболочка раскроет ~ в домашний каталог
+
+
 @pytest.mark.parametrize(
     "command, expected",
     [
