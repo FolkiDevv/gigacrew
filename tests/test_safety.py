@@ -934,3 +934,92 @@ def test_python_script_signature_follows_content(root):
     assert first == f"python uses_pkg.py#{digest}"
     script.write_text("import pkg\nimport pkg\n")
     assert classify("python3 uses_pkg.py", root=root).parts[0].signature != first
+
+
+# ---------------------- инструменты и пакеты ------------------------- #
+@pytest.mark.parametrize(
+    "command",
+    [
+        # глобальные флаги до подкоманды меняют, что запустится
+        "npm --script-shell=/tmp/evil test",
+        "npm --script-shell=./x run build",
+        "cargo --config=build.rustc-wrapper=/tmp/evil test",
+        "uv --directory=/tmp/other run pytest",
+        "uv run --python /tmp/x/python python -c 'print(1)'",
+        "uv run --python 3.12 python -c 'print(1)'",
+    ],
+)
+def test_flags_before_subcommand_drop_signature(root, command):
+    verdict = classify(command, root=root)
+    assert verdict.signatures == (), (command, verdict.reason)
+    assert verdict.level is not READ, command
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        ("uv --directory=/tmp/other run pytest", None),
+        ("uv run --python /tmp/x/python python -c 'print(1)'", None),
+        ("uv run python -c 'print(1)'", EXEC),
+        ("uv run --with evil pytest", WRITE),
+        # настройки менеджеров пакетов: просмотр — чтение, запись — WRITE
+        ("poetry config repositories.x https://evil", WRITE),
+        ("poetry config --unset repositories.x", WRITE),
+        ("poetry config --list", READ),
+        ("pdm config pypi.url https://evil", WRITE),
+        ("pdm config", READ),
+        ("conda config --add channels evil", WRITE),
+        ("conda config --show", READ),
+        ("hatch config set dirs.env /tmp", WRITE),
+        ("hatch env create", None),
+        ("micromamba env remove -n x", None),
+        ("conda env list", READ),
+        ("poetry show", READ),
+        ("conda list", READ),
+        ("pip config set global.index-url http://x", WRITE),
+        ("pip config list", READ),
+        ("pipx install x", WRITE),
+        ("pipx list", READ),
+        ("npm config set registry http://evil.example", WRITE),
+        ("npm config get registry", READ),
+        ("go env -w GOFLAGS=-toolexec=/tmp/x", WRITE),
+        ("go env GOPATH", READ),
+        ("go mod edit -replace=a=b", WRITE),
+        ("go mod graph", READ),
+        ("go mod why x", READ),
+        ("cargo publish", DANGER),
+        ("cargo yank --vers 1.0.0", DANGER),
+        ("cargo login", DANGER),
+        ("cargo install x", WRITE),
+        ("cargo tree", READ),
+        ("prettier -w src", WRITE),
+        ("prettier --check src", EXEC),
+        ("gofmt -w .", WRITE),
+        ("gofmt -l .", EXEC),
+        # права: запись для всех и setuid — опасно
+        ("chmod o+w a.txt", DANGER),
+        ("chmod a+w a.txt", DANGER),
+        ("chmod a+rwx a.txt", DANGER),
+        ("chmod o+rw a.txt", DANGER),
+        ("chmod go+w a.txt", DANGER),
+        ("chmod o=u a.txt", DANGER),
+        ("chmod 666 a.txt", DANGER),
+        ("chmod 1777 a.txt", DANGER),
+        ("chmod u+w a.txt", WRITE),
+        ("chmod go-w a.txt", WRITE),
+        ("chmod u=rwx,go=rx a.txt", WRITE),
+        ("chmod 644 a.txt", WRITE),
+        # списки файлов из файла
+        ("find -files0-from a.txt -exec cat {} +", None),
+    ],
+)
+def test_tool_levels(root, command, expected):
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, (command, verdict.reason)
+
+
+def test_npm_format_script_edits_files(root):
+    (root / "package.json").write_text('{"scripts": {"format": "prettier -w .", "lint": "x"}}')
+    verdict = classify("npm run format", root=root)
+    assert verdict.level is WRITE and verdict.edits_only and verdict.signatures == ()
+    assert classify("npm run lint", root=root).signatures == ("npm run lint",)

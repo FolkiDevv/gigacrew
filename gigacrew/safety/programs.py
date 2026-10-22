@@ -1312,6 +1312,8 @@ _FIND_WRITES = frozenset({"-fprint", "-fprint0", "-fprintf", "-fls"})
 
 
 def _find(env: Env, name: str, args: list[Word], classify: Callable[[Command], Part]) -> Part:
+    if any(a.static and a.value == "-files0-from" for a in args):
+        return _unknown("find -files0-from: каталоги поиска по списку из файла")
     starts: list[Word] = []
     i = 0
     while i < len(args) and not (
@@ -1928,9 +1930,28 @@ def _chmod(env: Env, args: list[Word]) -> Part:
     if not pos:
         return _unknown("chmod без аргументов")
     mode = pos[0].value if pos[0].static else ""
-    if not mode or re.search(r"[st]|777|[0-7]?[0-7][0-7][2367]$|o\+w|a\+w|^[1-7][0-7]{3}$", mode):
+    if (
+        not mode
+        or re.search(r"[st]|777|[0-7]?[0-7][0-7][2367]$|^[1-7][0-7]{3}$", mode)
+        or _chmod_world_writable(mode)
+    ):
         return _danger(f"chmod {mode}: права для всех или setuid")
     return _check_write(env, pos[1:], "chmod")
+
+
+def _chmod_world_writable(mode: str) -> bool:
+    """Символьный режим даёт запись «прочим»: `o+w`, `a+rwx`, `go+w`, `o=u` (копия)."""
+    for clause in mode.split(","):
+        m = re.fullmatch(r"([ugoa]*)((?:[-+=][rwxXst]*|[-+=][ugo])+)", clause)
+        if m is None:
+            return bool(clause) and not clause.isdigit()  # не разобрать — осторожно
+        who, ops = m.groups()
+        if who and not set(who) & set("oa"):
+            continue
+        for op, perms in re.findall(r"([-+=])([rwxXstugo]*)", ops):
+            if op in "+=" and ("w" in perms or set(perms) & set("ugo")) and who:
+                return True
+    return False
 
 
 # Флаги tar со значением (короткие — как в getopt GNU tar).
@@ -2412,8 +2433,15 @@ _NPM_DANGER = frozenset(
 )
 
 
+def _before_sub(args: list[Word], rest: list[Word]) -> list[Word]:
+    """Глобальные флаги до подкоманды (`npm --script-shell=x test`): _subcommand их
+    пропускает, а они меняют, что запустится, — проверяются вместе с аргументами."""
+    return args[: len(args) - len(rest) - 1]
+
+
 def _npm(env: Env, name: str, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
+    pre = _before_sub(args, rest)
     if not sub:
         if args and args[0].static and args[0].value in ("-v", "--version"):
             return _read(f"{name} --version")
@@ -2422,7 +2450,7 @@ def _npm(env: Env, name: str, args: list[Word]) -> Part:
         return _danger(f"{name} {sub}: публикация или учётная запись реестра")
     if sub in ("test", "t", "tst", "start", "stop", "restart", "build"):
         signature = f"{name} {sub}" if sub != "t" else f"{name} test"
-        return _exec_tool(env, rest, f"{name} {sub}: скрипт package.json", signature)
+        return _exec_tool(env, [*pre, *rest], f"{name} {sub}: скрипт package.json", signature)
     if sub in ("run", "run-script", "rum", "urn"):
         script, script_args = _subcommand(rest)
         if not script:
@@ -2434,7 +2462,10 @@ def _npm(env: Env, name: str, args: list[Word]) -> Part:
         if re.search(r"format|fmt|fix|prettier|lint:fix", script):
             return _write(f"{name} run {script}: правка файлов", edits=True)
         return _exec_tool(
-            env, script_args, f"{name} run {script}: скрипт package.json", f"{name} run {script}"
+            env,
+            [*pre, *script_args],
+            f"{name} run {script}: скрипт package.json",
+            f"{name} run {script}",
         )
     if sub == "config":
         action, _ = _subcommand(rest)
@@ -2454,9 +2485,9 @@ def _npm(env: Env, name: str, args: list[Word]) -> Part:
             return _danger(f"{name} {sub}: похоже на публикацию")
         if re.search(r"format|fmt|fix", sub):
             return _write(f"{name} {sub}: правка файлов", edits=True)
-        return _exec_tool(env, rest, f"{name} {sub}: скрипт package.json", f"{name} {sub}")
+        return _exec_tool(env, [*pre, *rest], f"{name} {sub}: скрипт package.json", f"{name} {sub}")
     if name == "bun" and sub in ("test", "build"):
-        return _exec_tool(env, rest, f"bun {sub}", f"bun {sub}")
+        return _exec_tool(env, [*pre, *rest], f"bun {sub}", f"bun {sub}")
     return _unknown(f"{name} {sub}: подкоманда не проверена")
 
 
@@ -2532,6 +2563,7 @@ _CARGO_DANGER = frozenset({"publish", "yank", "login", "logout", "owner"})
 
 def _cargo(env: Env, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
+    pre = _before_sub(args, rest)  # `cargo --config=build.rustc-wrapper=… test`
     if not sub and args and args[0].static and args[0].value in ("--version", "-V"):
         return _read("cargo --version")
     if sub in _CARGO_DANGER:
@@ -2540,7 +2572,7 @@ def _cargo(env: Env, args: list[Word]) -> Part:
         return _net(f"cargo {sub}")
     if sub == "fmt":
         if "--check" in _flagset(_split(rest)[0]):
-            return _exec_tool(env, rest, "cargo fmt --check", "cargo fmt --check")
+            return _exec_tool(env, [*pre, *rest], "cargo fmt --check", "cargo fmt --check")
         return _write("cargo fmt: форматирование", edits=True)
     if sub == "fix":
         return _write("cargo fix: правка файлов", edits=True)
@@ -2551,7 +2583,9 @@ def _cargo(env: Env, args: list[Word]) -> Part:
         return _read(f"cargo {sub}: сведения")
     if level is CommandLevel.EXEC:
         canon = {"b": "build", "c": "check", "t": "test", "r": "run"}.get(sub, sub)
-        return _exec_tool(env, rest, f"cargo {canon}: сборка и запуск кода", f"cargo {canon}")
+        return _exec_tool(
+            env, [*pre, *rest], f"cargo {canon}: сборка и запуск кода", f"cargo {canon}"
+        )
     return _unknown(f"cargo {sub}: подкоманда не проверена")
 
 
@@ -2755,6 +2789,7 @@ def _py_project_tool(
     env: Env, name: str, args: list[Word], classify: Callable[[Command], Part]
 ) -> Part:
     sub, rest = _subcommand(args)
+    pre = _before_sub(args, rest)  # `uv --directory=/другой/проект run pytest`
     if not sub:
         if args and args[0].static and args[0].value in ("--version", "-V", "version"):
             return _read(f"{name} --version")
@@ -2785,7 +2820,11 @@ def _py_project_tool(
             inner = inner[1:]
         if not inner:
             return _unknown(f"{name} run без команды")
-        flagged = len(inner) != len(rest)  # --with пакет, --python …: только точная команда
+        bad = _check_exec_args(env, [*pre, *rest[: len(rest) - len(inner)]], f"{name} run")
+        if bad is not None:  # --python /tmp/x/python, --directory вне проекта
+            return bad
+        # --with пакет, --python …, глобальные флаги: только точная команда
+        flagged = bool(pre) or len(inner) != len(rest)
         if any(
             a.static
             and a.value.split("=", 1)[0]
@@ -2802,25 +2841,22 @@ def _py_project_tool(
                 sub_part,
                 level=EXEC,
                 reason=f"{name} run: {sub_part.reason}",
-                signature=sub_part.signature or _first(inner),
+                signature=None if flagged else (sub_part.signature or _first(inner)),
             )
         return sub_part
     if name == "uv" and sub == "pip":
         return _pip(env, "uv pip", rest)
-    if sub in (
-        "--version",
-        "version",
-        "tree",
-        "show",
-        "list",
-        "info",
-        "env",
-        "help",
-        "check",
-        "config",
-    ) and not (name == "poetry" and sub == "env"):
-        if name in ("conda", "mamba") and sub == "env":
-            return _unknown(f"{name} env")
+    if sub == "config":
+        return _py_tool_config(name, rest)
+    if sub == "env":
+        # poetry env use/remove, conda env create, hatch env prune — меняют окружения
+        action = _subcommand(rest)[0]
+        if action in ("list", "show", "info", "find") and name != "poetry":
+            return _read(f"{name} env {action}: сведения")
+        if name == "poetry" and action in ("list", "info"):
+            return _read(f"{name} env {action}: сведения")
+        return _unknown(f"{name} env {action}".strip() + ": изменение окружений")
+    if sub in ("--version", "version", "tree", "show", "list", "info", "help", "check"):
         return _read(f"{name} {sub}: сведения")
     if sub in ("build",):
         return _exec(f"{name} build: сборка пакета", f"{name} build")
@@ -2850,6 +2886,32 @@ def _py_project_tool(
     ):
         return _net(f"{name} {sub}")
     return _unknown(f"{name} {sub}: подкоманда не проверена")
+
+
+def _py_tool_config(name: str, rest: list[Word]) -> Part:
+    """poetry/pdm/conda/hatch config: просмотр — чтение; ключ со значением, --add/--set/
+    --unset, set/unset — запись глобальных настроек (адрес индекса, учётные данные)."""
+    flags, pos = _split(rest)
+    fl = _flagset(flags)
+    if any(not a.static for a in rest):
+        return _unknown(f"{name} config: аргумент известен только при выполнении")
+    writes = _has(
+        fl,
+        "--add",
+        "--append",
+        "--prepend",
+        "--set",
+        "--remove",
+        "--remove-key",
+        "--unset",
+        "-d",
+        "--delete",
+        "--edit",
+        "-e",
+    ) or (pos[:1] and pos[0].value in ("set", "unset", "update", "restore", "edit", "init"))
+    if writes or len(pos) > 1:  # `poetry config ключ значение`
+        return _write(f"{name} config: изменение настроек")
+    return _read(f"{name} config: просмотр настроек")
 
 
 def _first(words: list[Word]) -> str | None:
