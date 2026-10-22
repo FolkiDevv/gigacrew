@@ -276,11 +276,46 @@ def test_redact(text, expected):
     assert redact(text) == expected
 
 
+def _worktree(main: Path, wt: Path, name: str = "wt") -> None:
+    """Связанное рабочее дерево, как его делает ``git worktree add``."""
+    gitdir = main / ".git" / "worktrees" / name
+    gitdir.mkdir(parents=True)
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text(f"gitdir: {gitdir}\n")
+    (gitdir / "gitdir").write_text(f"{wt / '.git'}\n")  # обратная ссылка git
+
+
 def test_project_key_follows_worktree_to_main_checkout(tmp_path):
     main = tmp_path / "main"
-    (main / ".git" / "worktrees" / "wt").mkdir(parents=True)
-    wt = tmp_path / "wt"
-    wt.mkdir()
-    (wt / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'wt'}\n")
-    assert project_key(wt) == project_key(main)
+    _worktree(main, tmp_path / "wt")
+    assert project_key(tmp_path / "wt") == project_key(main)
     assert project_key(tmp_path / "other") != project_key(main)
+
+
+def test_worktrees_share_approvals(tmp_path, home):
+    main, wt = tmp_path / "main", tmp_path / "wt"
+    _worktree(main, wt)
+    memory(main, home).approve(verdict("pytest", main))
+    in_wt = memory(wt, home)  # без предупреждения «файл другого проекта»
+    assert [r.value for r in in_wt.rules] == ["pytest"]
+    assert in_wt.match(verdict("pytest", wt)) is not None
+    in_wt.approve(verdict("npm test", wt))
+    assert {r.value for r in memory(main, home).rules} == {"pytest", "npm test"}
+    # файл, записанный прежней версией из рабочего дерева (корень — его путь), — тоже свой
+    data = json.loads(in_wt.approvals_path.read_text())
+    in_wt.approvals_path.write_text(json.dumps({**data, "root": str(wt.resolve())}))
+    assert len(memory(main, home).rules) == 2
+
+
+@pytest.mark.parametrize("variant", ["no_back_link", "back_link_elsewhere", "missing"])
+def test_forged_git_file_does_not_borrow_another_projects_memory(tmp_path, variant):
+    # Скачанный (не клонированный) проект с файлом .git, указывающим на чужой репозиторий.
+    trusted, other = tmp_path / "trusted", tmp_path / "other"
+    gitdir = trusted / ".git" / "worktrees" / "x"
+    if variant != "missing":
+        gitdir.mkdir(parents=True)
+    if variant == "back_link_elsewhere":
+        (gitdir / "gitdir").write_text(f"{tmp_path / 'real-wt' / '.git'}\n")
+    other.mkdir()
+    (other / ".git").write_text("gitdir: ../trusted/.git/worktrees/x\n")
+    assert project_key(other) != project_key(trusted)
