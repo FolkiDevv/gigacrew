@@ -102,6 +102,9 @@ _TOKENS = frozenset(
 _SEPARATORS = frozenset({"&&", "||", ";", "&", "\n", "|", "|&", ";;"})
 _OUTPUT_OPS = frozenset({">", ">>", ">|", "&>", "&>>", "&>|"})
 _GLOB_CHARS = re.compile(r"[*?\[]")
+# Текст без разбора внутри (слово, тело heredoc) и неэкранированная ` в нём.
+_PLAIN_TEXT = frozenset({"word", "heredoc_body", "heredoc_content"})
+_BACKTICK = re.compile(r"(?<!\\)(?:\\\\)*`")
 _BRACE = re.compile(r"\{[^{}\0]*(,|\.\.)[^{}\0]*\}")
 
 
@@ -121,13 +124,15 @@ class Word:
 @dataclass(frozen=True)
 class Redirect:
     """Перенаправление. ``target`` — файл (``>``, ``>>``, ``<``, ``&>``); у heredoc и
-    herestring — ``body`` (``body_static`` — без подстановок)."""
+    herestring — ``body`` (``body_static`` — без подстановок, ``body_vars`` —
+    раскрываемые в нём переменные)."""
 
     op: str
     target: Word | None = None
     fd_dup: bool = False  # >&2, 2>&1 — дублирование дескриптора, не файл
     body: str | None = None
     body_static: bool = True
+    body_vars: tuple[str, ...] = ()
 
     @property
     def writes(self) -> bool:
@@ -270,6 +275,10 @@ class _Walker:
                 continue
             if t == "ERROR" or n.is_missing:
                 self.problem("команда не разобрана")
+            if n.child_count == 0 and t in _PLAIN_TEXT and _BACKTICK.search(_text(n)):
+                # Грамматика не разбирает `…` в теле heredoc и внутри ${…}, а оболочка
+                # выполнит: команда в нём не проверена.
+                self.problem("подстановка `…`, которую не удалось разобрать")
             stack.extend(n.children)
         return dynamic, names
 
@@ -296,9 +305,11 @@ class _Walker:
         items: list[tuple[object, str]] = []  # (узел, разделитель после него)
         self._flatten(nodes, items)
         leading = leading_cd
-        for node, sep in items:
-            # Только «cd X && …»: после «;» команда выполнится и там, где cd не сработал.
-            if leading and _is_cd(node) and sep in ("&&", ""):
+        for i, (node, sep) in enumerate(items):
+            # Только «cd X && …» (или cd в конце): после «;» и перевода строки (у него
+            # нет лексемы, разделитель пуст) команда выполнится и там, где cd не сработал.
+            last = i == len(items) - 1
+            if leading and _is_cd(node) and (sep == "&&" or (sep == "" and last)):
                 target = self._cd_target(node, cwd)
                 if target is not None:
                     cwd = target
@@ -527,7 +538,10 @@ class _Walker:
             return Redirect(op), []
         first = self.word(words[0])
         if node.type == "herestring_redirect":
-            return Redirect(op, body=first.value, body_static=first.static), words[1:]
+            redirect = Redirect(
+                op, body=first.value, body_static=first.static, body_vars=first.vars
+            )
+            return redirect, words[1:]
         if op in (">&", "<&") and first.static and (first.value.isdigit() or first.value == "-"):
             return Redirect(op, first, fd_dup=True), words[1:]
         if op == "<>":
@@ -538,6 +552,7 @@ class _Walker:
         quoted = False
         body = ""
         static = True
+        names: list[str] = []
         extra: list = []
         for c in node.children:
             if c.type == "heredoc_start":
@@ -545,7 +560,7 @@ class _Walker:
             elif c.type == "heredoc_body":
                 body = _text(c)
                 if not quoted:
-                    dynamic, _ = self.scan(c)
+                    dynamic, names = self.scan(c)
                     # `…` и $… в теле без кавычек у разделителя раскрываются оболочкой.
                     static = not dynamic and not re.search(r"(?<!\\)[`$]", body)
             elif c.type in ("<<", "<<-", "heredoc_end", "heredoc_content"):
@@ -554,7 +569,7 @@ class _Walker:
                 extra.append(c)
         if not quoted:
             body = _unescape_heredoc(body)
-        return Redirect("<<", body=body, body_static=static), extra
+        return Redirect("<<", body=body, body_static=static, body_vars=tuple(names)), extra
 
     def command(
         self, node, *, cwd: str, substituted: bool, extra: list[Redirect] | None = None
