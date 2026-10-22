@@ -1272,3 +1272,39 @@ def test_repl_turn_and_autosave_with_file_name_not_in_utf8(repl_env, capsys):
     (chat,) = ctx.chats.store.recent()
     assert chat.requests == 1 and chat.preview == "готово"
     assert "не сохранён" not in _out(capsys)
+
+
+def test_yes_does_not_approve_dangerous_commands_but_yes_all_does(tmp_path, oneshot):
+    # -y — правки и команды без вопросов, кроме опасных; --yes-all — и опасные.
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "x").write_text("1", encoding="utf-8")
+    remove = [tool_turn("run_shell", {"command": "rm -rf build"}), text_turn("ок")]
+    oneshot(ScriptedProvider(list(remove)))
+    assert _main(tmp_path, "-y", "-p", "почисти", "--no-save") == 0
+    assert (tmp_path / "build" / "x").exists()  # опасная — спросили, ответа нет
+    oneshot(ScriptedProvider(list(remove)))
+    assert _main(tmp_path, "--yes-all", "-p", "почисти", "--no-save") == 0
+    assert not (tmp_path / "build").exists()
+
+
+def test_hooks_reload_honours_hook_trust(tmp_path, capsys):
+    import json
+
+    from gigacrew.project.settings import HookEvent
+
+    ws = Workspace(tmp_path)
+    ws.settings_file.parent.mkdir(parents=True, exist_ok=True)
+    hook = {"type": "command", "command": "./check.sh"}
+    settings = {"hooks": {"PreToolUse": [{"matcher": "run_shell", "hooks": [hook]}]}}
+    ws.settings_file.write_text(json.dumps(settings), encoding="utf-8")
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, auto_approve=True)
+    ui = Console(no_color=True)
+    agent = Agent(ScriptedProvider(), build_default_registry(), cfg, ui)
+    commands = default_commands()
+    # хуки проекта — команды из репозитория: без подтверждения (и без терминала) — нет
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands, trust_hooks=False)
+    commands.dispatch("/hooks reload", ctx)
+    assert not agent.hooks.has(HookEvent.PRE_TOOL_USE, "run_shell")
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands, trust_hooks=True)
+    commands.dispatch("/hooks reload", ctx)
+    assert agent.hooks.has(HookEvent.PRE_TOOL_USE, "run_shell")

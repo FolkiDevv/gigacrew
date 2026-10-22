@@ -844,3 +844,33 @@ def test_confirm_shows_directory_command_runs_in(tmp_path, dangerous, command):
     ui._c.input = lambda prompt: "n"
     ui.confirm(call, tool.preview(RunShellParams(command=command), ctx), dangerous=dangerous)
     assert "каталог" not in buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ("", False),  # Enter — «нет»: вопрос о доверии хукам и о платном замере
+        ("x", False),
+        ("н", False),  # н и т — клавиши y и n в русской раскладке: не «да»
+        ("т", False),
+        ("нет", False),
+        ("y", True),
+        ("Да", True),
+        ("д", True),
+    ],
+)
+def test_ask_defaults_to_no(reply, expected):
+    ui, _ = _console()
+    ui._c.input = lambda prompt: reply
+    assert ui.ask("Разрешить хуки?", dangerous=True) is expected
+
+
+@pytest.mark.parametrize("reply", ["н", "т", "нет", "N", ""])
+def test_confirm_russian_layout_no_is_a_plain_refusal(reply):
+    from gigacrew.agent.events import Approval
+    from gigacrew.permissions import ToolKind
+
+    ui, _ = _console()
+    ui._c.input = lambda prompt: reply
+    result = ui.confirm(ToolCallInfo("run_shell", "ls", ToolKind.COMMAND), None, dangerous=False)
+    assert result.approval is Approval.NO and result.feedback == "" and result.answered
