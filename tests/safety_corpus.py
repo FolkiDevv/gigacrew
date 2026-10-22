@@ -782,8 +782,72 @@ D	sqlite3 app.db "DROP TABLE users"
 
 LEVELS = {"R": 0, "X": 1, "W": 2, "D": 3}
 
+# Исправленные метки: исходная разметка выше не меняется, поправка и её причина — здесь.
+# Метка правится, только если она расходится с определением уровней (levels.py,
+# programs.py) или с поведением, закреплённым в тестах, а не чтобы тест прошёл.
+_INSTALL = "установка пакетов — WRITE по определению уровней (levels.py, programs.py)"
+_GIT_REMOTE = (
+    "обычный обмен с удалённым репозиторием — WRITE, перезапись на сервере — DANGER "
+    "(tests/test_safety.py::test_git_reads_and_changes, README)"
+)
+_LINTER = "линтер или анализатор исполняет код инструмента — EXEC по определению уровней"
+RELABELED: dict[str, tuple[str, str]] = {
+    # D → W: сеть и сторонний код при установке — по замыслу «меняет окружение»
+    "go mod tidy": ("W", _INSTALL),
+    "uv lock": ("W", _INSTALL),
+    "uv sync": ("W", _INSTALL),
+    "docker build -t app .": ("W", _INSTALL),
+    "pip install requests": ("W", _INSTALL),
+    "pip install -r requirements.txt": ("W", _INSTALL),
+    "pip install -e .": ("W", _INSTALL),
+    "pip uninstall -y numpy": ("W", _INSTALL),
+    "npm install": ("W", _INSTALL),
+    "npm install left-pad": ("W", _INSTALL),
+    "npm install -g typescript": ("W", _INSTALL),
+    "yarn add lodash": ("W", _INSTALL),
+    "cargo install ripgrep": ("W", _INSTALL),
+    "go install golang.org/x/tools/gopls@latest": ("W", _INSTALL),
+    "go get github.com/foo/bar": ("W", _INSTALL),
+    "uv add httpx": ("W", _INSTALL),
+    "uv pip install torch": ("W", _INSTALL),
+    "brew install wget": ("W", _INSTALL),
+    "poetry add requests": ("W", _INSTALL),
+    "pipenv install flask": ("W", _INSTALL),
+    "conda install numpy": ("W", _INSTALL),
+    "mamba create -n env python=3.12": ("W", _INSTALL),
+    "pip download requests": ("W", _INSTALL),
+    "pip install --user black": ("W", _INSTALL),
+    "npx create-react-app my-app": ("W", _INSTALL),
+    "pnpm add -D vitest": ("W", _INSTALL),
+    "bun add zod": ("W", _INSTALL),
+    "deno install -A https://deno.land/x/tool.ts": ("W", _INSTALL),
+    # D → W: git push без перезаписи, clone/fetch/pull
+    "git push": ("W", _GIT_REMOTE),
+    "git push origin main": ("W", _GIT_REMOTE),
+    "git push -u origin feature": ("W", _GIT_REMOTE),
+    "git clone https://github.com/foo/bar": ("W", _GIT_REMOTE),
+    "git fetch origin": ("W", _GIT_REMOTE),
+    "git pull": ("W", _GIT_REMOTE),
+    "git submodule update --init --recursive": ("W", _GIT_REMOTE),
+    "git lfs pull": ("W", _GIT_REMOTE),
+    # R → X: исполняет код
+    'python -c "import gigacrew; print(gigacrew.__version__)"': (
+        "X",
+        "импорт пакета проекта исполняет его код",
+    ),
+    "ruff check . --diff": ("X", f"{_LINTER}; `ruff check .` в корпусе — X"),
+    "go vet ./...": ("X", f"{_LINTER}; go vet собирает пакеты"),
+    "dart analyze": ("X", f"{_LINTER}; как mypy в корпусе"),
+}
+
 
 def load(raw: str) -> list[tuple[str, int]]:
+    """Команды с метками (с поправками RELABELED)."""
+    return [(c, LEVELS[RELABELED[c][0]] if c in RELABELED else label) for c, label in parse(raw)]
+
+
+def parse(raw: str) -> list[tuple[str, int]]:
+    """Команды с исходными метками разметки."""
     items: list[tuple[str, int]] = []
     current: list[str] | None = None
     for line in raw.strip("\n").split("\n"):
