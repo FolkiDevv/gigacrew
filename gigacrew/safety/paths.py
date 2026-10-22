@@ -145,7 +145,8 @@ def scope(word: Word, *, root: Path, cwd: str = ".") -> Scope:
 
 
 def _walk(directory: Path, limit: int):
-    """Обход дерева как у поиска gigacrew (служебные каталоги пропускаются). Отдаёт
+    """Обход дерева целиком, как у ``grep -r`` и ``find``: служебные каталоги (build,
+    node_modules, .venv…) они не пропускают, значит, и проверка не пропускает. Отдаёт
     (каталог, подкаталоги, файлы); None — дерево больше ``limit`` записей."""
     seen = 0
     for current, dirs, names in os.walk(directory):
@@ -154,7 +155,6 @@ def _walk(directory: Path, limit: int):
             yield None
             return
         yield Path(current), dirs, names
-        dirs[:] = [d for d in dirs if not files.is_ignored_dir(d)]
 
 
 def has_secrets_under(

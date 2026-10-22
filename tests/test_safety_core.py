@@ -105,3 +105,35 @@ def test_variables_in_heredoc_body_are_checked_like_arguments(root, command):
 )
 def test_heredoc_body_without_secret_variables_stays_read(root, command):
     assert level(command, root) is READ
+
+
+# ------------------------ рекурсивное чтение ------------------------ #
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "build/.env",
+        "dist/.env",
+        "node_modules/p/credentials.json",
+        "node_modules/p/.npmrc",
+        ".venv/lib/.env",
+        ".tox/py/id_rsa",
+        ".gigacode/.env",
+    ],
+)
+def test_recursive_read_sees_secrets_in_service_dirs(root, secret):
+    """grep -r и find не пропускают build, node_modules, .venv: секреты там прочитаются."""
+    (root / secret).parent.mkdir(parents=True, exist_ok=True)
+    (root / "build").mkdir(exist_ok=True)
+    (root / "build" / "out.txt").write_text("hello\n")
+    assert level("grep -rn hello .", root) is READ
+    (root / secret).write_text("TOKEN=1\n")
+    assert level("grep -rn hello .", root) is None
+    assert level("find . -type f -exec cat {} +", root) is None
+
+
+@pytest.mark.parametrize("directory", ["build", "node_modules/p", ".venv"])
+def test_recursive_read_sees_escaping_links_in_service_dirs(root, directory):
+    (root / directory).mkdir(parents=True)
+    assert level("grep -Rn hello .", root) is READ
+    (root / directory / "lnk").symlink_to(Path.home())
+    assert level("grep -Rn hello .", root) is None
