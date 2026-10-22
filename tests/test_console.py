@@ -820,3 +820,27 @@ def test_confirm_marks_invisible_characters_in_diff():
     out = buf.getvalue()
     assert "+# ⟨U+202E⟩; rm -rf ~ ⟨U+202C⟩⟨U+0001⟩" in out  # и управляющие — не молча
     assert "‮" not in out and "-ok = 1" in out
+
+
+@pytest.mark.parametrize("dangerous", [True, False])
+@pytest.mark.parametrize("command", ["rm -rf build", "make\nmake install"])
+def test_confirm_shows_directory_command_runs_in(tmp_path, dangerous, command):
+    from gigacrew.permissions import ToolKind
+    from gigacrew.project.workspace import Workspace
+    from gigacrew.tools.base import ToolContext
+    from gigacrew.tools.shell import RunShellParams, RunShellTool
+
+    (tmp_path / "vendor" / "lib").mkdir(parents=True)
+    ctx = ToolContext(workspace=Workspace(tmp_path))
+    tool = RunShellTool()
+    ui, buf = _console()
+    ui._c.input = lambda prompt: "n"
+    call = ToolCallInfo("run_shell", command, ToolKind.COMMAND)
+    params = RunShellParams(command=command, cwd="vendor/lib/")
+    ui.confirm(call, tool.preview(params, ctx), dangerous=dangerous)
+    assert "▌ каталог  vendor/lib\n" in buf.getvalue()
+    # в корне проекта — без строки о каталоге
+    ui, buf = _console()
+    ui._c.input = lambda prompt: "n"
+    ui.confirm(call, tool.preview(RunShellParams(command=command), ctx), dangerous=dangerous)
+    assert "каталог" not in buf.getvalue()

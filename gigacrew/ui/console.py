@@ -1199,6 +1199,9 @@ class Console(AgentEvents):
         bar = self._bar(dangerous=dangerous)
         long_preview = self._confirm_head(call, preview, bar)
         labeled = []
+        where = _command_dir(call, preview)
+        if where:  # где выполнится команда — тоже часть того, что подтверждается
+            labeled.append(("каталог", p.muted, Text(where, style=f"bold {p.fg}")))
         if call.reason:
             label = "почему опасно" if dangerous else "почему спрашиваю"
             style = f"bold {p.danger}" if dangerous else p.muted
@@ -1631,6 +1634,15 @@ class Console(AgentEvents):
             if detail:
                 lines.append(self._fit(Text(f"  {detail}", style=p.dim)))
         return lines
+
+
+def _command_dir(call: ToolCallInfo, preview: Display | None) -> str:
+    """Каталог, где выполнится команда, если не корень проекта: превью команды
+    подписано «команда · <каталог>». Пусто — в корне (или это не команда)."""
+    if call.kind is not ToolKind.COMMAND or preview is None:
+        return ""
+    head, sep, where = preview.title.partition(" · ")
+    return where.strip() if sep and head == "команда" else ""
 
 
 def _exchange_starts(messages: Sequence[Message]) -> list[int]:
