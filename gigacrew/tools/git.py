@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from gigacrew.safety.gitconfig import repo_config_runs_programs
 from gigacrew.security import RiskLevel
-from gigacrew.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
+from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.process import run_process, truncate_middle
 
 # Разрешённые подкоманды. Деструктивные (reset --hard, clean, push --force)
 # намеренно не входят — их при необходимости вызывают через run_shell с
-# подтверждением.
+# подтверждением. Формы разрешённых, теряющие работу (restore, checkout -- <пути>,
+# branch -D, stash drop/clear), — опасные: о них спрашивают и с -y.
 _READ_ONLY = {"status", "diff", "log", "show"}
 _ALLOWED = _READ_ONLY | {
     "branch",
@@ -93,6 +95,70 @@ def _is_forbidden(arg: str) -> bool:
     )
 
 
+def _options(args: list[str], valued: frozenset[str] = frozenset()) -> tuple[set[str], list[str]]:
+    """(опции, позиционные до ``--``): ``--name`` без значения, буквы ``-abc`` по отдельности.
+    Слово после опции из ``valued`` — её значение, а не позиционный аргумент."""
+    flags: set[str] = set()
+    positional: list[str] = []
+    skip = False
+    for arg in args:
+        if arg == "--":
+            break
+        if skip:
+            skip = False
+        elif arg.startswith("--"):
+            flags.add(arg.split("=", 1)[0])
+            skip = arg in valued
+        elif arg.startswith("-") and arg != "-":
+            flags.add(arg)
+            if arg[1:].isalpha():
+                flags.update("-" + ch for ch in arg[1:])
+            skip = arg in valued
+        else:
+            positional.append(arg)
+    return flags, positional
+
+
+def _has(flags: set[str], *names: str) -> bool:
+    """Есть ли опция; длинную git принимает и сокращённой (`--del` — это `--delete`)."""
+    return any(
+        f == n or (f.startswith("--") and len(f) >= 3 and n.startswith(f))
+        for f in flags
+        for n in names
+    )
+
+
+def _discards_work(sub: str, args: list[str], root: Path) -> str:
+    """Почему вызов теряет работу (правки, ветки, отложенное) — как у классификатора
+    run_shell; "" — не теряет. Такие вызовы спрашиваются и с ``-y``."""
+    flags, positional = _options(args, frozenset({"-b", "-B", "--orphan"}))
+    lost = "незакоммиченные правки будут потеряны"
+    if sub == "branch" and (
+        "-D" in flags or (_has(flags, "-d", "--delete") and _has(flags, "-f", "--force"))
+    ):
+        return "git branch -D: удаление ветки без проверки слияния"
+    if sub == "stash" and positional[:1] in (["drop"], ["clear"]):
+        return f"git stash {positional[0]}: удаление отложенных правок"
+    if sub == "checkout":
+        if _has(flags, "-f", "--force"):
+            return f"git checkout -f: {lost}"
+        paths = args[args.index("--") + 1 :] if "--" in args else []
+        # `checkout <ревизия> <пути>`, `checkout <файл>` или шаблон путей — это не ветка
+        if (
+            paths
+            or len(positional) > 1
+            or any(
+                p.startswith(":") or set(p) & set("*?[") or (root / p).exists() for p in positional
+            )
+        ):
+            return f"git checkout <файл>: {lost}"
+    if sub == "restore" and (not _has(flags, "-S", "--staged") or _has(flags, "-W", "--worktree")):
+        return f"git restore: {lost}"
+    if sub == "switch" and _has(flags, "--discard-changes", "-f", "--force"):
+        return f"git switch --discard-changes: {lost}"
+    return ""
+
+
 def _branch_is_listing(args: list[str]) -> bool:
     flags = [a for a in args if a.startswith("-")]
     positional = [a for a in args if not a.startswith("-")]
@@ -120,13 +186,14 @@ class GitTool(Tool):
     description = (
         "Runs git operations in the project repository. Supported: status, diff, log, "
         "show, branch (without arguments — list branches), stash list/show (read-only); "
-        "add, commit, checkout, switch, restore, stash (changing). Destructive operations "
-        "and the --output/--no-index options are not available. No editor is opened — "
-        "pass -m to commit."
+        "add, commit, checkout, switch, restore, stash (changing). Destructive subcommands "
+        "(reset, clean, push) and the --output/--no-index options are not available; forms "
+        "that discard work (restore, checkout <paths>, branch -D, stash drop/clear) always "
+        "need the user's confirmation. No editor is opened — pass -m to commit."
     )
     Params = GitParams
 
-    def risk(self, params: GitParams, ctx: ToolContext) -> RiskLevel:
+    def assess(self, params: GitParams, ctx: ToolContext) -> Assessment:
         # Читающая подкоманда, которой нет в инструменте, — ошибка с подсказкой до решения по
         # режиму: иначе в режиме плана и у explore `git blame` отклонялся бы как изменение.
         # Изменяющие (push, merge…) по-прежнему блокирует режим.
@@ -139,12 +206,16 @@ class GitTool(Tool):
             or (sub == "stash" and bool(args) and args[0] in ("list", "show"))
         )
         if not reading:
-            return RiskLevel.WRITE
+            reason = _discards_work(sub, args, ctx.root) if sub in _ALLOWED else ""
+            return Assessment(RiskLevel.DANGEROUS if reason else RiskLevel.WRITE, reason=reason)
         # diff/log/show запускают textconv и clean-фильтры из настроек репозитория:
         # если такие есть, чтение — уже не только чтение.
         if repo_config_runs_programs(ctx.root) is not False:
-            return RiskLevel.WRITE
-        return RiskLevel.SAFE
+            return Assessment(RiskLevel.WRITE)
+        return Assessment(RiskLevel.SAFE)
+
+    def risk(self, params: GitParams, ctx: ToolContext) -> RiskLevel:
+        return self.assess(params, ctx).risk
 
     def _check(self, params: GitParams) -> None:
         sub = params.subcommand

@@ -208,7 +208,7 @@ def test_git_forbidden_option_after_double_dash_is_rejected(git_ctx):
         ("branch", ["--show-current"], RiskLevel.SAFE),
         ("branch", ["-a", "-v"], RiskLevel.SAFE),
         ("branch", ["--list", "feat*"], RiskLevel.SAFE),
-        ("branch", ["-D", "main"], RiskLevel.WRITE),
+        ("branch", ["-D", "main"], RiskLevel.DANGEROUS),
         ("branch", ["-m", "new"], RiskLevel.WRITE),
         ("branch", ["newbranch"], RiskLevel.WRITE),
         ("stash", ["list"], RiskLevel.SAFE),

@@ -7,6 +7,8 @@ import sys
 
 import pytest
 
+from gigacrew.permissions import Decision, PermissionMode, decide
+from gigacrew.security import RiskLevel
 from gigacrew.tools.base import ToolError
 from gigacrew.tools.fs import WriteFileTool
 from gigacrew.tools.git import GitTool
@@ -223,6 +225,88 @@ def test_git_forbidden_options_for_every_subcommand(stashed_repo, sub, args):
         g.run(params, stashed_repo)
 
 
+@pytest.mark.parametrize(
+    "sub, args, reason",
+    [
+        ("branch", ["-D", "feature"], "git branch -D: удаление ветки без проверки слияния"),
+        ("branch", ["--delete", "--force", "feature"], "git branch -D"),
+        ("branch", ["-df", "feature"], "git branch -D"),
+        ("branch", ["--del", "--forc", "feature"], "git branch -D"),  # сокращения опций
+        ("stash", ["drop"], "git stash drop: удаление отложенных правок"),
+        ("stash", ["clear"], "git stash clear: удаление отложенных правок"),
+        ("checkout", ["--", "f.txt"], "git checkout <файл>: незакоммиченные правки"),
+        ("checkout", ["HEAD", "f.txt"], "git checkout <файл>"),
+        ("checkout", ["f.txt"], "git checkout <файл>"),
+        ("checkout", ["."], "git checkout <файл>"),
+        ("checkout", ["*.txt"], "git checkout <файл>"),
+        ("checkout", ["-f"], "git checkout -f: незакоммиченные правки будут потеряны"),
+        ("checkout", ["--force", "HEAD"], "git checkout -f"),
+        ("restore", ["f.txt"], "git restore: незакоммиченные правки будут потеряны"),
+        ("restore", ["."], "git restore"),
+        ("restore", ["--staged", "--worktree", "f.txt"], "git restore"),
+        ("restore", ["-SW", "f.txt"], "git restore"),
+        ("switch", ["--discard-changes", "x"], "git switch --discard-changes: незакоммиченные"),
+        ("switch", ["-f", "x"], "git switch --discard-changes"),
+        ("switch", ["--force", "x"], "git switch --discard-changes"),
+    ],
+)
+def test_git_destructive_operations_are_dangerous(stashed_repo, sub, args, reason):
+    """Как и через run_shell: -y и хук `allow` не запускают их без вопроса."""
+    g = GitTool()
+    assessment = g.assess(g.parse({"subcommand": sub, "args": args}), stashed_repo)
+    assert assessment.risk is RiskLevel.DANGEROUS
+    assert assessment.reason.startswith(reason)
+    decision = decide(PermissionMode.AUTO, assessment.risk, g.kind, auto_approve=True)
+    assert decision is Decision.ASK
+    hooked = decide(PermissionMode.AUTO, assessment.risk, g.kind, auto_approve=False, hook="allow")
+    assert hooked is Decision.ASK
+
+
+@pytest.mark.parametrize(
+    "sub, args",
+    [
+        ("branch", ["-d", "feature"]),
+        ("branch", ["-m", "new"]),
+        ("stash", []),
+        ("stash", ["pop"]),
+        ("stash", ["push", "-m", "drop"]),
+        ("checkout", ["other"]),  # ветка: файла с таким именем нет
+        ("checkout", ["-b", "f.txt"]),  # новая ветка f.txt, а не файл
+        ("checkout", ["other", "--"]),  # `--` без путей — явно ветка
+        ("restore", ["--staged", "f.txt"]),
+        ("switch", ["other"]),
+        ("switch", ["-c", "new"]),
+        ("add", ["."]),
+        ("commit", ["-m", "drop -f -- ."]),
+    ],
+)
+def test_git_changes_that_keep_work_are_write(stashed_repo, sub, args):
+    g = GitTool()
+    assessment = g.assess(g.parse({"subcommand": sub, "args": args}), stashed_repo)
+    assert assessment.risk is RiskLevel.WRITE
+    assert assessment.reason == ""
+
+
+def test_git_restore_with_yes_flag_still_asks(stashed_repo):
+    """Агент с -y: `restore .` спрашивает (как опасное), а правка остаётся при отказе."""
+    from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
+
+    from gigacrew.agent.loop import Agent
+    from gigacrew.config import Config
+    from gigacrew.tools.base import build_default_registry
+
+    root = stashed_repo.root
+    _write(stashed_repo, "f.txt", "three\n")
+    provider = ScriptedProvider(
+        [tool_turn("git", {"subcommand": "restore", "args": ["."]}), text_turn("ок")]
+    )
+    events = RecordingEvents(confirm_answer=False)
+    cfg = Config(access_key="x", project_root=root, stream=False, auto_approve=True)
+    Agent(provider, build_default_registry(), cfg, events).run_turn("откати правки")
+    assert len(events.confirms) == 1 and events.confirms[0][2] is True  # dangerous
+    assert (root / "f.txt").read_text(encoding="utf-8") == "three\n"
+
+
 def test_git_command_disables_external_programs():
     g = GitTool()
     cmd = g._command(g.parse({"subcommand": "diff", "args": ["--", "a.py"]}))
@@ -335,11 +419,11 @@ def test_search_skips_symlinks_to_secrets(tmp_path):
     assert "s3cr3t" not in result.content
 
 
-def test_git_describe_quotes_arguments():
+def test_git_describe_quotes_arguments(ctx):
     g = GitTool()
     params = g.parse({"subcommand": "commit", "args": ["-m", "fix bug"]})
     assert g.describe(params) == "commit -m 'fix bug'"
-    assert g.preview(params, None).text == "$ git commit -m 'fix bug'"
+    assert g.preview(params, ctx).text == "$ git commit -m 'fix bug'"
 
 
 def test_search_limit_note_only_when_more_matches(ctx):
