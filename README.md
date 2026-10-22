@@ -205,6 +205,19 @@ Claude Code, настройки — JSON (хуки из всех файлов о
 неподтверждённые хуки пропускаются; `--trust-hooks` разрешает все хуки на один запуск (например, в CI). Настройки читаются при старте: `/hooks` показывает действующие хуки, `/hooks reload`
 перечитывает файлы.
 
+## Разработка
+
+```sh
+make dev      # пакет и dev-группа (pytest, линтеры, mypy)
+make format   # автоисправления ruff и форматирование
+make check    # все статические проверки и офлайн-тесты — как в CI
+```
+
+Набор проверок — по образцу [wemake-django-template](https://github.com/wemake-services/wemake-django-template):
+ruff и wemake-python-styleguide (стиль и сложность), mypy `--strict`, import-linter (слои пакета —
+`.importlinter`), codespell и typos, yamllint, dotenv-linter, deptry; `make audit` — известные уязвимости
+зависимостей (pip-audit). Настройки — в `pyproject.toml` и `setup.cfg`.
+
 ## Лицензия
 
 MIT, см. [LICENSE](LICENSE).
