@@ -9,13 +9,16 @@
     таймауту, по Ctrl+C и если после выхода команды фоновые потомки (``cmd &``)
     продолжают держать вывод;
   * вывод декодируется терпимо (бинарный мусор не роняет инструмент), а его
-    объём в памяти ограничен.
+    объём в памяти ограничен;
+  * тег заметок gigacrew (``<system-reminder>``) в выводе становится цитатой
+    (:func:`quote_reminder_tags`) — вывод не выдаст себя за заметку harness'а.
 """
 
 from __future__ import annotations
 
 import codecs
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -65,6 +68,18 @@ def subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
         count += 1
     env["GIT_CONFIG_COUNT"] = str(count)
     return env
+
+
+# Тег заметок harness'а: системный промпт велит модели выполнять такие блоки и считать
+# блок о хуках словами пользователя. Вывод команды (cat файла проекта, git log с
+# подобранным сообщением коммита) мог бы его подделать — в выводе тег — цитата.
+_REMINDER_TAG_RE = re.compile(r"<(\s*/?\s*)system[-_ ]?reminder", re.IGNORECASE)
+QUOTED_REMINDER_TAG = "quoted-system-reminder"
+
+
+def quote_reminder_tags(text: str) -> str:
+    """``<system-reminder>`` → ``<quoted-system-reminder>`` (и закрывающий тег)."""
+    return _REMINDER_TAG_RE.sub(rf"<\1{QUOTED_REMINDER_TAG}", text)
 
 
 def truncate_middle(text: str, limit: int = 30_000, head: int = 10_000) -> str:
@@ -253,8 +268,8 @@ def run_process(
 
     return ProcessResult(
         returncode=None if timed_out else proc.returncode,
-        stdout=out.text(),
-        stderr=err.text(),
+        stdout=quote_reminder_tags(out.text()),
+        stderr=quote_reminder_tags(err.text()),
         timed_out=timed_out,
         killed_background=killed_background,
     )
