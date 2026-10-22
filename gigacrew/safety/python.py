@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import os
 import re
 import sys
@@ -491,6 +492,7 @@ _DYNAMIC_BUILTINS = frozenset(
         "__spec__",
     }
 )
+_BUILTIN_NAMES = frozenset(dir(builtins))
 _WRITE_MODES = set("wax+")
 _PATH_CTORS = frozenset(
     {"Path", "PurePath", "PosixPath", "PurePosixPath", "WindowsPath", "PureWindowsPath"}
@@ -531,6 +533,7 @@ class _Ctx:
     defs: set[str] = field(default_factory=set)  # свои функции и классы
     # import a.b связывает a: у a доступен только подмодуль b (если a не в белом списке)
     partial: dict[str, set[str]] = field(default_factory=dict)
+    star: bool = False  # был from X import *: незнакомое имя может прийти оттуда
     levels: list[tuple[Level | None, str]] = field(default_factory=list)
     hazard_cache: dict[tuple[Path, str | None], bool] = field(default_factory=dict)
 
@@ -646,9 +649,15 @@ def _check_imports(tree: ast.AST, ctx: _Ctx) -> None:
                     got = _module_level(module, ctx)
                     if got is not None:
                         ctx.flag(*got)
+                    ctx.star = True
                     continue
+                resolved = _attr_of_module(module, alias.name)
                 if full in SAFE_MODULES or full in DANGER_MODULES:
                     got = _module_level(full, ctx)
+                elif resolved != full:  # from glob import os — это os
+                    got = _module_level(resolved, ctx)
+                    if (parent := _module_level(module, ctx)) is not None:
+                        ctx.flag(*parent)
                 elif module in _MODULE_ATTRS:
                     _check_module_attr(module, alias.name, ctx)
                     got = None
@@ -656,7 +665,7 @@ def _check_imports(tree: ast.AST, ctx: _Ctx) -> None:
                     got = _module_level(module, ctx)
                 if got is not None:
                     ctx.flag(*got)
-                ctx.modules[alias.asname or alias.name] = full
+                ctx.modules[alias.asname or alias.name] = resolved
 
 
 # Безобидные встроенные из списка динамических: только «не знаю», без тревоги.
@@ -703,8 +712,31 @@ def _resolve_module(node: ast.AST, ctx: _Ctx) -> str | None:
     if isinstance(node, ast.Attribute):
         base = _resolve_module(node.value, ctx)
         if base is not None:
-            return f"{base}.{node.attr}"
+            return _attr_of_module(base, node.attr)
     return None
+
+
+# Атрибуты с именем модуля стандартной библиотеки, которые сами не модули.
+_NOT_SUBMODULES = frozenset(
+    {"ast.keyword", "ast.operator", "datetime.time", "locale.gettext", "unicodedata.decimal"}
+)
+
+
+def _attr_of_module(base: str, attr: str) -> str:
+    """«модуль.атрибут» — или сам модуль, если атрибут — модуль, импортированный модулем
+    стандартной библиотеки: ``glob.os`` и ``random._os`` — это ``os``, и их функции
+    проверяются как функции ``os``."""
+    full = f"{base}.{attr}"
+    name = attr.lstrip("_")
+    if full in SAFE_MODULES or full in DANGER_MODULES or full in _NOT_SUBMODULES:
+        return full
+    if base.split(".")[0] not in sys.stdlib_module_names:
+        return full  # код сторонних модулей и так не проверяется (EXEC)
+    if name == base.rpartition(".")[2] or name in _MODULE_ATTRS.get(base, ()):
+        return full  # glob.glob, time.time, os.stat — функции, а не модули
+    if name in sys.stdlib_module_names or name in DANGER_MODULES:
+        return name
+    return full
 
 
 def _is_path_ctor(func: ast.AST, ctx: _Ctx) -> bool:
@@ -1086,6 +1118,17 @@ def _defined(name: str, ctx: _Ctx) -> bool:
     return name in ctx.bindings or name in ctx.defs
 
 
+def _known_name(name: str, ctx: _Ctx) -> bool:
+    """Имя связано в коде (импорт, присваивание, def) или встроенное."""
+    return (
+        name in ctx.modules
+        or name in ctx.iterations
+        or _defined(name, ctx)
+        or name in _BUILTIN_NAMES
+        or name in _SAFE_DUNDERS
+    )
+
+
 def _looks_like_path(node: ast.AST, ctx: _Ctx, depth: int = 0) -> bool:
     """Выражение — объект pathlib (а не строка: у str тоже есть ``replace``)."""
     if depth > 12:
@@ -1200,6 +1243,11 @@ def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
                 ctx.flag(Level.DANGER, f"доступ к {attr} — внутренности интерпретатора")
             module = _resolve_module(node.value, ctx)
             if module is not None:
+                resolved = _attr_of_module(module, attr)
+                if resolved != f"{module}.{attr}":  # glob.os — импорт модуля os
+                    got = _module_level(resolved, ctx)
+                    if got is not None:
+                        ctx.flag(*got)
                 _check_module_attr(module, attr, ctx)
                 if module in ctx.partial and attr not in ctx.partial[module]:
                     if attr in ("import_module", "__import__", "reload", "util", "machinery"):
@@ -1219,6 +1267,9 @@ def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
                 node.id.startswith("__") and node.id.endswith("__") and node.id not in _SAFE_DUNDERS
             ):
                 ctx.flag(Level.DANGER, f"доступ к {node.id} — внутренности интерпретатора")
+            elif ctx.star and not _known_name(node.id, ctx):
+                # from platform import * приносит и os: что за объект — не узнать
+                ctx.flag(None, f"{node.id}: имя из from … import *, не проверено")
         elif isinstance(node, ast.Call):
             _check_call(node, ctx)
         elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):

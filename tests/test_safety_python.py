@@ -109,6 +109,41 @@ def test_risky_code(root, code, expected):
     assert result.level is expected, result.reason
 
 
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        # os, импортированный «безопасным» модулем, — тот же os
+        ("import glob; glob.os.system('id')", DANGER),
+        ("import posixpath; posixpath.os.system('id')", DANGER),
+        ("import platform; platform.os.popen('id')", DANGER),
+        ("import os.path as p; p.os.system('id')", DANGER),
+        ("import random; random._os.system('id')", DANGER),
+        ("import sysconfig; print(sysconfig.os.environ)", DANGER),
+        ("from glob import os as o; o.system('id')", DANGER),
+        ("import glob; glob.os.remove('/etc/hosts')", DANGER),
+        ("import glob; glob.os.remove('a.txt')", WRITE),
+        ("import shlex; shlex.os.getcwd()", READ),
+        ("import codecs; codecs.builtins.eval", DANGER),
+        ("from codecs import builtins", DANGER),
+        ("import importlib.metadata as m; m.zipfile.ZipFile('x.zip', 'w')", None),
+        ("import configparser; configparser.io.FileIO('/etc/x', 'w')", None),
+        # имена модулей, которые здесь функции и классы, — не модули
+        ("import glob; print(glob.glob('*.txt'))", READ),
+        ("import glob; print(glob.glob('../*'))", None),
+        ("import time, copy, datetime; print(time.time(), copy.copy([1]), datetime.time())", READ),
+        ("import ast; print(isinstance(ast.parse('1+1').body[0].value.op, ast.operator))", READ),
+        ("import os; print(os.stat('a.txt').st_size)", READ),
+        ("import sys; print(sys.platform.startswith('linux'))", READ),
+        # from X import * приносит и модули, импортированные X
+        ("from platform import *\nos.remove('/etc/hosts')", None),
+        ("from math import *\nprint(pi)", None),
+    ],
+)
+def test_modules_reached_through_other_modules(root, code, expected):
+    result = analyze(code, root=root)
+    assert result.level is expected, result.reason
+
+
 def test_secret_files_ask(root):
     (root / ".env").write_text("TOKEN=1\n")
     assert analyze("print(open('.env').read())", root=root).level is None
