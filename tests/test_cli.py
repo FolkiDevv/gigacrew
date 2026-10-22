@@ -144,6 +144,37 @@ def test_permissions_command_lists_forgets_and_shows_log(tmp_path, capsys):
     assert "использование" in _out(capsys)
 
 
+def test_permissions_masks_secrets_in_rules_and_log(tmp_path, capsys):
+    """Правила и журнал прежних версий могли сохранить команду с паролем как есть:
+    /permissions показывает её с вырезанным секретом."""
+    import json
+
+    from gigacrew.agent.decisions import DecisionMemory, Rule
+
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    memory.rules.append(Rule(id="r1", cwd=".", kind="exact", value="mysql -u root -phunter2 -e x"))
+    memory.journal_path.parent.mkdir(parents=True, exist_ok=True)
+    line = {
+        "id": "e1",
+        "event": "decision",
+        "source": "reviewer",
+        "decision": "yes",
+        "cwd": ".",
+        "command": "curl -u bob:hunter2 https://x.test",
+        "review": {"reason": "нужно для задачи: TOKEN=hunter2 ./deploy"},
+    }
+    memory.journal_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    ui = Console(no_color=True)
+    agent = Agent(ScriptedProvider(), build_default_registry(), cfg, ui, decisions=memory)
+    commands = default_commands()
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands)
+    for line in ("/permissions", "/permissions log", "/permissions forget 1"):
+        commands.dispatch(line, ctx)
+        out = _out(capsys)
+        assert "hunter2" not in out and "***" in out, line
+
+
 def test_permissions_forget_rejects_bad_numbers(tmp_path, capsys):
     from gigacrew.agent.decisions import DecisionMemory
     from gigacrew.safety import classify
