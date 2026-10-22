@@ -447,6 +447,76 @@ def test_git_status_does_not_run_fsmonitor_hook(git_repo):
     assert not marker.exists()
 
 
+@pytest.mark.parametrize(
+    "sub, args", [("diff", []), ("log", ["-p"]), ("show", []), ("status", []), ("stash", ["list"])]
+)
+def test_git_reads_with_textconv_in_repo_config_are_not_safe(stashed_repo, sub, args):
+    """textconv из .git/config запускается на чтении: оно уже не SAFE (и в репозитории)."""
+    g = GitTool()
+    params = g.parse({"subcommand": sub, "args": args})
+    assert g.risk(params, stashed_repo) is RiskLevel.SAFE
+    _git(stashed_repo, "config", "diff.evil.textconv", "sh -c id")
+    assert g.risk(params, stashed_repo) is RiskLevel.WRITE
+
+
+def test_git_reads_are_not_safe_when_repo_config_is_unknown(stashed_repo, monkeypatch):
+    import gigacrew.tools.git as git_module
+
+    monkeypatch.setattr(git_module, "repo_config_runs_programs", lambda root: None)
+    g = GitTool()
+    assert g.risk(g.parse({"subcommand": "diff"}), stashed_repo) is RiskLevel.WRITE
+
+
+@pytest.mark.parametrize(
+    "args, risk",
+    [
+        (["--set-upstream-to=origin/main"], RiskLevel.WRITE),
+        (["--unset-upstream"], RiskLevel.WRITE),
+        (["--edit-description"], RiskLevel.WRITE),
+        (["-u", "origin/main"], RiskLevel.WRITE),
+        (["--list", "-d", "x"], RiskLevel.WRITE),
+        (["-D", "--list", "x"], RiskLevel.DANGEROUS),
+        (["-r", "--no-color"], RiskLevel.SAFE),
+        (["-l", "feat*"], RiskLevel.SAFE),
+    ],
+)
+def test_git_branch_only_listing_flags_are_safe(stashed_repo, args, risk):
+    """Флаги без позиционных аргументов: изменяющие ветки — не список, даже без имени."""
+    g = GitTool()
+    assert g.risk(g.parse({"subcommand": "branch", "args": args}), stashed_repo) is risk
+
+
+def test_git_tool_is_not_an_edit():
+    """Правки файлов в «авто» идут без вопроса; git commit/restore — не правка файла."""
+    from gigacrew.permissions import ToolKind
+
+    assert GitTool.kind is ToolKind.OTHER
+    assert decide(PermissionMode.AUTO, RiskLevel.WRITE, GitTool.kind, auto_approve=False) is (
+        Decision.ASK
+    )
+
+
+def test_git_commit_in_auto_mode_is_confirmed(stashed_repo):
+    from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
+
+    from gigacrew.agent.loop import Agent
+    from gigacrew.config import Config
+    from gigacrew.tools.base import build_default_registry
+
+    root = stashed_repo.root
+    _git(stashed_repo, "add", "f.txt")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True).stdout
+    provider = ScriptedProvider(
+        [tool_turn("git", {"subcommand": "commit", "args": ["-m", "x"]}), text_turn("ок")]
+    )
+    events = RecordingEvents(confirm_answer=False)
+    cfg = Config(access_key="x", project_root=root, stream=False, auto_approve=False)
+    Agent(provider, build_default_registry(), cfg, events).run_turn("закоммить")
+    assert len(events.confirms) == 1 and events.confirms[0][2] is False
+    after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True).stdout
+    assert after == head
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
 def test_git_diff_does_not_run_external_diff(git_repo):
     root = git_repo.root
