@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 from pydantic import BaseModel, Field
 
-from gigacrew.project.files import is_excluded, is_secret_path
+from gigacrew.project.files import is_excluded
 from gigacrew.project.index import (
     INDEX_ERRORS,
     MAX_INDEX_FILE_BYTES,
@@ -32,6 +32,7 @@ from gigacrew.project.index import (
 )
 from gigacrew.project.repomap import CHARS_PER_TOKEN, build_repo_map
 from gigacrew.project.symbols import Symbol, language_of
+from gigacrew.safety.paths import is_secret_target
 from gigacrew.security import resolve_in_root
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 
@@ -180,7 +181,7 @@ class FileOutlineTool(Tool):
         if not target.exists():
             raise ToolError(f"Путь не найден: {params.path}")
         if target.is_file():
-            if is_secret_path(target):
+            if is_secret_target(ctx.root, target):
                 raise ToolError(f"Файлы с секретами не индексируются: {params.path}")
             if is_excluded(ctx.root, target):
                 raise ToolError(

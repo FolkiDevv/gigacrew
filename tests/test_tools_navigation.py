@@ -154,6 +154,11 @@ def test_goto_definition_errors(plain):
     _make(plain.root, ".env", "KEY=1\n")
     with pytest.raises(ToolError, match="секретами"):
         _goto(plain, ".env", 1, "KEY")
+    # То же правило, что у read_file и классификатора команд: не только .env*.
+    for rel in ("deploy/credentials.json", "certs/server.pem", ".aws/config.py"):
+        _make(plain.root, rel, "KEY = 1\n")
+        with pytest.raises(ToolError, match="секретами"):
+            _goto(plain, rel, 1, "KEY")
 
 
 def test_call_hierarchy_by_index(plain):

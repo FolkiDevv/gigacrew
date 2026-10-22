@@ -7,9 +7,10 @@ import re
 from pydantic import BaseModel, Field
 
 from gigacrew.project.files import glob_match, walk_files
+from gigacrew.safety.paths import is_secret_target
 from gigacrew.security import resolve_in_root
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
-from gigacrew.tools.fs import SECRET_READ_NOTE, is_secret_target
+from gigacrew.tools.fs import SECRET_READ_NOTE
 
 _MAX_MATCHES = 500  # потолок max_results, который может запросить модель
 _MAX_FILE_BYTES = 1_000_000  # файлы крупнее не читаем (сгенерированное, дампы)

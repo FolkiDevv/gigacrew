@@ -100,6 +100,28 @@ def scope_of_path(path: Path, root: Path) -> Scope:
     return Scope.INSIDE
 
 
+_SECRET_SCOPES = (Scope.SECRET, Scope.SECRET_OUTSIDE, Scope.DYNAMIC)
+
+
+def is_secret_target(root: Path, path: Path) -> bool:
+    """Файл с ключами или учётными данными — по тому же правилу, что у классификатора
+    команд (``cat .env`` там — непроверенная команда): ``.env*``, ``*.pem``, ``id_rsa``,
+    ``.npmrc``, ``credentials.json``, всё в ``.ssh/``, ``.aws/``… Симлинк проверяется и
+    по цели; путь, который не раскрыть, считается секретом. Так файлы с секретами
+    отказываются показывать все инструменты: чтение, поиск, навигация, индекс."""
+    return scope_of_path(path, root) in _SECRET_SCOPES
+
+
+def is_secret_entry(root: Path, path: Path) -> bool:
+    """:func:`is_secret_target` для файла из обхода каталогов проекта.
+
+    Обход не заходит в ссылки на каталоги, поэтому раскрывать путь нужно только у самой
+    ссылки: иначе проверка по имени. Так в разы быстрее — индекс проверяет каждый файл
+    проекта при каждом обновлении.
+    """
+    return _is_secret(path) or (path.is_symlink() and is_secret_target(root, path))
+
+
 def _resolve(root: Path, cwd: str, value: str) -> Scope:
     if value.startswith("~"):
         lexical = Path(os.path.expanduser(value))

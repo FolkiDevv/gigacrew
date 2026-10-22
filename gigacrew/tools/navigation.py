@@ -18,7 +18,7 @@ from typing import TypeVar
 from pydantic import BaseModel, Field
 
 from gigacrew.project import semantic
-from gigacrew.project.files import glob_match, is_secret_path
+from gigacrew.project.files import glob_match
 from gigacrew.project.index import (
     RESOLVED_IMPORT,
     RESOLVED_NAME,
@@ -30,6 +30,7 @@ from gigacrew.project.index import (
 from gigacrew.project.lsp import LspError
 from gigacrew.project.semantic import CallItem, Location, SemanticUnavailable, TyServer
 from gigacrew.project.symbols import split_lines
+from gigacrew.safety.paths import is_secret_target
 from gigacrew.security import resolve_in_root
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.index import (
@@ -359,7 +360,7 @@ class GotoDefinitionTool(Tool):
         target = resolve_in_root(ctx.root, params.path)
         if not target.is_file():
             raise ToolError(f"Файл не найден: {params.path}")
-        if is_secret_path(target):
+        if is_secret_target(ctx.root, target):
             raise ToolError(f"Файлы с секретами не разбираются: {params.path}")
         try:
             lines = split_lines(target.read_text(encoding="utf-8", errors="replace"))
