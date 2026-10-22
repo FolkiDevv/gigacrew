@@ -138,11 +138,16 @@ def _discards_work(sub: str, args: list[str], root: Path) -> str:
         "-D" in flags or (_has(flags, "-d", "--delete") and _has(flags, "-f", "--force"))
     ):
         return "git branch -D: удаление ветки без проверки слияния"
+    overwrite = "ветка с этим именем будет перезаписана"
+    if sub == "branch" and _has(flags, "-f", "--force", "-M", "-C"):
+        return f"git branch -f: {overwrite}"
     if sub == "stash" and positional[:1] in (["drop"], ["clear"]):
         return f"git stash {positional[0]}: удаление отложенных правок"
     if sub == "checkout":
         if _has(flags, "-f", "--force"):
             return f"git checkout -f: {lost}"
+        if "-B" in flags:
+            return f"git checkout -B: {overwrite}"
         paths = args[args.index("--") + 1 :] if "--" in args else []
         # `checkout <ревизия> <пути>`, `checkout <файл>` или шаблон путей — это не ветка
         if (
@@ -157,6 +162,8 @@ def _discards_work(sub: str, args: list[str], root: Path) -> str:
         return f"git restore: {lost}"
     if sub == "switch" and _has(flags, "--discard-changes", "-f", "--force"):
         return f"git switch --discard-changes: {lost}"
+    if sub == "switch" and _has(flags, "-C", "--force-create"):
+        return f"git switch -C: {overwrite}"
     return ""
 
 

@@ -248,6 +248,16 @@ def test_git_forbidden_options_for_every_subcommand(stashed_repo, sub, args):
         ("switch", ["--discard-changes", "x"], "git switch --discard-changes: незакоммиченные"),
         ("switch", ["-f", "x"], "git switch --discard-changes"),
         ("switch", ["--force", "x"], "git switch --discard-changes"),
+        # перезапись существующей ветки — DANGER и у классификатора run_shell
+        ("branch", ["-f", "main", "HEAD~1"], "git branch -f: ветка с этим именем будет"),
+        ("branch", ["--force", "main"], "git branch -f"),
+        ("branch", ["--forc", "main"], "git branch -f"),
+        ("branch", ["-M", "old", "main"], "git branch -f"),
+        ("branch", ["-C", "old", "main"], "git branch -f"),
+        ("checkout", ["-B", "main"], "git checkout -B: ветка с этим именем будет перезаписана"),
+        ("checkout", ["-qB", "main", "HEAD~1"], "git checkout -B"),
+        ("switch", ["-C", "main"], "git switch -C: ветка с этим именем будет перезаписана"),
+        ("switch", ["--force-create", "main"], "git switch -C"),
     ],
 )
 def test_git_destructive_operations_are_dangerous(stashed_repo, sub, args, reason):
@@ -267,6 +277,8 @@ def test_git_destructive_operations_are_dangerous(stashed_repo, sub, args, reaso
     [
         ("branch", ["-d", "feature"]),
         ("branch", ["-m", "new"]),
+        ("branch", ["-c", "copy"]),
+        ("branch", ["new", "HEAD"]),
         ("stash", []),
         ("stash", ["pop"]),
         ("stash", ["push", "-m", "drop"]),
