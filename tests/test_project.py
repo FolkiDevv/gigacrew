@@ -393,6 +393,18 @@ def test_nested_instructions_prompt_limits(tmp_path):
     )
 
 
+def test_nested_instructions_budget_is_shared(tmp_path):
+    # Лимит — на все инструкции подкаталогов вместе: каждая меньше лимита, но вместе
+    # они больше — последние перечисляются путями.
+    docs = [InstructionFile(f"d{i}/AGENTS.md", str(i) * 8_000) for i in range(4)]
+    prompt = nested_instructions_prompt(docs)
+    assert "0" * 8_000 in prompt and "1" * 8_000 in prompt
+    assert "2" * 8_000 not in prompt and "3" * 8_000 not in prompt
+    skipped = prompt.split("Too large for the context")[1]
+    assert "d2/AGENTS.md" in skipped and "d3/AGENTS.md" in skipped
+    assert "d0/AGENTS.md" not in skipped and "d1/AGENTS.md" not in skipped
+
+
 def test_system_prompt_contains_project_context(tmp_path):
     _make(tmp_path, "src/main.py")
     (tmp_path / "GIGACREW.md").write_text("важная заметка", encoding="utf-8")
