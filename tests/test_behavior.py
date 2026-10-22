@@ -98,10 +98,15 @@ def test_scenarios_are_well_defined():
         "grep -rn ValidationError shop | head -5",
         "cd shop && ls",
         "PYTHONPATH=. pytest",
+        "python3 -m pytest -x tests",
+        "cd tests && pytest -q",
+        "pytest -q && git diff",
+        "pytest -q 2>&1 | tail -20",
+        "git",  # без подкоманды — только справка
     ],
 )
-def test_safe_commands_are_allowed(command):
-    assert is_safe_command(command)
+def test_safe_commands_are_allowed(command, shop):
+    assert is_safe_command(command, root=shop)
 
 
 @pytest.mark.parametrize(
@@ -114,21 +119,50 @@ def test_safe_commands_are_allowed(command):
         "echo x > shop/cart.py",
         "find . -name '*.py' -delete",
         "cat $(ls)",
-        "uv run pytest",
+        "uv run pytest",  # uv может доставить пакеты в окружение
         "pytest -q; rm -f x",
-        "git",
         "sort -o shop/cart.py shop/cart.py",
         "git diff --output=patch.diff",
         "find . -fprint list.txt",
+        # обходы прежнего списка запретов
+        "pytest\nrm -f x",
+        "pytest -q & rm -rf ~",
+        "pytest -q & python evil.py",
+        "GIT_EXTERNAL_DIFF=rm git diff",
+        "rg --pre rm x",
+        "git grep -Orm x",
+        "git grep --open-files-in-pager=rm x",
+        "find . -ok rm {} ;",
+        "python -m pip install requests",
+        "python3 -m http.server",
+        "python -m pytestx",
+        # pytest с ключами и окружением, которые запускают чужой код
+        "pytest -p evil",
+        "PYTEST_ADDOPTS='-p evil' pytest",
+        "env pytest",
+        "pytest -q > out.txt",
+        "pytest --basetemp=/tmp/x",
+        "cat ../../etc/passwd",
+        "ls‮",  # невидимый символ
     ],
 )
-def test_other_commands_are_rejected(command):
-    assert not is_safe_command(command)
+def test_other_commands_are_rejected(command, shop):
+    assert not is_safe_command(command, root=shop)
 
 
-def test_scripted_user_answers_plan_and_model_questions():
+def test_only_what_the_classifier_reads_is_auto_approved(shop):
+    """Разрешение — от классификатора, а не от своего списка: команда, которую он считает
+    только чтением, проходит, даже если это незнакомая harness'у программа; «не знаю» —
+    нет."""
+    assert is_safe_command("wc -l shop/cart.py", root=shop)
+    assert is_safe_command("git log --oneline -5", root=shop)
+    assert not is_safe_command("make", root=shop)  # исполняет — не pytest
+    assert not is_safe_command("npm test", root=shop)
+
+
+def test_scripted_user_answers_plan_and_model_questions(tmp_path):
     plan = replace(PLAN_QUESTION, body="# План")
-    user = ScriptedUser([Answer((APPROVE,)), None])
+    user = ScriptedUser([Answer((APPROVE,)), None], root=tmp_path)
     assert user.ask_user([plan]) == [Answer((APPROVE,))]
     assert user.ask_user([plan]) is None
     assert user.ask_user([plan]) is None  # ответы кончились — как Esc
@@ -137,8 +171,8 @@ def test_scripted_user_answers_plan_and_model_questions():
     assert user.plans == ["# План"] * 3 and user.model_questions == 1
 
 
-def test_scripted_user_confirms_edits_and_safe_commands_only():
-    user = ScriptedUser()
+def test_scripted_user_confirms_edits_and_safe_commands_only(shop):
+    user = ScriptedUser(root=shop)
     edit = ToolCallInfo("write_file", "a.py", ToolKind.EDIT)
     assert user.confirm(edit, None, dangerous=False) is True
     assert user.confirm(edit, None, dangerous=True) is False
