@@ -6,20 +6,25 @@
     него подаётся готовый текст (``input``) — из временного файла, не из канала;
   * окружение без настроек и секретов gigacrew (``GIGACREW_*``) и без интерактива git;
   * процесс и его потомки живут в отдельной группе и убиваются целиком — по
-    таймауту, по Ctrl+C и если после выхода команды фоновые потомки (``cmd &``)
-    продолжают держать вывод;
+    таймауту, по Ctrl+C и если после выхода команды в группе остались фоновые
+    потомки (``cmd &``), держат они вывод или нет; потомок, ушедший из группы
+    (``setsid``), так не достать — это видно по ``escaped_output``;
   * вывод декодируется терпимо (бинарный мусор не роняет инструмент), а его
-    объём в памяти ограничен.
+    объём в памяти ограничен;
+  * тег заметок gigacrew (``<system-reminder>``) в выводе становится цитатой
+    (:func:`quote_reminder_tags`) — вывод не выдаст себя за заметку harness'а.
 """
 
 from __future__ import annotations
 
 import codecs
 import os
+import re
 import signal
 import subprocess
 import tempfile
 import threading
+import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -31,6 +36,8 @@ SECRET_ENV_PREFIXES = ("GIGACREW_",)
 # Сколько ждать закрытия вывода после выхода команды, прежде чем считать,
 # что его держат фоновые потомки.
 _PIPE_GRACE_SECONDS = 1.0
+# Сколько ждать, пока опустеет группа команды (зомби уже завершившихся потомков).
+_GROUP_SETTLE_SECONDS = 0.2
 # Сколько символов каждого потока держим в памяти (начало и конец).
 _CAPTURE_LIMIT = 200_000
 
@@ -65,6 +72,18 @@ def subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
         count += 1
     env["GIT_CONFIG_COUNT"] = str(count)
     return env
+
+
+# Тег заметок harness'а: системный промпт велит модели выполнять такие блоки и считать
+# блок о хуках словами пользователя. Вывод команды (cat файла проекта, git log с
+# подобранным сообщением коммита) мог бы его подделать — в выводе тег — цитата.
+_REMINDER_TAG_RE = re.compile(r"<(\s*/?\s*)system[-_ ]?reminder", re.IGNORECASE)
+QUOTED_REMINDER_TAG = "quoted-system-reminder"
+
+
+def quote_reminder_tags(text: str) -> str:
+    """``<system-reminder>`` → ``<quoted-system-reminder>`` (и закрывающий тег)."""
+    return _REMINDER_TAG_RE.sub(rf"<\1{QUOTED_REMINDER_TAG}", text)
 
 
 def truncate_middle(text: str, limit: int = 30_000, head: int = 10_000) -> str:
@@ -119,7 +138,9 @@ class ProcessResult:
     stdout: str
     stderr: str
     timed_out: bool = False
-    killed_background: bool = False  # после выхода остались фоновые потомки
+    killed_background: bool = False  # после выхода остались фоновые потомки — убиты
+    # Вывод держит процесс, ушедший из группы (setsid): остановить его не удалось.
+    escaped_output: bool = False
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -145,6 +166,49 @@ def _kill_group(proc: subprocess.Popen) -> None:
             proc.kill()  # на случай, если taskkill недоступен
         except OSError:
             pass
+
+
+def _group_alive(proc: subprocess.Popen) -> bool:
+    """Остались ли живые процессы в группе команды (её фоновые потомки). Только POSIX.
+
+    Сигнал 0 доходит и до зомби: уже завершившийся фоновый потомок (``(true &)``) ждёт,
+    пока его уберёт init (а в контейнере init может не убирать вовсе), — поэтому, если
+    есть /proc, зомби не считаются, а без него пустеющей группе даётся немного времени.
+    """
+    if os.name != "posix":
+        return False
+    deadline = time.monotonic() + _GROUP_SETTLE_SECONDS
+    while True:
+        try:
+            os.killpg(proc.pid, 0)
+        except PermissionError:
+            return True
+        except OSError:  # ProcessLookupError — группа пуста
+            return False
+        members = _live_members(proc.pid)
+        if members is not None:
+            return members
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(0.01)
+
+
+def _live_members(pgid: int) -> bool | None:
+    """Есть ли в группе ``pgid`` процессы, кроме зомби (по /proc); None — /proc нет."""
+    try:
+        pids = [name for name in os.listdir("/proc") if name.isdecimal()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                fields = f.read().rsplit(b")", 1)[1].split()
+        except (OSError, IndexError):
+            continue  # процесс уже завершился
+        # после имени: состояние, родитель, группа
+        if len(fields) > 2 and int(fields[2]) == pgid and fields[0] not in (b"Z", b"X"):
+            return True
+    return False
 
 
 def _pump(stream, capture: _Capture) -> None:
@@ -209,7 +273,7 @@ def run_process(
             stdin.close()  # у процесса своя копия дескриптора
     out, err = _Capture(), _Capture()
     readers: list[threading.Thread] = []
-    timed_out = killed_background = False
+    timed_out = killed_background = escaped = False
     # Защищённый блок начинается сразу после Popen: прерывание в любой момент
     # (в том числе при запуске читателей) не оставит команду работать.
     try:
@@ -228,11 +292,17 @@ def run_process(
         # Команда завершилась, но вывод может держать фоновый потомок (`cmd &`).
         for t in readers:
             t.join(timeout=_PIPE_GRACE_SECONDS)
-        if any(t.is_alive() for t in readers):
+        # Потомки в группе команды убиваются, даже если вывод они не держат
+        # (`server >/dev/null 2>&1 &`): иначе пережили бы и команду, и gigacrew.
+        alive = any(t.is_alive() for t in readers)
+        if _group_alive(proc) or (alive and os.name != "posix"):
             killed_background = True
             _kill_group(proc)
+        if alive:
             for t in readers:
                 t.join(timeout=_PIPE_GRACE_SECONDS)
+            # Вывод всё ещё держит процесс вне группы (setsid) — его не достать.
+            escaped = any(t.is_alive() for t in readers)
     except BaseException:  # Ctrl+C или сбой запуска читателей
         _kill_group(proc)
         proc.wait()
@@ -253,8 +323,9 @@ def run_process(
 
     return ProcessResult(
         returncode=None if timed_out else proc.returncode,
-        stdout=out.text(),
-        stderr=err.text(),
+        stdout=quote_reminder_tags(out.text()),
+        stderr=quote_reminder_tags(err.text()),
         timed_out=timed_out,
         killed_background=killed_background,
+        escaped_output=escaped,
     )

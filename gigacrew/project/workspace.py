@@ -1,18 +1,21 @@
 """Рабочее пространство проекта и служебная папка ``.gigacode/``.
 
-``.gigacode/`` в корне проекта — место для данных агента (индекс проекта, чаты,
-планы, история ввода), скиллов (``skills/``, см. :mod:`gigacrew.project.skills`) и
+``.gigacode/`` в корне проекта — место для данных агента (индекс проекта, планы,
+история ввода), скиллов (``skills/``, см. :mod:`gigacrew.project.skills`) и
 настроек (``settings.json`` и личный ``settings.local.json``, см.
 :mod:`gigacrew.project.settings`).
 Папка создаётся лениво, первым компонентом, которому нужно туда писать
 (:meth:`Workspace.ensure_data_dir`), и сразу получает собственный ``.gitignore``:
 рабочие данные агента в репозиторий не попадают, а скиллы — коммитятся.
 Пользовательская папка ``~/.gigacode`` (:func:`user_data_dir`) — замеры окон
-моделей, скиллы и настройки, общие для всех проектов.
+моделей, скиллы и настройки, общие для всех проектов, а в ``projects/<ключ>/`` —
+данные проекта, которым нельзя прийти вместе с репозиторием: разрешения, журнал
+решений (:mod:`gigacrew.agent.decisions`) и чаты (:attr:`Workspace.chats_dir`).
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,13 +25,23 @@ HISTORY_FILE_NAME = "history"
 SETTINGS_FILE_NAME = "settings.json"
 LOCAL_SETTINGS_FILE_NAME = "settings.local.json"
 # Игнорируются только рабочие данные агента и личные настройки — не вся папка: skills/ и
-# settings.json коммитятся.
+# settings.json коммитятся. chats/ — прежнее место чатов: то, что не удалось перенести в
+# ~/.gigacode/projects/, тоже не должно попасть в коммит.
 GITIGNORED_DATA: tuple[str, ...] = (
     "/chats/",
     "/plans/",
     "/index/",
     f"/{HISTORY_FILE_NAME}",
     f"/{LOCAL_SETTINGS_FILE_NAME}",
+)
+# Что gigacrew пишет в .gigacode/ сам (ty.log — журнал gigacrew.project.semantic).
+_OWN_ENTRIES: tuple[str, ...] = (
+    "chats",
+    "plans",
+    "index",
+    HISTORY_FILE_NAME,
+    ".gitignore",
+    "ty.log",
 )
 _GITIGNORE_BODY = (
     "# Создано gigacrew: рабочие данные агента и settings.local.json не коммитятся,\n"
@@ -63,7 +76,21 @@ class Workspace:
 
     @property
     def chats_dir(self) -> Path:
-        """Каталог сохранённых чатов."""
+        """Каталог сохранённых чатов: ``~/.gigacode/projects/<ключ проекта>/chats``.
+
+        Не в проекте: чат из репозитория при продолжении стал бы «запросами пользователя»
+        для рецензента команд и выбрал бы модель. Ключ — тот же, что у разрешений
+        (рабочие деревья одного репозитория git делят и чаты).
+        """
+        # Ключ проекта вычисляет слой решений; импорт здесь — без цикла импортов
+        # (decisions сам импортирует этот модуль).
+        from gigacrew.agent.decisions import PROJECTS_DIR, project_key
+
+        return user_data_dir() / PROJECTS_DIR / project_key(self.root) / "chats"
+
+    @property
+    def legacy_chats_dir(self) -> Path:
+        """Прежний каталог чатов в проекте (``.gigacode/chats``) — только для переноса."""
         return self.data_dir / "chats"
 
     @property
@@ -116,9 +143,23 @@ class Workspace:
         """Создаёт ``.gigacode/`` с ``.gitignore`` (идемпотентно) и возвращает путь.
 
         Существующий ``.gitignore`` не перезаписывается — пользователь мог его изменить.
+        Через эту проверку проходит всё, что gigacrew пишет в папку сам (история ввода,
+        чаты, индекс, планы, журнал ty): если ``.gigacode`` или одна из этих записей —
+        симлинк, — ``OSError``, и запись не идёт. Репозиторий может принести такой симлинк
+        (git восстанавливает их при клоне), и запись ушла бы за пределы проекта — например,
+        введённые запросы дописывались бы в чужой файл.
         """
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        gitignore = self.data_dir / ".gitignore"
-        if not gitignore.exists():
-            gitignore.write_text(_GITIGNORE_BODY, encoding="utf-8")
-        return self.data_dir
+        data_dir = self.data_dir
+        if data_dir.is_symlink():
+            raise OSError(f"{data_dir} — симлинк: gigacrew не пишет по нему")
+        data_dir.mkdir(parents=True, exist_ok=True)
+        for name in _OWN_ENTRIES:
+            if (data_dir / name).is_symlink():
+                raise OSError(f"{data_dir / name} — симлинк: gigacrew не пишет по нему")
+        try:
+            fd = os.open(data_dir / ".gitignore", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            return data_dir
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_GITIGNORE_BODY)
+        return data_dir

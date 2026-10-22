@@ -22,6 +22,8 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
+import httpx
+
 from gigacrew.llm.transport import ERROR_BODY_CHARS, ApiError, LeakedTagFilter, iter_sse_events
 from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolChoice, ToolSpec, Usage
 
@@ -298,13 +300,19 @@ class ChunkBuilder:
         return None
 
     def _add_call(self, raw: Mapping[str, Any]) -> None:
-        """Кусок вызова: по ``index``; без него — новый вызов при новом id, иначе к последнему."""
+        """Кусок вызова: по ``index``; без него — новый вызов при новом id, иначе к последнему.
+
+        Тот же ``index`` с другим id и именем — тоже новый вызов: некоторые серверы дают
+        index 0 каждому параллельному вызову, и второй иначе приклеился бы к первому.
+        """
         index = raw.get("index")
         call_id = str(raw["id"]) if raw.get("id") else ""
+        function = raw.get("function")
+        named = isinstance(function, Mapping) and bool(function.get("name"))
         parts: _CallParts | None = None
         if isinstance(index, int) and not isinstance(index, bool):
             parts = self._by_index.get(index)
-            if parts is None:
+            if parts is None or (named and call_id and parts.id and parts.id != call_id):
                 parts = self._by_index[index] = self._new_call()
         elif call_id:
             parts = next((p for p in self._calls if p.id == call_id), None)
@@ -316,7 +324,6 @@ class ChunkBuilder:
             parts = self._new_call()
         if call_id and not parts.id:
             parts.id = call_id
-        function = raw.get("function")
         if not isinstance(function, Mapping):
             return
         name = function.get("name")
@@ -440,7 +447,8 @@ def consume_stream(
     """Разбирает тело ответа (поток или целый ответ), отдавая куски текста в ``emit``.
 
     Поток без окончания (``[DONE]``, причина завершения или расход токенов) — оборван:
-    сервер закрыл соединение посреди ответа.
+    сервер закрыл соединение посреди ответа. Обрыв соединения уже после окончания
+    ответа — не ошибка: ответ получен целиком (не хватать может разве что расхода токенов).
     """
     lines = iter(lines)
     head: list[str] = []
@@ -451,21 +459,27 @@ def consume_stream(
     kind = _stream_kind(content_type, head[-1] if head else "")
     builder = ChunkBuilder()
     done = kind == "json"
-    for event, data in _chunks(kind, itertools.chain(head, lines)):
-        for chunk in _decode(data, kind):
-            if chunk is _DONE:
-                done = True
+    try:
+        for event, data in _chunks(kind, itertools.chain(head, lines)):
+            for chunk in _decode(data, kind):
+                if chunk is _DONE:
+                    done = True
+                    break
+                if not isinstance(chunk, Mapping):
+                    continue
+                error = _error_text(chunk, event)
+                if error is not None:
+                    raise ApiError(f"API вернул ошибку в потоке: {error}")
+                if kind == "json" and not isinstance(chunk.get("choices"), list):
+                    raise ApiError(
+                        f"Неожиданный формат ответа API: {str(chunk)[:ERROR_BODY_CHARS]}"
+                    )
+                piece = builder.add(chunk)
+                if piece:
+                    emit(piece)
+            if done and kind != "json":
                 break
-            if not isinstance(chunk, Mapping):
-                continue
-            error = _error_text(chunk, event)
-            if error is not None:
-                raise ApiError(f"API вернул ошибку в потоке: {error}")
-            if kind == "json" and not isinstance(chunk.get("choices"), list):
-                raise ApiError(f"Неожиданный формат ответа API: {str(chunk)[:ERROR_BODY_CHARS]}")
-            piece = builder.add(chunk)
-            if piece:
-                emit(piece)
-        if done and kind != "json":
-            break
+    except httpx.TransportError:
+        if not builder.finished:
+            raise
     return builder.turn(done=done)

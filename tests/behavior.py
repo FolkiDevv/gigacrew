@@ -31,7 +31,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -47,7 +46,7 @@ from fakes import RecordingEvents
 
 from gigacrew.agent.context_window import CHARS_PER_TOKEN
 from gigacrew.agent.loop import PLAN_BLOCKED_NOTE, REJECTED_NOTE, SELF_CHECK_NOTE, Agent
-from gigacrew.agent.prompts import SUBAGENT_PROMPT
+from gigacrew.agent.prompts import REVIEWER_PROMPT, SUBAGENT_PROMPT
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMProvider
 from gigacrew.llm.model_windows import ModelWindows
@@ -55,6 +54,7 @@ from gigacrew.llm.types import AssistantTurn, FunctionCall, Message
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.index import INDEX_ERRORS, ProjectIndex
 from gigacrew.project.workspace import Workspace
+from gigacrew.safety import CommandLevel, classify
 from gigacrew.tools.base import build_default_registry
 from gigacrew.tools.plan import APPROVE, PLAN_QUESTION
 from gigacrew.tools.questions import Answer, Question
@@ -576,61 +576,40 @@ def changed_files(before: Mapping[str, str], after: Mapping[str, str]) -> list[s
 # --------------------------------------------------------------------------- #
 # Сценарный пользователь и запись обращений к модели
 # --------------------------------------------------------------------------- #
-_SAFE_COMMANDS = frozenset(
-    {
-        "cd",
-        "ls",
-        "cat",
-        "head",
-        "tail",
-        "wc",
-        "grep",
-        "rg",
-        "find",
-        "tree",
-        "pwd",
-        "echo",
-        "sort",
-        "diff",
-        "pytest",
-    }
-)
-_SAFE_GIT = frozenset({"status", "log", "diff", "show", "grep", "ls-files", "blame"})
-# Перенаправления, подстановки и ключи, которыми «читающие» команды пишут файлы
-# (find -exec/-delete/-fprint, git … --output; sort/tree -o — ниже).
-_UNSAFE_SHELL = re.compile(r"[<>`]|\$\(|\s-(?:exec|execdir|delete|fprint\w*|fls)\b|--output")
-_ENV_ASSIGNMENT = re.compile(r"\w+=\S*")
+# Запуск тестов, который сценарный пользователь подтверждает: pytest без ключей и
+# окружения, меняющих, какой код запустится (их классификатор помечает — у части нет
+# сигнатуры ``pytest``), и не через ``uv run`` (тот может доставить пакеты).
+_TEST_RUN = re.compile(r"(?:PYTHONPATH=\S*\s+)?(?:python3?\s+-m\s+)?pytest(?:\s|$)")
+# Пробелы классификатора, которые уже видны: git grep -O запускает «пейджер» — любую
+# программу. Сам классификатор чинится отдельно; здесь — чтобы eval не подтверждал.
+_CLASSIFIER_GAPS = re.compile(r"^git\s+grep\b.*(?:\s-\w*O|--open-files-in-pager)")
 
 
-def is_safe_command(command: str) -> bool:
+def is_safe_command(command: str, *, root: Path) -> bool:
     """Команда только читает или гоняет тесты — сценарный пользователь её подтверждает.
 
-    Каждая часть цепочки (``&&``, ``||``, ``;``, ``|``) — из короткого списка, без
-    перенаправлений и подстановок; python — только ``-m pytest``, git — только чтение.
+    Только разрешающий список, без своего разбора оболочки: решает классификатор агента
+    (:func:`gigacrew.safety.classify`) для проекта ``root``. Подтверждается команда, все
+    части которой соединены ``&&``, ``||``, ``;`` и конвейерами (без фона ``&``,
+    перенаправлений в файлы и неразобранных конструкций) и каждая часть — только чтение
+    (READ) или запуск тестов pytest (:data:`_TEST_RUN`). Всё прочее, включая «не знаю», —
+    отказ: eval идёт без присмотра на машине разработчика.
     """
-    if _UNSAFE_SHELL.search(command):
+    verdict = classify(command, root=root)
+    if verdict.level not in (CommandLevel.READ, CommandLevel.EXEC) or not verdict.composable:
         return False
-    for segment in re.split(r"&&|\|\||[;|\n]", command):
-        try:
-            words = shlex.split(segment)
-        except ValueError:
+    for part in verdict.parts:
+        if _CLASSIFIER_GAPS.search(part.text):
             return False
-        while words and _ENV_ASSIGNMENT.fullmatch(words[0]):
-            words.pop(0)
-        if not words:
+        if part.level is CommandLevel.READ:
             continue
-        name, args = words[0], words[1:]
-        if name in ("python", "python3"):
-            if args[:2] != ["-m", "pytest"]:
-                return False
-        elif name == "git":
-            if not args or args[0] not in _SAFE_GIT:
-                return False
-        elif name not in _SAFE_COMMANDS:
+        if not (
+            part.level is CommandLevel.EXEC
+            and part.signature == "pytest"
+            and _TEST_RUN.match(part.text)
+        ):
             return False
-        elif name in ("sort", "tree") and any(arg.startswith("-o") for arg in args):
-            return False
-    return True
+    return bool(verdict.parts)
 
 
 def is_plan_question(questions: Sequence[Question]) -> bool:
@@ -643,18 +622,21 @@ class ScriptedUser(RecordingEvents):
 
     ``plan_answers`` — ответы на показы плана по порядку (``None`` — Esc, план не
     одобрен); когда ответы кончились — тоже Esc. На вопросы модели (``ask_user``) —
-    первый вариант. Подтверждает правки файлов и безопасные команды, остальное
-    отклоняет. ``on_plan`` вызывается при каждом показе плана (до ответа).
+    первый вариант. Подтверждает правки файлов и безопасные команды (для проекта
+    ``root``), остальное отклоняет. ``on_plan`` вызывается при каждом показе плана (до
+    ответа).
     """
 
     def __init__(
         self,
         plan_answers: Iterable[Answer | None] = (),
         *,
+        root: Path,
         on_plan: Callable[[], None] | None = None,
     ):
         super().__init__(confirm_answer=False)
         self._plan_answers = list(plan_answers)
+        self._root = root
         self._on_plan = on_plan
         self.plans: list[str] = []  # тексты показанных планов
         self.model_questions = 0  # вопросов модели через ask_user
@@ -684,7 +666,7 @@ class ScriptedUser(RecordingEvents):
         if call.kind is ToolKind.COMMAND:
             # В описании вызова команда обрезана — полная только в превью.
             command = preview.text.removeprefix("$ ") if preview is not None else call.summary
-            allowed = is_safe_command(command)
+            allowed = is_safe_command(command, root=self._root)
             self.commands.append((command, allowed))
             return allowed
         return False
@@ -729,10 +711,13 @@ class RecordingProvider(LLMProvider):
     ) -> None:
         system = messages[0].content if messages and messages[0].role == "system" else ""
         usage = turn.usage
+        # Без инструментов идут и сжатие контекста, и рецензент команд — различаются промптом.
+        reviewer = tools is None and system == REVIEWER_PROMPT
         self.calls.append(
             {
                 "subagent": system.startswith(_SUBAGENT_MARK),
-                "summary": tools is None,  # сжатие контекста
+                "summary": tools is None and not reviewer,  # сжатие контекста
+                "reviewer": reviewer,
                 "messages": len(messages),
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,
@@ -940,7 +925,7 @@ def run_scenario(
             at_plan.append(snapshot(root))
 
     recorder = RecordingProvider(provider)
-    user = ScriptedUser(scenario.plan_answers, on_plan=on_plan)
+    user = ScriptedUser(scenario.plan_answers, root=root, on_plan=on_plan)
     agent = Agent(
         recorder, build_default_registry(), config, user, windows=windows, chat_id=chat_id
     )
@@ -1046,19 +1031,26 @@ def _targets(call: FunctionCall, root: Path, target: Path | None) -> bool:
 
 
 def well_formed(messages: Sequence[Message]) -> bool:
-    """Каждый вызов инструмента получил ровно один результат, и результат — после вызова."""
-    pending = 0
+    """Каждый вызов инструмента получил ровно один результат, сразу после своего хода
+    (без сообщений между ними — на такую историю API отвечает 422); результат с id — того
+    вызова, у которого этот id."""
+    pending: list[str | None] = []  # id вызовов хода, ещё без результата
     for message in messages:
         if message.role == "function":
-            if pending == 0:
+            if not pending:
                 return False
-            pending -= 1
+            if message.call_id is not None and None not in pending:
+                if message.call_id not in pending:
+                    return False
+                pending.remove(message.call_id)
+            else:
+                pending.pop(0)
             continue
         if pending:
             return False
         if message.role == "assistant":
-            pending = len(message.function_calls)
-    return pending == 0
+            pending = [call.id for call in message.function_calls]
+    return not pending
 
 
 def _metrics(
@@ -1094,7 +1086,9 @@ def _metrics(
             for rel, text in scenario.files_expect.items()
         )
     subagents = [info for kind, info in user.events if kind == "subagent_start"]
-    main_requests = [c for c in recorder.calls if not c["subagent"] and not c["summary"]]
+    main_requests = [
+        c for c in recorder.calls if not (c["subagent"] or c["summary"] or c["reviewer"])
+    ]
     return {
         # план
         "plan_shown": len(user.plans),
@@ -1150,6 +1144,7 @@ def _metrics(
         "requests": len(recorder.calls),
         "requests_subagent": sum(1 for c in recorder.calls if c["subagent"]),
         "summaries": sum(1 for c in recorder.calls if c["summary"]),
+        "reviews": sum(1 for c in recorder.calls if c["reviewer"]),
         "prompt_tokens": sum(c["prompt_tokens"] for c in recorder.calls),
         "completion_tokens": sum(c["completion_tokens"] for c in recorder.calls),
         "cached_tokens": sum(c["cached_tokens"] for c in recorder.calls),

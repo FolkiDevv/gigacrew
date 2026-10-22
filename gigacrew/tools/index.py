@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 from pydantic import BaseModel, Field
 
-from gigacrew.project.files import is_excluded, is_secret_path
+from gigacrew.project.files import is_excluded
 from gigacrew.project.index import (
     INDEX_ERRORS,
     MAX_INDEX_FILE_BYTES,
@@ -28,9 +28,11 @@ from gigacrew.project.index import (
     ProjectIndex,
     RefreshStats,
     SymbolHit,
+    is_corruption,
 )
 from gigacrew.project.repomap import CHARS_PER_TOKEN, build_repo_map
 from gigacrew.project.symbols import Symbol, language_of
+from gigacrew.safety.paths import is_secret_target
 from gigacrew.security import resolve_in_root
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 
@@ -41,10 +43,19 @@ MAX_LISTED_FILES = 15  # файлов в строках «импортирует
 
 @contextmanager
 def open_index(ctx: ToolContext) -> Iterator[ProjectIndex]:
+    index = ProjectIndex(ctx.workspace)
     try:
-        with ProjectIndex(ctx.workspace) as index:
+        with index:
             yield index
     except INDEX_ERRORS as e:
+        if is_corruption(e):
+            # Испорченные страницы данных видны только на запросе: без пересоздания
+            # падал бы каждый вызов, а /index rebuild модели недоступна.
+            index.discard()
+            raise ToolError(
+                f"Индекс проекта был повреждён ({e}) и удалён — повторите вызов: "
+                "индекс построится заново."
+            ) from e
         raise ToolError(f"Индекс проекта недоступен: {e}") from e
 
 
@@ -170,7 +181,7 @@ class FileOutlineTool(Tool):
         if not target.exists():
             raise ToolError(f"Путь не найден: {params.path}")
         if target.is_file():
-            if is_secret_path(target):
+            if is_secret_target(ctx.root, target):
                 raise ToolError(f"Файлы с секретами не индексируются: {params.path}")
             if is_excluded(ctx.root, target):
                 raise ToolError(

@@ -30,6 +30,7 @@ from gigacrew.agent.events import (
 from gigacrew.agent.guard import MODEL_STOP_REASONS
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, ToolRegistry, ToolResult
+from gigacrew.tools.process import quote_reminder_tags
 from gigacrew.tools.task import SubagentSpec, allows_tool
 
 # Сколько суб-агентов основной агент может запустить за один ход.
@@ -225,7 +226,8 @@ def subagent_report(
         parts.append(LIMIT_STOPPED_NOTE.format(name=spec.name, reason=reason))
         tail = _STOP_REASONS.get(stop, stop)
     if text.strip():
-        parts.append(_clip(text))
+        # Отчёт пересказывает файлы и вывод команд — тег заметок gigacrew в нём цитата.
+        parts.append(_clip(quote_reminder_tags(text)))
     else:
         parts.append(NO_REPORT_NOTE.format(name=spec.name))
         tail = f"{tail} · без отчёта" if tail else "без отчёта"

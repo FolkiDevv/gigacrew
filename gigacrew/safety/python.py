@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import os
 import re
 import sys
@@ -345,6 +346,9 @@ _PATH_WRITERS = frozenset(
 )
 # Из них — только у путей: у объекта неизвестного типа такой вызов — возможно, запись.
 _PATH_ONLY_WRITERS = _PATH_WRITERS - {"rename", "replace", "copy", "move"}
+# Переносят или копируют: запись и туда, куда (первый аргумент).
+_PATH_MOVERS = frozenset({"rename", "replace", "copy", "copy_into", "move", "move_into"})
+_TARGET_KWARGS = ("target", "target_dir")
 _MODE_TEXT = re.compile(r"[rwxabt+U]+")
 # Методы путей, читающие содержимое.
 _PATH_READERS = frozenset({"read_text", "read_bytes"})
@@ -491,6 +495,7 @@ _DYNAMIC_BUILTINS = frozenset(
         "__spec__",
     }
 )
+_BUILTIN_NAMES = frozenset(dir(builtins))
 _WRITE_MODES = set("wax+")
 _PATH_CTORS = frozenset(
     {"Path", "PurePath", "PosixPath", "PurePosixPath", "WindowsPath", "PureWindowsPath"}
@@ -531,6 +536,7 @@ class _Ctx:
     defs: set[str] = field(default_factory=set)  # свои функции и классы
     # import a.b связывает a: у a доступен только подмодуль b (если a не в белом списке)
     partial: dict[str, set[str]] = field(default_factory=dict)
+    star: bool = False  # был from X import *: незнакомое имя может прийти оттуда
     levels: list[tuple[Level | None, str]] = field(default_factory=list)
     hazard_cache: dict[tuple[Path, str | None], bool] = field(default_factory=dict)
 
@@ -646,9 +652,15 @@ def _check_imports(tree: ast.AST, ctx: _Ctx) -> None:
                     got = _module_level(module, ctx)
                     if got is not None:
                         ctx.flag(*got)
+                    ctx.star = True
                     continue
+                resolved = _attr_of_module(module, alias.name)
                 if full in SAFE_MODULES or full in DANGER_MODULES:
                     got = _module_level(full, ctx)
+                elif resolved != full:  # from glob import os — это os
+                    got = _module_level(resolved, ctx)
+                    if (parent := _module_level(module, ctx)) is not None:
+                        ctx.flag(*parent)
                 elif module in _MODULE_ATTRS:
                     _check_module_attr(module, alias.name, ctx)
                     got = None
@@ -656,7 +668,7 @@ def _check_imports(tree: ast.AST, ctx: _Ctx) -> None:
                     got = _module_level(module, ctx)
                 if got is not None:
                     ctx.flag(*got)
-                ctx.modules[alias.asname or alias.name] = full
+                ctx.modules[alias.asname or alias.name] = resolved
 
 
 # Безобидные встроенные из списка динамических: только «не знаю», без тревоги.
@@ -703,8 +715,31 @@ def _resolve_module(node: ast.AST, ctx: _Ctx) -> str | None:
     if isinstance(node, ast.Attribute):
         base = _resolve_module(node.value, ctx)
         if base is not None:
-            return f"{base}.{node.attr}"
+            return _attr_of_module(base, node.attr)
     return None
+
+
+# Атрибуты с именем модуля стандартной библиотеки, которые сами не модули.
+_NOT_SUBMODULES = frozenset(
+    {"ast.keyword", "ast.operator", "datetime.time", "locale.gettext", "unicodedata.decimal"}
+)
+
+
+def _attr_of_module(base: str, attr: str) -> str:
+    """«модуль.атрибут» — или сам модуль, если атрибут — модуль, импортированный модулем
+    стандартной библиотеки: ``glob.os`` и ``random._os`` — это ``os``, и их функции
+    проверяются как функции ``os``."""
+    full = f"{base}.{attr}"
+    name = attr.lstrip("_")
+    if full in SAFE_MODULES or full in DANGER_MODULES or full in _NOT_SUBMODULES:
+        return full
+    if base.split(".")[0] not in sys.stdlib_module_names:
+        return full  # код сторонних модулей и так не проверяется (EXEC)
+    if name == base.rpartition(".")[2] or name in _MODULE_ATTRS.get(base, ()):
+        return full  # glob.glob, time.time, os.stat — функции, а не модули
+    if name in sys.stdlib_module_names or name in DANGER_MODULES:
+        return name
+    return full
 
 
 def _is_path_ctor(func: ast.AST, ctx: _Ctx) -> bool:
@@ -972,7 +1007,7 @@ def _check_list(target: _Path, ctx: _Ctx, what: str) -> None:
 
 
 def _check_write(target: _Path, ctx: _Ctx, what: str, *, recursive: bool = False) -> None:
-    from gigacrew.safety.paths import is_git_internal
+    from gigacrew.safety.paths import is_data_path, is_git_internal
 
     if recursive:
         ctx.flag(Level.DANGER, f"{what}: рекурсивное изменение")
@@ -984,6 +1019,8 @@ def _check_write(target: _Path, ctx: _Ctx, what: str, *, recursive: bool = False
         ctx.flag(Level.DANGER, f"{what}: запись вне проекта")
     elif is_git_internal(target.static.resolve(), ctx.root):
         ctx.flag(Level.DANGER, f"{what}: служебные файлы git")
+    elif is_data_path(target.static.resolve(), ctx.root):
+        ctx.flag(Level.DANGER, f"{what}: служебная папка gigacrew")  # как запись из shell
     else:
         ctx.flag(Level.WRITE, what)
 
@@ -1043,10 +1080,16 @@ def _check_call(node: ast.Call, ctx: _Ctx) -> None:
         elif attr in _PATH_WRITERS and _looks_like_path(func.value, ctx):
             target = _path_of(func.value, ctx)
             _check_write(target, ctx, f".{attr}()", recursive=False)
+            if attr in _PATH_MOVERS:
+                _check_destination(node, ctx, f".{attr}()")
+            if attr.startswith("copy"):
+                _check_read(target, ctx, f".{attr}()")  # копия секрета — его чтение
         elif attr in _PATH_READERS:
             _check_read(_path_of(func.value, ctx), ctx, f".{attr}()")
-        elif attr in _PATH_ONLY_WRITERS:
+        elif attr in _PATH_ONLY_WRITERS or (attr in _PATH_MOVERS and _one_target(node)):
             ctx.flag(None, f".{attr}(): объект неизвестен — возможно, запись в файл")
+            if attr in _PATH_MOVERS:
+                _check_destination(node, ctx, f".{attr}()")
         elif attr == "open" and _looks_like_path(func.value, ctx):
             _check_open(node, _path_of(func.value, ctx), 0, ctx, ".open()")
         elif attr == "open" and _opens_for_write(node):
@@ -1071,6 +1114,35 @@ def _check_call(node: ast.Call, ctx: _Ctx) -> None:
     ctx.flag(None, "вызов результата выражения")
 
 
+def _one_target(node: ast.Call) -> bool:
+    """Вызов как ``p.rename(target)``: один позиционный аргумент или ``target=``
+    (у ``str.replace`` их два, у ``dict.copy`` — ни одного)."""
+    if len(node.args) == 1:
+        return True
+    return not node.args and any(kw.arg in _TARGET_KWARGS for kw in node.keywords)
+
+
+def _check_destination(node: ast.Call, ctx: _Ctx, what: str) -> None:
+    """Куда переносит или копирует ``p.rename/replace/copy/move(_into)``."""
+    dest = _call_arg(node, 0, *_TARGET_KWARGS)
+    _check_write(_path_of(dest, ctx) if dest is not None else _UNKNOWN_PATH, ctx, what)
+
+
+def _call_arg(node: ast.Call, index: int, *names: str) -> ast.AST | None:
+    """Аргумент вызова — позиционный или именованный. ``*args`` и ``**kwargs`` могут
+    подставить любой: тогда значение известно только при выполнении."""
+    if any(isinstance(a, ast.Starred) for a in node.args[: index + 1]) or any(
+        kw.arg is None for kw in node.keywords
+    ):
+        return _RUNTIME_ARG
+    if len(node.args) > index:
+        return node.args[index]
+    for kw in node.keywords:
+        if kw.arg in names:
+            return kw.value
+    return None
+
+
 def _opens_for_write(node: ast.Call) -> bool:
     """``x.open(...)`` у объекта неизвестного типа: режим записи или неизвестный режим."""
     for kw in node.keywords:
@@ -1084,6 +1156,17 @@ def _opens_for_write(node: ast.Call) -> bool:
 
 def _defined(name: str, ctx: _Ctx) -> bool:
     return name in ctx.bindings or name in ctx.defs
+
+
+def _known_name(name: str, ctx: _Ctx) -> bool:
+    """Имя связано в коде (импорт, присваивание, def) или встроенное."""
+    return (
+        name in ctx.modules
+        or name in ctx.iterations
+        or _defined(name, ctx)
+        or name in _BUILTIN_NAMES
+        or name in _SAFE_DUNDERS
+    )
 
 
 def _looks_like_path(node: ast.AST, ctx: _Ctx, depth: int = 0) -> bool:
@@ -1148,15 +1231,21 @@ def _check_module_function(full: str, node: ast.Call, ctx: _Ctx) -> None:
         ctx.flag(Level.DANGER, f"{full}()")
         return
     if module in ("os", "shutil") and attr in _FILE_WRITERS | _RECURSIVE:
-        target = _path_of(node.args[0], ctx) if node.args else _UNKNOWN_PATH
+        src = _call_arg(node, 0, "path", "name", "src")
+        target = _path_of(src, ctx) if src is not None else _UNKNOWN_PATH
         _check_write(target, ctx, f"{full}()", recursive=attr in _RECURSIVE)
-        if (
-            attr in ("rename", "replace", "copy", "copy2", "copyfile", "move")
-            and len(node.args) > 1
-        ):
-            _check_write(_path_of(node.args[1], ctx), ctx, f"{full}()")
+        if attr in ("rename", "replace", "copy", "copy2", "copyfile", "move"):
+            dst = _call_arg(node, 1, "dst")
+            if dst is not None:
+                _check_write(_path_of(dst, ctx), ctx, f"{full}()")
             if attr.startswith("copy"):
                 _check_read(target, ctx, f"{full}()")
+        if any(
+            kw.arg in ("dir_fd", "src_dir_fd", "dst_dir_fd")
+            and not (isinstance(kw.value, ast.Constant) and kw.value.value is None)
+            for kw in node.keywords
+        ):
+            ctx.flag(None, f"{full}(): путь относительно открытого каталога")
         return
     if module == "os" and attr in ("listdir", "scandir", "walk"):
         target = _path_of(node.args[0], ctx) if node.args else _Path(static=ctx.cwd)
@@ -1183,6 +1272,16 @@ def _check_module_function(full: str, node: ast.Call, ctx: _Ctx) -> None:
     if module.startswith("pathlib") and attr in ("home",):
         ctx.flag(None, f"{full}() — путь вне проекта")
         return
+    if (
+        module.startswith("pathlib")
+        and module.rpartition(".")[2] in _PATH_CTORS
+        and attr in _PATH_WRITERS | _PATH_READERS | _PATH_LISTERS | {"open"}
+    ):
+        # метод, вызванный у класса: Path.write_text(p, 'x') — то же, что p.write_text('x')
+        obj = node.args[0] if node.args else _RUNTIME_ARG
+        method = ast.Attribute(value=obj, attr=attr, ctx=ast.Load())
+        _check_call(ast.Call(func=method, args=node.args[1:], keywords=node.keywords), ctx)
+        return
     if module in ("json", "tomllib", "csv", "pickle") and attr in ("dump",):
         return  # файл открыт open() — проверен там
     allowed = _MODULE_ATTRS.get(module)
@@ -1190,8 +1289,92 @@ def _check_module_function(full: str, node: ast.Call, ctx: _Ctx) -> None:
         ctx.flag(None, f"{full}() не проверен классификатором")
 
 
+def _collect_aliases(ctx: _Ctx) -> None:
+    """``rm = os.remove``, ``P = Path``: имя — псевдоним модуля или его атрибута, вызовы
+    через него проверяются как вызовы оригинала. Только если других значений у имени нет
+    (иначе ``p.unlink()`` для ``p`` из обхода стал бы «функцией модуля»)."""
+    changed = True
+    while changed:  # псевдоним псевдонима
+        changed = False
+        for name, values in ctx.bindings.items():
+            if name in ctx.modules or name in ctx.iterations or name in ctx.defs:
+                continue
+            resolved = {_resolve_module(v, ctx) for v in values}
+            if len(resolved) == 1 and (target := resolved.pop()) is not None:
+                ctx.modules[name] = target
+                changed = True
+
+
+def _is_alias(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> bool:
+    if (
+        not isinstance(parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+        or parent.value is not node
+    ):
+        return False
+    targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+    resolved = _resolve_module(node, ctx)
+    return all(isinstance(t, ast.Name) and ctx.modules.get(t.id) == resolved for t in targets)
+
+
+# Модули с функциями записи и процессов (и sys.path): переданное куда-то — не проследить.
+_ESCAPING_MODULES = frozenset({*_MODULE_ATTRS, "pathlib", "sys.path"})
+# Атрибуты, которые проверяются в месте вызова: как значения — проверяем вызов с
+# аргументами, известными только при выполнении.
+_REF_ATTRS = _PATH_WRITERS | _PATH_READERS | _PATH_LISTERS | _DANGER_METHODS | {"open", "format"}
+_RUNTIME_ARG = ast.Name(id="<при выполнении>")
+
+
+def _harmless_use(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> bool:
+    """Значение только читают: ``print(os)``, ``for p in sys.path``, ``'\\n'.join(...)``."""
+    if isinstance(parent, ast.Call):
+        func = parent.func
+        if isinstance(func, ast.Name):
+            return (
+                func.id in _SAFE_BUILTINS
+                and func.id not in ctx.modules
+                and not _defined(func.id, ctx)
+            )
+        return isinstance(func, ast.Attribute) and isinstance(func.value, ast.Constant)
+    if isinstance(parent, (ast.For, ast.AsyncFor, ast.comprehension)):
+        return parent.iter is node
+    return isinstance(parent, (ast.Compare, ast.FormattedValue, ast.Expr))
+
+
+def _check_reference(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> None:
+    """Функция или модуль как значение (``map(os.remove, …)``, ``o = open``, ``f(os)``):
+    проверки в месте вызова их не увидят."""
+    if isinstance(parent, ast.Call) and parent.func is node:
+        return  # вызов — проверяется в _check_call
+    if isinstance(parent, ast.Attribute):
+        return  # основание атрибута: os.path, Path('x').write_text
+    resolved = _resolve_module(node, ctx)
+    if resolved is not None and _is_alias(node, parent, ctx):
+        return  # псевдоним — проверяются его вызовы
+    if resolved in _ESCAPING_MODULES:
+        if not _harmless_use(node, parent, ctx):
+            ctx.flag(None, f"модуль {resolved} передан как значение — что с ним сделают, не видно")
+        return
+    if resolved is None:
+        if isinstance(node, ast.Name):
+            if node.id != "open" or _defined(node.id, ctx):
+                return
+        elif not isinstance(node, ast.Attribute) or node.attr not in _REF_ATTRS:
+            return
+    start = len(ctx.levels)
+    _check_call(ast.Call(func=node, args=[_RUNTIME_ARG], keywords=[]), ctx)
+    found = ctx.levels[start:]
+    del ctx.levels[start:]
+    if found:
+        what = resolved or (node.id if isinstance(node, ast.Name) else f".{node.attr}")
+        level = worst(*(lv for lv, _ in found))
+        ctx.flag(level, f"{what} передана как значение: аргументы известны только при выполнении")
+
+
 def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
+    parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     for node in ast.walk(tree):
+        if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
+            _check_reference(node, parents.get(id(node)), ctx)
         if isinstance(node, ast.Attribute):
             attr = node.attr
             if attr.startswith("__") and attr.endswith("__") and attr not in _SAFE_DUNDERS:
@@ -1200,17 +1383,18 @@ def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
                 ctx.flag(Level.DANGER, f"доступ к {attr} — внутренности интерпретатора")
             module = _resolve_module(node.value, ctx)
             if module is not None:
+                resolved = _attr_of_module(module, attr)
+                if resolved != f"{module}.{attr}":  # glob.os — импорт модуля os
+                    got = _module_level(resolved, ctx)
+                    if got is not None:
+                        ctx.flag(*got)
                 _check_module_attr(module, attr, ctx)
                 if module in ctx.partial and attr not in ctx.partial[module]:
                     if attr in ("import_module", "__import__", "reload", "util", "machinery"):
                         ctx.flag(Level.DANGER, f"{module}.{attr} — импорт при выполнении")
                     else:
                         ctx.flag(None, f"{module}.{attr} не проверен классификатором")
-            if (
-                isinstance(node.value, ast.Attribute)
-                and node.value.attr == "path"
-                and _resolve_module(node.value.value, ctx) == "sys"
-            ):
+            if module == "sys.path":  # и from sys import path, и p = sys.path
                 ctx.flag(Level.DANGER, "изменение sys.path — подмена модулей")
         elif isinstance(node, ast.Name):
             if node.id in _DYNAMIC_BUILTINS:
@@ -1219,6 +1403,9 @@ def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
                 node.id.startswith("__") and node.id.endswith("__") and node.id not in _SAFE_DUNDERS
             ):
                 ctx.flag(Level.DANGER, f"доступ к {node.id} — внутренности интерпретатора")
+            elif ctx.star and not _known_name(node.id, ctx):
+                # from platform import * приносит и os: что за объект — не узнать
+                ctx.flag(None, f"{node.id}: имя из from … import *, не проверено")
         elif isinstance(node, ast.Call):
             _check_call(node, ctx)
         elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
@@ -1279,6 +1466,7 @@ def analyze(
     ctx = _Ctx(root=root, cwd=run_dir, script=script)
     _collect_bindings(tree, ctx)
     _check_imports(tree, ctx)
+    _collect_aliases(ctx)
     _check_attributes(tree, ctx)
     first = script.parent if script is not None else run_dir
     for directory in (first, *path_dirs):

@@ -22,6 +22,7 @@ from gigacrew.cli.commands import (
     expand_skill,
     is_repl_command,
     mode_choices,
+    save_chat,
 )
 from gigacrew.cli.hooks import hook_session
 from gigacrew.cli.indexing import ensure_index
@@ -39,10 +40,6 @@ BANNER_HINTS = (
     ("/model", "модель"),
     ("/resume", "чаты"),
     ("/clear", "новый чат"),
-)
-TLS_OFF_WARNING = (
-    "проверка TLS-сертификата сервера API выключена — ключ или токен можно перехватить "
-    "подменой сервера; задайте GIGACREW_CA_BUNDLE (корневой сертификат сервера, PEM)"
 )
 
 
@@ -62,9 +59,7 @@ def autosave(chats: ChatRecorder | None, agent: Agent, ui: Console) -> None:
     """Сохранить чат после хода. Ход к этому моменту уже согласован (``repair``)."""
     if chats is None:
         return
-    warning = chats.save(agent.conversation, model=agent.model)
-    if warning:
-        ui.warn(warning)
+    save_chat(chats, agent, ui)
 
 
 def esc_interrupt_for(
@@ -144,9 +139,6 @@ def run_repl(
         auto_approve=agent.config.auto_approve,
         mode=agent.mode,
     )
-    cfg = agent.config
-    if cfg.auth_mode in ("oauth", "cli_token") and not cfg.verify_ssl:
-        ui.warn(TLS_OFF_WARNING)
     if resumed is not None:
         ui.chat_resumed(resumed, agent.conversation.messages, agent.call_info)
     # Ввод не принимается, пока строится индекс (Esc/Ctrl+C — отменить построение).
@@ -210,8 +202,13 @@ def _loop(
         if request is not None:
             line = request
         elif is_repl_command(line):
-            if not commands.dispatch(line, ctx):
-                return 0
+            try:
+                if not commands.dispatch(line, ctx):
+                    return 0
+            except Exception as e:  # как и ошибка в ходе: сбой команды не закрывает REPL
+                ui.stop_live()
+                name = line.split(maxsplit=1)[0]
+                ui.error(f"внутренняя ошибка в {name}: {type(e).__name__}: {e}")
             typeahead = esc.take_typeahead()
             continue
 

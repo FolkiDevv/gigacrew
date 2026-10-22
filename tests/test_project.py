@@ -9,7 +9,16 @@ import subprocess
 import pytest
 
 from gigacrew.agent.prompts import SYSTEM_PROMPT, build_system_prompt, nested_instructions_prompt
-from gigacrew.project.files import TREE_TRUNCATED, build_file_tree, glob_match, walk_files
+from gigacrew.project.files import (
+    TREE_TRUNCATED,
+    build_file_tree,
+    glob_match,
+    is_git_internal,
+    is_secret_file,
+    is_secret_path,
+    is_within,
+    walk_files,
+)
 from gigacrew.project.instructions import (
     INSTRUCTION_FILES,
     InstructionFile,
@@ -20,10 +29,16 @@ from gigacrew.project.workspace import Workspace
 
 
 # ------------------------------ Workspace ------------------------------ #
-def test_workspace_constructor_has_no_side_effects(tmp_path):
+def test_workspace_constructor_has_no_side_effects(tmp_path, _isolated_home):
+    from gigacrew.agent.decisions import project_key
+
     ws = Workspace(tmp_path)
     assert ws.data_dir == tmp_path.resolve() / ".gigacode"
-    assert ws.chats_dir == ws.data_dir / "chats"
+    # чаты — у пользователя, рядом с разрешениями проекта; в проекте — только прежнее место
+    assert ws.chats_dir == _isolated_home / ".gigacode" / "projects" / project_key(tmp_path) / (
+        "chats"
+    )
+    assert ws.legacy_chats_dir == ws.data_dir / "chats"
     assert ws.index_dir == ws.data_dir / "index"
     assert ws.skills_dir == ws.data_dir / "skills"
     assert not ws.data_dir.exists()
@@ -39,7 +54,13 @@ def test_gitignore_covers_agent_data_but_not_skills(tmp_path):
     ws = Workspace(tmp_path)
     ws.ensure_data_dir()
     ignored = _gitignored(ws)
-    for path in (ws.chats_dir, ws.plans_dir, ws.index_dir, ws.history_file, ws.local_settings_file):
+    for path in (
+        ws.legacy_chats_dir,  # что не удалось перенести, тоже не коммитится
+        ws.plans_dir,
+        ws.index_dir,
+        ws.history_file,
+        ws.local_settings_file,
+    ):
         assert path.relative_to(ws.data_dir).as_posix() in ignored
     assert not any(p == "*" or p.startswith("skills") for p in ignored)
     assert "settings.json" not in ignored
@@ -81,6 +102,35 @@ def test_ensure_data_dir_creates_gitignore_idempotently(tmp_path):
     assert gi.read_text(encoding="utf-8") == "# мой\n*\n!keep\n"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+@pytest.mark.parametrize("entry", ["", ".gitignore", "chats", "index", "plans", "history"])
+def test_ensure_data_dir_refuses_symlinks_out_of_it(tmp_path, entry):
+    """Репозиторий может принести симлинк на месте .gigacode или её служебной записи (git
+    восстанавливает симлинки при клоне): gigacrew не пишет по нему за пределы проекта."""
+    root, outside = tmp_path / "proj", tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    ws = Workspace(root)
+    if not entry:
+        ws.data_dir.symlink_to(outside, target_is_directory=True)
+    else:
+        ws.data_dir.mkdir()
+        target = outside if entry in ("chats", "index", "plans") else outside / "victim"
+        (ws.data_dir / entry).symlink_to(target)  # .gitignore — висячий симлинк
+    with pytest.raises(OSError, match="симлинк"):
+        ws.ensure_data_dir()
+    assert list(outside.iterdir()) == []
+
+
+def test_ensure_data_dir_keeps_regular_entries(tmp_path):
+    ws = Workspace(tmp_path)
+    for path in (ws.legacy_chats_dir, ws.index_dir):
+        path.mkdir(parents=True)
+    ws.history_file.write_text("+a\n", encoding="utf-8")
+    assert ws.ensure_data_dir() == ws.data_dir
+    assert (ws.data_dir / ".gitignore").is_file()
+
+
 # ------------------------------ glob_match ------------------------------ #
 @pytest.mark.parametrize(
     "path, pattern, expected",
@@ -99,6 +149,8 @@ def test_ensure_data_dir_creates_gitignore_idempotently(tmp_path):
         ("x/README.md", "**/README.md", True),
         ("README.md", "**/README.md", True),
         ("a+b.txt", "a+b.txt", True),  # спецсимволы regex экранируются
+        ("src/ab/x.py", "src/a**/x.py", True),  # '**' внутри сегмента — как '*'
+        ("src/ab/c/x.py", "src/a**/x.py", False),
     ],
 )
 def test_glob_match(path, pattern, expected):
@@ -128,6 +180,53 @@ def test_walk_files_skips_symlinks_outside_root(tmp_path):
     (root / "inner_link.txt").symlink_to(root / "in.txt")
     rels = sorted(p.name for p in walk_files(root))
     assert rels == ["in.txt", "inner_link.txt"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_sibling_with_root_prefix_is_outside(tmp_path):
+    # /x/root-evil — не внутри /x/root, хотя строка пути начинается так же
+    root, evil = tmp_path / "root", tmp_path / "root-evil"
+    _make(evil, "secret.txt")
+    _make(root, "in.txt")
+    (root / "link.txt").symlink_to(evil / "secret.txt")
+    assert not is_within(root.resolve(), evil / "secret.txt")
+    assert [p.name for p in walk_files(root)] == ["in.txt"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_git_internal_by_path_as_given(tmp_path):
+    # nested/.git — симлинк на обычный каталог: путь через .git — внутренности git, даже
+    # если после раскрытия симлинка компонента .git в нём нет
+    root = tmp_path.resolve()
+    (root / "nested" / "plain").mkdir(parents=True)
+    (root / "nested" / ".git").symlink_to(root / "nested" / "plain")
+    resolved = (root / "nested" / ".git" / "config").resolve()
+    assert is_git_internal(root, resolved, "nested/.git/config")
+    assert not is_git_internal(root, resolved)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        (".env", True),
+        (".ENV", True),  # на macOS/Windows — тот же файл
+        (".Env.Local", True),
+        (".env.production", True),
+        (".env.example", False),
+        (".ENV.Example", False),
+        ("env.py", False),
+    ],
+)
+def test_secret_file_names(name, expected):
+    assert is_secret_file(name) is expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_secret_path_through_symlink(tmp_path):
+    _make(tmp_path, ".env", "TOKEN=1")
+    (tmp_path / "settings.py").symlink_to(tmp_path / ".env")
+    assert is_secret_path(tmp_path / "settings.py")
+    assert not is_secret_path(tmp_path / ".env.example")
 
 
 def test_file_tree_shows_dotfiles_hides_service_dirs(tmp_path):
@@ -232,6 +331,17 @@ def test_instruction_symlink_counted_once(tmp_path):
     assert [d.name for d in load_instructions(tmp_path)] == ["AGENTS.md"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_instruction_symlink_outside_project_is_not_loaded(tmp_path):
+    # Репозиторий не может подсунуть в системный промпт файл вне проекта.
+    root = tmp_path / "proj"
+    root.mkdir()
+    (tmp_path / "secret.txt").write_text("TOKEN=abc", encoding="utf-8")
+    (root / "AGENTS.md").symlink_to(tmp_path / "secret.txt")
+    assert load_instructions(root) == []
+    assert "TOKEN=abc" not in build_system_prompt(Workspace(root))
+
+
 def test_instruction_total_limit_prefers_higher_priority(tmp_path):
     (tmp_path / "AGENTS.md").write_text("a" * 50, encoding="utf-8")
     (tmp_path / "GIGACREW.md").write_text("d" * 50, encoding="utf-8")
@@ -293,6 +403,18 @@ def test_nested_instructions_prompt_limits(tmp_path):
     assert (
         "bbbb" not in prompt and "Too large for the context" in prompt and "b/AGENTS.md" in prompt
     )
+
+
+def test_nested_instructions_budget_is_shared(tmp_path):
+    # Лимит — на все инструкции подкаталогов вместе: каждая меньше лимита, но вместе
+    # они больше — последние перечисляются путями.
+    docs = [InstructionFile(f"d{i}/AGENTS.md", str(i) * 8_000) for i in range(4)]
+    prompt = nested_instructions_prompt(docs)
+    assert "0" * 8_000 in prompt and "1" * 8_000 in prompt
+    assert "2" * 8_000 not in prompt and "3" * 8_000 not in prompt
+    skipped = prompt.split("Too large for the context")[1]
+    assert "d2/AGENTS.md" in skipped and "d3/AGENTS.md" in skipped
+    assert "d0/AGENTS.md" not in skipped and "d1/AGENTS.md" not in skipped
 
 
 def test_system_prompt_contains_project_context(tmp_path):

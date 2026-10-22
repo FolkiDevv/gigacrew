@@ -1,8 +1,14 @@
-"""Сохранённые чаты: ``.gigacode/chats/<id>.json``.
+"""Сохранённые чаты: ``~/.gigacode/projects/<ключ проекта>/chats/<id>.json``.
 
 Один файл на чат: метаданные (заголовок, время, модель) и диалог в формате
 :meth:`Conversation.to_dict`. Запись атомарная (временный файл + ``os.replace``),
 файл доступен только владельцу — в диалоге бывают секреты из вывода команд.
+
+Чаты хранятся у пользователя, а не в проекте: продолженный чат — доверенные данные (его
+запросы видит рецензент команд как запросы пользователя, его модель становится текущей),
+а файл в проекте мог прийти вместе с репозиторием. Чаты с прежнего места
+(``.gigacode/chats`` проекта) переносятся при первом обращении (:meth:`ChatStore.migrate`);
+закоммиченные в git — нет. Из проекта чаты не читаются никогда.
 
 :class:`ChatStore` — хранилище, :class:`ChatRecorder` — текущий чат сессии
 (автосохранение после хода, переключение по ``/resume``, новый чат по ``/clear``).
@@ -11,10 +17,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import json
 import os
 import re
 import secrets
+import shutil
+import stat
+import subprocess
 import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -97,16 +108,149 @@ def _message_count(data: dict[str, Any]) -> int:
     return len(messages) if isinstance(messages, list) else 0
 
 
+_GIT_TIMEOUT = 10
+# Как у инструмента git: fsmonitor-хук из настроек репозитория — внешняя программа.
+_GIT_SAFE_CONFIG = ("-c", "core.fsmonitor=false", "-c", "safe.bareRepository=explicit")
+
+
+def _git_tracked(workspace: Workspace, directory: Path) -> set[str] | None:
+    """Имена файлов ``directory`` (в git-репозитории), которые отслеживает git.
+
+    None — не удалось узнать (git не установлен, ошибка): тогда переносить нельзя.
+    """
+    try:
+        run = subprocess.run(
+            ["git", *_GIT_SAFE_CONFIG, "-C", str(workspace.root), "ls-files", "-z", "--"]
+            + [directory.relative_to(workspace.root).as_posix()],
+            capture_output=True,
+            timeout=_GIT_TIMEOUT,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if run.returncode != 0:
+        return None
+    names = run.stdout.decode("utf-8", "surrogateescape").split("\0")
+    return {name.rsplit("/", 1)[-1] for name in names if name}
+
+
+def _move(src: Path, dst: Path) -> None:
+    """Переместить файл; на другую файловую систему — копия и удаление оригинала.
+
+    Сбой до удаления оригинала — ``OSError``, оригинал на месте, неполной копии нет.
+    """
+    try:
+        os.replace(src, dst)
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    fd, tmp = tempfile.mkstemp(prefix=f".{dst.stem}.", suffix=".tmp", dir=dst.parent)
+    os.close(fd)
+    try:
+        shutil.copyfile(src, tmp)  # mkstemp уже дал права 0600
+        os.replace(tmp, dst)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    src.unlink()
+
+
 class ChatStore:
     FORMAT_VERSION = 1
 
     def __init__(self, workspace: Workspace):
         """Конструктор не трогает файловую систему."""
         self._workspace = workspace
+        self._directory: Path | None = None
+        self._migrated = False
 
     @property
     def directory(self) -> Path:
-        return self._workspace.chats_dir
+        if self._directory is None:  # ключ проекта читает .git — один раз
+            self._directory = self._workspace.chats_dir
+        return self._directory
+
+    # ------------------------------------------------------------------ #
+    def migrate(self) -> list[str]:
+        """Перенести чаты с прежнего места (``.gigacode/chats`` проекта) в :attr:`directory`.
+
+        Выполняется один раз на хранилище (повторный вызов — пустой список), остальные
+        методы вызывают его сами. Возвращает тексты для пользователя. Переносятся только
+        обычные файлы (не симлинки), которые не отслеживает git: закоммиченный чат пришёл
+        с репозиторием. Вне git-репозитория этого не узнать (проект мог прийти архивом) —
+        там чаты не переносятся, пользователь переносит свои сам. Перенос — перемещение;
+        не удалось — оригинал остаётся на месте (но и оттуда не читается). Чат с тем же id
+        у пользователя не перезаписывается.
+        """
+        if self._migrated:
+            return []
+        self._migrated = True
+        legacy = self._workspace.legacy_chats_dir
+        try:
+            if legacy.parent.is_symlink() or legacy.is_symlink() or not legacy.is_dir():
+                return []
+            files = sorted(
+                p for p in legacy.iterdir() if p.suffix == ".json" and _ID_RE.match(p.stem)
+            )
+        except OSError as e:
+            return [f"не удалось прочитать прежний каталог чатов {legacy}: {e}"]
+        if not files:
+            return []
+        if not self._workspace.in_git_repo():
+            return [
+                f"чаты в {legacy} не перенесены: проект не в git-репозитории, и не проверить, "
+                "не пришли ли они вместе с ним; оттуда они не загружаются. Если это ваши "
+                f"чаты, перенесите файлы в {self.directory} вручную"
+            ]
+        tracked = _git_tracked(self._workspace, legacy)
+        if tracked is None:
+            return [
+                f"чаты в {legacy} не перенесены: не удалось проверить через git, не пришли ли "
+                "они с репозиторием; оттуда они не загружаются"
+            ]
+        moved, shipped, existing, failed = 0, [], [], []
+        for path in files:
+            if path.name in tracked:
+                shipped.append(path.stem)
+                continue
+            try:
+                if not stat.S_ISREG(os.lstat(path).st_mode):
+                    continue  # симлинк или не файл — не наш чат
+                target = self._path(path.stem)
+                if target.exists():
+                    existing.append(path.stem)
+                    continue
+                self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _move(path, target)
+            except OSError as e:
+                failed.append(f"{path.stem} ({e})")
+                continue
+            moved += 1
+        with contextlib.suppress(OSError):
+            legacy.rmdir()  # только пустой
+        notices = []
+        if moved:
+            notices.append(
+                f"перенесено чатов: {moved} — из {legacy} в {self.directory} (чаты теперь "
+                "хранятся у пользователя, а не в проекте)"
+            )
+        if shipped:
+            notices.append(
+                f"чаты {', '.join(shipped)} в {legacy} отслеживает git — они пришли с "
+                "репозиторием и не загружаются"
+            )
+        if existing:
+            notices.append(
+                f"чаты {', '.join(existing)} уже есть в {self.directory} — копии в {legacy} "
+                "оставлены и не загружаются"
+            )
+        if failed:
+            notices.append(
+                f"не удалось перенести чаты из {legacy}: {'; '.join(failed)} — они остались "
+                "на месте и не загружаются"
+            )
+        return notices
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -115,7 +259,20 @@ class ChatStore:
         return f"{(now or _now()):%Y%m%d-%H%M%S}-{secrets.token_hex(4)}"
 
     def exists(self, chat_id: str) -> bool:
+        self.migrate()
         return self._path(chat_id).exists()
+
+    def version(self, chat_id: str) -> tuple[int, int, int] | None:
+        """Версия файла чата: inode, время изменения, размер (None — файла нет).
+
+        Запись атомарна (новый файл + ``os.replace``), поэтому каждая запись — из
+        этой сессии или из другой — меняет inode.
+        """
+        try:
+            st = self._path(chat_id).stat()
+        except OSError:
+            return None
+        return st.st_ino, st.st_mtime_ns, st.st_size
 
     def _path(self, chat_id: str) -> Path:
         if not _ID_RE.match(chat_id):
@@ -156,12 +313,14 @@ class ChatStore:
             "conversation": conversation.to_dict(),
         }
         path = self._path(chat_id)
-        self._workspace.ensure_data_dir()
-        self.directory.mkdir(exist_ok=True)
+        self.migrate()
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         # mkstemp создаёт файл с правами 0600 в том же каталоге — os.replace атомарен.
         fd, tmp = tempfile.mkstemp(prefix=f".{chat_id}.", suffix=".tmp", dir=self.directory)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            # backslashreplace: одиночный суррогат (имя файла не в UTF-8), если он всё же
+            # попал в диалог, пишется экранированным «\udcee» — это корректный JSON.
+            with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
                 json.dump(data, f, ensure_ascii=False)
             os.replace(tmp, path)
         except BaseException:
@@ -172,6 +331,7 @@ class ChatStore:
     # ------------------------------------------------------------------ #
     def load(self, chat_id: str) -> SavedChat:
         path = self._path(chat_id)
+        self.migrate()
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -205,6 +365,7 @@ class ChatStore:
 
     def _files(self) -> list[Path]:
         """Файлы чатов, свежие первыми (по времени изменения)."""
+        self.migrate()
         try:
             files = [p for p in self.directory.glob("*.json") if _ID_RE.match(p.stem)]
         except OSError:
@@ -262,6 +423,11 @@ class ChatRecorder:
 
     Если записать не удалось (проект только для чтения), сохранение отключается до
     конца сессии, а :meth:`save` один раз возвращает текст предупреждения.
+
+    Один чат могут продолжить две сессии (два терминала с ``gigacrew -c``): каждая
+    пишет файл целиком, и вторая затёрла бы ходы первой. Поэтому запоминается
+    версия файла после своей записи (или при продолжении); если к следующей записи
+    файл изменила другая сессия, диалог сохраняется новым чатом — с предупреждением.
     """
 
     def __init__(self, store: ChatStore, *, enabled: bool = True):
@@ -269,6 +435,7 @@ class ChatRecorder:
         self.enabled = enabled
         self._chat_id = store.new_id()
         self._created_at: datetime | None = None
+        self._version: tuple[int, int, int] | None = None  # файла после своей записи
         self.title = ""  # заголовок продолженного чата (пусто — новый)
 
     @property
@@ -278,19 +445,34 @@ class ChatRecorder:
     def start_new(self) -> None:
         self._chat_id = self.store.new_id()
         self._created_at = None
+        self._version = None
         self.title = ""
 
     def switch_to(self, info: ChatInfo) -> None:
         """Дальнейшие сохранения идут в этот (продолженный) чат."""
         self._chat_id = info.id
         self._created_at = info.created_at
+        self._version = self.store.version(info.id)
         self.title = info.title
 
     def save(self, conversation: Conversation, *, model: str = "") -> str | None:
-        """Сохраняет диалог; возвращает предупреждение, если запись не удалась."""
+        """Сохраняет диалог; возвращает предупреждение, если запись не удалась или
+        диалог пришлось сохранить новым чатом."""
         if not self.enabled or not any(m.is_request for m in conversation.messages):
             return None
+        warning = None
         try:
+            if self._created_at is not None and self._version is not None:
+                current = self.store.version(self._chat_id)
+                if current is not None and current != self._version:
+                    # Чат изменила другая сессия: не затирать её ходы — новый чат.
+                    old = self._chat_id
+                    self._chat_id = self.store.new_id()
+                    self._created_at = None
+                    warning = (
+                        f"чат {old} изменила другая сессия gigacrew — чтобы не затереть её "
+                        f"ходы, этот диалог сохранён отдельным чатом {self._chat_id}"
+                    )
             if self._created_at is None:
                 # Первая запись нового чата: id не должен затереть чужой чат
                 # (другое окно gigacrew, начатое в ту же секунду).
@@ -299,8 +481,9 @@ class ChatRecorder:
             info = self.store.save(
                 self._chat_id, conversation, model=model, created_at=self._created_at
             )
-        except OSError as e:
+        except (OSError, ValueError) as e:  # ValueError — в том числе UnicodeEncodeError
             self.enabled = False
             return f"чат не сохранён, автосохранение отключено: {e}"
         self._created_at = info.created_at
-        return None
+        self._version = self.store.version(self._chat_id)
+        return warning

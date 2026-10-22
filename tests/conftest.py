@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -51,7 +52,7 @@ def live_config() -> Config:
     model = env.get("GIGACREW_TEST_MODEL")
     if not model:
         pytest.skip("Не задана GIGACREW_TEST_MODEL — live-тесты пропущены")
-    cfg = Config.load(project_root=REPO_ROOT, model=model)
+    cfg = Config.load(project_root=REPO_ROOT, trusted_dotenv=True, model=model)
     if cfg.provider != "api":
         pytest.skip("live-тесты — для API v2 (GIGACREW_PROVIDER=api)")
     try:
@@ -67,24 +68,14 @@ def oneshot(tmp_path, monkeypatch):
     import gigacrew.cli.app as cli_app
 
     monkeypatch.chdir(tmp_path)
+    # Настройки пользователя из окружения (любые GIGACREW_*/GIGACODE_*, и новые тоже) не
+    # должны менять поведение теста — убираем все, а не перечисленные.
+    for name in [n for n in os.environ if n.startswith(("GIGACREW_", "GIGACODE_"))]:
+        monkeypatch.delenv(name)
     monkeypatch.setenv("GIGACREW_ACCESS_KEY", "dummy")
     monkeypatch.setenv("GIGACREW_AUTH_URL", "https://auth.test/oauth")
     monkeypatch.setenv("GIGACREW_API_URL", "https://api.test/v1")
     monkeypatch.setenv("GIGACREW_MODEL", "M-default")
-    for name in (
-        "GIGACREW_TIMEOUT",
-        "GIGACREW_TEMPERATURE",
-        "GIGACREW_CONTEXT_TOKENS",
-        "GIGACREW_SAVE_CHATS",
-        "GIGACREW_MODE",
-        "GIGACREW_REVIEWER_MODEL",
-        "GIGACREW_AUTO_COMPACT",
-        "GIGACREW_COMPACT_THRESHOLD",
-        "GIGACREW_AUTO_MEASURE",
-        "GIGACREW_PROVIDER",
-        "GIGACREW_USER_AGENT",
-    ):
-        monkeypatch.delenv(name, raising=False)
 
     def use(provider):
         monkeypatch.setattr(cli_app, "_make_provider", lambda _cfg: provider)

@@ -50,11 +50,24 @@ __all__ = ["ApiError", "ApiProvider", "chat_url"]
 
 
 _VERSION_SUFFIX = re.compile(r"/v\d+$")
+# Ключ и токен — значение заголовка: только видимые символы ASCII. Иначе httpx/h11
+# отвергнет заголовок, и в тексте ошибки окажется сам секрет.
+_CREDENTIAL = re.compile(r"[!-~]+")
 
 
 def chat_url(base_url: str) -> str:
     """Адрес чата v2: хвост ``/vN`` базы заменяется на ``/v2`` (без хвоста — база как есть)."""
     return _VERSION_SUFFIX.sub("/v2", base_url.rstrip("/")) + "/chat/completions"
+
+
+def _strict_json(value: Any) -> bool:
+    """Сериализуется ли значение строгим JSON. ``json.loads`` (и ``resp.json()``) принимают
+    NaN и Infinity, а тело запроса httpx собирает без них — ValueError до отправки."""
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _build_function_call(raw: Any) -> FunctionCall | None:
@@ -67,12 +80,11 @@ def _build_function_call(raw: Any) -> FunctionCall | None:
             args = json.loads(args) if args.strip() else {}
         except json.JSONDecodeError:
             args = {}
+    # Вызов уходит обратно в истории: NaN в аргументах ломал бы каждый следующий запрос.
+    if not isinstance(args, dict) or not _strict_json(args):
+        args = {}
     call_id = raw.get("id")
-    return FunctionCall(
-        name=raw["name"],
-        arguments=args if isinstance(args, dict) else {},
-        id=str(call_id) if call_id else None,
-    )
+    return FunctionCall(name=raw["name"], arguments=args, id=str(call_id) if call_id else None)
 
 
 def _has_reasoning(payload: Mapping[str, Any]) -> bool:
@@ -196,11 +208,18 @@ class ApiProvider(HttpProvider):
         if not force and self._token and time.time() < self._token_exp - 30:
             return self._token
 
+        # Хвост ключа из файла с CRLF (``$(cat key.txt)``) или пробел в .env — не часть ключа.
+        key = (self._cfg.access_key or "").strip()
+        if not _CREDENTIAL.fullmatch(key):
+            raise ApiError(
+                "GIGACREW_ACCESS_KEY содержит пробелы, управляющие или не-ASCII символы — "
+                "проверьте ключ (значение не показывается)"
+            )
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
             "RqUID": str(uuid.uuid4()),
-            "Authorization": f"Basic {self._cfg.access_key}",
+            "Authorization": f"Basic {key}",
         }
         resp = self._request_with_retry(
             lambda: self._client.post(
@@ -218,8 +237,12 @@ class ApiProvider(HttpProvider):
 
         data = self._json(resp)
         token = data.get("access_token")
+        # Значения ответа не показываются: токен мог прийти под другим именем поля.
         if not token:
-            raise ApiError(f"В ответе OAuth нет access_token: {str(data)[:500]}")
+            fields = ", ".join(sorted(str(name) for name in data))[:ERROR_BODY_CHARS]
+            raise ApiError(f"В ответе OAuth нет access_token (поля ответа: {fields or 'нет'})")
+        if not isinstance(token, str) or not _CREDENTIAL.fullmatch(token):
+            raise ApiError("access_token в ответе OAuth — не строка из видимых символов ASCII")
         self._token = token
         # expires_at приходит в миллисекундах unix-времени; если нет — живём 25 мин.
         exp_ms = data.get("expires_at")
@@ -254,13 +277,14 @@ class ApiProvider(HttpProvider):
         Объект передаётся как есть, всё остальное — текст, но и голые JSON-значения
         (``42``, ``true``, ``[]`` — например, листинг из одного файла ``1``) —
         заворачивается в ``{"result": ...}``: отвергнутое API сообщение осталось бы
-        в истории и ломало бы каждый следующий запрос этого чата."""
+        в истории и ломало бы каждый следующий запрос этого чата. Объект с NaN или
+        Infinity — тоже текст: строгим JSON тело запроса с ним не собрать."""
         text = content or ""
         try:
             value = json.loads(text)
         except ValueError:
             value = None
-        return value if isinstance(value, dict) else {"result": text}
+        return value if isinstance(value, dict) and _strict_json(value) else {"result": text}
 
     @staticmethod
     def _assistant_payload(msg: Message) -> dict[str, Any]:
@@ -379,26 +403,31 @@ class ApiProvider(HttpProvider):
         ``tool_state_id``, ``finish_reason`` и ``usage``. Поток, где не пришло окончание
         ответа (событие ``response.message.done``, маркер ``[DONE]``, причина завершения
         или расход токенов), — незавершённый: шлюз закрыл соединение посреди ответа.
+        Обрыв соединения уже после окончания ответа — не ошибка: ответ получен целиком.
         """
         builder = _TurnBuilder()
         done = False
-        for event, data in iter_sse_events(resp.iter_lines()):
-            if data.strip() == "[DONE]":
-                done = True
-                break
-            try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(chunk, dict):
-                continue
-            error = _stream_error(event, chunk)
-            if error is not None:
-                raise ApiError(f"API вернул ошибку в потоке: {error}")
-            done = done or event == "response.message.done"
-            piece = builder.add(chunk)
-            if piece:
-                emit(piece)
+        try:
+            for event, data in iter_sse_events(resp.iter_lines()):
+                if data.strip() == "[DONE]":
+                    done = True
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                error = _stream_error(event, chunk)
+                if error is not None:
+                    raise ApiError(f"API вернул ошибку в потоке: {error}")
+                done = done or event == "response.message.done"
+                piece = builder.add(chunk)
+                if piece:
+                    emit(piece)
+        except httpx.TransportError:
+            if not (done or builder.finished):
+                raise
         return builder.turn(complete=done or builder.finished)
 
     def list_models(self) -> list[str]:

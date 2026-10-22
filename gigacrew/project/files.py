@@ -82,15 +82,23 @@ def git_dirs(root: Path) -> list[Path]:
     return []
 
 
-def looks_like_git_dir(directory: Path) -> bool:
+def looks_like_git_dir(directory: Path, adding: Path | None = None) -> bool:
     """Каталог устроен как каталог git (обычный ``.git``, bare-репозиторий или цель
-    ``gitdir:``/симлинка вложенного репозитория): ``HEAD``, ``objects/``, ``refs/``."""
+    ``gitdir:``/симлинка вложенного репозитория): ``HEAD``, ``objects/``, ``refs/``.
+
+    ``adding`` — путь, который сейчас будет записан: каталог проверяется таким, каким
+    станет после записи. Иначе раскладку можно было бы собрать по файлу — ``config``
+    первым, ``HEAD`` последним, — и каждая запись по отдельности прошла бы проверку.
+    """
+
+    def present(name: str, is_dir: bool) -> bool:
+        entry = directory / name
+        if adding is not None and (adding == entry or (is_dir and entry in adding.parents)):
+            return True
+        return entry.is_dir() if is_dir else entry.is_file()
+
     try:
-        return (
-            (directory / "HEAD").is_file()
-            and (directory / "objects").is_dir()
-            and (directory / "refs").is_dir()
-        )
+        return present("HEAD", False) and present("objects", True) and present("refs", True)
     except OSError:
         return False
 
@@ -102,7 +110,8 @@ def is_git_internal(root: Path, path: Path, raw: str = "") -> bool:
     ``nested/.git`` — симлинк, который раскрытие уберёт), и раскрытый: компонент
     ``.git`` без учёта регистра (``.GIT`` на macOS/Windows) на любой глубине; каталоги
     по пути от корня, устроенные как каталог git (цель симлинка или ``gitdir:``
-    вложенного репозитория); каталог git корня. ``.github``, ``.gitignore`` — обычные.
+    вложенного репозитория), — в том числе если такими их сделает эта запись; каталог
+    git корня. ``.github``, ``.gitignore`` — обычные.
     """
     try:
         parts = path.relative_to(root).parts
@@ -114,7 +123,9 @@ def is_git_internal(root: Path, path: Path, raw: str = "") -> bool:
     if any(path == d or d in path.parents for d in git_dirs(root)):
         return True
     candidates = [path, *path.parents] if path.is_dir() else list(path.parents)
-    return any(looks_like_git_dir(d) for d in candidates if d != root and root in d.parents)
+    return any(
+        looks_like_git_dir(d, adding=path) for d in candidates if d != root and root in d.parents
+    )
 
 
 def is_within(root: Path, path: Path) -> bool:

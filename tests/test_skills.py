@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from gigacrew.cli.commands import CommandContext, default_commands, expand_skill
 from gigacrew.cli.repl import run_repl
 from gigacrew.config import Config
 from gigacrew.project.skills import (
+    MAX_SKILL_BYTES,
     SkillCatalog,
     discover_skills,
     parse_skill,
@@ -23,7 +25,7 @@ from gigacrew.project.skills import (
     user_skills_dir,
 )
 from gigacrew.project.workspace import Workspace
-from gigacrew.tools.base import ToolError, build_default_registry
+from gigacrew.tools.base import ToolContext, ToolError, build_default_registry
 from gigacrew.tools.skill import SkillTool
 from gigacrew.ui.console import Console
 
@@ -103,6 +105,21 @@ def test_discover_project_and_user_skills(tmp_path, _isolated_home):
     assert user_skills_dir() == _isolated_home / ".gigacode" / "skills"
 
 
+def test_project_skill_overrides_user_skill_ignoring_case(tmp_path):
+    project = tmp_path / "proj"
+    _skill(user_skills_dir(), "Deploy", "---\ndescription: пользовательский\n---\nx\n")
+    _project_skill(project, "deploy", "проектный")
+    skills = discover_skills(Workspace(project))
+    assert [(s.name, s.description, s.source) for s in skills] == [
+        ("deploy", "проектный", "project")
+    ]
+
+
+def test_oversized_skill_is_ignored(tmp_path):
+    path = _skill(tmp_path, "big", "---\nname: big\n---\n" + "x" * MAX_SKILL_BYTES)
+    assert parse_skill(path) is None
+
+
 def test_old_gigacrew_folder_is_not_used(tmp_path):
     _skill(tmp_path / ".gigacrew" / "skills", "old", "---\ndescription: x\n---\nx\n")
     assert discover_skills(Workspace(tmp_path)) == []
@@ -163,6 +180,77 @@ def test_skill_tool_file_stays_in_skill_dir(ctx, file):
     tool = SkillTool()
     with pytest.raises(ToolError):
         tool.run(tool.parse({"name": "deploy", "file": file}), ctx)
+
+
+def _outside_skill(base: Path) -> Path:
+    """Файл вне проекта и вне каталогов скиллов (как ~/.aws/credentials)."""
+    return _skill(base / "outside", "keys", "---\nname: keys\n---\nTOKEN=abc\n")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+@pytest.mark.parametrize("link", ["file", "dir"])
+def test_symlinked_project_skill_outside_is_not_a_skill(tmp_path, link):
+    # Репозиторий коммитит .gigacode/skills/<имя>/SKILL.md (или весь каталог) симлинком
+    # наружу: содержимое чужого файла не должно попасть к модели без вопроса.
+    project = tmp_path / "proj"
+    target = _outside_skill(tmp_path)
+    skills = project / ".gigacode" / "skills"
+    if link == "file":
+        (skills / "keys").mkdir(parents=True)
+        (skills / "keys" / "SKILL.md").symlink_to(target)
+    else:
+        skills.mkdir(parents=True)
+        (skills / "keys").symlink_to(target.parent)
+    ws = Workspace(project)
+    assert discover_skills(ws) == []
+    tool = SkillTool()
+    with pytest.raises(ToolError, match="Скилл не найден"):
+        tool.run(tool.parse({"name": "keys"}), ToolContext(workspace=ws))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_symlinked_skills_dir_outside_project_is_ignored(tmp_path):
+    project = tmp_path / "proj"
+    target = _outside_skill(tmp_path)
+    (project / ".gigacode").mkdir(parents=True)
+    (project / ".gigacode" / "skills").symlink_to(target.parent.parent)
+    assert discover_skills(Workspace(project)) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_symlinked_user_skill_outside_is_not_a_skill(tmp_path):
+    target = _outside_skill(tmp_path)
+    user_skills_dir().mkdir(parents=True)
+    (user_skills_dir() / "keys").symlink_to(target.parent)
+    assert discover_skills(Workspace(tmp_path / "proj")) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_symlinks_inside_skills_dir_still_work(tmp_path, _isolated_home):
+    # Каталог скиллов целиком — симлинк (dotfiles), скилл — симлинк на соседний: можно.
+    real = _isolated_home / "dotfiles" / "skills"
+    _skill(real, "notes", "---\ndescription: заметки\n---\nТело.\n")
+    (real / "alias").symlink_to(real / "notes")
+    user_skills_dir().parent.mkdir(parents=True)
+    user_skills_dir().symlink_to(real)
+    assert [s.name for s in discover_skills(Workspace(tmp_path))] == ["alias", "notes"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_skill_tool_does_not_list_or_read_files_outside_skill_dir(ctx, tmp_path):
+    secret = tmp_path / "outside" / "id_rsa"
+    secret.parent.mkdir()
+    secret.write_text("PRIVATE KEY")
+    _project_skill(ctx.root, "deploy", "x")
+    skill_dir = ctx.root / ".gigacode" / "skills" / "deploy"
+    (skill_dir / "key").symlink_to(secret)
+    (skill_dir / "ref").symlink_to(secret.parent)
+    tool = SkillTool()
+    result = tool.run(tool.parse({"name": "deploy"}), ctx)
+    assert "- key" not in result.content and "- ref/" not in result.content
+    for file in ("key", "ref/id_rsa"):
+        with pytest.raises(ToolError, match="за пределы каталога скилла"):
+            tool.run(tool.parse({"name": "deploy", "file": file}), ctx)
 
 
 def test_skill_tool_unknown_lists_available(ctx):

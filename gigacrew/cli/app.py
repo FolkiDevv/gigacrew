@@ -12,8 +12,9 @@
 (``gigacode``): токен — из файла официального CLI GigaCode, модели и их окна — из
 каталога бэкенда, модель по умолчанию — его же.
 
-Чаты сохраняются в ``.gigacode/chats/`` (``--no-save`` — нет); ``-c`` продолжает
-последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
+Чаты сохраняются в ``~/.gigacode/projects/<ключ>/chats/`` (``--no-save`` — нет; прежние
+из ``.gigacode/chats/`` проекта переносятся туда); ``-c`` продолжает последний, ``-r [ID]`` —
+выбранный (без ID — селектор чатов).
 
 Хуки пользователя — из ``~/.gigacode/settings.json`` и ``.gigacode/settings*.json``
 проекта (:mod:`gigacrew.cli.hooks`), после подтверждения или с ``--trust-hooks``; хук
@@ -75,13 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
         "-y",
         "--yes",
         action="store_true",
-        help="Авто-подтверждение операций, кроме опасных (rm -rf, git reset --hard, "
-        "секреты, файлы вне проекта…)",
+        help="Авто-подтверждение операций, кроме опасных (rm -rf, git reset --hard, правка "
+        ".env, файлы вне проекта…) и команд, которые классификатор не смог проверить: их "
+        "в режиме auto смотрит рецензент, затем вы. Файлы с секретами read_file и поиск "
+        "не читают и с -y",
     )
     p.add_argument(
         "--yes-all",
         action="store_true",
-        help="Авто-подтверждение всех операций, включая опасные (используйте осознанно)",
+        help="Авто-подтверждение всех операций, включая опасные и (в режиме auto) "
+        "непроверенные команды — используйте осознанно",
     )
     p.add_argument(
         "--mode",
@@ -112,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-save",
         action="store_true",
-        help="Не сохранять чат в .gigacode/chats/ и журнал решений о командах",
+        help="Не сохранять чат и журнал решений о командах (~/.gigacode/projects/)",
     )
     p.add_argument(
         "--trust-hooks",
@@ -151,6 +155,18 @@ def _make_provider(config: Config) -> LLMProvider:
     if config.provider == "gigacode":
         return GigaCodeProvider(config)
     return ApiProvider(config)
+
+
+def tls_warning(config: Config) -> str | None:
+    """Предупреждение о выключенной проверке TLS (только явный GIGACREW_VERIFY_SSL=0)."""
+    if config.verify_ssl:
+        return None
+    what = "запросы и код проекта" if config.auth_mode == "mtls" else "ключ или токен"
+    return (
+        f"проверка TLS-сертификата сервера выключена (GIGACREW_VERIFY_SSL=0) — {what} можно "
+        "перехватить подменой сервера; если корень сертификата сервера не в стандартном "
+        "хранилище, задайте GIGACREW_CA_BUNDLE (PEM) вместо отключения проверки"
+    )
 
 
 def _not_in_catalogue(model: str, known: list[str]) -> str:
@@ -239,6 +255,14 @@ def _chat_to_resume(args: argparse.Namespace, store: ChatStore, ui: Console) -> 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     ui = Console(no_color=args.no_color)
+    # -p "$TASK" с пустой переменной — ошибка: иначе запустился бы REPL, а в CI (stdin
+    # уже в конце) он сразу выходит с кодом 0, как будто запрос выполнен.
+    for flag, value in (("-p", args.prompt), ("--test-context", args.test_context)):
+        if value is not None and not value.strip():
+            ui.error(f"{flag}: пустое значение")
+            return EXIT_ERROR
+    if args.prompt is not None:
+        ui.keyboard_only()  # -p: ответы на вопросы — не из перенаправленного stdin
     root = Path(args.dir)
     if not root.is_dir():
         ui.error(f"каталог проекта не найден: {root}")
@@ -253,6 +277,9 @@ def main(argv: list[str] | None = None) -> int:
             stream=not args.no_stream,
             save_chats=not args.no_save,
         )
+        # До проверки реквизитов: адрес API из .env проекта пропущен — пусть будет видно почему.
+        if config.ignored_env_warning:
+            ui.warn(config.ignored_env_warning)
         config.require_credentials()
     except ConfigError as e:
         ui.error(f"ошибка конфигурации: {e}")
@@ -260,6 +287,10 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as e:
         ui.error(str(e))
         return EXIT_ERROR
+    # До первого запроса и во всех режимах: ключ уходит уже при подключении.
+    warning = tls_warning(config)
+    if warning:
+        ui.warn(warning)
 
     try:
         provider = _make_provider(config)
@@ -273,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         hooks = load_hooks(
             Workspace(config.project_root),
             ui,
-            interactive=not args.prompt and ui.interactive(),
+            interactive=args.prompt is None and ui.interactive(),
             trust=args.trust_hooks,
         )
         install_request_hook(provider, hooks, ui, config)
@@ -301,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             ui.warn(warning)
         if catalogue is not None:
             windows.report({m.id: m.context_window for m in catalogue})
-        if args.test_context:
+        if args.test_context is not None:
             model = args.test_context.strip()
             if known is not None and model not in known:
                 ui.error(_not_in_catalogue(model, known))
@@ -338,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
             hooks=hooks,
         )
         store = ChatStore(agent.workspace)
+        for notice in store.migrate():  # чаты с прежнего места — из .gigacode/chats проекта
+            ui.info(notice)
         chats = ChatRecorder(store, enabled=config.save_chats)
         agent.chat_id = chats.chat_id  # файл плана назван по id чата
         try:
@@ -351,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
             if skipped:
                 ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {agent.model}")
         commands = default_commands()
-        if args.prompt:
+        if args.prompt is not None:
             skills = SkillCatalog(agent.workspace)
             skills.refresh()
             try:  # -p "/скилл аргументы" — как в REPL

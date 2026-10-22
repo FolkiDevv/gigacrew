@@ -154,6 +154,11 @@ def test_goto_definition_errors(plain):
     _make(plain.root, ".env", "KEY=1\n")
     with pytest.raises(ToolError, match="секретами"):
         _goto(plain, ".env", 1, "KEY")
+    # То же правило, что у read_file и классификатора команд: не только .env*.
+    for rel in ("deploy/credentials.json", "certs/server.pem", ".aws/config.py"):
+        _make(plain.root, rel, "KEY = 1\n")
+        with pytest.raises(ToolError, match="секретами"):
+            _goto(plain, rel, 1, "KEY")
 
 
 def test_call_hierarchy_by_index(plain):
@@ -355,3 +360,41 @@ def test_call_hierarchy_with_ty_keeps_other_language_definitions(typed):
     lines = _calls(typed, "helper").content.splitlines()
     assert lines[0] == "кто вызывает (глубина 1, ty + индекс):"
     assert "helper — web/helper.js:1" in lines and "  ← use — web/helper.js (строка 2)" in lines
+
+
+@pytest.mark.parametrize("path", ["../outside.py", "{outside}"])
+def test_goto_definition_rejects_paths_outside_project(tmp_path, path):
+    # Инструмент «только чтение» не должен открывать файлы вне проекта: его сообщение
+    # «В строке N нет имени…» процитировало бы их строку.
+    root = tmp_path / "proj"
+    root.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("API_TOKEN = 'hunter2'\n", encoding="utf-8")
+    ctx = ToolContext(workspace=Workspace(root), semantic=False)
+    params = GotoDefinitionParams(path=path.format(outside=outside), line=1, name="nothing")
+    with pytest.raises(ToolError, match="за пределы") as error:
+        GotoDefinitionTool().run(params, ctx)
+    assert "hunter2" not in str(error.value)
+
+
+def test_find_references_orders_files_by_resolution_not_by_path(tmp_path):
+    # Алфавитный порядок путей здесь обратен порядку разрешения: сортировка видна.
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "core.py").write_text("def helper(): pass\n", encoding="utf-8")
+    (tmp_path / "z_user.py").write_text("from pkg.core import helper\nhelper()\n", encoding="utf-8")
+    (tmp_path / "a_other.py").write_text("def f(x):\n    x.helper()\n", encoding="utf-8")
+    ctx = ToolContext(workspace=Workspace(tmp_path), semantic=False)
+    out = FindReferencesTool().run(FindReferencesParams(query="helper"), ctx).content
+    heads = [line for line in out.splitlines() if line.endswith(":") and " — " in line]
+    assert heads[0].startswith("z_user.py — импортирует")
+    assert heads[-1].startswith("a_other.py — совпадение только по имени")
+
+
+def test_call_hierarchy_depth_is_clamped(tmp_path):
+    (tmp_path / "m.py").write_text(
+        "def helper(): pass\ndef main():\n    helper()\n", encoding="utf-8"
+    )
+    ctx = ToolContext(workspace=Workspace(tmp_path), semantic=False)
+    out = CallHierarchyTool().run(CallHierarchyParams(query="helper", depth=10), ctx)
+    assert out.content.splitlines()[0] == "кто вызывает (глубина 3, по индексу):"

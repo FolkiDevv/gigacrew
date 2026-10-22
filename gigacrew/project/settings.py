@@ -90,7 +90,10 @@ class HookGroup:
 @dataclass(frozen=True)
 class HookSettings:
     groups: tuple[HookGroup, ...] = ()
-    disabled: bool = False  # "disableAllHooks": true хотя бы в одном файле
+    disabled: bool = False  # "disableAllHooks": true в файле пользователя — все хуки
+    # "disableAllHooks": true в файле проекта: выключены только хуки проекта — файл приходит
+    # с репозиторием и не может выключить хуки пользователя (его проверки, запреты).
+    project_disabled: bool = False
 
     def commands(self, event: HookEvent, target: str = "") -> list[HookCommand]:
         """Команды события для ``target`` по порядку; одинаковая команда — один раз."""
@@ -145,20 +148,26 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
     """
     groups: list[HookGroup] = []
     warnings: list[str] = []
-    disabled = False
+    disabled = project_disabled = False
     for path, source in settings_files(workspace):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             continue
-        except (OSError, UnicodeDecodeError, ValueError) as e:
+        # RecursionError — глубоко вложенный JSON ([[[…]]]) из репозитория: не повод падать.
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError) as e:
             warnings.append(f"не удалось прочитать {path}: {e} — файл пропущен")
             continue
         if not isinstance(data, dict):
             warnings.append(f"{path}: ожидается JSON-объект — файл пропущен")
             continue
-        if data.get("disableAllHooks") is True:
+        off = data.get("disableAllHooks")
+        if off is True and source in PROJECT_SOURCES:
+            project_disabled = True
+        elif off is True:
             disabled = True
+        elif off not in (None, False):  # "true" или 1 молча не выключили бы ничего
+            warnings.append(f"{path}: disableAllHooks — ожидается true или false, пропущено")
         hooks = data.get("hooks")
         if hooks is None:
             continue
@@ -180,7 +189,10 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
                 group = _parse_group(event, entry, source, f"{where}[{i}]", warnings)
                 if group is not None:
                     groups.append(group)
-    return HookSettings(tuple(groups), disabled=disabled), warnings
+    if project_disabled:
+        groups = [g for g in groups if g.source not in PROJECT_SOURCES]
+    settings = HookSettings(tuple(groups), disabled=disabled, project_disabled=project_disabled)
+    return settings, warnings
 
 
 def _parse_group(
@@ -227,6 +239,10 @@ def _parse_command(raw: Any, where: str, warnings: list[str]) -> HookCommand | N
     if not isinstance(command, str) or not command.strip():
         warnings.append(f"{where}: command — ожидается непустая строка")
         return None
+    # json.loads пропускает \u0000 и одиночные суррогаты — такую команду не запустить.
+    if "\0" in command or _has_surrogate(command):
+        warnings.append(f"{where}: command — NUL или неверный символ Unicode, пропущено")
+        return None
     timeout = raw.get("timeout", DEFAULT_HOOK_TIMEOUT)
     # json.loads пропускает NaN, Infinity и 1e400 — int() на них упал бы. Огромное целое
     # (10**400) isfinite не переводит во float — оно доходит до ограничения сверху.
@@ -244,6 +260,14 @@ def _parse_command(raw: Any, where: str, warnings: list[str]) -> HookCommand | N
             f"взято {clamped}"
         )
     return HookCommand(command, clamped)
+
+
+def _has_surrogate(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------- #
@@ -326,7 +350,7 @@ class TrustStore:
         """(отпечаток хуков пользователя, отпечатки проектов)."""
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError):
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
             return "", {}
         if not isinstance(data, dict) or data.get("version") != TRUST_FORMAT_VERSION:
             return "", {}

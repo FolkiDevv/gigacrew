@@ -12,14 +12,20 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from pydantic import BaseModel
+
+try:
+    import fcntl
+except ImportError:  # Windows: файл плана не блокируется
+    fcntl = None  # type: ignore[assignment]
 
 from gigacrew.agent.chat_store import ChatStore
 from gigacrew.agent.compaction import CompactionError, plan_compaction, summarize
@@ -100,9 +106,11 @@ from gigacrew.project.instructions import NestedInstructions
 from gigacrew.project.settings import HookEvent
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety import CommandLevel, Verdict
-from gigacrew.security import RiskLevel
+from gigacrew.security import RiskLevel, resolve_in_root
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
+from gigacrew.tools.fs import write_atomic
 from gigacrew.tools.plan import PlanReview, review_plan
+from gigacrew.tools.process import quote_reminder_tags
 from gigacrew.tools.questions import Answer, Question
 from gigacrew.tools.task import SUBAGENTS, SubagentSpec
 
@@ -167,6 +175,10 @@ STOP_HOOK_NOTE = (
     "# Turn not finished\nThe user's {event} hook did not let you finish yet. Reason:\n"
     "{reason}\nAddress it, then give your final answer."
 )
+PLAN_MOVED_NOTE = (
+    "Not executed: another gigacrew session continues this chat and writes its plan file "
+    "{old}. Your plan is now in {new} (as you last saw it); make the change there."
+)
 OUTPUT_LIMIT_MESSAGE = (
     "Прервано: ответ модели {count} раза подряд оборвался, не дойдя до конца "
     "(finish_reason={reason}). Задача может быть не завершена."
@@ -205,6 +217,15 @@ USER_STOP_REASON = "Пользователь остановил суб-аген�
 
 def _with_note(content: str, note: str | None) -> str:
     return f"{content}\n\n{note}" if note else content
+
+
+def _tool_text(content: str, note: str | None = None) -> str:
+    """Результат вызова для истории: тег заметок в нём — цитата, затем заметка harness'а.
+
+    Содержимое файла, найденные строки, текст ошибки (цитата из файла) не должны выдать
+    себя за ``<system-reminder>``, который системный промпт велит выполнять.
+    """
+    return _with_note(quote_reminder_tags(content), note)
 
 
 def _reminder(note: str) -> str:
@@ -297,6 +318,10 @@ class Agent:
         # Файл плана чата — только у основного агента: суб-агент план не пишет.
         self._chat_id = chat_id or ChatStore.new_id()
         self._plan = None if parent is not None else PlanFile(self._plan_path(self._chat_id))
+        # Файл плана пишет одна сессия чата: блокировка — у той, что начала его писать;
+        # _plan_seen — план, каким эта сессия видела его при продолжении чата.
+        self._plan_lock: BinaryIO | None = None  # закрытие (и сборка мусора) снимает flock
+        self._plan_seen = self._read_plan_file() if chat_id else ""
         self._hooks = (
             parent._hooks if parent is not None else HookRunner() if hooks is None else hooks
         )
@@ -542,8 +567,125 @@ class Agent:
     def chat_id(self, value: str) -> None:
         self._chat_id = value
         if self._plan is not None:
+            self._release_plan()
             self._plan.path = self._plan_path(value)
             self._plan.dirty = False
+            self._plan_seen = self._read_plan_file()
+
+    def continue_as(self, chat_id: str) -> None:
+        """Диалог сохранён новым чатом ``chat_id`` (прежний файл чата изменила другая
+        сессия): план этой сессии переезжает в файл плана нового чата.
+
+        В отличие от смены ``chat_id`` (другой чат — другой план) план не теряется:
+        и непоказанный (``dirty``), и уже показанный.
+        """
+        plan = self._plan
+        self._chat_id = chat_id
+        if plan is None:
+            return
+        # Свой (записанный этой сессией) план — с диска; чужой — каким его видела сессия.
+        text = self._read_plan_file() if self._plan_lock is not None else self._plan_seen
+        self._release_plan()
+        plan.path = self._plan_path(chat_id)
+        self._plan_seen = text
+        self._seed_plan(text)
+
+    def _read_plan_file(self) -> str:
+        """Текст файла плана ("" — нет, не читается или это ссылка)."""
+        plan = self._plan
+        if plan is None or not plan.is_target(plan.path):
+            return ""
+        try:
+            return plan.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return ""
+
+    def _seed_plan(self, text: str) -> None:
+        """Записать ``text`` в новый файл плана и занять его (пустой план — не писать)."""
+        plan = self._plan
+        if plan is None or not text:
+            return
+        try:
+            self._workspace.ensure_data_dir()
+            plan.path.parent.mkdir(parents=True, exist_ok=True)
+            if self._lock_plan() and plan.is_target(plan.path):
+                write_atomic(plan.path, text.encode())
+        except OSError as e:
+            self._events.on_notice(f"план не перенесён в {self._plan_display()}: {e}", level="warn")
+
+    def _lock_plan(self) -> bool:
+        """Занять файл плана для этой сессии; False — его уже пишет другая сессия.
+
+        Блокировка — ``flock`` на соседнем файле (сам план заменяется атомарно, у него
+        меняется inode); снимается при смене чата или с завершением процесса. Нечем
+        блокировать (Windows, файловая система без блокировок) — True: защиты нет, но и
+        запись не запрещается.
+        """
+        plan = self._plan
+        if plan is None or self._plan_lock is not None or fcntl is None:
+            return True
+        lock = plan.path.with_name(f".{plan.path.stem}.lock")
+        try:
+            self._workspace.ensure_data_dir()
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            if not plan.is_target(plan.path):  # ссылка — запись плана и так откажет
+                return True
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except OSError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        except OSError:
+            os.close(fd)
+            return True
+        self._plan_lock = os.fdopen(fd, "r+b", buffering=0)
+        return True
+
+    def _release_plan(self) -> None:
+        if self._plan_lock is not None:
+            self._plan_lock.close()
+            self._plan_lock = None
+
+    def _own_plan(self, tool: Tool, params: BaseModel) -> str | None:
+        """Перед записью плана: файл плана чата пишет одна сессия.
+
+        Один чат могут продолжить две сессии (два терминала с ``gigacrew -c``), а файл
+        плана назван по id чата — они затирали бы планы друг друга. Если файл уже занят
+        другой сессией, план этой переезжает в новый файл (с планом, каким она его
+        видела). Возвращает заметку для модели, если вызов писал в прежний файл.
+        """
+        plan = self._plan
+        if plan is None or self._plan_lock is not None:
+            return None
+        old = plan.path
+        targets = tool.name == "exit_plan_mode" or any(
+            plan.is_target(resolve_in_root(self._workspace.root, path))
+            for path in tool.paths(params)
+            if isinstance(path, str)
+        )
+        if not targets or self._lock_plan():
+            return None
+        old_display = self._plan_display()
+        plan.path = self._plan_path(ChatStore.new_id())
+        self._seed_plan(self._plan_seen)
+        self._lock_plan()
+        new_display = self._plan_display()
+        self._events.on_notice(
+            f"файл плана {old_display} пишет другая сессия gigacrew этого чата — "
+            f"план этой сессии теперь в {new_display}",
+            level="warn",
+        )
+        if tool.name == "exit_plan_mode" or plan.path == old:
+            return None
+        return PLAN_MOVED_NOTE.format(old=old_display, new=new_display)
+
+    @property
+    def _session_chat_id(self) -> str:
+        """Id чата для хуков и журнала решений: у суб-агента своего чата нет — основного."""
+        return self._parent.chat_id if self._parent is not None else self._chat_id
 
     def _plan_path(self, chat_id: str) -> Path:
         return self._workspace.plans_dir / f"{chat_id}.md"
@@ -623,7 +765,7 @@ class Agent:
         """
         if not self._hooks.has(event, target):
             return HookResult()
-        chat_id = self._parent.chat_id if self._parent is not None else self._chat_id
+        chat_id = self._session_chat_id
         payload = {
             "session_id": chat_id,
             "transcript_path": str(self._workspace.chats_dir / f"{chat_id}.json"),
@@ -1443,20 +1585,23 @@ class Agent:
                 and verdict.level >= CommandLevel.WRITE
             ):
                 decision = Decision.BLOCK  # план: изменяющая команда, а не проверка
-            if (
-                decision is Decision.ALLOW
-                and source == "yes_flag"
-                and self.mode is PermissionMode.PLAN
-                and verdict is not None
-                and verdict.level is None
-            ):
-                # план: -y не ручается за непроверенную команду — решает пользователь
-                decision = Decision.ASK
-            # Хук — после уточнений по вердикту: allow не снимает запрет режима плана.
+            unverified = verdict is not None and verdict.level is None
+            if decision is Decision.ALLOW and source == "yes_flag" and unverified:
+                # -y не ручается за команду, которую классификатор не проверил: в плане
+                # решает пользователь, в «авто» — как без -y (рецензент, затем пользователь).
+                # Выполнять всё без вопроса обещает только --yes-all — и только в «авто».
+                if self.mode is PermissionMode.PLAN:
+                    decision = Decision.ASK
+                elif not self._cfg.yes_all:
+                    decision = Decision.REVIEW
+            # Хук — после уточнений по вердикту: allow не снимает запрет режима плана
+            # и, как -y, не ручается за непроверенную команду.
             hooked = apply_hook(decision, risk, pre.decision)
             if hooked is Decision.ALLOW and decision is not Decision.ALLOW:
-                source = "hook"
-            decision = hooked
+                if not unverified:
+                    decision, source = hooked, "hook"
+            else:
+                decision = hooked
             asking = (Decision.ASK, Decision.REVIEW)
             # Хук требует спросить — сохранённые разрешения и «всегда» не действуют.
             if decision in asking and verdict is not None and pre.decision != "ask":
@@ -1464,7 +1609,14 @@ class Agent:
                 if rule is not None:
                     decision, source = Decision.ALLOW, f"rule:{rule.id}"
                     self._events.on_notice(f"разрешено сохранённым правилом: {rule.describe()}")
-            if decision in asking and key in self._session_allowed and pre.decision != "ask":
+            if (
+                decision in asking
+                and key in self._session_allowed
+                and pre.decision != "ask"
+                and risk < RiskLevel.DANGEROUS
+                # план, как и сохранённые правила, не разрешает непроверенную команду
+                and not (self.mode is PermissionMode.PLAN and unverified)
+            ):
                 decision, source = Decision.ALLOW, "session"  # «всегда» до конца сессии
             if decision is Decision.REVIEW:
                 decision, review, review_note = self._review_command(call, params, verdict, check)
@@ -1528,8 +1680,9 @@ class Agent:
                     f"gigacrew ждёт подтверждения: {name} {call.summary}".strip(),
                 )
                 answer = _confirm_result(self._events.confirm(asked, preview, dangerous=dangerous))
-                if answer.approval is Approval.ALWAYS and pre.decision == "ask":
-                    # Хук спрашивает каждый раз — «всегда» не запомнить.
+                if answer.approval is Approval.ALWAYS and (pre.decision == "ask" or dangerous):
+                    # «Всегда» не запомнить — значит, «да» один раз: хук спрашивает каждый
+                    # раз, опасное не запоминается (интерфейс «всегда» для него не предлагает).
                     answer = replace(answer, approval=Approval.YES)
                 if verdict is not None:
                     journal = self._journal_start(
@@ -1542,7 +1695,7 @@ class Agent:
                         source="user",
                         review=review,
                     )
-                if answer.approval is Approval.ALWAYS and not dangerous:
+                if answer.approval is Approval.ALWAYS:
                     self._allow_always(asked, key, verdict)
                 elif answer.approval is not Approval.YES:
                     model_text = REJECTED_NOTE
@@ -1560,39 +1713,58 @@ class Agent:
         except Exception as e:  # неожиданная ошибка — не роняем агента
             return self._fail(call, f"внутренняя ошибка при подготовке: {e}", note=note)
 
+        try:
+            moved = self._own_plan(tool, params)
+        except Exception:  # путь вне корня и т. п. — ошибку сообщит сам инструмент
+            moved = None
+        if moved is not None:
+            return self._fail(call, "файл плана пишет другая сессия", model_text=moved, note=note)
+
         # 3) Выполнение
         result: ToolResult | None = None
         error = ""
         plan_writes = self._plan.writes if self._plan is not None else 0
         started = time.monotonic()
+        journaled = False
         self._events.on_tool_start(call)
         try:
-            result = tool.run(params, self._ctx)
-        except ToolError as e:
-            error = str(e)
-        except Exception as e:  # неожиданная ошибка — не роняем агента
-            error = f"внутренняя ошибка выполнения: {e}"
-        except BaseException:  # Ctrl+C: исход в журнале — «прервано»
-            self._journal_end(journal, interrupted=True, duration=time.monotonic() - started)
-            raise
-        finally:
-            self._events.on_tool_end(call)
-        self._journal_end(journal, result=result, error=error, duration=time.monotonic() - started)
-        if result is None:
-            return self._fail(call, error or "инструмент не вернул результат", note=note)
+            try:
+                result = tool.run(params, self._ctx)
+            except ToolError as e:
+                error = str(e)
+            except Exception as e:  # неожиданная ошибка — не роняем агента
+                error = f"внутренняя ошибка выполнения: {e}"
+            finally:
+                self._events.on_tool_end(call)
+            self._journal_end(
+                journal, result=result, error=error, duration=time.monotonic() - started
+            )
+            journaled = True
+            if result is None:
+                return self._fail(call, error or "инструмент не вернул результат", note=note)
 
-        if result.ok and risk >= RiskLevel.WRITE:
-            result.changed = True  # UI и журнал суб-агента видят изменение
-        self._events.on_tool_result(call, result, previewed=previewed)
-        content = result.as_function_content()
-        try:
+            if result.ok and risk >= RiskLevel.WRITE:
+                result.changed = True  # UI и журнал суб-агента видят изменение
+            self._events.on_tool_result(call, result, previewed=previewed)
             feedback = self._post_tool_hooks(name, hook_fields, result)
         except BaseException:
-            # Инструмент уже выполнен: модель должна знать результат, даже если хук прерван.
-            self._conversation.add_function_result(name, _with_note(content, note))
+            # Ctrl+C/Esc во время работы инструмента — в журнале «прервано». Пришёл уже
+            # после неё (показ результата, хук PostToolUse) — действие совершено: модель
+            # должна знать настоящий результат, а не «прервано, результата нет».
+            if not journaled:
+                self._journal_end(
+                    journal,
+                    result=result,
+                    interrupted=result is None,
+                    duration=time.monotonic() - started,
+                )
+            if result is not None:
+                self._conversation.add_function_result(
+                    name, _tool_text(result.as_function_content(), note)
+                )
             raise
         self._conversation.add_function_result(
-            name, _with_note(content, _join_notes(feedback, note))
+            name, _tool_text(result.as_function_content(), _join_notes(feedback, note))
         )
         if result.ok:
             self._attach_instructions(tool, params)
@@ -1660,7 +1832,11 @@ class Agent:
             if child._stop_level >= 2:  # повторный Esc: оборвать суб-агента, ход идёт дальше
                 return aborted_report(spec, events.trail)
             # Ctrl+C: ход останавливается, но модель узнает, что успел сделать суб-агент.
-            self._conversation.add_function_result("task", interrupted_note(spec, events.trail))
+            # Ответ — тому вызову (task или explore), что его запустил: он первый без ответа.
+            pending = self._conversation.pending_calls()
+            self._conversation.add_function_result(
+                pending[0].name if pending else "task", interrupted_note(spec, events.trail)
+            )
             raise
         finally:
             with self._stop_lock:
@@ -1817,7 +1993,7 @@ class Agent:
                     "risk": risk.name,
                     "mode": self.mode.value,
                     "agent": self._subagent.name if self._subagent is not None else "main",
-                    "chat": self._chat_id,
+                    "chat": self._session_chat_id,
                     "model": self._model,
                     "decision": decision,
                     "source": source or "auto",
@@ -1882,7 +2058,7 @@ class Agent:
         result = ToolResult(content=error, ok=False, summary=summary)
         self._events.on_tool_result(call, result, previewed=False)
         content = model_text or f"ОШИБКА: {error}"
-        self._conversation.add_function_result(call.name, _with_note(content, note))
+        self._conversation.add_function_result(call.name, _tool_text(content, note))
         return ToolOutcome(ok=False)
 
     def call_info(self, call: FunctionCall) -> ToolCallInfo:

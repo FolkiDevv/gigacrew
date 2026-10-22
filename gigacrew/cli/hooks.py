@@ -33,7 +33,7 @@ from gigacrew.project.settings import (
     user_fingerprint,
 )
 from gigacrew.project.workspace import Workspace
-from gigacrew.ui.console import Console, sanitize
+from gigacrew.ui.console import Console, visible_text
 
 SOURCE_LABELS: dict[SettingsSource, str] = {
     "user": "~/.gigacode/settings.json",
@@ -153,7 +153,16 @@ def install_request_hook(
 
 
 def describe_groups(groups: tuple[HookGroup, ...]) -> str:
-    """Хуки по событиям: matcher, полная команда (без управляющих символов), файл."""
+    """Хуки по событиям: matcher, полная команда, файл.
+
+    Пользователь подтверждает ровно то, что выполнится: невидимые символы (управляющие,
+    смена направления текста, нулевой ширины) не убираются, а показываются как
+    ``⟨U+202E⟩`` — иначе ``\\r`` или ESC стёрли бы на экране начало команды.
+    """
+
+    def shown(text: str) -> str:
+        return visible_text(text, numbered=False).plain
+
     lines: list[str] = []
     for event in HookEvent:
         found = [group for group in groups if group.event is event]
@@ -161,9 +170,9 @@ def describe_groups(groups: tuple[HookGroup, ...]) -> str:
             continue
         lines.append(f"  {event.value}")
         for group in found:
-            matcher = f"[{group.matcher}] " if group.matcher not in ("", "*") else ""
+            matcher = f"[{shown(group.matcher)}] " if group.matcher not in ("", "*") else ""
             for hook in group.hooks:
-                command = sanitize(hook.command).strip().replace("\n", "\n      ")
+                command = shown(hook.command.strip(" \t\n")).replace("\n", "\n      ")
                 lines.append(f"    {matcher}{command}")
                 lines.append(f"      таймаут {hook.timeout} с · {SOURCE_LABELS[group.source]}")
     return "\n".join(lines)
@@ -174,9 +183,10 @@ def describe_hooks(settings: HookSettings) -> str:
     files = ", ".join(SOURCE_LABELS.values())
     if settings.disabled:
         return f"хуки выключены (disableAllHooks); настройки: {files}"
+    note = "; хуки проекта выключены (disableAllHooks)" if settings.project_disabled else ""
     if not settings.groups:
-        return f"хуков нет; настройки: {files}"
-    return f"хуки (настройки: {files}):\n{describe_groups(settings.groups)}"
+        return f"хуков нет{note}; настройки: {files}"
+    return f"хуки (настройки: {files}{note}):\n{describe_groups(settings.groups)}"
 
 
 def _session_hook(ui: Console, event: HookEvent, run: Callable[[], None]) -> None:

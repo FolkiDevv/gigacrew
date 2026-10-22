@@ -6,9 +6,11 @@ import re
 
 from pydantic import BaseModel, Field
 
-from gigacrew.project.files import glob_match, is_secret_path, walk_files
+from gigacrew.project.files import glob_match, walk_files
+from gigacrew.safety.paths import is_secret_target
 from gigacrew.security import resolve_in_root
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
+from gigacrew.tools.fs import SECRET_READ_NOTE
 
 _MAX_MATCHES = 500  # потолок max_results, который может запросить модель
 _MAX_FILE_BYTES = 1_000_000  # файлы крупнее не читаем (сгенерированное, дампы)
@@ -37,7 +39,7 @@ class SearchContentTool(Tool):
         "Returns matches as path:line:text. Use it for strings, messages, config keys and "
         "other text; to find where a class or function is defined, find_symbol is faster. "
         "Skips service directories, files ignored by .gitignore, binary and very large "
-        "files, and .env."
+        "files, and files with secrets (.env, keys, credentials)."
     )
     Params = SearchContentParams
 
@@ -57,6 +59,8 @@ class SearchContentTool(Tool):
         limit = min(max(params.max_results, 1), _MAX_MATCHES)
 
         walking = base.is_dir()
+        if not walking and is_secret_target(ctx.root, base):
+            raise ToolError(SECRET_READ_NOTE.format(path=params.path))
         files = walk_files(ctx.root, base) if walking else [base]
         matches: list[str] = []
         scanned = skipped = 0
@@ -65,8 +69,8 @@ class SearchContentTool(Tool):
             rel = f.relative_to(ctx.root).as_posix()
             if params.glob and not glob_match(rel, params.glob):
                 continue
-            # секреты не ищем при обходе каталога; явно указанный файл — можно
-            if walking and is_secret_path(f):
+            # секреты не ищем — то же правило, что у read_file и классификатора команд
+            if walking and is_secret_target(ctx.root, f):
                 continue
             try:
                 # FIFO, сокеты, устройства: открытие на чтение может заблокироваться

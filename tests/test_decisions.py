@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from gigacrew.agent.decisions import DecisionMemory, project_key, redact
-from gigacrew.safety import classify
+from gigacrew.agent.decisions import DecisionMemory, Rule, history_key, project_key, redact
+from gigacrew.safety import CommandLevel, classify
 
 
 @pytest.fixture
@@ -89,6 +89,113 @@ def test_dangerous_is_never_remembered_or_matched(root, home):
     assert mem.offer(danger) == "" and mem.approve(danger) == []
     mem.rules.append(mem._candidates(verdict("touch x", root))[0])
     assert mem.match(verdict("touch x && rm -rf build", root)) is None
+    # целиком, не по частям (перенаправление): защита — у всей команды
+    whole = verdict("rm -rf build > log.txt", root)
+    assert whole.level is CommandLevel.DANGER and not whole.composable
+    assert mem.offer(whole) == "" and mem.approve(whole) == []
+    # устаревшее (прежняя версия правил) или вписанное руками правило не действует
+    mem.rules.append(Rule("old", ".", "command", whole.command))
+    assert mem.match(whole) is None
+
+
+def test_plan_mode_ignores_whole_command_rules(root, home):
+    mem = memory(root, home)
+    v = verdict("pytest > log.txt", root)  # пишет в файл
+    mem.approve(v)
+    assert mem.match(v) is not None and mem.match(v, plan=True) is None
+
+
+def test_venv_activation_needs_an_approved_program(root, home):
+    _venv(root)
+    mem = memory(root, home)
+    mem.approve(verdict("touch x", root))
+    v = verdict("source .venv/bin/activate && touch x", root)
+    assert v.parts[0].prelude
+    assert mem.match(v) is None  # скрипт активации — код проекта: только с программой
+    mem.approve(verdict("pytest", root))
+    assert mem.match(verdict("source .venv/bin/activate && pytest", root)) is not None
+
+
+def test_always_counts_as_allowed(root, home):
+    mem = memory(root, home)
+    mem.record(
+        {"command": "make", "cwd": ".", "key": "make", "source": "user", "decision": "always"}
+    )
+    assert mem.history((".", "make")) == (1, 0)
+    assert memory(root, home).history((".", "make")) == (1, 0)  # и из журнала
+
+
+def test_history_key_is_the_program_or_whole_command(root):
+    assert history_key(verdict("pytest -q", root)) == (".", "pytest")
+    assert history_key(verdict("pytest && make", root)) == (".", "pytest && make")
+    assert history_key(verdict("npm test", root, cwd="frontend")) == ("frontend", "npm test")
+
+
+def test_forget_rejects_numbers_outside_the_list(root, home):
+    mem = memory(root, home)
+    mem.approve(verdict("pytest", root))
+    for index in (0, -1, 2):
+        with pytest.raises(IndexError):
+            mem.forget(index)
+    assert len(mem.rules) == 1
+
+
+def _venv(root: Path) -> None:
+    (root / ".venv" / "bin").mkdir(parents=True)
+    (root / ".venv" / "bin" / "activate").write_text("")
+    (root / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "frobnicate > out.txt",  # непроверенная и по частям не сверить
+        "if pytest; then echo ok; fi",
+        "source .venv/bin/activate && touch x",  # активация venv — только с программой
+        ". .venv/bin/activate && ./build.sh --release",
+        " && ".join(f"touch {name}" for name in "abcdef"),  # частей больше предела
+    ],
+)
+def test_always_does_not_save_rules_that_never_match(root, home, command):
+    # Такое правило match() не применит: «всегда» — только до конца сессии (в агенте).
+    _venv(root)
+    mem = memory(root, home)
+    v = verdict(command, root)
+    assert mem.offer(v) == "" and mem.approve(v) == [] and mem.rules == []
+    assert mem.approvals_path is not None and not mem.approvals_path.exists()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest -q",
+        "pytest > log.txt",
+        "./build.sh --release",
+        "frobnicate --all",
+        "source .venv/bin/activate && pytest -q",
+        "touch a && touch b",
+        "LANG=C ./build.sh",
+    ],
+)
+def test_offered_rule_matches_the_same_command(root, home, command):
+    _venv(root)
+    mem = memory(root, home)
+    v = verdict(command, root)
+    assert mem.offer(v) != ""
+    assert mem.approve(v) and mem.match(v) is not None
+    assert memory(root, home).match(v) is not None  # и после перечитывания с диска
+
+
+def test_rules_are_bound_to_working_directory_for_every_kind(root, home):
+    script = root / "frontend" / "build.sh"  # другой скрипт с тем же именем
+    script.write_text("#!/bin/sh\necho frontend\n")
+    script.chmod(0o755)
+    mem = memory(root, home)
+    for command in ("./build.sh --release", "pytest > log.txt"):  # точная и целиком
+        mem.approve(verdict(command, root))
+        assert mem.match(verdict(command, root)) is not None, command
+        assert mem.match(verdict(command, root, cwd="frontend")) is None, command
+        assert mem.match(verdict(f"cd frontend && {command}", root)) is None, command
 
 
 def test_plan_mode_applies_only_non_changing_rules(root, home):
@@ -211,18 +318,110 @@ def test_in_memory_only():
         ("git clone https://user:pa55@host/repo", "git clone https://user:***@host/repo"),
         ("curl -H 'Authorization: Bearer abc.def' x", "curl -H 'Authorization: Bearer ***' x"),
         ("tool --password hunter2 --x", "tool --password ***** --x".replace("*****", "***")),
+        ("tool --password=hunter2 x", "tool --password=*** x"),
+        ("gh --access-token abc x", "gh --access-token *** x"),
+        ("x --auth-token=abc --client-secret s", "x --auth-token=*** --client-secret ***"),
+        ("mysql -u root -phunter2 -e 'select 1'", "mysql -u root -p*** -e 'select 1'"),
+        ("mysqldump -uroot -p'pa ss' db", "mysqldump -uroot -p*** db"),
+        ("curl -u bob:hunter2 http://x", "curl -u bob:*** http://x"),
+        ("curl --user 'bob:hunter2' http://x", "curl --user 'bob:***' http://x"),
+        ("sshpass -p hunter2 ssh host", "sshpass -p *** ssh host"),
+        ("curl -H 'X-Api-Key: k123' x", "curl -H 'X-Api-Key: ***' x"),
+        ('curl -H "X-Auth-Token:t123" x', 'curl -H "X-Auth-Token:***" x'),
+        (
+            """curl -d '{"api_key": "k123", "n": 1}' x""",
+            """curl -d '{"api_key": "***", "n": 1}' x""",
+        ),
+        ("http POST x token:=abc", "http POST x token:=***"),
+        (
+            "echo ghp_" + "a1" * 18 + " | gh auth login --with-token",
+            "echo *** | gh auth login --with-token",
+        ),
         ("ls -la", "ls -la"),
+        ("git push -u origin main", "git push -u origin main"),
+        ("sort -u keys.txt", "sort -u keys.txt"),
+        ("pytest -p no:cacheprovider", "pytest -p no:cacheprovider"),
     ],
 )
 def test_redact(text, expected):
     assert redact(text) == expected
 
 
+def test_outcome_error_is_redacted(root, home):
+    mem = memory(root, home)
+    mem.outcome("id1", ok=False, error="ошибка: TOKEN=abc123 не подошёл")
+    assert "abc123" not in mem.journal_path.read_text()
+
+
+def test_feedback_and_description_are_redacted(root, home):
+    mem = memory(root, home)
+    mem.record(
+        {
+            "command": "x",
+            "cwd": ".",
+            "key": "x",
+            "decision": "no",
+            "source": "user",
+            "feedback": "используй TOKEN=fb_secret",
+            "description": "деплой с API_KEY=desc_secret",
+        }
+    )
+    text = mem.journal_path.read_text()
+    assert "fb_secret" not in text and "desc_secret" not in text
+    assert "TOKEN=***" in text and "API_KEY=***" in text
+
+
+@pytest.mark.parametrize(
+    "command", ["TOKEN=hunter2 ./build.sh", "./build.sh --password hunter2 > log.txt"]
+)
+def test_command_with_secret_is_not_saved_as_rule(root, home, command):
+    # approvals.json не журнал: секрет из правила не вырезать — правило не сохраняется.
+    mem = memory(root, home)
+    v = verdict(command, root)
+    assert mem.offer(v) == "" and mem.approve(v) == []
+    assert not mem.approvals_path.exists()
+
+
+def _worktree(main: Path, wt: Path, name: str = "wt") -> None:
+    """Связанное рабочее дерево, как его делает ``git worktree add``."""
+    gitdir = main / ".git" / "worktrees" / name
+    gitdir.mkdir(parents=True)
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text(f"gitdir: {gitdir}\n")
+    (gitdir / "gitdir").write_text(f"{wt / '.git'}\n")  # обратная ссылка git
+
+
 def test_project_key_follows_worktree_to_main_checkout(tmp_path):
     main = tmp_path / "main"
-    (main / ".git" / "worktrees" / "wt").mkdir(parents=True)
-    wt = tmp_path / "wt"
-    wt.mkdir()
-    (wt / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'wt'}\n")
-    assert project_key(wt) == project_key(main)
+    _worktree(main, tmp_path / "wt")
+    assert project_key(tmp_path / "wt") == project_key(main)
     assert project_key(tmp_path / "other") != project_key(main)
+
+
+def test_worktrees_share_approvals(tmp_path, home):
+    main, wt = tmp_path / "main", tmp_path / "wt"
+    _worktree(main, wt)
+    memory(main, home).approve(verdict("pytest", main))
+    in_wt = memory(wt, home)  # без предупреждения «файл другого проекта»
+    assert [r.value for r in in_wt.rules] == ["pytest"]
+    assert in_wt.match(verdict("pytest", wt)) is not None
+    in_wt.approve(verdict("npm test", wt))
+    assert {r.value for r in memory(main, home).rules} == {"pytest", "npm test"}
+    # файл, записанный прежней версией из рабочего дерева (корень — его путь), — тоже свой
+    data = json.loads(in_wt.approvals_path.read_text())
+    in_wt.approvals_path.write_text(json.dumps({**data, "root": str(wt.resolve())}))
+    assert len(memory(main, home).rules) == 2
+
+
+@pytest.mark.parametrize("variant", ["no_back_link", "back_link_elsewhere", "missing"])
+def test_forged_git_file_does_not_borrow_another_projects_memory(tmp_path, variant):
+    # Скачанный (не клонированный) проект с файлом .git, указывающим на чужой репозиторий.
+    trusted, other = tmp_path / "trusted", tmp_path / "other"
+    gitdir = trusted / ".git" / "worktrees" / "x"
+    if variant != "missing":
+        gitdir.mkdir(parents=True)
+    if variant == "back_link_elsewhere":
+        (gitdir / "gitdir").write_text(f"{tmp_path / 'real-wt' / '.git'}\n")
+    other.mkdir()
+    (other / ".git").write_text("gitdir: ../trusted/.git/worktrees/x\n")
+    assert project_key(other) != project_key(trusted)

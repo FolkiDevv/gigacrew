@@ -102,32 +102,73 @@ _TOKENS = frozenset(
 _SEPARATORS = frozenset({"&&", "||", ";", "&", "\n", "|", "|&", ";;"})
 _OUTPUT_OPS = frozenset({">", ">>", ">|", "&>", "&>>", "&>|"})
 _GLOB_CHARS = re.compile(r"[*?\[]")
+# Текст без разбора внутри (слово, тело heredoc) и неэкранированная ` в нём.
+_PLAIN_TEXT = frozenset({"word", "heredoc_body", "heredoc_content"})
+_BACKTICK = re.compile(r"(?<!\\)(?:\\\\)*`")
 _BRACE = re.compile(r"\{[^{}\0]*(,|\.\.)[^{}\0]*\}")
+# Ссылка на переменную «как есть» ($X, ${X}) — только внутри этих узлов слова: в арифметике
+# $((X)) и в ${X:-…}, ${!X}, ${X@P} значение не просто подставляется.
+_PLAIN_PARENTS = frozenset({"string", "concatenation", "heredoc_body"})
+# Значение присваивания, которое при подстановке не раскроется ни во что другое: без $, `,
+# шаблонов, кавычек, пробелов.
+_PLAIN_VALUE = re.compile(r"[\w./:,@%+=-]*")
+_ASSIGNMENTS = frozenset({"variable_assignment", "variable_assignments", "declaration_command"})
+# Встроенные команды, которые могут присвоить переменную оболочки (или выполнить то, что
+# присвоит): после них присвоенное раньше значение неизвестно.
+_SETS_VARS = frozenset(
+    {
+        "read",
+        "getopts",
+        "printf",
+        "mapfile",
+        "readarray",
+        "let",
+        "eval",
+        ".",
+        "source",
+        "declare",
+        "typeset",
+        "local",
+        "export",
+        "readonly",
+        "unset",
+        "set",
+        "command",
+        "builtin",
+        "exec",
+        "trap",
+    }
+)
 
 
 @dataclass(frozen=True)
 class Word:
     """Слово команды. ``value`` — значение после снятия кавычек (у нестатичного слова —
     исходный текст); ``vars`` — раскрываемые переменные; ``glob`` — оболочка раскроет
-    шаблон имён файлов (``*``, ``?``, ``[`` вне кавычек)."""
+    шаблон имён файлов (``*``, ``?``, ``[`` вне кавычек); ``plain`` — те из ``vars``,
+    что только подставляются как есть (``$X``, ``${X}``)."""
 
     value: str
     raw: str = ""
     static: bool = True
     glob: bool = False
     vars: tuple[str, ...] = ()
+    plain: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class Redirect:
     """Перенаправление. ``target`` — файл (``>``, ``>>``, ``<``, ``&>``); у heredoc и
-    herestring — ``body`` (``body_static`` — без подстановок)."""
+    herestring — ``body`` (``body_static`` — без подстановок, ``body_vars`` —
+    раскрываемые в нём переменные)."""
 
     op: str
     target: Word | None = None
     fd_dup: bool = False  # >&2, 2>&1 — дублирование дескриптора, не файл
     body: str | None = None
     body_static: bool = True
+    body_vars: tuple[str, ...] = ()
+    body_plain: tuple[str, ...] = ()  # как Word.plain
 
     @property
     def writes(self) -> bool:
@@ -149,6 +190,9 @@ class Command:
     cwd: str = "."
     stdin: Command | None = None
     substituted: bool = False  # внутри $(…), `…` или <(…)
+    # Переменные, которым команда раньше, в этой же оболочке и без условий, присвоила
+    # постоянное значение (``X=1; echo $X``): их значение известно — это не секрет.
+    assigned: frozenset[str] = frozenset()
 
     @property
     def name(self) -> Word | None:
@@ -220,6 +264,41 @@ def _static_value(node) -> str:
     return _text(node)
 
 
+def _plain_vars(node) -> tuple[str, ...]:
+    """Переменные, которые в слове ``node`` только подставляются как есть (см. Word.plain).
+
+    Команды в подстановках ``$(…)`` — отдельные команды, в них не заходим.
+    """
+    plain: set[str] = set()
+    other: set[str] = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.type in _SUBSTITUTIONS:
+            continue
+        if n.type == "variable_name":
+            (plain if _is_plain_ref(n, node) else other).add(_text(n))
+        stack.extend(n.children)
+    return tuple(sorted(plain - other))
+
+
+def _is_plain_ref(var, top) -> bool:
+    exp = var.parent
+    if exp is None:
+        return False
+    if exp.type == "expansion":
+        if [c.type for c in exp.children] != ["${", "variable_name", "}"]:
+            return False
+    elif exp.type != "simple_expansion":
+        return False
+    n = exp
+    while n != top:
+        n = n.parent
+        if n is None or (n != top and n.type not in _PLAIN_PARENTS):
+            return False
+    return True
+
+
 def _has_glob(node) -> bool:
     if node.type == "word":
         return bool(_GLOB_CHARS.search(re.sub(r"\\.", "", _text(node))))
@@ -242,6 +321,7 @@ class _Walker:
         self.root = root
         self.script = Script(cwd=cwd)
         self._cwd = cwd  # каталог оператора, который сейчас разбирается
+        self._assigned: set[str] = set()  # см. Command.assigned
         self.rest_start: int | None = None  # начало команды после ведущих cd
 
     def problem(self, text: str) -> None:
@@ -270,6 +350,10 @@ class _Walker:
                 continue
             if t == "ERROR" or n.is_missing:
                 self.problem("команда не разобрана")
+            if n.child_count == 0 and t in _PLAIN_TEXT and _BACKTICK.search(_text(n)):
+                # Грамматика не разбирает `…` в теле heredoc и внутри ${…}, а оболочка
+                # выполнит: команда в нём не проверена.
+                self.problem("подстановка `…`, которую не удалось разобрать")
             stack.extend(n.children)
         return dynamic, names
 
@@ -277,7 +361,7 @@ class _Walker:
         raw = _text(node)
         dynamic, names = self.scan(node)
         if dynamic:
-            return Word(raw, raw, static=False, vars=tuple(names))
+            return Word(raw, raw, static=False, vars=tuple(names), plain=_plain_vars(node))
         if _has_brace(node):
             return Word(raw, raw, static=False)
         return Word(_static_value(node), raw, glob=_has_glob(node))
@@ -296,9 +380,11 @@ class _Walker:
         items: list[tuple[object, str]] = []  # (узел, разделитель после него)
         self._flatten(nodes, items)
         leading = leading_cd
-        for node, sep in items:
-            # Только «cd X && …»: после «;» команда выполнится и там, где cd не сработал.
-            if leading and _is_cd(node) and sep in ("&&", ""):
+        for i, (node, sep) in enumerate(items):
+            # Только «cd X && …» (или cd в конце): после «;» и перевода строки (у него
+            # нет лексемы, разделитель пуст) команда выполнится и там, где cd не сработал.
+            last = i == len(items) - 1
+            if leading and _is_cd(node) and (sep == "&&" or (sep == "" and last)):
                 target = self._cd_target(node, cwd)
                 if target is not None:
                     cwd = target
@@ -310,8 +396,22 @@ class _Walker:
             if sep == "&":
                 self.problem("фоновый процесс (&)")
             saved, self._cwd = self._cwd, cwd
+            known = len(self.script.assigns)
             self.statement(node, cwd=cwd, substituted=substituted)
             self._cwd = saved
+            # Присваивание запоминается, только если оно точно выполнено в этой оболочке:
+            # на верхнем уровне, не после && или || и не в фоне.
+            certain = (
+                top
+                and node.type in _ASSIGNMENTS
+                and (i == 0 or items[i - 1][1] not in ("&&", "||"))
+                and sep != "&"
+            )
+            for name, value in self.script.assigns[known:]:
+                if certain and value.static and _PLAIN_VALUE.fullmatch(value.value):
+                    self._assigned.add(name)
+                else:
+                    self._assigned.discard(name)
         return cwd
 
     def _flatten(self, nodes, items: list) -> None:
@@ -527,7 +627,14 @@ class _Walker:
             return Redirect(op), []
         first = self.word(words[0])
         if node.type == "herestring_redirect":
-            return Redirect(op, body=first.value, body_static=first.static), words[1:]
+            redirect = Redirect(
+                op,
+                body=first.value,
+                body_static=first.static,
+                body_vars=first.vars,
+                body_plain=first.plain,
+            )
+            return redirect, words[1:]
         if op in (">&", "<&") and first.static and (first.value.isdigit() or first.value == "-"):
             return Redirect(op, first, fd_dup=True), words[1:]
         if op == "<>":
@@ -538,6 +645,8 @@ class _Walker:
         quoted = False
         body = ""
         static = True
+        names: list[str] = []
+        plain: tuple[str, ...] = ()
         extra: list = []
         for c in node.children:
             if c.type == "heredoc_start":
@@ -545,7 +654,8 @@ class _Walker:
             elif c.type == "heredoc_body":
                 body = _text(c)
                 if not quoted:
-                    dynamic, _ = self.scan(c)
+                    dynamic, names = self.scan(c)
+                    plain = _plain_vars(c)
                     # `…` и $… в теле без кавычек у разделителя раскрываются оболочкой.
                     static = not dynamic and not re.search(r"(?<!\\)[`$]", body)
             elif c.type in ("<<", "<<-", "heredoc_end", "heredoc_content"):
@@ -554,12 +664,15 @@ class _Walker:
                 extra.append(c)
         if not quoted:
             body = _unescape_heredoc(body)
-        return Redirect("<<", body=body, body_static=static), extra
+        redirect = Redirect(
+            "<<", body=body, body_static=static, body_vars=tuple(names), body_plain=plain
+        )
+        return redirect, extra
 
     def command(
         self, node, *, cwd: str, substituted: bool, extra: list[Redirect] | None = None
     ) -> Command:
-        cmd = Command(argv=[], cwd=cwd, substituted=substituted)
+        cmd = Command(argv=[], cwd=cwd, substituted=substituted, assigned=frozenset(self._assigned))
         for c in node.children:
             t = c.type
             if t == "variable_assignment":
@@ -582,6 +695,12 @@ class _Walker:
         if extra:
             cmd.redirects.extend(extra)
         self.script.commands.append(cmd)
+        # Префикс `X=… :` у специальной встроенной команды в dash остаётся в оболочке, а
+        # встроенные read, printf -v, eval… присваивают сами: значение больше не известно.
+        for name, _ in cmd.assigns:
+            self._assigned.discard(name)
+        if cmd.name is None or not cmd.name.static or cmd.name.value in _SETS_VARS:
+            self._assigned.clear()
         return cmd
 
     def pipeline(self, node, *, cwd: str, substituted: bool) -> list[Command]:

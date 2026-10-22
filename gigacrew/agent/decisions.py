@@ -14,8 +14,11 @@
   написал вместо «да/нет»), в каком каталоге и режиме, чем кончилось выполнение. Также
   команды, выполненные без вопроса (только чтение, сохранённое правило). Это данные для
   будущей модели-классификатора и история для подсказок «раньше вы разрешали».
-  Секреты (``TOKEN=…``, пароли в URL, заголовки авторизации) вырезаются; файл доступен
-  только владельцу. Журнал отключается вместе с сохранением чатов (``--no-save``).
+  Секреты (``TOKEN=…``, пароли в URL и флагах, заголовки авторизации — см. :func:`redact`)
+  вырезаются из каждой записи; файл доступен только владельцу. Журнал отключается вместе
+  с сохранением чатов (``--no-save``).
+
+Команда с секретом в ``approvals.json`` не сохраняется: «всегда» для неё — до конца сессии.
 """
 
 from __future__ import annotations
@@ -80,24 +83,40 @@ def _now() -> str:
 
 def project_key(root: Path) -> str:
     """Ключ проекта: путь корня; рабочее дерево git — путь основного репозитория."""
+    return hashlib.sha256(str(_key_root(root)).encode("utf-8")).hexdigest()[:16]
+
+
+def _key_root(root: Path) -> Path:
+    """Путь, от которого считается ключ: у рабочего дерева git — основной репозиторий."""
     root = Path(os.path.normcase(str(Path(root).resolve())))
-    main = _main_worktree(root)
-    return hashlib.sha256(str(main or root).encode("utf-8")).hexdigest()[:16]
+    return _main_worktree(root) or root
 
 
 def _main_worktree(root: Path) -> Path | None:
+    """Основной репозиторий связанного рабочего дерева (``root/.git`` — файл) или None.
+
+    Ссылке верим, только если её подтверждает git: каталог ``<gitdir>`` есть и его файл
+    ``gitdir`` указывает обратно на ``root/.git``. Иначе скачанный проект с поддельным
+    ``.git`` делил бы с чужим проектом его память решений.
+    """
     dot_git = root / ".git"
     try:
         if not dot_git.is_file():
             return None
         for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("gitdir:"):
-                target = Path(line[len("gitdir:") :].strip())
-                gitdir = (target if target.is_absolute() else root / target).resolve()
-                # <основной>/.git/worktrees/<имя>
-                if gitdir.parent.name == "worktrees" and gitdir.parent.parent.name == ".git":
-                    return gitdir.parent.parent.parent
-    except OSError:
+            if not line.startswith("gitdir:"):
+                continue
+            target = Path(line[len("gitdir:") :].strip())
+            gitdir = (target if target.is_absolute() else root / target).resolve()
+            # <основной>/.git/worktrees/<имя>
+            if gitdir.parent.name != "worktrees" or gitdir.parent.parent.name != ".git":
+                return None
+            back = Path((gitdir / "gitdir").read_text(encoding="utf-8").strip())
+            back = (back if back.is_absolute() else gitdir / back).resolve()
+            if os.path.normcase(str(back)) != os.path.normcase(str(dot_git.resolve())):
+                return None
+            return gitdir.parent.parent.parent
+    except (OSError, ValueError):
         return None
     return None
 
@@ -112,15 +131,44 @@ _SECRET_ASSIGN = re.compile(
 )
 _URL_CREDS = re.compile(r"(\b[a-z][a-z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@", re.IGNORECASE)
 _AUTH_HEADER = re.compile(r"(authorization:\s*(?:bearer|basic|token)?\s*)[^\s'\"]+", re.I)
-_FLAG_SECRET = re.compile(r"(--(?:password|token|secret|api-key|apikey)[=\s]+)(\S+)", re.I)
+# --password, --access-token, --client-secret, --api-key…
+_FLAG_SECRET = re.compile(r"(--[\w-]*(?:password|passwd|token|secret|api-?key)[=\s]+)(\S+)", re.I)
+_SECRET_NAME = r"[\w-]*(?:key|token|secret|password|passwd)"
+# Значение в кавычках целиком или слово.
+_VALUE = r"('[^']*'|\"[^\"]*\"|[^\s'\"]+)"
+# mysql -phunter2 (пароль слитно с -p); sshpass -p hunter2
+_MYSQL_PASS = re.compile(r"(\b(?:mysql\w*|mariadb\w*)\b[^|;&\n]*?\s-p)" + _VALUE)
+_SSHPASS = re.compile(r"(\bsshpass\b[^|;&\n]*?\s-p\s*)" + _VALUE)
+# curl -u user:pass, --user=user:pass
+_USER_PASS = re.compile(r"(\s(?:-u\s*|--user(?:=|\s+))['\"]?)([^\s:'\"]+):([^\s'\"]+)")
+# httpie: token:=…
+_HTTPIE_JSON = re.compile(rf"(\b{_SECRET_NAME}[\w-]*:=)(\S+)", re.I)
+# заголовки и YAML: X-Api-Key: …, api_token: …
+_HEADER = re.compile(rf"(\b{_SECRET_NAME}:[ \t]*)([^\s'\"=][^\s'\"]*)", re.I)
+# JSON: "api_key": "…"
+_JSON_FIELD = re.compile(rf"(\"{_SECRET_NAME}\"\s*:\s*\")[^\"]*(\")", re.I)
+# Узнаваемые токены сервисов (GitHub, GitLab, Slack, OpenAI, AWS)
+_KNOWN_TOKEN = re.compile(
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|glpat-[\w-]{20,}"
+    r"|xox[abprs]-[\w-]{10,}|sk-[\w-]{20,}|AKIA[0-9A-Z]{16})\b"
+)
 
 
 def redact(text: str) -> str:
-    """Убрать из команды похожее на секреты: ``TOKEN=…``, пароль в URL, авторизацию."""
+    """Убрать из команды похожее на секреты: ``TOKEN=…``, пароли в URL и флагах
+    (``--password``, ``mysql -p…``, ``curl -u user:pass``), заголовки авторизации и
+    ключей, поля JSON с ключами, узнаваемые токены сервисов."""
     text = _SECRET_ASSIGN.sub(lambda m: f"{m.group(1)}=***", text)
     text = _URL_CREDS.sub(lambda m: f"{m.group(1)}{m.group(2)}:***@", text)
     text = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}***", text)
-    return _FLAG_SECRET.sub(lambda m: f"{m.group(1)}***", text)
+    text = _FLAG_SECRET.sub(lambda m: f"{m.group(1)}***", text)
+    text = _MYSQL_PASS.sub(lambda m: f"{m.group(1)}***", text)
+    text = _SSHPASS.sub(lambda m: f"{m.group(1)}***", text)
+    text = _USER_PASS.sub(lambda m: f"{m.group(1)}{m.group(2)}:***", text)
+    text = _HTTPIE_JSON.sub(lambda m: f"{m.group(1)}***", text)
+    text = _HEADER.sub(lambda m: f"{m.group(1)}***", text)
+    text = _JSON_FIELD.sub(lambda m: f"{m.group(1)}***{m.group(2)}", text)
+    return _KNOWN_TOKEN.sub("***", text)
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +215,8 @@ class DecisionMemory:
         directory = (
             (base if base is not None else user_data_dir()) / PROJECTS_DIR / project_key(root)
         )
-        memory = cls(directory, str(Path(root).resolve()), remember=remember, log=log)
+        # Корень в файле — путь ключа: рабочие деревья одного репозитория делят разрешения.
+        memory = cls(directory, str(_key_root(root)), remember=remember, log=log)
         warning = None
         try:
             memory.rules = memory._read_rules()
@@ -252,6 +301,18 @@ class DecisionMemory:
         return added
 
     def _candidates(self, verdict: Verdict | None) -> list[Rule]:
+        rules = self._proposed(verdict)
+        # Правила, которые match() к этой же команде не применит (непроверенная команда
+        # с условием или перенаправлением, активация venv без программы, частей больше
+        # предела), не предлагаются: иначе «всегда» обещает то, чего не будет.
+        if verdict is None or not rules or DecisionMemory(rules=rules).match(verdict) is None:
+            return []
+        # Правило — команда как есть: секрет из него не вырезать, и на диск оно не идёт.
+        if any(r.kind != "program" and redact(r.value) != r.value for r in rules):
+            return []
+        return rules
+
+    def _proposed(self, verdict: Verdict | None) -> list[Rule]:
         if verdict is None or verdict.level is CommandLevel.DANGER:
             return []
         now = _now()
@@ -324,8 +385,13 @@ class DecisionMemory:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("version") != FORMAT_VERSION:
             raise ValueError("неподдерживаемая версия формата")
-        if data.get("root") not in (None, "", self.root):
-            raise ValueError(f"файл другого проекта ({data.get('root')})")
+        stored = data.get("root")
+        # Корень рабочего дерева, а не основного репозитория (так писали прежние версии) —
+        # тот же проект.
+        if stored not in (None, "", self.root) and not (
+            isinstance(stored, str) and project_key(Path(stored)) == project_key(Path(self.root))
+        ):
+            raise ValueError(f"файл другого проекта ({stored})")
         rules = []
         for item in data.get("rules", []):
             if not isinstance(item, dict):
@@ -403,6 +469,8 @@ class DecisionMemory:
     def outcome(self, entry_id: str, **fields: Any) -> None:
         if not self.log or self.journal_path is None:
             return
+        # Текст ошибки может цитировать команду.
+        fields = {k: redact(v) if isinstance(v, str) else v for k, v in fields.items()}
         self._append({"id": entry_id, "ts": _now(), "event": "outcome", **fields})
 
     def history(self, key: tuple[str, str]) -> tuple[int, int]:

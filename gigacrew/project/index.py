@@ -11,6 +11,10 @@
 сделанное, а следующее обновление его продолжает. Признак полноты
 (:meth:`ProjectIndex.is_complete`) выставляется только в конце полного обхода.
 
+Повреждённая база пересоздаётся: несовместимая или с испорченным заголовком — при
+открытии, с испорченными страницами данных — когда это обнаружит запрос
+(:func:`is_corruption`, :meth:`ProjectIndex.discard`).
+
 Файлы с секретами (``.env``) не индексируются; большие и бинарные файлы попадают
 в список файлов без разбора содержимого.
 
@@ -28,7 +32,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from gigacrew.project.files import glob_match, is_excluded, is_secret_path, walk_files
+from gigacrew.project.files import glob_match, is_excluded, walk_files
 from gigacrew.project.symbols import Symbol, extract, language_of, module_parts
 from gigacrew.project.workspace import Workspace
 
@@ -41,6 +45,20 @@ _COUNT_CAP = 10_000  # дальше совпадения не досчитыва
 
 # Ошибки, которые вызывающий код ловит при работе с индексом.
 INDEX_ERRORS: tuple[type[BaseException], ...] = (sqlite3.Error, OSError)
+
+
+def is_corruption(error: BaseException) -> bool:
+    """Ошибка SQLite «база повреждена»: испорченные страницы данных (сбой диска, запись
+    наполовину) или не база вовсе. Заголовок и схему проверяет :meth:`ProjectIndex.open`,
+    а порча страниц всплывает только на запросе — такой индекс надо пересоздать
+    (:meth:`ProjectIndex.discard`), иначе каждый запрос к нему будет падать."""
+    code = getattr(error, "sqlite_errorcode", None)
+    return (
+        isinstance(error, sqlite3.DatabaseError)
+        and code is not None
+        and code & 0xFF in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB)
+    )
+
 
 # Подписчики на изменения файлов, замеченные обновлением индекса (корень проекта,
 # добавленные, изменённые и удалённые пути) — например, LSP-сервер, который сам за
@@ -326,6 +344,13 @@ class ProjectIndex:
         conn.close()
         raise sqlite3.DatabaseError("несовместимая версия индекса")
 
+    def discard(self) -> None:
+        """Удаляет базу (повреждённую, см. :func:`is_corruption`): следующее открытие
+        создаст пустую, а обновление построит индекс заново."""
+        self.close()
+        self._recreate_file()
+        self._modules.clear()
+
     def _recreate_file(self) -> None:
         for suffix in ("", "-wal", "-shm", "-journal"):
             Path(f"{self.path}{suffix}").unlink(missing_ok=True)
@@ -364,6 +389,10 @@ class ProjectIndex:
         ``progress`` получает число просмотренных файлов. Прерывание (в т.ч. Ctrl+C)
         откатывает только незафиксированную пачку изменений.
         """
+        # Импорт здесь: safety.bash загружает gigacrew.project (treesitter), а с ним и
+        # этот модуль — импорт на уровне модуля замкнул бы цикл.
+        from gigacrew.safety.paths import is_secret_entry
+
         started = time.monotonic()
         db = self._db
         base = self.root if base is None else base
@@ -387,7 +416,8 @@ class ProjectIndex:
                 with db:
                     self._set_meta("complete", "0")
             for path in self._candidates(base):
-                if is_secret_path(path):
+                # Секреты — по правилу read_file и классификатора команд (не только .env).
+                if is_secret_entry(self.root, path):
                     continue
                 # симлинк на исключённое (.gitignore, служебные каталоги) — тоже мимо
                 if path.is_symlink() and is_excluded(self.root, path.resolve()):

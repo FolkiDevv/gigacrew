@@ -8,7 +8,7 @@ from enum import IntEnum
 __all__ = ["CommandLevel", "Part", "Verdict", "worst"]
 
 # Версия правил: в журнале решений — чтобы переоценить старые записи после правок.
-RULES_VERSION = 2
+RULES_VERSION = 3
 
 
 class CommandLevel(IntEnum):
@@ -65,7 +65,10 @@ class Verdict:
     ``cd X &&``), ``command`` — команда без ведущих ``cd``. ``parts`` — оценки простых
     команд; ``composable`` — команда состоит только из частей, соединённых ``&&``,
     ``||``, ``;`` и конвейерами, без записи через перенаправления и без конструкций,
-    которые не удалось оценить: такую можно сверять с сохранёнными разрешениями по частям.
+    которые не удалось оценить, и все части выполняются в ``cwd`` (не в подоболочке
+    с ``cd``): такую можно сверять с сохранёнными разрешениями по частям.
+    ``redirects_edit`` — запись через перенаправления (если есть) только в обычные файлы
+    проекта: ``> .env`` — не правка, как и ``cp a.txt .env``.
     """
 
     level: CommandLevel | None
@@ -74,6 +77,7 @@ class Verdict:
     command: str = ""
     parts: tuple[Part, ...] = field(default_factory=tuple)
     composable: bool = False
+    redirects_edit: bool = True
 
     @property
     def known(self) -> bool:
@@ -84,6 +88,7 @@ class Verdict:
         """Только правки обычных файлов проекта (как write_file/edit_file)."""
         return (
             self.level is CommandLevel.WRITE
+            and self.redirects_edit
             and bool(self.parts)
             and all(p.level is CommandLevel.READ or p.edits for p in self.parts)
         )

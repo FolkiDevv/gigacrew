@@ -46,6 +46,11 @@ _SECRET_NAME = re.compile(
 )
 _SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".gcloud"})
 _PROC_ENV = re.compile(r"^/proc/[^/]+/(environ|cmdline|mem|maps)$")
+# Известные места учётных данных: пароли системы, ключи хоста ssh, токены gh и gcloud.
+_SECRET_PATH = re.compile(
+    r"^/etc/(g?shadow|sudoers)-?$|^/etc/ssh/ssh_host_[^/]*_key$|"
+    r"(^|/)\.config/(gh|hub)/hosts\.ya?ml$|(^|/)\.config/gcloud/"
+)
 
 
 class Scope(Enum):
@@ -62,7 +67,7 @@ def is_secret_name(name: str) -> bool:
 
 
 def _is_secret(path: Path) -> bool:
-    if is_secret_path(path) or is_secret_name(path.name):
+    if is_secret_path(path) or is_secret_name(path.name) or _SECRET_PATH.search(path.as_posix()):
         return True
     return any(part in _SECRET_DIRS for part in path.parts)
 
@@ -93,6 +98,28 @@ def scope_of_path(path: Path, root: Path) -> Scope:
     if _is_secret(path) or _is_secret(resolved):
         return Scope.SECRET
     return Scope.INSIDE
+
+
+_SECRET_SCOPES = (Scope.SECRET, Scope.SECRET_OUTSIDE, Scope.DYNAMIC)
+
+
+def is_secret_target(root: Path, path: Path) -> bool:
+    """Файл с ключами или учётными данными — по тому же правилу, что у классификатора
+    команд (``cat .env`` там — непроверенная команда): ``.env*``, ``*.pem``, ``id_rsa``,
+    ``.npmrc``, ``credentials.json``, всё в ``.ssh/``, ``.aws/``… Симлинк проверяется и
+    по цели; путь, который не раскрыть, считается секретом. Так файлы с секретами
+    отказываются показывать все инструменты: чтение, поиск, навигация, индекс."""
+    return scope_of_path(path, root) in _SECRET_SCOPES
+
+
+def is_secret_entry(root: Path, path: Path) -> bool:
+    """:func:`is_secret_target` для файла из обхода каталогов проекта.
+
+    Обход не заходит в ссылки на каталоги, поэтому раскрывать путь нужно только у самой
+    ссылки: иначе проверка по имени. Так в разы быстрее — индекс проверяет каждый файл
+    проекта при каждом обновлении.
+    """
+    return _is_secret(path) or (path.is_symlink() and is_secret_target(root, path))
 
 
 def _resolve(root: Path, cwd: str, value: str) -> Scope:
@@ -145,7 +172,8 @@ def scope(word: Word, *, root: Path, cwd: str = ".") -> Scope:
 
 
 def _walk(directory: Path, limit: int):
-    """Обход дерева как у поиска gigacrew (служебные каталоги пропускаются). Отдаёт
+    """Обход дерева целиком, как у ``grep -r`` и ``find``: служебные каталоги (build,
+    node_modules, .venv…) они не пропускают, значит, и проверка не пропускает. Отдаёт
     (каталог, подкаталоги, файлы); None — дерево больше ``limit`` записей."""
     seen = 0
     for current, dirs, names in os.walk(directory):
@@ -154,7 +182,6 @@ def _walk(directory: Path, limit: int):
             yield None
             return
         yield Path(current), dirs, names
-        dirs[:] = [d for d in dirs if not files.is_ignored_dir(d)]
 
 
 def has_secrets_under(

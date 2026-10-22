@@ -45,10 +45,7 @@ def classify(
     """
     root = Path(root).resolve()
     cwd = cwd or "."
-    if not _is_posix():
-        return Verdict(None, "классификатор работает только с /bin/sh", cwd, command.strip())
-    if len(command) > MAX_COMMAND:
-        return Verdict(None, "слишком длинная команда", cwd, command.strip())
+    # Невидимые символы — до всех отказов «не знаю»: длинный хвост не должен их прятать.
     hidden = invisible_chars(command)
     if hidden:
         return Verdict(
@@ -58,6 +55,10 @@ def classify(
             cwd,
             command.strip(),
         )
+    if not _is_posix():
+        return Verdict(None, "классификатор работает только с /bin/sh", cwd, command.strip())
+    if len(command) > MAX_COMMAND:
+        return Verdict(None, "слишком длинная команда", cwd, command.strip())
     env = environ if environ is not None else os.environ
     return _classify(command, root=root, cwd=cwd, environ=env, depth=0)
 
@@ -105,10 +106,17 @@ def _classify(
     parts: list[Part] = []
     writes: list[Part] = []
     for cmd in script.commands:
-        env = replace(base, cwd=cmd.cwd)
+        env = replace(base, cwd=cmd.cwd, assigned=cmd.assigned)
         part = replace(programs.classify_simple(cmd, env), text=_text_of(cmd))
         parts.append(part)
         for r in cmd.redirects:
+            if r.body is not None and r.body_vars:
+                # Тело heredoc/herestring программа получит на stdin и, как правило,
+                # выведет: переменные в нём — как в аргументах echo.
+                body = bash.Word(r.body, static=False, vars=r.body_vars, plain=r.body_plain)
+                bad = programs._check_vars(env, [body], "текст на stdin")
+                if bad is not None:
+                    writes.append(bad)
             if r.writes and r.target is not None:
                 if r.target.static and r.target.value in (
                     "/dev/null",
@@ -141,8 +149,12 @@ def _classify(
         )
     level = worst(*(p.level for p in everything))
     reason = _reason(level, everything)
-    composable = not writes and not problems and bool(parts)
-    return Verdict(level, reason, script.cwd, script.rest, tuple(parts), composable)
+    # Часть, выполняемая не в script.cwd (`(cd X && make test)`), сверялась бы с
+    # разрешениями другого каталога: память решений ищет их по Verdict.cwd.
+    same_dir = all(cmd.cwd == script.cwd for cmd in script.commands)
+    composable = not writes and not problems and bool(parts) and same_dir
+    redirects_edit = all(w.edits for w in writes if w.level is CommandLevel.WRITE)
+    return Verdict(level, reason, script.cwd, script.rest, tuple(parts), composable, redirects_edit)
 
 
 def _text_of(cmd, depth: int = 0) -> str:

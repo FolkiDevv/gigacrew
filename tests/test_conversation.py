@@ -270,6 +270,39 @@ def test_fit_history_pins_task_and_keeps_pairs():
         if m.role == "function":
             prev = fitted[i - 1]
             assert prev.role == "assistant" and prev.function_calls
+    # что именно отброшено: сначала прошлый ход, затем ранние шаги текущего — не свежие
+    assert fitted == [history[2], *history[5:]]
+
+
+def test_fit_history_drops_call_and_result_only_together():
+    # Бюджет чуть меньше всей истории: отбросить одно сообщение (вызов) хватило бы, но
+    # его результат без вызова API не примет — уходит пара целиком.
+    history = [
+        Message(role="user", content="ЗАДАЧА"),
+        _call(path="1"),
+        _result(content="x" * 3000),
+        _call(path="2"),
+        _result(content="ok"),
+    ]
+    assert fit_history(history, estimate_tokens(history) - 5) == [history[0], *history[3:]]
+
+
+def test_token_estimate_counts_call_arguments_and_reasoning():
+    from gigacrew.agent.context_window import estimate_message_tokens, estimate_text_tokens
+
+    # Большой write_file — главный расход контекста: аргументы вызова считаются.
+    write = _call("write_file", path="a.py", content="y" * 3000)
+    assert estimate_message_tokens(write) >= 1000
+    thinking = Message(role="assistant", content="ok", reasoning="r" * 3000)
+    assert estimate_message_tokens(thinking) >= 1000
+    assert estimate_text_tokens("ab") == 1 and estimate_text_tokens("abcd") == 2  # вверх
+
+
+def test_budget_for_small_window_has_a_floor():
+    from gigacrew.agent.context_window import MIN_BUDGET_TOKENS, budget_for_window
+
+    assert budget_for_window(8_192) == budget_for_window(0) == MIN_BUDGET_TOKENS
+    assert budget_for_window(128_000) > MIN_BUDGET_TOKENS
 
 
 def test_fit_history_keeps_pinned_even_over_budget():
@@ -480,3 +513,30 @@ def test_guard_rejection_is_neutral_and_remembered():
     assert guard.failure_warning() is not None  # серия у предела — запрос с предупреждением
     stop = guard.after_tool(other, FAIL)  # ...и не сбрасывает её
     assert stop is not None and stop.kind == "tool_failures"
+
+
+def test_lone_surrogates_are_replaced_on_the_way_into_history():
+    # Имя файла с байтами не в UTF-8 Python декодирует в суррогаты (\udcee); такой текст
+    # нельзя закодировать в UTF-8 — ни запрос к модели, ни сохранение чата.
+    from gigacrew.agent.conversation import clean_text
+
+    name = b"\xee\xf2\xf7.txt".decode("utf-8", "surrogateescape")
+    assert clean_text(name) == "���.txt"
+    assert clean_text("обычный текст") == "обычный текст"
+    conv = Conversation()
+    conv.add_user(f"открой {name}")
+    conv.add_assistant(
+        Message(
+            role="assistant",
+            content="смотрю \ud800",
+            reasoning="думаю \udfff",
+            function_calls=[FunctionCall(name="read_file", arguments={"path": [name]})],
+        )
+    )
+    conv.add_function_result("list_dir", f"{name}\nb.txt")
+    for m in conv.messages:
+        m.model_dump_json().encode("utf-8")  # не UnicodeEncodeError
+    assert conv.messages[0].content == "открой ���.txt"
+    assert conv.messages[1].content == "смотрю �"
+    assert conv.messages[1].function_calls[0].arguments == {"path": ["���.txt"]}
+    assert conv.messages[2].content == "���.txt\nb.txt"

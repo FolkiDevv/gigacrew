@@ -19,6 +19,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 
 from gigacrew.agent.chat_store import ChatRecorder, ChatStoreError, SavedChat
+from gigacrew.agent.decisions import redact
 from gigacrew.agent.loop import Agent
 from gigacrew.agent.prompts import skill_invocation_prompt
 from gigacrew.cli.hooks import (
@@ -36,6 +37,16 @@ from gigacrew.project import semantic
 from gigacrew.project.index import ProjectIndex
 from gigacrew.project.skills import COMMAND_NAME_PATTERN, SkillCatalog
 from gigacrew.ui.console import Console
+
+
+def save_chat(chats: ChatRecorder, agent: Agent, ui: Console) -> None:
+    """Сохранить чат. Если файл чата изменила другая сессия, диалог сохраняется новым
+    чатом — тогда и план этой сессии переезжает к нему (:meth:`Agent.continue_as`)."""
+    warning = chats.save(agent.conversation, model=agent.model)
+    if chats.chat_id != agent.chat_id:
+        agent.continue_as(chats.chat_id)
+    if warning:
+        ui.warn(warning)
 
 
 @dataclass
@@ -183,9 +194,7 @@ def _model(ctx: CommandContext, arg: str) -> bool:
     ctx.ui.info(f"модель теперь: {arg} (применится со следующего запроса)")
     ensure_context_window(agent, ctx.ui, interrupt=ctx.interrupt, declined=ctx.declined_windows)
     if ctx.chats is not None:  # модель — часть чата: сохраняем, не дожидаясь хода
-        warning = ctx.chats.save(agent.conversation, model=agent.model)
-        if warning:
-            ctx.ui.warn(warning)
+        save_chat(ctx.chats, agent, ctx.ui)
     return True
 
 
@@ -239,7 +248,8 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
     words = arg.split()
     action = words[0].lower() if words else ""
     if action in ("forget", "rm", "удалить"):
-        if len(words) != 2 or not words[1].isdigit():
+        # isdecimal, а не isdigit: «²» — цифра, но int() её не разберёт
+        if len(words) != 2 or not words[1].isdecimal():
             ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
             return True
         try:
@@ -249,7 +259,7 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
         except OSError as e:
             ctx.ui.error(f"не удалось сохранить: {e}")
         else:
-            ctx.ui.info(f"разрешение удалено: {rule.describe()}")
+            ctx.ui.info(f"разрешение удалено: {redact(rule.describe())}")
         return True
     if action in ("clear", "очистить"):
         try:
@@ -278,6 +288,9 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
                 text += f" — «{item['feedback']}»"
             elif item.get("source") == "reviewer" and review.get("reason"):
                 text += f" — {review['reason']}"
+            # Журнал прежних версий вырезал меньше форм секретов, пояснение рецензента
+            # не вырезается вовсе — на экран не выводим ни то, ни другое.
+            text = redact(text)
             lines.append(text)
         ctx.ui.info("последние решения:\n" + "\n".join(lines))
         return True
@@ -290,7 +303,8 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
         lines = ["разрешено без вопросов:"]
         for i, rule in enumerate(memory.rules, 1):
             used = f", применялось {rule.hits}" if rule.hits else ""
-            lines.append(f"  {i}. {rule.describe()}{used}")
+            # Правило — команда как есть: прежние версии сохраняли и команды с паролем.
+            lines.append(f"  {i}. {redact(rule.describe())}{used}")
         lines.append("удалить — /permissions forget N, все — /permissions clear")
     if memory.approvals_path is not None and memory.remember:
         lines.append(f"файл: {memory.approvals_path}")
@@ -329,9 +343,7 @@ def _compact(ctx: CommandContext, arg: str) -> bool:
         ctx.ui.info("сжимать нечего: история пуста или уже сжата")
         return True
     if ctx.chats is not None:  # краткое содержание — часть чата: сохраняем сразу
-        warning = ctx.chats.save(agent.conversation, model=agent.model)
-        if warning:
-            ctx.ui.warn(warning)
+        save_chat(ctx.chats, agent, ctx.ui)
     return True
 
 

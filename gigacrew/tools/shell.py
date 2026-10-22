@@ -7,7 +7,7 @@ import os
 from pydantic import BaseModel, Field
 
 from gigacrew.permissions import ToolKind
-from gigacrew.safety import CommandLevel, Verdict, classify
+from gigacrew.safety import MAX_COMMAND, CommandLevel, Verdict, classify
 from gigacrew.security import RiskLevel, classify_shell_command, resolve_in_root
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.process import run_process, subprocess_env, truncate_middle
@@ -59,6 +59,11 @@ def _relative_cwd(params: RunShellParams, ctx: ToolContext) -> str:
 def _risk(verdict: Verdict, command: str, *, classify_commands: bool) -> RiskLevel:
     level = verdict.level
     if level is None:
+        if len(command) > MAX_COMMAND:
+            # Классификатор такую команду не разбирал вовсе (даже невидимые символы не
+            # искал), а регэксп в ней найдёт не всё опасное: решает пользователь, -y не
+            # ручается.
+            return RiskLevel.DANGEROUS
         return classify_shell_command(command)  # «не знаю» — как раньше: регэксп опасного
     if level is CommandLevel.READ:
         return RiskLevel.SAFE if classify_commands else RiskLevel.WRITE
@@ -132,6 +137,13 @@ class RunShellTool(Tool):
         else:
             head = f"exit code: {res.returncode}"
             summary = f"$ {params.command[:60]} → код {res.returncode}"
+        if res.escaped_output:
+            # Потомок ушёл из группы команды (setsid) и держит вывод: killpg его не достал.
+            notes.append(
+                "фоновый процесс, ушедший из группы команды (setsid), остановить не удалось: "
+                "он продолжает работать, его вывод сюда больше не попадёт"
+            )
+            summary += " · фоновый процесс остановить не удалось"
         note_text = "".join(f"\n[{n}]" for n in notes)
         content = f"{head}{note_text}\n{combined or '(пустой вывод)'}"
         ok = res.returncode == 0 and not res.timed_out
