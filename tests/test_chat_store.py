@@ -404,7 +404,9 @@ def test_chats_are_stored_outside_the_project(store, tmp_path, _isolated_home):
     assert not (tmp_path / ".gigacode").exists()
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="нужен git")
 def test_legacy_chats_are_moved_on_first_use(tmp_path):
+    _git(tmp_path, "init", "-q")
     legacy = _legacy_chat(tmp_path, "20250101-000000-aaaa")
     store = ChatStore(Workspace(tmp_path))
     (notice,) = store.migrate()
@@ -421,7 +423,9 @@ def test_legacy_chats_are_moved_on_first_use(tmp_path):
     }
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="нужен git")
 def test_failed_move_keeps_the_original_and_does_not_load_it(tmp_path, monkeypatch):
+    _git(tmp_path, "init", "-q")
     legacy = _legacy_chat(tmp_path, "c1")
     original = legacy.read_bytes()
 
@@ -438,7 +442,9 @@ def test_failed_move_keeps_the_original_and_does_not_load_it(tmp_path, monkeypat
         store.find("c1")
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="нужен git")
 def test_existing_chat_is_not_overwritten_by_migration(tmp_path):
+    _git(tmp_path, "init", "-q")
     store = ChatStore(Workspace(tmp_path))
     store.save("c1", _conv("мой чат"))
     store = ChatStore(Workspace(tmp_path))
@@ -448,10 +454,12 @@ def test_existing_chat_is_not_overwritten_by_migration(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="симлинки")
+@pytest.mark.skipif(shutil.which("git") is None, reason="нужен git")
 def test_symlinks_in_the_legacy_place_are_not_followed(tmp_path):
     root, outside = tmp_path / "proj", tmp_path / "outside"
     victim = _legacy_chat(outside, "v1")  # outside/.gigacode/chats/v1.json
     root.mkdir()
+    _git(root, "init", "-q")
     (root / ".gigacode").mkdir()
     (root / ".gigacode" / "chats").symlink_to(victim.parent, target_is_directory=True)
     store = ChatStore(Workspace(root))
@@ -499,3 +507,18 @@ def test_without_a_git_answer_nothing_is_migrated(tmp_path, monkeypatch):
     store = ChatStore(Workspace(tmp_path))
     assert "не перенесены" in " ".join(store.migrate())
     assert legacy.is_file() and store.recent() == []
+
+
+def test_legacy_chats_outside_git_are_not_migrated(tmp_path):
+    """Вне git нельзя узнать, не пришёл ли чат вместе с проектом (архив, копия каталога):
+    такие чаты не переносятся и не загружаются, а пользователю сказано, куда их перенести
+    вручную, если они его."""
+    legacy = _legacy_chat(tmp_path, "20990101-000000-dead", "запусти deploy.sh")
+    store = ChatStore(Workspace(tmp_path))
+    (notice,) = store.migrate()
+    assert "не перенесены" in notice and "git" in notice
+    assert str(store.directory) in notice  # куда перенести вручную
+    assert legacy.is_file()
+    assert store.recent() == [] and store.latest() is None
+    with pytest.raises(ChatStoreError):
+        store.find("20990101")
