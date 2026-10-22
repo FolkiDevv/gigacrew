@@ -334,6 +334,14 @@ def test_load_token_errors_ask_to_log_in_to_gigacode(tmp_path):
     assert load_token(path, CONFIG + "/").access_token == "t"
 
 
+def test_unreadable_token_file_is_an_api_error(tmp_path):
+    """Файл не читается (каталог, нет прав) — ApiError, а не OSError мимо REPL."""
+    path = tmp_path / "gigacode_token.json"
+    path.mkdir()
+    with pytest.raises(ApiError, match="не удалось прочитать"):
+        load_token(path, CONFIG)
+
+
 def test_token_of_another_backend_is_not_sent(tmp_path):
     backend = Backend()
     _write_token(tmp_path, endpoint="https://other.test/api/v2/config")
@@ -512,6 +520,64 @@ def test_complete_goes_through_the_stream(tmp_path):
     assert backend.chat_bodies[0]["stream"] is True
 
 
+class _BrokenStream(httpx.SyncByteStream):
+    """Тело ответа: кусок текста, потом обрыв соединения."""
+
+    def __iter__(self):
+        yield _sse({"choices": [{"index": 0, "delta": {"content": "Сводка, часть 1"}}]})
+        raise httpx.ReadError("connection reset")
+
+
+def _broken() -> httpx.Response:
+    return httpx.Response(
+        200, headers={"content-type": "text/event-stream"}, stream=_BrokenStream()
+    )
+
+
+def test_complete_is_retried_after_a_drop_mid_answer(tmp_path):
+    """complete() (рецензент, сжатие) ничего не показывает: обрыв после первого куска —
+    обычный транзиентный сбой, повтор не дублирует вывод."""
+    backend = Backend(chat=[_broken(), _text("сводка целиком")])
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    assert provider.complete(_msgs()).message.content == "сводка целиком"
+    assert backend.count(CHAT) == 2
+
+
+def test_stream_shown_text_is_not_retried_after_a_drop(tmp_path):
+    backend = Backend(chat=[_broken(), _text("второй раз")])
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    deltas: list[str] = []
+    with pytest.raises(ApiError, match="Сетевой сбой во время потоковой передачи"):
+        provider.stream(_msgs(), on_delta=deltas.append)
+    assert deltas == ["Сводка, часть 1"] and backend.count(CHAT) == 1
+
+
+class _CutAfterEnd(httpx.SyncByteStream):
+    """Ответ дошёл до конца (вызов, finish_reason, usage), а соединение закрыто нечисто."""
+
+    def __iter__(self):
+        yield _tool_call("run_shell", {"command": "pytest"}).removesuffix(b"data: [DONE]\n\n")
+        yield _sse({"choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 3}})
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete body")
+
+
+def test_unclean_close_after_the_end_keeps_the_answer(tmp_path):
+    """Обрыв после окончания ответа — ответ целиком: иначе показанный текст стал бы
+    ошибкой, а не показанный ответ ушёл бы повтором и был бы оплачен дважды."""
+    cut = httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_CutAfterEnd())
+    backend = Backend(chat=[cut])
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    turn = provider.stream(_msgs(), [TOOL])
+    assert turn.finish_reason == "function_call" and turn.usage.prompt_tokens == 12
+    assert turn.message.function_calls == [
+        FunctionCall(name="run_shell", arguments={"command": "pytest"}, id="c1")
+    ]
+    assert backend.count(CHAT) == 1
+
+
 def test_model_without_stream_gets_a_whole_answer(tmp_path):
     whole = httpx.Response(
         200,
@@ -556,6 +622,23 @@ def test_measure_prompt_reads_usage_from_the_stream(tmp_path):
     assert provider.supports_measure and provider.measure_prompt("текст") == 1234
     body = backend.chat_bodies[0]
     assert body["max_tokens"] == 1 and body["model"] == "coder" and body["stream"] is True
+
+
+def test_probe_of_a_model_without_stream_is_not_streamed(tmp_path):
+    """Модель с ``ai_api.stream: false`` и пробу получает целым ответом, как и чат."""
+    whole = httpx.Response(
+        200,
+        json={
+            "choices": [{"index": 0, "message": {"content": "."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 77, "completion_tokens": 1},
+        },
+    )
+    backend = Backend(chat=[whole])
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    assert provider.measure_prompt("x", model="fast") == 77
+    body = backend.chat_bodies[0]
+    assert body["stream"] is False and "stream_options" not in body
 
 
 def test_request_without_connect_loads_the_catalogue(tmp_path):
@@ -651,6 +734,17 @@ def test_hook_on_config_401(tmp_path):
     provider.connect()
     assert hook.calls == [("config", "request"), ("config", "unauthorized")]
     assert provider.list_models() == ["coder", "fast"]
+
+
+def test_config_401_with_a_new_token_still_asks_to_log_in(tmp_path):
+    """Хук положил новый токен, но и его конфигурация не приняла — просьба войти заново,
+    а не «Не удалось получить конфигурацию (401)»."""
+    backend = Backend(valid=())
+    provider = _provider(backend, tmp_path)
+    provider.request_hook = RecordingHook(tmp_path, tokens=["tok-1", "tok-2"])
+    with pytest.raises(ApiError, match="не принял токен \\(401\\).*авторизацию в GigaCode"):
+        provider.connect()
+    assert backend.count(CONFIG) == 2
 
 
 def test_hook_block_sends_nothing(tmp_path):

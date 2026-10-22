@@ -8,6 +8,7 @@ import pytest
 
 from gigacrew.config import Config
 from gigacrew.llm.api import ApiError, ApiProvider, chat_url
+from gigacrew.llm.transport import iter_sse_events
 from gigacrew.llm.types import FunctionCall, Message, ToolSpec
 
 
@@ -213,6 +214,41 @@ def test_non_object_results_are_wrapped(content):
 
 def test_object_result_passed_as_is():
     assert ApiProvider._result_object('{"a": 1}') == {"a": 1}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"loss": NaN}',
+        '{"max": Infinity, "min": -Infinity}',
+        '{"big": 1e400}',
+        '{"nested": {"items": [1, NaN]}}',
+    ],
+)
+def test_result_with_non_finite_numbers_is_text(content):
+    """json.loads принимает NaN/Infinity, а тело запроса — строгий JSON (httpx отверг бы его
+    ValueError, и сообщение сломало бы каждый следующий запрос чата): такой результат — текст."""
+    result = ApiProvider._result_object(content)
+    assert result == {"result": content}
+    json.dumps(result, allow_nan=False)  # тело запроса собирается
+
+
+def test_arguments_with_non_finite_numbers_are_dropped():
+    """Вызов из ответа уходит обратно в истории: NaN в аргументах сломал бы каждый запрос."""
+    data = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"function_call": {"id": "c1", "name": "f", "arguments": '{"x": NaN}'}},
+                    {"function_call": {"id": "c2", "name": "g", "arguments": {"y": float("inf")}}},
+                    {"function_call": {"id": "c3", "name": "h", "arguments": {"z": 1.5}}},
+                ],
+            }
+        ]
+    }
+    calls = ApiProvider._parse_response(data).message.function_calls
+    assert [(c.name, c.arguments) for c in calls] == [("f", {}), ("g", {}), ("h", {"z": 1.5})]
 
 
 # ------------------------------ ответ ------------------------------ #
@@ -457,11 +493,80 @@ def test_consume_sse_multiline_data_and_comments():
     [
         'event: error\ndata: {"message":"boom"}\n\n',
         'data: {"status":422,"message":"Function calls count does not match"}\n\n',
+        'data: {"status":400,"message":"bad request"}\n\n',  # граница: 400 — уже ошибка
+        'data: {"error":{"message":"overloaded"}}\n\n',
     ],
 )
 def test_consume_sse_error_event_raises(event):
     with pytest.raises(ApiError, match="ошибку в потоке"):
         ApiProvider._consume_sse(_FakeSSE(event), lambda _s: None)
+
+
+def test_consume_sse_status_below_400_is_not_an_error():
+    stream = 'data: {"status":200}\n\n' + _delta("ok") + _DONE
+    assert ApiProvider._consume_sse(_FakeSSE(stream), lambda _s: None).message.content == "ok"
+
+
+def test_sse_event_without_blank_separator_is_not_merged():
+    """Строка ``event:`` без пустой строки перед ней начинает новое событие: склеенный
+    JSON не разобрался бы и молча пропал бы — вместе с текстом, вызовами или окончанием."""
+    assert list(iter_sse_events(["event: a", "data: 1", "event: b", "data: 2", ""])) == [
+        ("a", "1"),
+        ("b", "2"),
+    ]
+    stream = _delta("ok").rstrip("\n") + "\n" + _DONE
+    deltas: list[str] = []
+    turn = ApiProvider._consume_sse(_FakeSSE(stream), deltas.append)
+    assert deltas == ["ok"] and turn.finish_reason == "stop"
+
+
+def test_parallel_calls_without_ids_are_all_kept():
+    data = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"function_call": {"name": "f", "arguments": {"a": 1}}},
+                    {"function_call": {"name": "g", "arguments": {"b": 2}}},
+                ],
+            }
+        ]
+    }
+    assert ApiProvider._parse_response(data).message.function_calls == [
+        FunctionCall(name="f", arguments={"a": 1}),
+        FunctionCall(name="g", arguments={"b": 2}),
+    ]
+
+
+@pytest.mark.parametrize("key", ["tool_state_id", "tools_state_id"])
+def test_state_id_under_either_spelling(key):
+    data = {
+        "messages": [
+            {
+                "role": "assistant",
+                key: "S",
+                "content": [{"function_call": {"id": "c1", "name": "f", "arguments": {}}}],
+            }
+        ]
+    }
+    assert ApiProvider._parse_response(data).message.state_id == "S"
+
+
+def test_malformed_parts_are_skipped():
+    """Мусор в ответе — пропускается, а не роняет разбор; аргументы-не-JSON — {}."""
+    data = {
+        "messages": [
+            "junk",
+            {"role": "user", "content": [{"text": "чужое"}]},
+            {
+                "role": "assistant",
+                "content": ["x", {"function_call": {"name": "f", "arguments": "{bad"}}],
+            },
+        ]
+    }
+    turn = ApiProvider._parse_response(data)
+    assert turn.message.function_calls == [FunctionCall(name="f", arguments={})]
+    assert turn.message.content == ""
 
 
 def test_provider_without_catalogue_defaults():

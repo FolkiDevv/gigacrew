@@ -45,15 +45,23 @@ class ScriptedProvider(LLMProvider):
     def model(self) -> str:
         return "scripted"
 
+    _streaming = False  # идёт stream(): запрос пишется с ``streamed=True``
+
     def complete(self, messages, tools=None, **kwargs) -> AssistantTurn:
+        request = {"messages": list(messages), **kwargs, "streamed": self._streaming}
         if tools is None:
-            self.summary_requests.append({"messages": list(messages), **kwargs})
+            self.summary_requests.append(request)
             return _next(self.summaries, "сводка")
-        self.requests.append({"messages": list(messages), "tools": tools, **kwargs})
+        self.requests.append({**request, "tools": tools})
         return _next(self._turns, "конец")
 
     def stream(self, messages, tools=None, *, on_delta=None, **kwargs) -> AssistantTurn:
-        turn = self.complete(messages, tools, **kwargs)
+        # через complete(): подклассы тестов переопределяют только его
+        self._streaming = True
+        try:
+            turn = self.complete(messages, tools, **kwargs)
+        finally:
+            self._streaming = False
         if on_delta and turn.message.content:
             on_delta(turn.message.content)
         return turn
@@ -87,6 +95,8 @@ class WindowProvider(ScriptedProvider):
         status: int | None = 422,
         error: BaseException | None = None,
         overhead: int = 5,
+        truncate: bool = False,
+        max_chars: int | None = None,
     ):
         super().__init__(turns)
         self.window = window
@@ -95,12 +105,21 @@ class WindowProvider(ScriptedProvider):
         self.status = status
         self.error = error
         self.overhead = overhead  # служебные токены сообщения
+        self.truncate = truncate  # сервер молча обрезает запрос до окна, а не отказывает
         self.measured: list[tuple[str | None, int]] = []
+        self.sent_chars: list[int] = []  # длина текста каждой пробы
+        self.max_chars = max_chars  # проба длиннее — AssertionError
 
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
         if self.error is not None:
             raise self.error
+        self.sent_chars.append(len(text))
+        if self.max_chars is not None and len(text) > self.max_chars:
+            # тест падает сразу, а не на таймауте, пока замер строит гигабайтные пробы
+            raise AssertionError(f"проба в {len(text)} символов — замер пошёл вразнос")
         tokens = int(len(text) / self.chars_per_token) + self.overhead
+        if self.truncate:
+            tokens = min(tokens, self.window - 1)
         self.measured.append((model, tokens))
         if tokens + 1 > self.window:
             detail = (

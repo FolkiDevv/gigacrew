@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import ssl
 import time
 from abc import abstractmethod
@@ -86,6 +87,18 @@ def error_body(resp: httpx.Response) -> str:
     return text if len(text) <= ERROR_BODY_CHARS else text[:ERROR_BODY_CHARS] + "…"
 
 
+def connection_error(exc: httpx.HTTPError) -> str:
+    """Текст ошибки транспорта для пользователя. Запрос, отвергнутый до отправки
+    (``LocalProtocolError``), — без текста исключения: h11 цитирует в нём значение
+    заголовка, а это ключ или токен."""
+    if isinstance(exc, httpx.LocalProtocolError):
+        return (
+            "Ошибка соединения с API: запрос отвергнут до отправки (недопустимый заголовок "
+            "или тело запроса)"
+        )
+    return f"Ошибка соединения с API: {exc}"
+
+
 def raise_if_cert_rejected(exc: BaseException) -> None:
     """Сетевая ошибка из-за того, что сертификат сервера не прошёл проверку TLS, —
     :class:`ApiError` с подсказкой сразу: повтор тут не поможет."""
@@ -135,9 +148,12 @@ def retry_after(resp: httpx.Response, default: float) -> float:
     ra = resp.headers.get("Retry-After")
     if ra:
         try:
-            return max(min(float(ra), 30.0), 0.0)  # отрицательное — ValueError в sleep
+            value = float(ra)
         except ValueError:
-            pass
+            return default
+        # nan и бесконечность — ValueError в sleep (nan проходит и через min/max).
+        if math.isfinite(value):
+            return max(min(value, 30.0), 0.0)  # отрицательное — ValueError в sleep
     return default
 
 
@@ -382,7 +398,7 @@ class HttpProvider(LLMProvider):
                     delay = min(delay * 2, 8.0)
                 continue
             except httpx.HTTPError as e:
-                raise ApiError(f"Ошибка соединения с API: {e}") from e
+                raise ApiError(connection_error(e)) from e
 
             if resp.status_code == 429:
                 if limit.wait(resp):
@@ -565,15 +581,16 @@ class HttpProvider(LLMProvider):
         возвращает финальный AssistantTurn (идентичный complete()).
 
         Повтор при сетевом сбое выполняется, только пока пользователю не отдан
-        ни один кусок текста — иначе он увидел бы ответ дважды. Авторизация после 401
-        обновляется перед следующей попыткой, когда ответ уже закрыт.
+        ни один кусок текста — иначе он увидел бы ответ дважды; без ``on_delta`` (ответ
+        целиком — рецензент, сжатие) показывать некому, и обрыв повторяется всегда.
+        Авторизация после 401 обновляется перед следующей попыткой, когда ответ уже закрыт.
         """
-        sink = on_delta or (lambda _s: None)
         state = {"emitted": False}
 
         def emit(piece: str) -> None:
-            state["emitted"] = True
-            sink(piece)
+            if on_delta is not None:
+                state["emitted"] = True
+                on_delta(piece)
 
         name = model or self.model
         payload = self._payload(
@@ -658,7 +675,7 @@ class HttpProvider(LLMProvider):
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)
             except httpx.HTTPError as e:
-                raise ApiError(f"Ошибка соединения с API: {e}") from e
+                raise ApiError(connection_error(e)) from e
 
         raise ApiError(
             f"Сетевая ошибка при потоковом обращении к API (после "

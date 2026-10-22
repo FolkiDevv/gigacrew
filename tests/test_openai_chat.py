@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 from gigacrew.llm.openai_chat import (
@@ -304,6 +305,37 @@ def test_repeated_name_and_repeated_arguments_are_not_glued():
     assert call.arguments == {"path": "a", "content": "x\ny"}
 
 
+def test_new_call_on_a_reused_index_is_not_merged_into_the_old_one():
+    """Сервер даёт каждому параллельному вызову index 0: новый id с именем — новый вызов,
+    иначе второй вызов молча пропал бы (его аргументы приклеились бы к первому)."""
+    turn, _ = _consume(
+        _sse(
+            _delta(tool_calls=[_call(0, id="call_A", name="read_file", args='{"path": "a.py"}')]),
+            _delta(tool_calls=[_call(0, id="call_B", name="run_shell", args='{"command": ')]),
+            _delta(tool_calls=[_call(0, args='"pytest -q"}')]),  # продолжение — к последнему
+            _delta("tool_calls"),
+        )
+    )
+    assert [(c.id, c.name, c.arguments) for c in turn.message.function_calls] == [
+        ("call_A", "read_file", {"path": "a.py"}),
+        ("call_B", "run_shell", {"command": "pytest -q"}),
+    ]
+
+
+def test_fresh_id_without_a_name_continues_the_call():
+    """Сервер, который шлёт новый id в каждом куске одного вызова, не дробит его."""
+    turn, _ = _consume(
+        _sse(
+            _delta(tool_calls=[_call(0, id="c1", name="read_file", args='{"path": ')]),
+            _delta(tool_calls=[_call(0, id="c2", args='"a.py"}')]),
+            _delta("tool_calls"),
+        )
+    )
+    assert [(c.id, c.name, c.arguments) for c in turn.message.function_calls] == [
+        ("c1", "read_file", {"path": "a.py"})
+    ]
+
+
 def test_whole_call_in_one_chunk_and_object_arguments():
     turn, _ = _consume(
         _sse(
@@ -445,3 +477,37 @@ def test_sse_events_without_blank_lines_between_them():
 def test_garbage_lines_in_stream_are_skipped():
     turn, shown = _consume([": ping", "", "data: не json", "", *_sse(_delta("stop", content="ok"))])
     assert shown == ["ok"] and turn.finish_reason == "stop"
+
+
+def test_nothing_after_done_is_read():
+    """После ``[DONE]`` поток не читается: мусор нестандартного сервера не показывается."""
+
+    def lines():
+        yield from _sse(_delta(content="ok"), "[DONE]", _delta(content="мусор"))
+        raise AssertionError("поток читается после [DONE]")
+
+    turn, shown = _consume(lines())
+    assert shown == ["ok"] and turn.message.content == "ok" and turn.finish_reason == "stop"
+
+
+def _cut(lines: list[str]):
+    """Строки потока, после которых соединение рвётся."""
+    yield from lines
+    raise httpx.RemoteProtocolError("peer closed connection without sending complete body")
+
+
+def test_drop_after_finish_reason_keeps_the_answer():
+    """Ответ закончен (finish_reason), осталось только usage и ``[DONE]``: обрыв — не ошибка."""
+    call = _call(0, id="c1", name="read_file", args='{"path": "a.py"}')
+    turn, shown = _consume(
+        _cut(_sse(_delta(content="Читаю"), _delta(tool_calls=[call]), _delta("tool_calls")))
+    )
+    assert shown == ["Читаю"] and turn.finish_reason == "function_call"
+    assert turn.message.function_calls == [
+        FunctionCall(name="read_file", arguments={"path": "a.py"}, id="c1")
+    ]
+
+
+def test_drop_before_the_end_of_the_answer_is_an_error():
+    with pytest.raises(httpx.RemoteProtocolError):
+        _consume(_cut(_sse(_delta(content="Читаю"))))
