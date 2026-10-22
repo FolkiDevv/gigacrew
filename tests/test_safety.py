@@ -348,6 +348,14 @@ def test_env_options_and_assignments(root, command, expected):
         ("fd -Hx rm", None),
         ("fd -e py -X rm -rf", DANGER),
         ("fd -e py -x wc -l", READ),
+        # каталоги поиска перед -x/-X проверяются, как без --exec
+        ("fd x /etc -x cat", None),
+        ("fd x /etc", None),
+        ("fd id_rsa ~/.ssh -x cat", DANGER),
+        ("fd x --search-path /etc -x cat", None),
+        ("fd x --search-path=/etc -X cat", None),
+        ("fd x --base-directory /etc -x cat", None),
+        ("fd x src -x cat", READ),
         ("docker run -itv /var/run/docker.sock:/s alpine", DANGER),
         ("split --filter='sh -c id' a.txt", None),
         # patch пишет файл из аргументов, -o и -r
@@ -1151,6 +1159,8 @@ def test_recursive_reads_follow_secrets_and_links(root, tmp_path_factory):
     assert level("find src -type f -exec cat {} +", root) is None
     assert level("find src -type f | xargs cat", root) is None
     assert level("fd -x cat", root) is None
+    assert level("fd x src -x cat", root) is None  # ссылка в каталоге поиска до -x
+    assert level("fd x . src -x cat", root) is None
     (root / "src" / "lnk").unlink()
     (root / ".env").write_text("TOKEN=1\n")
     assert level("grep -R hello .", root) is None

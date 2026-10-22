@@ -1429,11 +1429,23 @@ def _fd_exec(args: list[Word]) -> int | None:
     return None
 
 
+def _fd_dirs(args: list[Word]) -> list[Word]:
+    """Каталоги поиска fd: позиционные после шаблона, --search-path и --base-directory."""
+    rest, found = _options(args, _FD_VALUED)
+    _, pos = _split(rest)
+    return pos[1:] + [w for n, w in found if n in ("--base-directory", "--search-path")]
+
+
 def _fd(env: Env, name: str, args: list[Word], classify: Callable[[Command], Part]) -> Part:
     at = _fd_exec(args)
     if at == -1:
         return _unknown(f"{name}: --exec в группе флагов не разобрать")
     if at is not None:
+        # Каталоги поиска — до -x/-X: найденные там файлы и прочитает команда.
+        dirs = _fd_dirs(args[:at])
+        bad = _check_read(env, dirs, name)
+        if bad is not None:
+            return bad
         inner = [
             _FOUND if w.value == "{}" else w
             for w in args[at + 1 :]
@@ -1444,12 +1456,9 @@ def _fd(env: Env, name: str, args: list[Word], classify: Callable[[Command], Par
         sub = classify(Command(argv=inner, cwd=env.cwd))
         if sub.level is not CommandLevel.READ:
             return sub if sub.level is not None else _unknown(f"fd --exec: {sub.reason}")
-        rec = _check_recursive(env, [], "fd --exec")
+        rec = _check_recursive(env, dirs, "fd --exec")
         return rec if rec is not None else _read("fd --exec: чтение найденных файлов")
-    rest, found = _options(args, _FD_VALUED)
-    _, pos = _split(rest)
-    dirs = [w for n, w in found if n in ("--base-directory", "--search-path")]
-    bad = _check_read(env, pos[1:] + dirs, name)
+    bad = _check_read(env, _fd_dirs(args), name)
     return bad if bad is not None else _read(f"{name}: поиск файлов")
 
 
