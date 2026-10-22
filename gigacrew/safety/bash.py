@@ -102,6 +102,9 @@ _TOKENS = frozenset(
 _SEPARATORS = frozenset({"&&", "||", ";", "&", "\n", "|", "|&", ";;"})
 _OUTPUT_OPS = frozenset({">", ">>", ">|", "&>", "&>>", "&>|"})
 _GLOB_CHARS = re.compile(r"[*?\[]")
+# Текст без разбора внутри (слово, тело heredoc) и неэкранированная ` в нём.
+_PLAIN_TEXT = frozenset({"word", "heredoc_body", "heredoc_content"})
+_BACKTICK = re.compile(r"(?<!\\)(?:\\\\)*`")
 _BRACE = re.compile(r"\{[^{}\0]*(,|\.\.)[^{}\0]*\}")
 
 
@@ -270,6 +273,10 @@ class _Walker:
                 continue
             if t == "ERROR" or n.is_missing:
                 self.problem("команда не разобрана")
+            if n.child_count == 0 and t in _PLAIN_TEXT and _BACKTICK.search(_text(n)):
+                # Грамматика не разбирает `…` в теле heredoc и внутри ${…}, а оболочка
+                # выполнит: команда в нём не проверена.
+                self.problem("подстановка `…`, которую не удалось разобрать")
             stack.extend(n.children)
         return dynamic, names
 
