@@ -108,6 +108,60 @@ def test_heredoc_body_without_secret_variables_stays_read(root, command):
     assert level(command, root) is READ
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "TZ=UTC; echo $TZ",
+        'LC_ALL="C.UTF-8"; echo "${LC_ALL}"',
+        "export TZ=Europe/Moscow\necho $TZ",
+        "DEBUG=1; TZ=UTC; echo $DEBUG$TZ",
+        "TZ=$GITHUB_TOKEN; TZ=UTC; echo $TZ",  # последнее присваивание — постоянное
+        "TZ=UTC\ncat <<EOF\n$TZ\nEOF",
+    ],
+)
+def test_variable_assigned_earlier_to_a_static_value_is_not_a_secret(root, command):
+    """Переменная, которой команда сама раньше присвоила постоянное значение, — не секрет
+    из окружения: вывести её можно без вопроса (присваивать — только безвредные имена,
+    другие меняют окружение следующих команд)."""
+    assert level("TZ=UTC; echo hi", root) is READ
+    assert level("echo $TZ", root) is None
+    verdict = classify(command, root=root)
+    assert verdict.level is READ, verdict.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $TZ; TZ=UTC",  # присвоено позже
+        "TZ=UTC echo $TZ",  # префикс: $TZ раскрывается до присваивания
+        "TZ=$GITHUB_TOKEN; echo $TZ",  # значение — из окружения
+        "TZ=UTC; TZ=$GITHUB_TOKEN; echo $TZ",  # переприсвоено
+        "false && TZ=UTC; echo $TZ",  # присваивание могло не выполниться
+        "false || TZ=UTC; echo $TZ",
+        "(TZ=UTC); echo $TZ",  # в подоболочке: снаружи не видно
+        "TZ=UTC | true; echo $TZ",  # звено конвейера — тоже подоболочка
+        "echo $(TZ=UTC); echo $TZ",
+        "TZ=GITHUB_TOKEN; echo ${!TZ}",  # косвенная ссылка: значение другой переменной
+        "TZ=GITHUB_TOKEN; echo $((TZ))",  # арифметика вычисляет переменную по имени
+        "TZ=GITHUB_TOKEN; echo $(($TZ + 1))",
+        "TZ='$(cat .env)'; echo ${TZ@P}",  # @P выполняет подстановки
+        "TZ=GITHUB_TOKEN; echo ${TZ:-$GITHUB_TOKEN}",
+        "TZ='*'; echo $TZ",  # шаблон имён файлов
+        "TZ='$GITHUB_TOKEN'; eval echo $TZ",
+        "TZ=UTC; sh -c 'echo $TZ'",  # другой процесс: переменная — из окружения
+        # Префикс у специальной встроенной команды (:) в dash остаётся в оболочке.
+        "TZ=UTC; TZ=$GITHUB_TOKEN :; echo $TZ",
+        # Встроенные команды, которые присваивают переменные сами.
+        "TZ=UTC; read TZ < a.txt; echo $TZ",
+        "TZ=UTC; getopts ab TZ; echo $TZ",
+        "TZ=UTC; printf -v TZ %s x; echo $TZ",
+    ],
+)
+def test_assigned_variable_is_trusted_only_when_certainly_static(root, command):
+    verdict = classify(command, root=root)
+    assert verdict.level is not READ, verdict.reason
+
+
 # ------------------------ рекурсивное чтение ------------------------ #
 @pytest.mark.parametrize(
     "secret",

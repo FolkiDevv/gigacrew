@@ -106,14 +106,14 @@ def _classify(
     parts: list[Part] = []
     writes: list[Part] = []
     for cmd in script.commands:
-        env = replace(base, cwd=cmd.cwd)
+        env = replace(base, cwd=cmd.cwd, assigned=cmd.assigned)
         part = replace(programs.classify_simple(cmd, env), text=_text_of(cmd))
         parts.append(part)
         for r in cmd.redirects:
             if r.body is not None and r.body_vars:
                 # Тело heredoc/herestring программа получит на stdin и, как правило,
                 # выведет: переменные в нём — как в аргументах echo.
-                body = bash.Word(r.body, static=False, vars=r.body_vars)
+                body = bash.Word(r.body, static=False, vars=r.body_vars, plain=r.body_plain)
                 bad = programs._check_vars(env, [body], "текст на stdin")
                 if bad is not None:
                     writes.append(bad)
