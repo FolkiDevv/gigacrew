@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from gigacrew.agent.decisions import DecisionMemory, project_key, redact
-from gigacrew.safety import classify
+from gigacrew.agent.decisions import DecisionMemory, Rule, history_key, project_key, redact
+from gigacrew.safety import CommandLevel, classify
 
 
 @pytest.fixture
@@ -89,6 +89,55 @@ def test_dangerous_is_never_remembered_or_matched(root, home):
     assert mem.offer(danger) == "" and mem.approve(danger) == []
     mem.rules.append(mem._candidates(verdict("touch x", root))[0])
     assert mem.match(verdict("touch x && rm -rf build", root)) is None
+    # целиком, не по частям (перенаправление): защита — у всей команды
+    whole = verdict("rm -rf build > log.txt", root)
+    assert whole.level is CommandLevel.DANGER and not whole.composable
+    assert mem.offer(whole) == "" and mem.approve(whole) == []
+    # устаревшее (прежняя версия правил) или вписанное руками правило не действует
+    mem.rules.append(Rule("old", ".", "command", whole.command))
+    assert mem.match(whole) is None
+
+
+def test_plan_mode_ignores_whole_command_rules(root, home):
+    mem = memory(root, home)
+    v = verdict("pytest > log.txt", root)  # пишет в файл
+    mem.approve(v)
+    assert mem.match(v) is not None and mem.match(v, plan=True) is None
+
+
+def test_venv_activation_needs_an_approved_program(root, home):
+    _venv(root)
+    mem = memory(root, home)
+    mem.approve(verdict("touch x", root))
+    v = verdict("source .venv/bin/activate && touch x", root)
+    assert v.parts[0].prelude
+    assert mem.match(v) is None  # скрипт активации — код проекта: только с программой
+    mem.approve(verdict("pytest", root))
+    assert mem.match(verdict("source .venv/bin/activate && pytest", root)) is not None
+
+
+def test_always_counts_as_allowed(root, home):
+    mem = memory(root, home)
+    mem.record(
+        {"command": "make", "cwd": ".", "key": "make", "source": "user", "decision": "always"}
+    )
+    assert mem.history((".", "make")) == (1, 0)
+    assert memory(root, home).history((".", "make")) == (1, 0)  # и из журнала
+
+
+def test_history_key_is_the_program_or_whole_command(root):
+    assert history_key(verdict("pytest -q", root)) == (".", "pytest")
+    assert history_key(verdict("pytest && make", root)) == (".", "pytest && make")
+    assert history_key(verdict("npm test", root, cwd="frontend")) == ("frontend", "npm test")
+
+
+def test_forget_rejects_numbers_outside_the_list(root, home):
+    mem = memory(root, home)
+    mem.approve(verdict("pytest", root))
+    for index in (0, -1, 2):
+        with pytest.raises(IndexError):
+            mem.forget(index)
+    assert len(mem.rules) == 1
 
 
 def _venv(root: Path) -> None:

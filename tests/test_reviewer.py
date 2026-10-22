@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from fakes import RecordingEvents, ScriptedProvider, cut_turn, text_turn, tool_turn
 
-from gigacrew.agent.decisions import DecisionMemory
+from gigacrew.agent.decisions import DecisionMemory, history_key
 from gigacrew.agent.events import Approval, ConfirmResult, Review
 from gigacrew.agent.loop import REJECTED_NOTE, Agent
 from gigacrew.agent.prompts import REVIEWER_PROMPT
@@ -169,8 +169,9 @@ def test_review_command_calls_model_without_tools(tmp_path):
     assert used[0].prompt_tokens == 7
 
 
-def test_review_command_cut_answer_is_an_error(tmp_path):
-    provider = ScriptedProvider(summaries=[cut_turn(ALLOW)])
+@pytest.mark.parametrize("reason", ["length", "incomplete"])
+def test_review_command_cut_answer_is_an_error(tmp_path, reason):
+    provider = ScriptedProvider(summaries=[cut_turn(ALLOW, reason)])
     with pytest.raises(ReviewError, match="не закончен"):
         review_command(
             provider,
@@ -335,6 +336,63 @@ def test_rejected_command_is_not_reviewed_again(tmp_path):
     agent.run_turn("ещё раз")
     assert len(provider.summary_requests) == 1  # второй раз — сразу пользователю
     assert events.confirms[1][0].review == "рецензент не спрашивался: такую команду уже отклоняли"
+
+
+class _Answers(RecordingEvents):
+    """Ответы пользователя по очереди."""
+
+    def __init__(self, answers):
+        super().__init__()
+        self._answers = list(answers)
+
+    def confirm(self, call, preview, *, dangerous):
+        self.confirms.append((call, preview, dangerous))
+        return self._answers.pop(0)
+
+
+def test_command_rejected_in_earlier_session_is_not_reviewed(tmp_path):
+    script = _script(tmp_path)
+    home = tmp_path / "home"
+    memory, _ = DecisionMemory.load(tmp_path, base=home)
+    key = history_key(classify(script, root=tmp_path))
+    memory.record(
+        {"command": script, "cwd": ".", "key": key[1], "decision": "no", "source": "user"}
+    )
+    fresh, _ = DecisionMemory.load(tmp_path, base=home)  # новая сессия: отказ — из журнала
+    assert not fresh.rejected_in_session(key) and fresh.history(key) == (0, 1)
+    provider = ScriptedProvider([_run(script), text_turn("ок")], summaries=[text_turn(ALLOW)])
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events, decisions=fresh).run_turn("x")
+    assert provider.summary_requests == []
+    assert events.confirms[0][0].review == "рецензент не спрашивался: такую команду уже отклоняли"
+
+
+def test_rejection_in_this_session_beats_earlier_approvals(tmp_path):
+    # Разрешали дважды, отклонили сейчас: (2, 1) — но до конца сессии рецензент не нужен.
+    script = _script(tmp_path)
+    provider = ScriptedProvider(
+        [_run(script), text_turn("ок")] * 4,
+        summaries=[text_turn(DENY)] * 3 + [text_turn(ALLOW)],
+    )
+    events = _Answers([Approval.YES, Approval.YES, Approval.NO, Approval.NO])
+    agent = _agent(provider, tmp_path, events=events)
+    for i in range(4):
+        agent.run_turn(f"ход {i}")
+    assert len(provider.summary_requests) == 3 and len(events.confirms) == 4
+    assert events.confirms[3][0].review == "рецензент не спрашивался: такую команду уже отклоняли"
+
+
+def test_reviewer_success_resets_failure_count(tmp_path):
+    script = _script(tmp_path)
+    turns = [t for i in range(5) for t in (_run(f"{script} {i}"), text_turn("ок"))]
+    error = LLMError("шлюз недоступен")
+    provider = ScriptedProvider(
+        turns, summaries=[error, error, text_turn(ALLOW), error, text_turn(ALLOW)]
+    )
+    agent = _agent(provider, tmp_path, events=RecordingEvents(confirm_answer=True))
+    for i in range(5):
+        agent.run_turn(f"ход {i}")
+    assert agent.reviewer.enabled and len(provider.summary_requests) == 5
 
 
 def test_saved_rule_wins_before_reviewer(tmp_path):
