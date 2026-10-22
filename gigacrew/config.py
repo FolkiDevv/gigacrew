@@ -338,7 +338,7 @@ class Config:
     # бюджета истории (бюджет за вычетом системного промпта и схем инструментов).
     auto_compact: bool = True
     compact_threshold: float = 0.8
-    # Сохранять чаты в .gigacode/chats/ (продолжение — /resume, --continue).
+    # Сохранять чаты в ~/.gigacode/projects/<ключ>/chats/ (продолжение — /resume, -c).
     save_chats: bool = True
     # Предлагать замер окна незамеренной модели (пробы оплачиваются); False — только
     # по --test-context.

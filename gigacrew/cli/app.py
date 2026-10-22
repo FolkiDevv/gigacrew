@@ -12,8 +12,9 @@
 (``gigacode``): токен — из файла официального CLI GigaCode, модели и их окна — из
 каталога бэкенда, модель по умолчанию — его же.
 
-Чаты сохраняются в ``.gigacode/chats/`` (``--no-save`` — нет); ``-c`` продолжает
-последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
+Чаты сохраняются в ``~/.gigacode/projects/<ключ>/chats/`` (``--no-save`` — нет; прежние
+из ``.gigacode/chats/`` проекта переносятся туда); ``-c`` продолжает последний, ``-r [ID]`` —
+выбранный (без ID — селектор чатов).
 
 Хуки пользователя — из ``~/.gigacode/settings.json`` и ``.gigacode/settings*.json``
 проекта (:mod:`gigacrew.cli.hooks`), после подтверждения или с ``--trust-hooks``; хук
@@ -112,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-save",
         action="store_true",
-        help="Не сохранять чат в .gigacode/chats/ и журнал решений о командах",
+        help="Не сохранять чат и журнал решений о командах (~/.gigacode/projects/)",
     )
     p.add_argument(
         "--trust-hooks",
@@ -365,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
             hooks=hooks,
         )
         store = ChatStore(agent.workspace)
+        for notice in store.migrate():  # чаты с прежнего места — из .gigacode/chats проекта
+            ui.info(notice)
         chats = ChatRecorder(store, enabled=config.save_chats)
         agent.chat_id = chats.chat_id  # файл плана назван по id чата
         try:

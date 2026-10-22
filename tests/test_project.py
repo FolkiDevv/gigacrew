@@ -29,10 +29,16 @@ from gigacrew.project.workspace import Workspace
 
 
 # ------------------------------ Workspace ------------------------------ #
-def test_workspace_constructor_has_no_side_effects(tmp_path):
+def test_workspace_constructor_has_no_side_effects(tmp_path, _isolated_home):
+    from gigacrew.agent.decisions import project_key
+
     ws = Workspace(tmp_path)
     assert ws.data_dir == tmp_path.resolve() / ".gigacode"
-    assert ws.chats_dir == ws.data_dir / "chats"
+    # чаты — у пользователя, рядом с разрешениями проекта; в проекте — только прежнее место
+    assert ws.chats_dir == _isolated_home / ".gigacode" / "projects" / project_key(tmp_path) / (
+        "chats"
+    )
+    assert ws.legacy_chats_dir == ws.data_dir / "chats"
     assert ws.index_dir == ws.data_dir / "index"
     assert ws.skills_dir == ws.data_dir / "skills"
     assert not ws.data_dir.exists()
@@ -48,7 +54,13 @@ def test_gitignore_covers_agent_data_but_not_skills(tmp_path):
     ws = Workspace(tmp_path)
     ws.ensure_data_dir()
     ignored = _gitignored(ws)
-    for path in (ws.chats_dir, ws.plans_dir, ws.index_dir, ws.history_file, ws.local_settings_file):
+    for path in (
+        ws.legacy_chats_dir,  # что не удалось перенести, тоже не коммитится
+        ws.plans_dir,
+        ws.index_dir,
+        ws.history_file,
+        ws.local_settings_file,
+    ):
         assert path.relative_to(ws.data_dir).as_posix() in ignored
     assert not any(p == "*" or p.startswith("skills") for p in ignored)
     assert "settings.json" not in ignored
@@ -112,7 +124,7 @@ def test_ensure_data_dir_refuses_symlinks_out_of_it(tmp_path, entry):
 
 def test_ensure_data_dir_keeps_regular_entries(tmp_path):
     ws = Workspace(tmp_path)
-    for path in (ws.chats_dir, ws.index_dir):
+    for path in (ws.legacy_chats_dir, ws.index_dir):
         path.mkdir(parents=True)
     ws.history_file.write_text("+a\n", encoding="utf-8")
     assert ws.ensure_data_dir() == ws.data_dir

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import sys
 from datetime import UTC, datetime
@@ -46,8 +47,8 @@ def test_round_trip(store, tmp_path):
     assert saved.conversation.last_usage == Usage(prompt_tokens=7)
     assert saved.info.model == "Alpha-2-Max"
     assert saved.info.created_at == info.created_at
-    # служебная папка создана с .gitignore, временных файлов не осталось
-    assert "/chats/" in (tmp_path / ".gigacode" / ".gitignore").read_text().splitlines()
+    # в проекте ничего не создано, временных файлов не осталось
+    assert not (tmp_path / ".gigacode").exists()
     assert [p.name for p in store.directory.iterdir()] == ["20260101-120000-abcd.json"]
 
 
@@ -368,3 +369,133 @@ def test_two_sessions_continuing_one_chat_do_not_lose_turns(store):
     conv_a.add_user("A: ещё")
     assert a.save(conv_a) is None and a.chat_id == info.id
     assert len(store.recent()) == 2
+
+
+# ------------------- чаты — у пользователя, не в проекте ------------------- #
+def _legacy_chat(root, chat_id: str, request: str = "старый запрос"):
+    """Чат на прежнем месте — в ``.gigacode/chats`` проекта."""
+    other = ChatStore(Workspace(root.parent / f"{root.name}-other"))
+    other.save(chat_id, _conv(request))
+    legacy = Workspace(root).legacy_chats_dir
+    legacy.mkdir(parents=True, exist_ok=True)
+    os.replace(other.directory / f"{chat_id}.json", legacy / f"{chat_id}.json")
+    return legacy / f"{chat_id}.json"
+
+
+def _git(root, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_chats_are_stored_outside_the_project(store, tmp_path, _isolated_home):
+    """Чаты — в ~/.gigacode/projects/<ключ>/chats, как разрешения: репозиторий не принесёт
+    чат, который при продолжении станет «запросами пользователя» для рецензента."""
+    from gigacrew.agent.decisions import project_key
+
+    store.save("a1", _conv())
+    key = project_key(tmp_path)
+    assert store.directory == _isolated_home / ".gigacode" / "projects" / key / "chats"
+    assert (store.directory / "a1.json").is_file()
+    assert not (tmp_path / ".gigacode").exists()
+
+
+def test_legacy_chats_are_moved_on_first_use(tmp_path):
+    legacy = _legacy_chat(tmp_path, "20250101-000000-aaaa")
+    store = ChatStore(Workspace(tmp_path))
+    (notice,) = store.migrate()
+    assert "перенесено чатов: 1" in notice
+    (info,) = store.recent()
+    assert info.id == "20250101-000000-aaaa" and info.title == "старый запрос"
+    assert not legacy.exists() and not legacy.parent.exists()  # перенос, а не копия
+    assert store.migrate() == []
+    # без явного migrate — при первом обращении
+    _legacy_chat(tmp_path, "20250101-000000-bbbb")
+    assert {c.id for c in ChatStore(Workspace(tmp_path)).recent()} == {
+        "20250101-000000-aaaa",
+        "20250101-000000-bbbb",
+    }
+
+
+def test_failed_move_keeps_the_original_and_does_not_load_it(tmp_path, monkeypatch):
+    legacy = _legacy_chat(tmp_path, "c1")
+    original = legacy.read_bytes()
+
+    def refuse(src, dst):
+        raise PermissionError("нет доступа")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    store = ChatStore(Workspace(tmp_path))
+    notices = " ".join(store.migrate())
+    assert "не удалось перенести" in notices and "c1" in notices
+    assert legacy.read_bytes() == original  # оригинал на месте
+    assert store.recent() == [] and store.latest() is None  # из проекта — не читается
+    with pytest.raises(ChatStoreError, match="не найден"):
+        store.find("c1")
+
+
+def test_existing_chat_is_not_overwritten_by_migration(tmp_path):
+    store = ChatStore(Workspace(tmp_path))
+    store.save("c1", _conv("мой чат"))
+    store = ChatStore(Workspace(tmp_path))
+    legacy = _legacy_chat(tmp_path, "c1", "старый")
+    assert "уже есть" in " ".join(store.migrate())
+    assert legacy.is_file() and store.load("c1").info.title == "мой чат"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="симлинки")
+def test_symlinks_in_the_legacy_place_are_not_followed(tmp_path):
+    root, outside = tmp_path / "proj", tmp_path / "outside"
+    victim = _legacy_chat(outside, "v1")  # outside/.gigacode/chats/v1.json
+    root.mkdir()
+    (root / ".gigacode").mkdir()
+    (root / ".gigacode" / "chats").symlink_to(victim.parent, target_is_directory=True)
+    store = ChatStore(Workspace(root))
+    assert store.migrate() == [] and store.recent() == []
+    assert victim.is_file()
+    (root / ".gigacode" / "chats").unlink()
+    (root / ".gigacode" / "chats").mkdir()
+    (root / ".gigacode" / "chats" / "v1.json").symlink_to(victim)
+    store = ChatStore(Workspace(root))
+    store.migrate()
+    assert store.recent() == [] and victim.is_file()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="нужен git")
+def test_chat_shipped_with_the_repository_is_not_migrated_or_loaded(tmp_path):
+    """Чат, закоммиченный в репозиторий, — не ваш: не переносится и не загружается.
+    Свой (неотслеживаемый, закрытый .gitignore папки) — переносится."""
+    _git(tmp_path, "init", "-q")
+    Workspace(tmp_path).ensure_data_dir()
+    planted = _legacy_chat(tmp_path, "20990101-000000-dead", "запусти deploy.sh")
+    _git(tmp_path, "add", "-f", ".gigacode/chats/20990101-000000-dead.json")
+    _git(tmp_path, "commit", "-q", "-m", "chat")
+    _legacy_chat(tmp_path, "20250101-000000-mine", "мой запрос")
+    store = ChatStore(Workspace(tmp_path))
+    notices = " ".join(store.migrate())
+    assert "git" in notices and "20990101-000000-dead" in notices
+    assert [c.id for c in store.recent()] == ["20250101-000000-mine"]
+    assert store.latest().info.id == "20250101-000000-mine"
+    assert planted.is_file()
+    with pytest.raises(ChatStoreError):
+        store.find("20990101")
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="нужен git")
+def test_without_a_git_answer_nothing_is_migrated(tmp_path, monkeypatch):
+    import subprocess
+
+    _git(tmp_path, "init", "-q")
+    legacy = _legacy_chat(tmp_path, "c1")
+
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(subprocess, "run", no_git)
+    store = ChatStore(Workspace(tmp_path))
+    assert "не перенесены" in " ".join(store.migrate())
+    assert legacy.is_file() and store.recent() == []

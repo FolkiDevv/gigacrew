@@ -1,14 +1,16 @@
 """Рабочее пространство проекта и служебная папка ``.gigacode/``.
 
-``.gigacode/`` в корне проекта — место для данных агента (индекс проекта, чаты,
-планы, история ввода), скиллов (``skills/``, см. :mod:`gigacrew.project.skills`) и
+``.gigacode/`` в корне проекта — место для данных агента (индекс проекта, планы,
+история ввода), скиллов (``skills/``, см. :mod:`gigacrew.project.skills`) и
 настроек (``settings.json`` и личный ``settings.local.json``, см.
 :mod:`gigacrew.project.settings`).
 Папка создаётся лениво, первым компонентом, которому нужно туда писать
 (:meth:`Workspace.ensure_data_dir`), и сразу получает собственный ``.gitignore``:
 рабочие данные агента в репозиторий не попадают, а скиллы — коммитятся.
 Пользовательская папка ``~/.gigacode`` (:func:`user_data_dir`) — замеры окон
-моделей, скиллы и настройки, общие для всех проектов.
+моделей, скиллы и настройки, общие для всех проектов, а в ``projects/<ключ>/`` —
+данные проекта, которым нельзя прийти вместе с репозиторием: разрешения, журнал
+решений (:mod:`gigacrew.agent.decisions`) и чаты (:attr:`Workspace.chats_dir`).
 """
 
 from __future__ import annotations
@@ -23,7 +25,8 @@ HISTORY_FILE_NAME = "history"
 SETTINGS_FILE_NAME = "settings.json"
 LOCAL_SETTINGS_FILE_NAME = "settings.local.json"
 # Игнорируются только рабочие данные агента и личные настройки — не вся папка: skills/ и
-# settings.json коммитятся.
+# settings.json коммитятся. chats/ — прежнее место чатов: то, что не удалось перенести в
+# ~/.gigacode/projects/, тоже не должно попасть в коммит.
 GITIGNORED_DATA: tuple[str, ...] = (
     "/chats/",
     "/plans/",
@@ -73,7 +76,21 @@ class Workspace:
 
     @property
     def chats_dir(self) -> Path:
-        """Каталог сохранённых чатов."""
+        """Каталог сохранённых чатов: ``~/.gigacode/projects/<ключ проекта>/chats``.
+
+        Не в проекте: чат из репозитория при продолжении стал бы «запросами пользователя»
+        для рецензента команд и выбрал бы модель. Ключ — тот же, что у разрешений
+        (рабочие деревья одного репозитория git делят и чаты).
+        """
+        # Ключ проекта вычисляет слой решений; импорт здесь — без цикла импортов
+        # (decisions сам импортирует этот модуль).
+        from gigacrew.agent.decisions import PROJECTS_DIR, project_key
+
+        return user_data_dir() / PROJECTS_DIR / project_key(self.root) / "chats"
+
+    @property
+    def legacy_chats_dir(self) -> Path:
+        """Прежний каталог чатов в проекте (``.gigacode/chats``) — только для переноса."""
         return self.data_dir / "chats"
 
     @property
