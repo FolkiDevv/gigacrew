@@ -219,9 +219,9 @@ def test_git_forbidden_option_after_double_dash_is_rejected(git_ctx):
         ("commit", ["-m", "x"], RiskLevel.WRITE),
     ],
 )
-def test_git_risk_levels(ctx, sub, args, risk):
+def test_git_risk_levels(git_ctx, sub, args, risk):
     g = GitTool()
-    assert g.risk(g.parse({"subcommand": sub, "args": args}), ctx) == risk
+    assert g.risk(g.parse({"subcommand": sub, "args": args}), git_ctx) == risk
 
 
 def test_git_stash_list_pseudo_subcommand_rejected(git_ctx):

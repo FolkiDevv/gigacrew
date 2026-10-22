@@ -278,13 +278,17 @@ def test_git_destructive_operations_are_dangerous(stashed_repo, sub, args, reaso
         ("switch", ["-c", "new"]),
         ("add", ["."]),
         ("commit", ["-m", "drop -f -- ."]),
+        ("commit", ["-m", "../../outside"]),  # сообщение, а не путь
+        ("commit", ["-qm", "/etc/passwd", "--trailer", "x"]),
     ],
 )
 def test_git_changes_that_keep_work_are_write(stashed_repo, sub, args):
     g = GitTool()
-    assessment = g.assess(g.parse({"subcommand": sub, "args": args}), stashed_repo)
+    params = g.parse({"subcommand": sub, "args": args})
+    assessment = g.assess(params, stashed_repo)
     assert assessment.risk is RiskLevel.WRITE
     assert assessment.reason == ""
+    assert g.preview(params, stashed_repo).text == f"$ git {g.describe(params)}"
 
 
 def test_git_restore_with_yes_flag_still_asks(stashed_repo):
@@ -305,6 +309,99 @@ def test_git_restore_with_yes_flag_still_asks(stashed_repo):
     Agent(provider, build_default_registry(), cfg, events).run_turn("откати правки")
     assert len(events.confirms) == 1 and events.confirms[0][2] is True  # dangerous
     assert (root / "f.txt").read_text(encoding="utf-8") == "three\n"
+
+
+@pytest.fixture
+def outside_secret(tmp_path_factory):
+    secret = tmp_path_factory.mktemp("outside") / "secret.txt"
+    secret.write_text("SECRET-LINE\n", encoding="utf-8")
+    return secret
+
+
+@pytest.mark.parametrize(
+    "sub, args",
+    [
+        ("diff", ["{abs}", "f.txt"]),  # путь вне дерева — git сам включает --no-index
+        ("diff", ["--", "{abs}", "/dev/null"]),
+        ("diff", ["f.txt", "/dev/null"]),
+        ("diff", ["{rel}", "f.txt"]),
+        ("log", ["-p", "--", "{abs}"]),
+        ("show", ["HEAD:../{rel}"]),
+        ("stash", ["show", "--", "{abs}"]),
+        ("commit", ["-F", "{abs}"]),  # текст файла попал бы в сообщение коммита
+        ("commit", ["--file={abs}"]),
+        ("commit", ["--templ", "{abs}"]),  # сокращение --template
+        ("commit", ["-qF", "{rel}"]),
+        ("commit", ["-t{abs}"]),
+    ],
+)
+def test_git_paths_outside_project_are_refused(stashed_repo, outside_secret, sub, args):
+    rel = f"../{outside_secret.parent.name}/{outside_secret.name}"
+    args = [a.format(abs=outside_secret, rel=rel) for a in args]
+    g = GitTool()
+    params = g.parse({"subcommand": sub, "args": args})
+    with pytest.raises(ToolError, match="вне проекта"):
+        g.preview(params, stashed_repo)
+    with pytest.raises(ToolError, match="вне проекта"):
+        g.run(params, stashed_repo)
+
+
+def test_git_paths_outside_project_are_refused_outside_a_repository(ctx, outside_secret):
+    """Вне репозитория `git diff a b` — это `--no-index`: содержимое любого файла."""
+    _write(ctx, "f.txt", "x\n")
+    g = GitTool()
+    params = g.parse({"subcommand": "diff", "args": [str(outside_secret), "/dev/null"]})
+    with pytest.raises(ToolError, match="вне проекта"):
+        g.run(params, ctx)
+
+
+@pytest.mark.parametrize(
+    "sub, args",
+    [
+        ("diff", ["f.txt"]),
+        ("diff", ["HEAD", "--", "f.txt"]),
+        ("log", ["--oneline", "HEAD~0..HEAD", "--", "."]),
+        ("show", ["HEAD:f.txt"]),
+        ("stash", ["show", "-p"]),
+    ],
+)
+def test_git_reads_inside_project_stay_safe(stashed_repo, sub, args):
+    g = GitTool()
+    params = g.parse({"subcommand": sub, "args": args})
+    assert g.assess(params, stashed_repo).risk is RiskLevel.SAFE
+    assert g.run(params, stashed_repo).ok is True
+
+
+@pytest.mark.parametrize("sub, args", [("status", []), ("diff", []), ("log", [])])
+def test_git_reads_outside_a_repository_are_not_safe(ctx, sub, args):
+    g = GitTool()
+    assessment = g.assess(g.parse({"subcommand": sub, "args": args}), ctx)
+    assert assessment.risk is RiskLevel.WRITE
+    assert assessment.reason == "git: каталог проекта — не репозиторий git"
+
+
+def test_git_reads_in_enclosing_repository_are_not_safe(tmp_path):
+    """Проект — подкаталог чужого репозитория: git показал бы и файлы вне проекта."""
+    from gigacrew.project.workspace import Workspace
+    from gigacrew.tools.base import ToolContext
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".netrc").write_text("password hunter2\n", encoding="utf-8")
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "a.txt").write_text("a\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    commit = ["git", "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", "i"]
+    subprocess.run(commit, cwd=tmp_path, check=True)
+    ctx = ToolContext(workspace=Workspace(project))
+    g = GitTool()
+    for sub, args in [("status", []), ("log", ["-p"]), ("show", ["HEAD:./../.netrc"])]:
+        assessment = g.assess(g.parse({"subcommand": sub, "args": args}), ctx)
+        assert assessment.risk is RiskLevel.WRITE
+        assert assessment.reason.startswith("git: проект — подкаталог репозитория ")
+        assert decide(PermissionMode.PLAN, assessment.risk, g.kind, auto_approve=False) is (
+            Decision.BLOCK
+        )
 
 
 def test_git_command_disables_external_programs():

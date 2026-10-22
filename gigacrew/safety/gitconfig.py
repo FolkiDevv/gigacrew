@@ -14,7 +14,7 @@ import re
 import subprocess
 from pathlib import Path
 
-__all__ = ["repo_config_runs_programs"]
+__all__ = ["repo_config_runs_programs", "repo_toplevel"]
 
 _TIMEOUT = 5
 _RUNS_PROGRAM = re.compile(
@@ -26,14 +26,13 @@ _FALSE = frozenset({"", "false", "no", "off", "0"})
 _LOCAL_SCOPES = frozenset({"local", "worktree", "command"})
 
 
-def repo_config_runs_programs(cwd: Path) -> bool | None:
-    """Есть ли в настройках репозитория (вокруг ``cwd``) программы, которые git запустит
-    при чтении. None — не удалось выяснить (git не запустился)."""
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
+    """Служебный запуск git в ``cwd``; None — git не запустился."""
     from gigacrew.tools.process import subprocess_env
 
     try:
-        res = subprocess.run(
-            ["git", "config", "--list", "--includes", "--show-scope", "-z"],
+        return subprocess.run(
+            ["git", *args],
             cwd=str(cwd),
             env=subprocess_env(),
             stdin=subprocess.DEVNULL,
@@ -43,7 +42,23 @@ def repo_config_runs_programs(cwd: Path) -> bool | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if res.returncode != 0:
+
+
+def repo_toplevel(cwd: Path) -> Path | None:
+    """Корень рабочего дерева репозитория, который git найдёт из ``cwd``. None — ``cwd``
+    не в рабочем дереве (или git не запустился)."""
+    res = _git(cwd, "rev-parse", "--show-toplevel")
+    if res is None or res.returncode != 0:
+        return None
+    top = res.stdout.decode("utf-8", errors="replace").strip()
+    return Path(top).resolve() if top else None
+
+
+def repo_config_runs_programs(cwd: Path) -> bool | None:
+    """Есть ли в настройках репозитория (вокруг ``cwd``) программы, которые git запустит
+    при чтении. None — не удалось выяснить (git не запустился)."""
+    res = _git(cwd, "config", "--list", "--includes", "--show-scope", "-z")
+    if res is None or res.returncode != 0:
         return None
     # -z --show-scope: «область\0ключ\nзначение\0» подряд
     tokens = res.stdout.decode("utf-8", errors="replace").split("\0")
