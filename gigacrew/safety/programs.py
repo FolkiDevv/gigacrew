@@ -1392,6 +1392,7 @@ _FD_VALUED = (
     "--threads",
     "--color",
     "-c",
+    "-C",
     "--base-directory",
     "--search-path",
 )
@@ -1430,10 +1431,10 @@ def _fd_exec(args: list[Word]) -> int | None:
 
 
 def _fd_dirs(args: list[Word]) -> list[Word]:
-    """Каталоги поиска fd: позиционные после шаблона, --search-path и --base-directory."""
+    """Каталоги поиска fd: позиционные после шаблона, --search-path и --base-directory (-C)."""
     rest, found = _options(args, _FD_VALUED)
     _, pos = _split(rest)
-    return pos[1:] + [w for n, w in found if n in ("--base-directory", "--search-path")]
+    return pos[1:] + [w for n, w in found if n in ("-C", "--base-directory", "--search-path")]
 
 
 def _fd(env: Env, name: str, args: list[Word], classify: Callable[[Command], Part]) -> Part:

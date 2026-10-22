@@ -355,6 +355,11 @@ def test_env_options_and_assignments(root, command, expected):
         ("fd x --search-path /etc -x cat", None),
         ("fd x --search-path=/etc -X cat", None),
         ("fd x --base-directory /etc -x cat", None),
+        ("fd -C /etc -x cat", None),  # -C — короткая форма --base-directory
+        ("fd -C/etc x -x cat", None),
+        ("fd -HC /etc x -x cat", None),
+        ("fd -C /etc x", None),
+        ("fd -C src x -x cat", READ),
         ("fd x src -x cat", READ),
         ("docker run -itv /var/run/docker.sock:/s alpine", DANGER),
         ("split --filter='sh -c id' a.txt", None),
