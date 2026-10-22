@@ -3160,6 +3160,25 @@ def _git(env: Env, args: list[Word]) -> Part:
             "--textconv",
         ) or (name.startswith("--exec-path") or name in ("--git-dir", "--work-tree")):
             return _unknown(f"git {sub} {name}: запуск программ")
+    if sub == "grep":
+        # -O[пейджер] в группе (`-nOid`): найденные файлы открываются программой
+        for v in values:
+            if v.startswith("-") and not v.startswith("--"):
+                for ch in v[1:]:
+                    if ch == "O":
+                        return _unknown(f"git grep {v}: файлы открываются программой")
+                    if ch in "efABCm":  # дальше — значение флага
+                        break
+    # Файлы, которые читаются по значению флага: шаблоны grep, содержимое blame.
+    if sub in ("grep", "blame"):
+        files = (
+            _values(rest, "-f", valued=("-e", "-A", "-B", "-C", "-m", "--threads"))
+            if sub == "grep"
+            else _values(rest, "--contents", valued=("-L", "-S"))
+        )
+        bad = _check_read(env, files, f"git {sub}")
+        if bad is not None:
+            return bad
     if sub in _GIT_READ:
         # git diff с путём вне репозитория сравнивает файлы как --no-index (`git diff
         # ~/.ssh/id_rsa /dev/null`), поэтому пути проверяются и без флага.

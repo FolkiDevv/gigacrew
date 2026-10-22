@@ -478,6 +478,25 @@ def test_git_reads_and_changes(repo):
         ("git diff HEAD~1 -- src", READ),
         ("git grep --no-index KEY ~/.ssh", DANGER),
         ("git grep KEY", READ),
+        # программа-пейджер для найденных файлов, в том числе в группе флагов
+        ("git grep -Oid x", None),
+        ("git grep -nOid x", None),
+        ("git grep -O id x", None),
+        ("git grep --open-files-in-pager=id x", None),
+        ("git grep --open x", None),
+        ("git grep -e Oid x", READ),  # «O» — часть образца
+        ("git grep -n hello", READ),
+        ("git -p log", None),
+        ("git log --ext-diff -p", None),
+        ("git show --textconv HEAD", None),
+        ("git cat-file --textconv HEAD:a.txt", None),
+        ("git log --no-ext-diff -p", READ),
+        # файлы, которые читаются по значению флага
+        ("git blame --contents ~/.ssh/id_rsa a.txt", DANGER),
+        ("git blame --contents=/etc/shadow a.txt", None),
+        ("git blame --contents b.txt a.txt", READ),
+        ("git grep -f ~/.ssh/id_rsa", DANGER),
+        ("git grep -f a.txt", READ),
         # запуск команд
         ("git rebase -x 'rm -rf ~' main", None),
         ("git rebase -ix 'rm -rf ~' main", None),
