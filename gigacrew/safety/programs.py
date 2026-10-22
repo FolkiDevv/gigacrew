@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 from collections.abc import Callable, Collection, Mapping
@@ -1430,11 +1431,25 @@ def _fd_exec(args: list[Word]) -> int | None:
     return None
 
 
+def _under(base: Word, path: Word) -> Word:
+    """Путь ``path`` для программы, перешедшей в каталог ``base``: относительный — от
+    ``base``. Шаблон имён оболочка раскроет от каталога команды — такой путь «не знаю»."""
+    if path.static and not path.glob and path.value.startswith(("/", "~")):
+        return path
+    joined = posixpath.join(base.value, path.value)
+    return Word(joined, joined, static=base.static and path.static and not path.glob)
+
+
 def _fd_dirs(args: list[Word]) -> list[Word]:
-    """Каталоги поиска fd: позиционные после шаблона, --search-path и --base-directory (-C)."""
+    """Каталоги поиска fd: позиционные после шаблона, --search-path и --base-directory (-C).
+    Относительные пути поиска fd отсчитывает от --base-directory — так они и проверяются."""
     rest, found = _options(args, _FD_VALUED)
     _, pos = _split(rest)
-    return pos[1:] + [w for n, w in found if n in ("-C", "--base-directory", "--search-path")]
+    paths = pos[1:] + [w for n, w in found if n == "--search-path"]
+    bases = [w for n, w in found if n in ("-C", "--base-directory")]
+    if bases:
+        paths = [_under(b, p) for b in bases for p in paths]
+    return paths + bases
 
 
 def _fd(env: Env, name: str, args: list[Word], classify: Callable[[Command], Part]) -> Part:

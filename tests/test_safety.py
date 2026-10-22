@@ -1154,6 +1154,22 @@ def test_rule_levels(root, command, expected):
     assert verdict.level is expected, (command, verdict.reason)
 
 
+def test_fd_search_paths_are_relative_to_base_directory(root):
+    """Относительные пути поиска fd отсчитывает от -C/--base-directory, а не от каталога
+    команды: из src/a `fd y ../x -C ../..` ищет в <проект>/../x — за пределами проекта."""
+    (root / "src" / "a").mkdir()
+    sub = {"cwd": "src/a"}
+    assert level("fd y ../x -x cat", root, **sub) is READ  # src/x — внутри
+    assert level("fd y ../x -C ../.. -x cat", root, **sub) is None
+    assert level("fd y ../x --base-directory=../.. -x cat", root, **sub) is None
+    assert level("fd y --search-path ../x -C ../.. -X cat", root, **sub) is None
+    assert level("fd y ../x -C ../..", root, **sub) is None
+    assert level("fd y src -C ../.. -x cat", root, **sub) is READ  # <проект>/src
+    assert level(f"fd y {root}/src -C .. -x cat", root, **sub) is READ  # абсолютный — как есть
+    assert level("fd y '*' -C ../.. -x cat", root, **sub) is READ  # шаблон fd в кавычках
+    assert level("fd y * -C ../.. -x cat", root, **sub) is None  # имена раскроет оболочка
+
+
 def test_recursive_reads_follow_secrets_and_links(root, tmp_path_factory):
     outside = tmp_path_factory.mktemp("outside") / "secret.txt"
     outside.write_text("s")
