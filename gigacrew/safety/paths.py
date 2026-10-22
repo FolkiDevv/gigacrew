@@ -46,6 +46,11 @@ _SECRET_NAME = re.compile(
 )
 _SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".gcloud"})
 _PROC_ENV = re.compile(r"^/proc/[^/]+/(environ|cmdline|mem|maps)$")
+# Известные места учётных данных: пароли системы, ключи хоста ssh, токены gh и gcloud.
+_SECRET_PATH = re.compile(
+    r"^/etc/(g?shadow|sudoers)-?$|^/etc/ssh/ssh_host_[^/]*_key$|"
+    r"(^|/)\.config/(gh|hub)/hosts\.ya?ml$|(^|/)\.config/gcloud/"
+)
 
 
 class Scope(Enum):
@@ -62,7 +67,7 @@ def is_secret_name(name: str) -> bool:
 
 
 def _is_secret(path: Path) -> bool:
-    if is_secret_path(path) or is_secret_name(path.name):
+    if is_secret_path(path) or is_secret_name(path.name) or _SECRET_PATH.search(path.as_posix()):
         return True
     return any(part in _SECRET_DIRS for part in path.parts)
 

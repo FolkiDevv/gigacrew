@@ -421,3 +421,26 @@ def test_git_config_that_cannot_be_read_is_unknown(repo):
     (repo / ".git" / "config").write_text("[core\n broken")
     assert repo_config_runs_programs(repo) is None
     assert level("git status", repo) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat /etc/shadow",
+        "cat /etc/gshadow-",
+        "cat /etc/sudoers",
+        "cat /etc/ssh/ssh_host_ed25519_key",
+        "cat ~/.config/gh/hosts.yml",
+        "cat ~/.config/gcloud/application_default_credentials.json",
+        "head ~/.config/gcloud/access_tokens.db",
+    ],
+)
+def test_well_known_credential_files_outside_project_are_danger(root, command):
+    """Пароли системы, ключи хоста ssh, токены gh и gcloud — секреты вне проекта."""
+    assert level(command, root) is DANGER
+
+
+def test_ordinary_files_outside_project_stay_unknown(root):
+    assert level("cat /etc/hosts", root) is None
+    assert level("cat ~/.config/gh/config.yml", root) is None
+    assert level("cat /etc/ssh/ssh_host_ed25519_key.pub", root) is None
