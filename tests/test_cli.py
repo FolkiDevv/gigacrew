@@ -144,6 +144,40 @@ def test_permissions_command_lists_forgets_and_shows_log(tmp_path, capsys):
     assert "использование" in _out(capsys)
 
 
+def test_permissions_forget_rejects_bad_numbers(tmp_path, capsys):
+    from gigacrew.agent.decisions import DecisionMemory
+    from gigacrew.safety import classify
+
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    ui = Console(no_color=True)
+    agent = Agent(ScriptedProvider(), build_default_registry(), cfg, ui, decisions=memory)
+    commands = default_commands()
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands)
+    memory.approve(classify("pytest -q", root=tmp_path))
+    memory.approve(classify("ruff check .", root=tmp_path))
+    commands.dispatch("/permissions forget 0", ctx)  # не «последнее» (pop(-1))
+    assert "нет разрешения №0" in _out(capsys) and len(memory.rules) == 2
+    for word in ("²", "abc", "-1"):  # «²».isdigit() — да, но int() его не разберёт
+        commands.dispatch(f"/permissions forget {word}", ctx)
+        assert "использование: /permissions" in _out(capsys)
+    assert len(memory.rules) == 2
+
+
+def test_repl_survives_errors_in_commands(cli_env, capsys):
+    agent, ui, commands, _, _ = cli_env
+
+    def broken(_ctx, _arg):
+        raise RuntimeError("команда сломалась")
+
+    commands.register(SlashCommand("/broken", "ломается", broken))
+    read = _reader("/broken", "/permissions forget ²", "/exit")
+    assert run_repl(agent, ui, commands, read_input=read, index_on_start=False) == 0
+    out = _out(capsys)
+    assert "внутренняя ошибка в /broken: RuntimeError: команда сломалась" in out
+    assert "использование: /permissions" in out and "до встречи!" in out
+
+
 # ------------------------------- REPL ------------------------------- #
 def _reader(*items):
     queue = list(items)

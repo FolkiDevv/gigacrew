@@ -239,7 +239,8 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
     words = arg.split()
     action = words[0].lower() if words else ""
     if action in ("forget", "rm", "удалить"):
-        if len(words) != 2 or not words[1].isdigit():
+        # isdecimal, а не isdigit: «²» — цифра, но int() её не разберёт
+        if len(words) != 2 or not words[1].isdecimal():
             ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
             return True
         try:
