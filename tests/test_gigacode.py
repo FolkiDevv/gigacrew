@@ -334,6 +334,14 @@ def test_load_token_errors_ask_to_log_in_to_gigacode(tmp_path):
     assert load_token(path, CONFIG + "/").access_token == "t"
 
 
+def test_unreadable_token_file_is_an_api_error(tmp_path):
+    """Файл не читается (каталог, нет прав) — ApiError, а не OSError мимо REPL."""
+    path = tmp_path / "gigacode_token.json"
+    path.mkdir()
+    with pytest.raises(ApiError, match="не удалось прочитать"):
+        load_token(path, CONFIG)
+
+
 def test_token_of_another_backend_is_not_sent(tmp_path):
     backend = Backend()
     _write_token(tmp_path, endpoint="https://other.test/api/v2/config")
@@ -616,6 +624,23 @@ def test_measure_prompt_reads_usage_from_the_stream(tmp_path):
     assert body["max_tokens"] == 1 and body["model"] == "coder" and body["stream"] is True
 
 
+def test_probe_of_a_model_without_stream_is_not_streamed(tmp_path):
+    """Модель с ``ai_api.stream: false`` и пробу получает целым ответом, как и чат."""
+    whole = httpx.Response(
+        200,
+        json={
+            "choices": [{"index": 0, "message": {"content": "."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 77, "completion_tokens": 1},
+        },
+    )
+    backend = Backend(chat=[whole])
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    assert provider.measure_prompt("x", model="fast") == 77
+    body = backend.chat_bodies[0]
+    assert body["stream"] is False and "stream_options" not in body
+
+
 def test_request_without_connect_loads_the_catalogue(tmp_path):
     backend = Backend()
     provider = _provider(backend, tmp_path)
@@ -709,6 +734,17 @@ def test_hook_on_config_401(tmp_path):
     provider.connect()
     assert hook.calls == [("config", "request"), ("config", "unauthorized")]
     assert provider.list_models() == ["coder", "fast"]
+
+
+def test_config_401_with_a_new_token_still_asks_to_log_in(tmp_path):
+    """Хук положил новый токен, но и его конфигурация не приняла — просьба войти заново,
+    а не «Не удалось получить конфигурацию (401)»."""
+    backend = Backend(valid=())
+    provider = _provider(backend, tmp_path)
+    provider.request_hook = RecordingHook(tmp_path, tokens=["tok-1", "tok-2"])
+    with pytest.raises(ApiError, match="не принял токен \\(401\\).*авторизацию в GigaCode"):
+        provider.connect()
+    assert backend.count(CONFIG) == 2
 
 
 def test_hook_block_sends_nothing(tmp_path):

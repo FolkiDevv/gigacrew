@@ -8,6 +8,7 @@ import pytest
 
 from gigacrew.config import Config
 from gigacrew.llm.api import ApiError, ApiProvider, chat_url
+from gigacrew.llm.transport import iter_sse_events
 from gigacrew.llm.types import FunctionCall, Message, ToolSpec
 
 
@@ -492,11 +493,80 @@ def test_consume_sse_multiline_data_and_comments():
     [
         'event: error\ndata: {"message":"boom"}\n\n',
         'data: {"status":422,"message":"Function calls count does not match"}\n\n',
+        'data: {"status":400,"message":"bad request"}\n\n',  # граница: 400 — уже ошибка
+        'data: {"error":{"message":"overloaded"}}\n\n',
     ],
 )
 def test_consume_sse_error_event_raises(event):
     with pytest.raises(ApiError, match="ошибку в потоке"):
         ApiProvider._consume_sse(_FakeSSE(event), lambda _s: None)
+
+
+def test_consume_sse_status_below_400_is_not_an_error():
+    stream = 'data: {"status":200}\n\n' + _delta("ok") + _DONE
+    assert ApiProvider._consume_sse(_FakeSSE(stream), lambda _s: None).message.content == "ok"
+
+
+def test_sse_event_without_blank_separator_is_not_merged():
+    """Строка ``event:`` без пустой строки перед ней начинает новое событие: склеенный
+    JSON не разобрался бы и молча пропал бы — вместе с текстом, вызовами или окончанием."""
+    assert list(iter_sse_events(["event: a", "data: 1", "event: b", "data: 2", ""])) == [
+        ("a", "1"),
+        ("b", "2"),
+    ]
+    stream = _delta("ok").rstrip("\n") + "\n" + _DONE
+    deltas: list[str] = []
+    turn = ApiProvider._consume_sse(_FakeSSE(stream), deltas.append)
+    assert deltas == ["ok"] and turn.finish_reason == "stop"
+
+
+def test_parallel_calls_without_ids_are_all_kept():
+    data = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"function_call": {"name": "f", "arguments": {"a": 1}}},
+                    {"function_call": {"name": "g", "arguments": {"b": 2}}},
+                ],
+            }
+        ]
+    }
+    assert ApiProvider._parse_response(data).message.function_calls == [
+        FunctionCall(name="f", arguments={"a": 1}),
+        FunctionCall(name="g", arguments={"b": 2}),
+    ]
+
+
+@pytest.mark.parametrize("key", ["tool_state_id", "tools_state_id"])
+def test_state_id_under_either_spelling(key):
+    data = {
+        "messages": [
+            {
+                "role": "assistant",
+                key: "S",
+                "content": [{"function_call": {"id": "c1", "name": "f", "arguments": {}}}],
+            }
+        ]
+    }
+    assert ApiProvider._parse_response(data).message.state_id == "S"
+
+
+def test_malformed_parts_are_skipped():
+    """Мусор в ответе — пропускается, а не роняет разбор; аргументы-не-JSON — {}."""
+    data = {
+        "messages": [
+            "junk",
+            {"role": "user", "content": [{"text": "чужое"}]},
+            {
+                "role": "assistant",
+                "content": ["x", {"function_call": {"name": "f", "arguments": "{bad"}}],
+            },
+        ]
+    }
+    turn = ApiProvider._parse_response(data)
+    assert turn.message.function_calls == [FunctionCall(name="f", arguments={})]
+    assert turn.message.content == ""
 
 
 def test_provider_without_catalogue_defaults():

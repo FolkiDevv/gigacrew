@@ -479,6 +479,17 @@ def test_garbage_lines_in_stream_are_skipped():
     assert shown == ["ok"] and turn.finish_reason == "stop"
 
 
+def test_nothing_after_done_is_read():
+    """После ``[DONE]`` поток не читается: мусор нестандартного сервера не показывается."""
+
+    def lines():
+        yield from _sse(_delta(content="ok"), "[DONE]", _delta(content="мусор"))
+        raise AssertionError("поток читается после [DONE]")
+
+    turn, shown = _consume(lines())
+    assert shown == ["ok"] and turn.message.content == "ok" and turn.finish_reason == "stop"
+
+
 def _cut(lines: list[str]):
     """Строки потока, после которых соединение рвётся."""
     yield from lines

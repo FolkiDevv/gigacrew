@@ -85,12 +85,11 @@ def test_server_that_truncates_silently_stops_the_probe(window):
     """Сервер молча обрезает запрос до окна и считает обрезанное: prompt_tokens не растёт
     вслед за текстом. Доверься замер ему — соотношение символов и токенов росло бы
     с каждой пробой, и пробы раздувались бы в геометрической прогрессии."""
-    provider = WindowProvider(window, truncate=True)
+    provider = WindowProvider(window, truncate=True, max_chars=MAX_CONTEXT_WINDOW * 4)
     with pytest.raises(LLMError, match="обрезает") as e:
         probe_context_window(provider, "M")
     assert str(window - 1) in str(e.value)
     assert len(provider.sent_chars) == 2  # калибровка и первая же большая проба
-    assert max(provider.sent_chars) <= MAX_CONTEXT_WINDOW * 4
 
 
 # ------------------------------ хранилище ------------------------------ #
@@ -122,6 +121,13 @@ def test_store_broken_file_warns_and_is_overwritten(tmp_path):
     assert warning and "models.json" in warning and windows.get("A") is None
     windows.record(probe_context_window(WindowProvider(8_192), "A"))
     assert ModelWindows.load(path)[0].get("A") is not None
+
+
+def test_store_of_an_unknown_format_version_is_not_trusted(tmp_path):
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps({"version": 2, "models": {"A": {"context_window": 1000}}}))
+    windows, warning = ModelWindows.load(path)
+    assert warning and windows.get("A") is None
 
 
 def test_store_in_memory_and_default_path(_isolated_home):

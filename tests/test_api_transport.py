@@ -284,16 +284,21 @@ def test_rejected_server_certificate_is_not_retried(streaming):
 
 @pytest.mark.parametrize("exc", [httpx.ProxyError, httpx.LocalProtocolError])
 def test_non_retryable_transport_errors_wrapped(exc):
+    chat_calls = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == AUTH_URL:
             return _auth_response()
+        chat_calls.append(request)
         raise exc("nope")
 
     p = _provider(handler)
-    with pytest.raises(ApiError):
+    with pytest.raises(ApiError, match="Ошибка соединения"):
         p.complete(_msgs())
-    with pytest.raises(ApiError):
+    assert len(chat_calls) == 1  # не повторяется
+    with pytest.raises(ApiError, match="Ошибка соединения"):
         p.stream(_msgs())
+    assert len(chat_calls) == 2
     p.close()
 
 
@@ -341,12 +346,19 @@ def test_non_json_response_wrapped():
 
 
 def test_auth_without_token_wrapped():
+    """Ответ OAuth без токена — ошибка до чата: иначе ушёл бы «Bearer None»."""
+    chat_calls = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"error": "no"})
+        if str(request.url) == AUTH_URL:
+            return httpx.Response(200, json={"error": "no"})
+        chat_calls.append(request)
+        return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
 
     p = _provider(handler)
-    with pytest.raises(ApiError):
+    with pytest.raises(ApiError, match="access_token"):
         p.complete(_msgs())
+    assert chat_calls == []
     p.close()
 
 
@@ -453,14 +465,23 @@ def test_malformed_access_token_is_refused_without_echo(token):
     p.close()
 
 
-def test_list_models_http_error_wrapped():
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx.Response(403, text="forbidden"),
+        # JSON-тело с данными: статус всё равно ошибка, а не пустой или чужой список
+        httpx.Response(403, json={"data": [{"id": "x", "type": "chat"}]}),
+    ],
+    ids=["text", "json"],
+)
+def test_list_models_http_error_wrapped(reply):
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == AUTH_URL:
             return _auth_response()
-        return httpx.Response(403, text="forbidden")
+        return reply
 
     p = _provider(handler)
-    with pytest.raises(ApiError):
+    with pytest.raises(ApiError, match=r"список моделей \(403\)"):
         p.list_models()
     p.close()
 
@@ -490,11 +511,265 @@ def test_model_override_per_call():
     p.close()
 
 
+# ------------------------------ авторизация и повторы ------------------------------ #
+CHAT_URL = "https://api.test/v2/chat/completions"
+REQUEST_CAP = 8  # больше запросов чата за вызов — бесконечный цикл: тест падает, а не висит
+
+
+class _Server:
+    """Подменный шлюз: OAuth и чат по отдельным обработчикам, запросы — в ``auth``/``chat``."""
+
+    def __init__(self, chat=None, auth=None):
+        self.chat_reply = chat or _ok_for
+        self.auth_reply = auth or (lambda _r: _auth_response())
+        self.auth: list[httpx.Request] = []
+        self.chat: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            self.auth.append(request)
+            return self.auth_reply(request)
+        self.chat.append(request)
+        if len(self.chat) > REQUEST_CAP:
+            raise AssertionError(f"больше {REQUEST_CAP} запросов чата — цикл повторов")
+        return self.chat_reply(request)
+
+
+def _ok_for(request: httpx.Request) -> httpx.Response:
+    """Успешный ответ на любой запрос чата: целый, поток или замер окна."""
+    body = json.loads(request.content)
+    if body.get("stream"):
+        return httpx.Response(200, content=_done("ok"))
+    if body["model_options"].get("max_tokens") == 1:
+        return _chat_reply(10)
+    return httpx.Response(200, json={**_text("ok"), "finish_reason": "stop"})
+
+
+def _then_ok(times: int, reply):
+    """Обработчик чата: ``times`` раз ответ ``reply()``, потом — успешный."""
+    left = {"n": times}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if left["n"] > 0:
+            left["n"] -= 1
+            return reply()
+        return _ok_for(request)
+
+    return handler
+
+
+def _call_of(p: ApiProvider, kind: str):
+    return {
+        "complete": lambda: p.complete(_msgs()),
+        "stream": lambda: p.stream(_msgs()),
+        "measure": lambda: p.measure_prompt("x"),
+    }[kind]
+
+
+@pytest.mark.parametrize("kind", ["complete", "stream", "measure"])
+def test_persistent_401_refreshes_the_token_exactly_once(kind):
+    """Отозванный ключ: токен обновляется один раз, потом — «API вернул 401» с телом,
+    а не бесконечный цикл обновлений или «Сетевая ошибка … : None»."""
+    server = _Server(chat=lambda _r: httpx.Response(401, text="token revoked"))
+    p = _provider(server)
+    with pytest.raises(ApiError, match="401: token revoked"):
+        _call_of(p, kind)()
+    assert (len(server.auth), len(server.chat)) == (2, 2)
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_oauth_and_chat_wire_format(streaming):
+    """Запрос токена — POST с Basic-ключом, scope в теле формы и RqUID; чат — Bearer."""
+    server = _Server()
+    cfg = Config(
+        access_key="dummy", auth_url=AUTH_URL, base_url=BASE_URL, model="M", scope="MY_SCOPE"
+    )
+    p = ApiProvider(cfg, transport=httpx.MockTransport(server))
+    (p.stream if streaming else p.complete)(_msgs())
+    (auth,) = server.auth
+    assert auth.method == "POST"
+    assert auth.headers["Authorization"] == "Basic dummy"
+    assert auth.headers["Content-Type"] == "application/x-www-form-urlencoded"
+    assert auth.headers["Accept"] == "application/json"
+    assert auth.headers.get("RqUID")
+    assert auth.content == b"scope=MY_SCOPE"
+    (chat,) = server.chat
+    assert str(chat.url) == CHAT_URL
+    assert chat.headers["Authorization"] == "Bearer t"
+    p.close()
+
+
+def test_oauth_without_scope_sends_an_empty_form():
+    server = _Server()
+    p = _provider(server)
+    p.complete(_msgs())
+    assert server.auth[0].content == b""
+    p.close()
+
+
+def _mtls_provider(monkeypatch, handler) -> ApiProvider:
+    monkeypatch.setattr(Config, "build_ssl_verify", lambda self: True)  # без файлов PEM
+    cfg = Config(cert="c.pem", key="k.pem", base_url=BASE_URL, model="M")
+    assert cfg.auth_mode == "mtls"
+    return ApiProvider(cfg, transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize("kind", ["complete", "stream", "measure"])
+def test_mtls_sends_no_oauth_request_and_no_authorization(monkeypatch, kind):
+    """mTLS: клиента авторизует сертификат — ни запроса токена, ни заголовка Authorization."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return _ok_for(request)
+
+    p = _mtls_provider(monkeypatch, handler)
+    _call_of(p, kind)()
+    assert [str(r.url) for r in seen] == [CHAT_URL]
+    assert "authorization" not in seen[0].headers
+    p.close()
+
+
+@pytest.mark.parametrize("kind", ["complete", "stream"])
+def test_mtls_401_is_not_refreshed(monkeypatch, kind):
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(401, text="certificate not accepted")
+
+    p = _mtls_provider(monkeypatch, handler)
+    with pytest.raises(ApiError, match="401: certificate not accepted"):
+        _call_of(p, kind)()
+    assert len(seen) == 1
+    p.close()
+
+
+def test_token_is_refreshed_before_it_expires():
+    """Токен, истекающий в ближайшие 30 с, обновляется заранее, а не ценой 401."""
+    soon = _Server(auth=lambda _r: _auth_response_expiring(10))
+    p = _provider(soon)
+    p.complete(_msgs())
+    p.complete(_msgs())
+    assert len(soon.auth) == 2 and len(soon.chat) == 2
+    p.close()
+
+    later = _Server()
+    p = _provider(later)
+    p.complete(_msgs())
+    p.complete(_msgs())
+    assert len(later.auth) == 1  # кэшируется до истечения
+    p.close()
+
+
+def _auth_response_expiring(seconds: float) -> httpx.Response:
+    return httpx.Response(
+        200, json={"access_token": "t", "expires_at": int((time.time() + seconds) * 1000)}
+    )
+
+
+def test_token_endpoint_errors():
+    """Ошибка выдачи токена — с её статусом и телом, чат не вызывается."""
+    server = _Server(auth=lambda _r: httpx.Response(401, text="bad key"))
+    p = _provider(server)
+    with pytest.raises(ApiError, match=r"токен API \(401\): bad key"):
+        p.complete(_msgs())
+    assert server.chat == []
+    p.close()
+
+    # срок токена не разобрался — живёт 25 минут, а не истекает сразу
+    odd = _Server(
+        auth=lambda _r: httpx.Response(200, json={"access_token": "t", "expires_at": "soon"})
+    )
+    p = _provider(odd)
+    p.complete(_msgs())
+    p.complete(_msgs())
+    assert len(odd.auth) == 1
+    p.close()
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504, 529])
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_transient_server_errors_are_retried(monkeypatch, status, streaming):
+    pauses = _sleeps(monkeypatch)
+    server = _Server(chat=_then_ok(1, lambda: httpx.Response(status, text="busy")))
+    p = _provider(server)
+    assert (p.stream if streaming else p.complete)(_msgs()).message.content == "ok"
+    assert len(server.chat) == 2 and pauses == [1.0]
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_server_error_backoff_is_exponential(monkeypatch, streaming):
+    pauses = _sleeps(monkeypatch)
+    server = _Server(chat=_then_ok(4, lambda: httpx.Response(503, text="busy")))
+    p = _provider(server)
+    assert (p.stream if streaming else p.complete)(_msgs()).message.content == "ok"
+    assert pauses == [1.0, 2.0, 4.0, 8.0] and len(server.chat) == 5
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_persistent_server_error_reports_status_and_body(monkeypatch, streaming):
+    """Пять попыток, затем ошибка со статусом и телом шлюза, а не «Сетевая ошибка: None»."""
+    pauses = _sleeps(monkeypatch)
+    server = _Server(chat=lambda _r: httpx.Response(503, text="busy-body"))
+    p = _provider(server)
+    with pytest.raises(ApiError, match="503: busy-body"):
+        (p.stream if streaming else p.complete)(_msgs())
+    assert len(server.chat) == 5 and pauses == [1.0, 2.0, 4.0, 8.0]
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_server_error_retry_after_is_capped(monkeypatch, streaming):
+    """Retry-After: 600 на 5xx — не десять минут на повтор (у 429 свой потолок)."""
+    pauses = _sleeps(monkeypatch)
+    busy = {"Retry-After": "600"}
+    server = _Server(chat=_then_ok(1, lambda: httpx.Response(503, headers=busy, text="x")))
+    p = _provider(server)
+    (p.stream if streaming else p.complete)(_msgs())
+    assert pauses == [30.0]
+    p.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+def test_persistent_connection_failure_gives_up_after_five_attempts(monkeypatch, streaming):
+    pauses = _sleeps(monkeypatch)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    server = _Server(chat=refuse)
+    p = _provider(server)
+    with pytest.raises(ApiError, match="после 5 попыток.*connection refused"):
+        (p.stream if streaming else p.complete)(_msgs())
+    assert len(server.chat) == 5 and pauses == [1.0, 2.0, 4.0, 8.0]
+    p.close()
+
+
+@pytest.mark.parametrize("target", ["chat", "auth", "models"])
+def test_json_that_is_not_an_object_is_an_api_error(target):
+    """Шлюз ответил JSON-массивом — ApiError, а не AttributeError мимо LLMError."""
+    array = httpx.Response(200, json=[1, 2])
+    server = _Server(
+        chat=lambda _r: array if target != "auth" else _ok_for(_r),
+        auth=(lambda _r: array) if target == "auth" else None,
+    )
+    p = _provider(server)
+    with pytest.raises(ApiError, match="Неожиданный формат"):
+        p.list_models() if target == "models" else p.complete(_msgs())
+    p.close()
+
+
 def test_usage_from_raw_is_tolerant():
     assert Usage.from_raw(None) == Usage()
     assert Usage.from_raw("garbage") == Usage()  # type: ignore[arg-type]
     u = Usage.from_raw({"prompt_tokens": "5", "completion_tokens": None, "total_tokens": "x"})
     assert (u.prompt_tokens, u.completion_tokens, u.total_tokens) == (5, 0, 0)
+    # отрицательные числа от сломанного шлюза не попадают в счёт контекста и бюджета
+    assert Usage.from_raw({"prompt_tokens": -5, "output_tokens": -1}) == Usage()
 
 
 @pytest.mark.parametrize(
@@ -586,6 +861,37 @@ def test_measure_prompt_timeout_is_oversize_but_other_errors_are_not():
     p = _provider(no_usage)
     with pytest.raises(ApiError, match="usage"):
         p.measure_prompt("x")
+    p.close()
+
+
+def _refuse(exc):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exc("no route", request=request)
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    "chat",
+    [
+        _refuse(httpx.ConnectError),
+        _refuse(httpx.ConnectTimeout),
+        lambda _r: httpx.Response(401, text="unauthorized"),
+        lambda _r: httpx.Response(403, text="нет доступа к модели"),
+        lambda _r: httpx.Response(429, text="too many requests"),
+    ],
+    ids=["connect-error", "connect-timeout", "401", "403", "429"],
+)
+def test_measure_prompt_errors_that_are_not_about_size(chat):
+    """Ошибки установки соединения, авторизация и лимит частоты — не «не помещается»:
+    иначе окно занизилось бы и сохранилось в ~/.gigacode/models.json."""
+    cfg = Config(
+        access_key="dummy", auth_url=AUTH_URL, base_url=BASE_URL, model="M", rate_limit_wait=0
+    )
+    p = ApiProvider(cfg, transport=httpx.MockTransport(_Server(chat=chat)))
+    with pytest.raises(ApiError) as e:
+        p.measure_prompt("x")
+    assert not isinstance(e.value, PromptTooLong)
     p.close()
 
 

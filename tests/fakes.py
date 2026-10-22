@@ -88,6 +88,7 @@ class WindowProvider(ScriptedProvider):
         error: BaseException | None = None,
         overhead: int = 5,
         truncate: bool = False,
+        max_chars: int | None = None,
     ):
         super().__init__(turns)
         self.window = window
@@ -99,11 +100,15 @@ class WindowProvider(ScriptedProvider):
         self.truncate = truncate  # сервер молча обрезает запрос до окна, а не отказывает
         self.measured: list[tuple[str | None, int]] = []
         self.sent_chars: list[int] = []  # длина текста каждой пробы
+        self.max_chars = max_chars  # проба длиннее — AssertionError
 
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
         if self.error is not None:
             raise self.error
         self.sent_chars.append(len(text))
+        if self.max_chars is not None and len(text) > self.max_chars:
+            # тест падает сразу, а не на таймауте, пока замер строит гигабайтные пробы
+            raise AssertionError(f"проба в {len(text)} символов — замер пошёл вразнос")
         tokens = int(len(text) / self.chars_per_token) + self.overhead
         if self.truncate:
             tokens = min(tokens, self.window - 1)
