@@ -164,6 +164,65 @@ def test_git_disallowed_subcommand(git_repo):
         g.run(g.parse({"subcommand": "push"}), git_repo)
 
 
+def _git(ctx, *args):
+    subprocess.run(["git", *args], cwd=ctx.root, check=True, capture_output=True)
+
+
+@pytest.fixture
+def stashed_repo(git_repo):
+    """Репозиторий с коммитом и одной отложенной правкой (refs/stash есть)."""
+    _write(git_repo, "f.txt", "one\n")
+    _git(git_repo, "add", "f.txt")
+    _git(git_repo, "commit", "-qm", "init")
+    _write(git_repo, "f.txt", "two\n")
+    _git(git_repo, "stash", "-q")
+    return git_repo
+
+
+@pytest.mark.parametrize("dashdash", [False, True])
+@pytest.mark.parametrize(
+    "sub, args",
+    [
+        ("stash", ["list"]),
+        ("stash", ["show"]),
+        ("diff", []),
+        ("log", []),
+        ("show", []),
+    ],
+)
+def test_git_forbidden_options_rejected_after_double_dash(stashed_repo, sub, args, dashdash):
+    """`stash list` передаёт слова после `--` в `git log` как опции: --output записал бы файл."""
+    target = stashed_repo.root / "written.txt"
+    extra = ["--"] if dashdash else []
+    params_args = [*args, *extra, "--pretty=format:CHOSEN", f"--output={target}"]
+    g = GitTool()
+    params = g.parse({"subcommand": sub, "args": params_args})
+    with pytest.raises(ToolError, match="запрещена"):
+        g.preview(params, stashed_repo)
+    with pytest.raises(ToolError, match="запрещена"):
+        g.run(params, stashed_repo)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "sub, args",
+    [
+        ("add", ["--pathspec-from-file=/etc/hostname"]),
+        ("add", ["--pathspec-from=x"]),  # сокращение опции
+        ("commit", ["--", "--pathspec-from-file=x"]),
+        ("stash", ["list", "--ext-diff"]),
+        ("show", ["--no-index"]),
+    ],
+)
+def test_git_forbidden_options_for_every_subcommand(stashed_repo, sub, args):
+    g = GitTool()
+    params = g.parse({"subcommand": sub, "args": args})
+    with pytest.raises(ToolError, match="запрещена"):
+        g.preview(params, stashed_repo)
+    with pytest.raises(ToolError, match="запрещена"):
+        g.run(params, stashed_repo)
+
+
 def test_git_command_disables_external_programs():
     g = GitTool()
     cmd = g._command(g.parse({"subcommand": "diff", "args": ["--", "a.py"]}))
@@ -178,6 +237,9 @@ def test_git_command_disables_external_programs():
     ]
     stash = g._command(g.parse({"subcommand": "stash", "args": ["show", "-p"]}))
     assert stash[5:] == ["stash", "show", "--no-ext-diff", "-p"]
+    # stash list передаёт опции git log: -p показал бы дифф внешней программой
+    stash = g._command(g.parse({"subcommand": "stash", "args": ["list", "-p"]}))
+    assert stash[5:] == ["stash", "list", "--no-ext-diff", "-p"]
     assert g._command(g.parse({"subcommand": "status"}))[5:] == ["status"]
 
 

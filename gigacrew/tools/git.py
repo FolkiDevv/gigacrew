@@ -159,9 +159,9 @@ class GitTool(Tool):
                 f"Подкоманда git '{sub}' не поддерживается этим инструментом. Доступно: "
                 f"{sorted(_ALLOWED)}.{hint}"
             )
+        # Опции проверяются и после `--`: `stash list` отбрасывает `--` и передаёт следующие
+        # слова в `git log` как опции. Путь, названный как запрещённая опция, не пройдёт.
         for arg in params.args:
-            if arg == "--":
-                break  # дальше — пути, а не опции
             if _is_forbidden(arg):
                 raise ToolError(f"Опция '{arg}' запрещена политикой безопасности gigacrew.")
 
@@ -172,8 +172,8 @@ class GitTool(Tool):
             args = ["--oneline", "-n", "20"]  # компактный лог по умолчанию
         if sub in _NO_EXT_DIFF:
             args = ["--no-ext-diff", *args]
-        elif sub == "stash" and args[:1] == ["show"]:
-            args = ["show", "--no-ext-diff", *args[1:]]
+        elif sub == "stash" and args[:1] in (["show"], ["list"]):
+            args = [args[0], "--no-ext-diff", *args[1:]]  # list передаёт опции git log
         return ["git", *_SAFE_CONFIG, sub, *args]
 
     def describe(self, params: GitParams) -> str:

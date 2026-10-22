@@ -194,10 +194,11 @@ def test_git_forbidden_options(git_ctx, args):
     assert not (git_ctx.root.parent / "stolen.txt").exists()
 
 
-def test_git_options_after_double_dash_are_paths(git_ctx):
+def test_git_forbidden_option_after_double_dash_is_rejected(git_ctx):
+    # не все подкоманды считают слова после `--` путями (stash list передаёт их git log)
     g = GitTool()
-    res = g.run(g.parse({"subcommand": "diff", "args": ["--", "--output"]}), git_ctx)
-    assert res.ok
+    with pytest.raises(ToolError, match="запрещена"):
+        g.run(g.parse({"subcommand": "diff", "args": ["--", "--output"]}), git_ctx)
 
 
 @pytest.mark.parametrize(
