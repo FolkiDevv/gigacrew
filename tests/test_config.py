@@ -41,6 +41,19 @@ def test_read_dotenv_inline_comments_and_quotes(tmp_path):
     }
 
 
+def test_read_dotenv_with_bom_keeps_first_setting(tmp_path):
+    # UTF-8 с BOM пишут PowerShell 5 и старый Блокнот: первая настройка не теряется
+    (tmp_path / ".env").write_bytes("GIGACREW_VERIFY_SSL=1\nB=2\n".encode("utf-8-sig"))
+    assert read_dotenv(tmp_path / ".env") == {"GIGACREW_VERIFY_SSL": "1", "B": "2"}
+    assert Config.load(project_root=tmp_path, environ={}, cwd=tmp_path).verify_ssl is True
+
+
+def test_undecodable_dotenv_is_a_config_error(tmp_path):
+    (tmp_path / ".env").write_bytes(b"\xff\xfe=1\n")
+    with pytest.raises(ConfigError, match=r"\.env"):
+        Config.load(project_root=tmp_path, environ={}, cwd=tmp_path)
+
+
 def test_priority_environ_over_root_over_cwd(tmp_path):
     root, cwd = tmp_path / "proj", tmp_path / "cwd"
     _env_file(root, "GIGACREW_MODEL=from-root\nGIGACREW_SCOPE=root-scope\n")

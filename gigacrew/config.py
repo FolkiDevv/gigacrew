@@ -40,7 +40,9 @@ def read_dotenv(path: Path) -> dict[str, str]:
     if not path.is_file():
         return values
     try:
-        text = path.read_text(encoding="utf-8")
+        # utf-8-sig: BOM (PowerShell 5, старый Блокнот) иначе приклеился бы к первому ключу,
+        # и первая настройка — например, GIGACREW_VERIFY_SSL=1 — молча пропала бы.
+        text = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"Не удалось прочитать {path}: {e}") from e
     for raw in text.splitlines():
