@@ -7,10 +7,13 @@
 * вес ребра: ×10 — имя из фокуса; ×10 — длинное составное имя (``snake_case``,
   ``CamelCase``, от 8 символов); ×0,1 — ``_приватное``; ×0,1 — имя определено
   больше чем в 5 файлах (``run``); ×0,1 — имя совпадает с методом встроенных типов
-  (``get``, ``items``: ``d.get()`` по имени не отличить от своего ``get``); ×50 —
-  ссылка из файла в фокусе; ×√(число использований);
+  (``get``, ``items``: ``d.get()`` по имени не отличить от своего ``get``);
+  ×√(число использований);
 * персонализированный PageRank (телепорт — в файлы фокуса, без фокуса —
-  равномерно); ранг файла делится между его рёбрами и достаётся определениям;
+  равномерно); ранг файла делится между его рёбрами и достаётся определениям, а
+  файл в фокусе отдаёт тем, что использует, ×50;
+* пары «использует × определяет» не строятся (имя, определённое и вызываемое в
+  тысячах файлов, дало бы их миллионы): время и память линейны;
 * в карту попадает столько лучших определений, сколько влезает в бюджет (двоичный
   поиск по числу).
 
@@ -24,7 +27,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from gigacrew.project.index import ProjectIndex
@@ -112,6 +115,60 @@ def _is_compound(name: str) -> bool:
     return (snake or camel) and len(name) >= 8
 
 
+def _name_weight(name: str, definers: int, mentioned: set[str]) -> float:
+    """Множитель веса рёбер имени (см. описание модуля)."""
+    mul = 1.0
+    if name in mentioned:
+        mul *= 10
+    if _is_compound(name):
+        mul *= 10
+    if name.startswith("_"):
+        mul *= 0.1
+    if definers > 5:
+        mul *= 0.1
+    if name in _COMMON_METHODS:
+        mul *= 0.1
+    return mul
+
+
+def _file_pagerank(
+    uses: Mapping[str, Mapping[str, float]],
+    defines: Mapping[str, Sequence[str]],
+    out_weight: Mapping[str, float],
+    nodes: Iterable[str],
+    personalization: Mapping[str, float] | None,
+) -> dict[str, float]:
+    """PageRank графа файлов без самого графа: :func:`pagerank` по рёбрам «файл, где
+    имя используется → каждый файл, где оно определено» (вес — ``uses[name][user]``).
+
+    Пары «использует × определяет» не строятся: имя, которое определено и вызывается
+    в тысячах файлов (``handle``, ``String``), дало бы их миллионы. Поток по имени
+    считается один раз — сумма от всех использующих — и достаётся каждому
+    определяющему: время и память линейны по числу использований и определений.
+    """
+    names = sorted(set(nodes) | set(out_weight))
+    if not names:
+        return {}
+    total = sum(personalization.values()) if personalization else 0.0
+    if personalization and total > 0:
+        teleport = {n: personalization.get(n, 0.0) / total for n in names}
+    else:
+        teleport = {n: 1.0 / len(names) for n in names}
+    rank = dict.fromkeys(names, 1.0 / len(names))
+    for _ in range(_MAX_ITERATIONS):
+        dangling = sum(rank[n] for n in names if out_weight.get(n, 0.0) <= 0)
+        new = {n: (1 - _DAMPING + _DAMPING * dangling) * teleport[n] for n in names}
+        for name, users in uses.items():
+            flow = _DAMPING * sum(rank[u] * w / out_weight[u] for u, w in users.items())
+            for definer in defines[name]:
+                new[definer] += flow
+        error = sum(abs(new[n] - rank[n]) for n in names)
+        rank = new
+        if error < _TOLERANCE * len(names):
+            break
+    return rank
+
+
 def rank_definitions(
     index: ProjectIndex,
     *,
@@ -121,13 +178,14 @@ def rank_definitions(
     """Определения (файл, имя) по убыванию важности."""
     db = index._db  # noqa: SLF001 — карта — часть слоя индекса, агрегаты нужны на SQL
     marks = ",".join("?" * len(_SKIP_KINDS))
-    defines: dict[str, set[str]] = defaultdict(set)
+    found: dict[str, set[str]] = defaultdict(set)
     for path, name in db.execute(
         f"SELECT DISTINCT path, name FROM symbols WHERE kind NOT IN ({marks})", _SKIP_KINDS
     ):
-        defines[name].add(path)
-    if not defines:
+        found[name].add(path)
+    if not found:
         return []
+    defines = {name: sorted(paths) for name, paths in found.items()}
     references: dict[str, dict[str, int]] = defaultdict(dict)
     for path, name, count in db.execute(
         "SELECT r.path, r.name, COUNT(*) FROM refs r "
@@ -138,42 +196,34 @@ def rank_definitions(
 
     focus = set(focus_files)
     mentioned = set(focus_names)
-    # вес ребра по каждому имени: (откуда, куда, имя) -> вес
-    weights: dict[tuple[str, str, str], float] = defaultdict(float)
+    # Вес ребра «использующий файл → каждый определяющий» по имени: uses[имя][файл].
+    uses: dict[str, dict[str, float]] = {}
+    out_weight: dict[str, float] = defaultdict(float)  # сумма исходящих рёбер файла
     unused: list[tuple[str, str]] = []  # (файл, имя) — определено, но не используется
     for name, definers in defines.items():
         users = references.get(name)
         if not users:
             unused += [(definer, name) for definer in definers]
             continue
-        mul = 1.0
-        if name in mentioned:
-            mul *= 10
-        if _is_compound(name):
-            mul *= 10
-        if name.startswith("_"):
-            mul *= 0.1
-        if len(definers) > 5:
-            mul *= 0.1
-        if name in _COMMON_METHODS:
-            mul *= 0.1
-        for user, count in users.items():
-            use_mul = mul * (50 if user in focus else 1)
-            for definer in definers:
-                weights[(user, definer, name)] += use_mul * math.sqrt(count)
-
-    edges: dict[str, dict[str, float]] = defaultdict(dict)
-    out_total: dict[str, float] = defaultdict(float)
-    for (src, dst, _), weight in weights.items():
-        edges[src][dst] = edges[src].get(dst, 0.0) + weight
-        out_total[src] += weight
+        mul = _name_weight(name, len(definers), mentioned)
+        uses[name] = {user: mul * math.sqrt(count) for user, count in users.items()}
+        for user, weight in uses[name].items():
+            out_weight[user] += weight * len(definers)
     nodes = {p for paths in defines.values() for p in paths}
-    personalization = {p: 1.0 for p in focus if p in nodes or p in edges} or None
-    ranks = pagerank(edges, nodes, personalization)
+    personalization = {p: 1.0 for p in focus if p in nodes or p in out_weight} or None
+    ranks = _file_pagerank(uses, defines, out_weight, nodes, personalization)
 
-    ranked: dict[tuple[str, str], float] = defaultdict(float)
-    for (src, dst, name), weight in weights.items():
-        ranked[(dst, name)] += ranks.get(src, 0.0) * weight / out_total[src]
+    # Ранг файла делится между его рёбрами. Файл в фокусе отдаёт определениям, которые
+    # использует, ×50: множитель на рёбрах внутри PageRank ничего бы не менял — и там,
+    # и здесь вес ребра делится на сумму исходящих рёбер того же файла.
+    ranked: dict[tuple[str, str], float] = {}
+    for name, users in uses.items():
+        share = sum(
+            ranks.get(u, 0.0) * w / out_weight[u] * (50 if u in focus else 1)
+            for u, w in users.items()
+        )
+        for definer in defines[name]:
+            ranked[(definer, name)] = share
     used = sorted(
         (RankedDefinition(path, name, rank) for (path, name), rank in ranked.items()),
         key=lambda d: (-d.rank, d.path, d.name),

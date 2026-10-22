@@ -239,6 +239,14 @@ def _chat_to_resume(args: argparse.Namespace, store: ChatStore, ui: Console) -> 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     ui = Console(no_color=args.no_color)
+    # -p "$TASK" с пустой переменной — ошибка: иначе запустился бы REPL, а в CI (stdin
+    # уже в конце) он сразу выходит с кодом 0, как будто запрос выполнен.
+    for flag, value in (("-p", args.prompt), ("--test-context", args.test_context)):
+        if value is not None and not value.strip():
+            ui.error(f"{flag}: пустое значение")
+            return EXIT_ERROR
+    if args.prompt is not None:
+        ui.keyboard_only()  # -p: ответы на вопросы — не из перенаправленного stdin
     root = Path(args.dir)
     if not root.is_dir():
         ui.error(f"каталог проекта не найден: {root}")
@@ -273,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         hooks = load_hooks(
             Workspace(config.project_root),
             ui,
-            interactive=not args.prompt and ui.interactive(),
+            interactive=args.prompt is None and ui.interactive(),
             trust=args.trust_hooks,
         )
         install_request_hook(provider, hooks, ui, config)
@@ -301,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
             ui.warn(warning)
         if catalogue is not None:
             windows.report({m.id: m.context_window for m in catalogue})
-        if args.test_context:
+        if args.test_context is not None:
             model = args.test_context.strip()
             if known is not None and model not in known:
                 ui.error(_not_in_catalogue(model, known))
@@ -351,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
             if skipped:
                 ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {agent.model}")
         commands = default_commands()
-        if args.prompt:
+        if args.prompt is not None:
             skills = SkillCatalog(agent.workspace)
             skills.refresh()
             try:  # -p "/скилл аргументы" — как в REPL

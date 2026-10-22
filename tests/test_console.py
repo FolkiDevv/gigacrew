@@ -697,3 +697,180 @@ def test_prompt_toolkit_color_depth_follows_rich(monkeypatch):
         monkeypatch.setattr(colors, "color_system", lambda s=system: s)
         assert colors.prompt_color_depth(False) == depth
     assert colors.prompt_color_depth(True) == ColorDepth.MONOCHROME
+
+
+# --------------- управляющие символы: все пути вывода в терминал --------------- #
+_ESC = "x\x1b[2K\x1b[1A\x1b]0;owned\x07\x9bевил"
+
+
+def _sink_tool_name(ui):
+    _step(ui, ToolCallInfo(f"read{_ESC}", "a.py"), ToolResult(content="", summary="ok"))
+    ui.on_turn_end(TurnStats(steps=1))
+
+
+def _sink_diff_title(ui):
+    from gigacrew.permissions import ToolKind
+
+    ui._c.input = lambda prompt: "n"
+    preview = Display("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n", "diff", f"a{_ESC}.py")
+    ui.confirm(ToolCallInfo("edit_file", "a.py", ToolKind.EDIT), preview, dangerous=False)
+
+
+def _sink_exact_title(ui):
+    from gigacrew.permissions import ToolKind
+
+    ui._c.input = lambda prompt: "n"
+    preview = Display("$ make\nmake test", title=f"команда · {_ESC}")
+    ui.confirm(ToolCallInfo("run_shell", "make", ToolKind.COMMAND), preview, dangerous=False)
+
+
+def _sink_purpose(ui):
+    from gigacrew.permissions import ToolKind
+
+    ui._c.input = lambda prompt: "n"
+    call = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND, purpose=_ESC)
+    ui.confirm(call, None, dangerous=True)
+
+
+def _sink_plain_question(ui):
+    ui._c.input = lambda prompt: "1"
+    question = Question(f"Q{_ESC}?", (QuestionOption(f"A{_ESC}", f"d{_ESC}"), QuestionOption("B")))
+    ui._ask_plain(question, 1, 1)
+
+
+def _sink_help(ui):
+    ui.help([("/deploy [аргументы]", f"скилл · {_ESC}")])
+
+
+def _sink_messages(ui):
+    ui.info(f"последние решения: {_ESC}")
+    ui.warn(_ESC)
+    ui.on_notice(_ESC, level="warn")
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        _sink_tool_name,
+        _sink_diff_title,
+        _sink_exact_title,
+        _sink_purpose,
+        _sink_plain_question,
+        _sink_help,
+        _sink_messages,
+    ],
+)
+def test_control_characters_never_reach_terminal(sink):
+    # Rich (Text) не убирает ESC и C1: очистка — в одной точке на весь вывод консоли.
+    ui, buf = _console()
+    sink(ui)
+    out = buf.getvalue()
+    assert "x[2K[1A]0;owned" in out and "евил" in out  # текст виден, без управляющих
+    assert "\x1b" not in out and "\x07" not in out and "\x9b" not in out
+
+
+def test_control_characters_stripped_in_live_terminal_but_own_codes_kept():
+    ui, buf = _live_console()
+    ui.on_tool_call(ToolCallInfo(f"read{_ESC}", "a.py", read_only=True))
+    ui.on_tool_start(ToolCallInfo(f"read{_ESC}", "a.py", read_only=True))
+    ui.stop_live()
+    out = buf.getvalue()
+    assert "\x1b]0;owned" not in out and "\x07" not in out
+    assert "\x1b[" in out  # свои последовательности Rich (цвет, курсор) — на месте
+
+
+# ------------------- невидимые символы в том, что подтверждается ------------------- #
+@pytest.mark.parametrize(
+    "char",
+    [
+        "​",  # нулевой ширины
+        "‍",  # соединитель нулевой ширины
+        "‏",  # RLM
+        "؜",  # ARABIC LETTER MARK — тоже управляет направлением текста
+        "­",  # мягкий перенос
+        "ᅟ",  # заполнитель хангыля
+        "ㅤ",
+        "️",  # селектор варианта
+        "\U000e0041",  # символ-тег
+        " ",  # разделитель строк
+    ],
+)
+def test_confirm_marks_every_invisible_character_in_command(char):
+    from gigacrew.permissions import ToolKind
+
+    ui, buf = _console()
+    ui._c.input = lambda prompt: "n"
+    call = ToolCallInfo("run_shell", "rm", ToolKind.COMMAND)
+    ui.confirm(call, Display(f"$ rm{char} -rf x"), dangerous=True)
+    out = buf.getvalue()
+    assert f"$ rm⟨U+{ord(char):04X}⟩ -rf x" in out and char not in out
+
+
+def test_confirm_marks_invisible_characters_in_diff():
+    from gigacrew.permissions import ToolKind
+
+    ui, buf = _console()
+    ui._c.input = lambda prompt: "n"
+    diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-ok = 1\n+# ‮; rm -rf ~ ‬\x01\n"
+    ui.confirm(
+        ToolCallInfo("edit_file", "x.py", ToolKind.EDIT),
+        Display(diff, "diff", "x.py"),
+        dangerous=False,
+    )
+    out = buf.getvalue()
+    assert "+# ⟨U+202E⟩; rm -rf ~ ⟨U+202C⟩⟨U+0001⟩" in out  # и управляющие — не молча
+    assert "‮" not in out and "-ok = 1" in out
+
+
+@pytest.mark.parametrize("dangerous", [True, False])
+@pytest.mark.parametrize("command", ["rm -rf build", "make\nmake install"])
+def test_confirm_shows_directory_command_runs_in(tmp_path, dangerous, command):
+    from gigacrew.permissions import ToolKind
+    from gigacrew.project.workspace import Workspace
+    from gigacrew.tools.base import ToolContext
+    from gigacrew.tools.shell import RunShellParams, RunShellTool
+
+    (tmp_path / "vendor" / "lib").mkdir(parents=True)
+    ctx = ToolContext(workspace=Workspace(tmp_path))
+    tool = RunShellTool()
+    ui, buf = _console()
+    ui._c.input = lambda prompt: "n"
+    call = ToolCallInfo("run_shell", command, ToolKind.COMMAND)
+    params = RunShellParams(command=command, cwd="vendor/lib/")
+    ui.confirm(call, tool.preview(params, ctx), dangerous=dangerous)
+    assert "▌ каталог  vendor/lib\n" in buf.getvalue()
+    # в корне проекта — без строки о каталоге
+    ui, buf = _console()
+    ui._c.input = lambda prompt: "n"
+    ui.confirm(call, tool.preview(RunShellParams(command=command), ctx), dangerous=dangerous)
+    assert "каталог" not in buf.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ("", False),  # Enter — «нет»: вопрос о доверии хукам и о платном замере
+        ("x", False),
+        ("н", False),  # н и т — клавиши y и n в русской раскладке: не «да»
+        ("т", False),
+        ("нет", False),
+        ("y", True),
+        ("Да", True),
+        ("д", True),
+    ],
+)
+def test_ask_defaults_to_no(reply, expected):
+    ui, _ = _console()
+    ui._c.input = lambda prompt: reply
+    assert ui.ask("Разрешить хуки?", dangerous=True) is expected
+
+
+@pytest.mark.parametrize("reply", ["н", "т", "нет", "N", ""])
+def test_confirm_russian_layout_no_is_a_plain_refusal(reply):
+    from gigacrew.agent.events import Approval
+    from gigacrew.permissions import ToolKind
+
+    ui, _ = _console()
+    ui._c.input = lambda prompt: reply
+    result = ui.confirm(ToolCallInfo("run_shell", "ls", ToolKind.COMMAND), None, dangerous=False)
+    assert result.approval is Approval.NO and result.feedback == "" and result.answered

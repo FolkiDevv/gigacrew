@@ -28,6 +28,7 @@ from gigacrew.project.index import (
     ProjectIndex,
     RefreshStats,
     SymbolHit,
+    is_corruption,
 )
 from gigacrew.project.repomap import CHARS_PER_TOKEN, build_repo_map
 from gigacrew.project.symbols import Symbol, language_of
@@ -41,10 +42,19 @@ MAX_LISTED_FILES = 15  # файлов в строках «импортирует
 
 @contextmanager
 def open_index(ctx: ToolContext) -> Iterator[ProjectIndex]:
+    index = ProjectIndex(ctx.workspace)
     try:
-        with ProjectIndex(ctx.workspace) as index:
+        with index:
             yield index
     except INDEX_ERRORS as e:
+        if is_corruption(e):
+            # Испорченные страницы данных видны только на запросе: без пересоздания
+            # падал бы каждый вызов, а /index rebuild модели недоступна.
+            index.discard()
+            raise ToolError(
+                f"Индекс проекта был повреждён ({e}) и удалён — повторите вызов: "
+                "индекс построится заново."
+            ) from e
         raise ToolError(f"Индекс проекта недоступен: {e}") from e
 
 

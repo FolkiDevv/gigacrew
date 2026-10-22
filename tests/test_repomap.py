@@ -157,3 +157,69 @@ def test_repo_map_tool_explains_too_small_budget(tmp_path, project, monkeypatch)
     ctx = ToolContext(workspace=Workspace(tmp_path), semantic=False)
     content = RepoMapTool().run(RepoMapParams(max_tokens=200), ctx).content
     assert content == "(определения не поместились в объём карты — увеличьте max_tokens)"
+
+
+# ----------------------- фокус меняет порядок (строго) ----------------------- #
+def test_focus_names_reorder_two_equally_used_names(tmp_path):
+    _make(tmp_path, "core.py", "def alpha_function(): pass\ndef beta_function(): pass\n")
+    _make(tmp_path, "user.py", "alpha_function()\nbeta_function()\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        assert rank_definitions(ix)[0].name == "alpha_function"  # ничья — по имени
+        assert rank_definitions(ix, focus_names=["beta_function"])[0].name == "beta_function"
+
+
+def test_definitions_used_by_focus_files_rank_first(tmp_path):
+    # f.py (в фокусе) использует alpha и GatewayClient; GatewayClient — из g.py, а g.py
+    # использует BackendService. Без фокуса BackendService важнее alpha (через g.py);
+    # то, что прямо использует файл в фокусе, — важнее (×50 — после PageRank: внутри
+    # него нормировка по источнику свела бы множитель на нет).
+    _make(tmp_path, "a.py", "def alpha(): pass\n")
+    _make(tmp_path, "g.py", "class GatewayClient:\n    pass\n\nBackendService()\n")
+    _make(tmp_path, "b.py", "class BackendService:\n    pass\n")
+    _make(tmp_path, "f.py", "alpha()\nGatewayClient()\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        plain = [d.name for d in rank_definitions(ix, focus_files=["f.py"])][:3]
+        assert plain == ["GatewayClient", "alpha", "BackendService"]
+        assert [d.name for d in rank_definitions(ix)][:3] != plain  # это сделал фокус
+
+
+def test_repo_map_tool_directory_focus_reorders_map(tmp_path):
+    _make(tmp_path, "lib/a.py", "def alpha_function(): pass\n")
+    _make(tmp_path, "lib/b.py", "def beta_function(): pass\n")
+    _make(tmp_path, "app/x.py", "beta_function()\n")
+    _make(tmp_path, "other/y.py", "alpha_function()\n")
+    ctx = ToolContext(workspace=Workspace(tmp_path), semantic=False)
+    plain = RepoMapTool().run(RepoMapParams(), ctx).content.splitlines()
+    assert plain[1] == "lib/a.py:"
+    focused = RepoMapTool().run(RepoMapParams(focus=["app"]), ctx).content.splitlines()
+    assert focused[1] == "lib/b.py:"
+
+
+def test_ranking_does_not_build_pairs_of_users_and_definers(tmp_path):
+    # Имена-интерфейсы (handle, validate…) определены и вызываются в сотнях файлов: пары
+    # «использует × определяет» на имя — N² по времени и памяти. Подсчёт — линейный.
+    import tracemalloc
+
+    n = 600
+    names = ("handle_event", "to_string", "validate")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        db = ix._db  # noqa: SLF001 — быстрее, чем индексировать 600 файлов
+        db.executemany(
+            "INSERT INTO symbols VALUES (?, ?, ?, '', '', 'method', 1, 2, 1, '', '', 0)",
+            [(f"h{i}.py", name, name) for i in range(n) for name in names],
+        )
+        db.executemany(
+            "INSERT INTO refs VALUES (?, ?, 'call', 3, 0, '')",
+            [(f"h{i}.py", name) for i in range(n) for name in names],
+        )
+        tracemalloc.start()
+        try:
+            ranked = rank_definitions(ix)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+    assert len(ranked) == n * len(names)
+    assert peak < 20 * 2**20  # пары заняли бы ~150 МБ

@@ -188,3 +188,34 @@ def test_find_symbol_and_outline_show_docstring(ctx):
     assert _outline(ctx, "app/doc.py").content.splitlines()[1] == (
         "1-4  def documented():  # Делает дело."
     )
+
+
+def test_corrupted_index_is_recreated_by_the_next_call(tmp_path):
+    # Повреждены страницы данных (не заголовок): без пересоздания каждый вызов
+    # навигации падал бы до /index rebuild, которую модель выполнить не может.
+    import sqlite3
+
+    from gigacrew.project.index import INDEX_FILE_NAME, ProjectIndex
+    from gigacrew.tools.navigation import FindReferencesParams, FindReferencesTool
+
+    for i in range(150):
+        body = "\n".join(f"def func_{i}_{j}(x):\n    return helper_{j}(x)\n" for j in range(20))
+        (tmp_path / f"m{i}.py").write_text(body, encoding="utf-8")
+    ctx = ToolContext(workspace=Workspace(tmp_path), semantic=False)
+    tool = FindSymbolTool()
+    assert "func_1_1" in tool.run(FindSymbolParams(query="func_1_1"), ctx).content
+    db = ctx.workspace.index_dir / INDEX_FILE_NAME
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    size = db.stat().st_size
+    with open(db, "r+b") as f:  # страницы 1–16 (схема, meta) целы, дальше — мусор
+        f.seek(16 * 4096)
+        f.write(bytes(range(256)) * ((size - 16 * 4096) // 256))
+    with ProjectIndex(ctx.workspace) as ix:
+        assert ix.is_complete()
+    with pytest.raises(ToolError, match="повреждён"):
+        tool.run(FindSymbolParams(query="func_1_1"), ctx)
+    assert "m1.py" in tool.run(FindSymbolParams(query="func_1_1"), ctx).content
+    refs = FindReferencesTool().run(FindReferencesParams(query="helper_1"), ctx)
+    assert "m1.py" in refs.content

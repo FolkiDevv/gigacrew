@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import sys
+from datetime import UTC, datetime
 
 import pytest
 
@@ -74,6 +75,16 @@ def test_load_errors(store):
     (store.directory / "bad.json").write_text("{не json", encoding="utf-8")
     with pytest.raises(ChatStoreError):
         store.load("bad")
+
+
+@pytest.mark.parametrize("bad", ["../secret", "a/../../secret", "a/b", "a.json", "a\nb", ""])
+def test_ids_that_could_leave_the_chats_dir_are_rejected(store, bad):
+    # Первый символ id — буква или цифра, и весь id — без «/» и «.»: ни load, ни save, ни
+    # exists не выходят за .gigacode/chats.
+    (store.directory / "a").mkdir(parents=True)
+    for action in (store.load, store.exists, lambda i: store.save(i, _conv())):
+        with pytest.raises(ChatStoreError, match="некорректный"):
+            action(bad)
 
 
 @pytest.mark.parametrize("conversation", [[], "x", None, {"version": 1, "messages": 5}])
@@ -172,6 +183,26 @@ def test_find_by_id_and_prefix(store):
         store.find("  ")
 
 
+def test_find_prefers_exact_id_over_longer_ids_with_that_prefix(store):
+    store.save("a1", _conv("первый"))
+    store.save("a10", _conv("второй"))
+    assert store.find("a1").title == "первый"
+    with pytest.raises(ChatStoreError, match="несколько"):
+        store.find("a")
+
+
+def test_failed_write_leaves_no_temporary_file(store, monkeypatch):
+    import gigacrew.agent.chat_store as chat_store
+
+    def full(*a, **kw):
+        raise OSError("диск заполнен")
+
+    monkeypatch.setattr(chat_store.json, "dump", full)
+    with pytest.raises(OSError, match="заполнен"):
+        store.save("a1", _conv())
+    assert list(store.directory.iterdir()) == []
+
+
 def test_new_ids_are_unique_and_sortable(store):
     ids = {store.new_id() for _ in range(50)}
     assert len(ids) == 50
@@ -209,6 +240,23 @@ def test_recorder_skips_empty_and_keeps_created_at(store):
     rec.save(conv)
     again = store.load(rec.chat_id).info
     assert again.created_at == first.created_at and again.requests == 2
+    assert [c.id for c in store.recent()] == [rec.chat_id]  # тот же файл, не новый
+    # Продолженный чат хранит время создания, а не время продолжения (метки — в
+    # секундах: в одной секунде проверка выше прошла бы и без этого).
+    when = datetime(2020, 1, 1, tzinfo=UTC)
+    assert store.save("old1", conv, created_at=when).created_at == when
+    rec.switch_to(store.load("old1").info)
+    conv.add_user("и ещё")
+    rec.save(conv)
+    info = store.load("old1").info
+    assert info.created_at == when and info.updated_at > when and info.requests == 3
+
+
+def test_recorder_does_not_save_harness_only_conversation(store):
+    conv = Conversation()
+    conv.add_user("<system-reminder>\nплан одобрен\n</system-reminder>", meta=True)
+    assert ChatRecorder(store).save(conv) is None
+    assert store.recent() == []
 
 
 def test_recorder_new_and_switch(store):
@@ -259,3 +307,64 @@ def test_recorder_write_error_warns_once(store, monkeypatch):
     assert warning and "только чтение" in warning
     assert rec.enabled is False
     assert rec.save(_conv()) is None
+
+
+# ------------------- имена файлов не в UTF-8 (одиночные суррогаты) ------------------- #
+_CP1251_NAME = b"\xee\xf2\xf7\xb8\xf2.txt".decode("utf-8", "surrogateescape")  # «отчёт.txt»
+
+
+def test_save_survives_lone_surrogates(store):
+    # Диалог, собранный в обход Conversation.add_* (например, из старого файла), с
+    # одиночными суррогатами: запись не падает, чат читается.
+    conv = Conversation(
+        [
+            Message(role="user", content=f"открой {_CP1251_NAME}"),
+            Message(role="assistant", content="ок \ud800"),
+        ]
+    )
+    info = store.save("a1", conv)
+    assert info.title.startswith("открой ")
+    loaded = store.load("a1").conversation
+    assert [m.role for m in loaded.messages] == ["user", "assistant"]
+
+
+def test_recorder_serialization_error_warns_once(store, monkeypatch):
+    rec = ChatRecorder(store)
+
+    def boom(*a, **kw):
+        raise UnicodeEncodeError("utf-8", "\udcee", 0, 1, "surrogates not allowed")
+
+    monkeypatch.setattr(store, "save", boom)
+    warning = rec.save(_conv())
+    assert warning and "surrogates not allowed" in warning
+    assert rec.enabled is False and rec.save(_conv()) is None
+
+
+def test_two_sessions_continuing_one_chat_do_not_lose_turns(store):
+    # Два терминала с `gigacrew -c`: второй сохранивший не затирает ход первого, а
+    # продолжает в новом чате и предупреждает.
+    ChatRecorder(store).save(_conv("запрос 1"))
+    (info,) = store.recent()
+    a, b = ChatRecorder(store), ChatRecorder(store)
+    a.switch_to(store.load(info.id).info)
+    b.switch_to(store.load(info.id).info)
+    conv_a, conv_b = store.load(info.id).conversation, store.load(info.id).conversation
+    conv_a.add_user("A: допиши docs")
+    assert a.save(conv_a) is None and a.chat_id == info.id
+    conv_b.add_user("B: допиши тесты")
+    warning = b.save(conv_b)
+    assert warning is not None and info.id in warning and b.chat_id in warning
+    assert b.chat_id != info.id
+    requests = [m.content for m in store.load(info.id).conversation.messages if m.is_request]
+    assert requests == ["запрос 1", "A: допиши docs"]  # ход A сохранён
+    forked = store.load(b.chat_id)
+    assert [m.content for m in forked.conversation.messages if m.is_request] == [
+        "запрос 1",
+        "B: допиши тесты",
+    ]
+    # дальше каждый пишет в свой чат без предупреждений
+    conv_b.add_user("B: ещё")
+    assert b.save(conv_b) is None
+    conv_a.add_user("A: ещё")
+    assert a.save(conv_a) is None and a.chat_id == info.id
+    assert len(store.recent()) == 2

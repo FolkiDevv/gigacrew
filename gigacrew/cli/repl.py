@@ -210,8 +210,13 @@ def _loop(
         if request is not None:
             line = request
         elif is_repl_command(line):
-            if not commands.dispatch(line, ctx):
-                return 0
+            try:
+                if not commands.dispatch(line, ctx):
+                    return 0
+            except Exception as e:  # как и ошибка в ходе: сбой команды не закрывает REPL
+                ui.stop_live()
+                name = line.split(maxsplit=1)[0]
+                ui.error(f"внутренняя ошибка в {name}: {type(e).__name__}: {e}")
             typeahead = esc.take_typeahead()
             continue
 

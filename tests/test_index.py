@@ -349,3 +349,125 @@ def test_recursive_call_on_definition_line_is_a_reference(tmp_path):
         ix.refresh()
         hits = ix.find_refs("fact").hits
         assert [(h.line, h.kind, h.scope) for h in hits] == [(1, "call", "fact")]
+
+
+def _corrupt_pages(ws: Workspace) -> None:
+    """Порча страниц данных при целых заголовке и meta (сбой диска, запись наполовину)."""
+    import sqlite3
+
+    db = ws.index_dir / INDEX_FILE_NAME
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # страницы — в основной файл
+    conn.close()
+    size = db.stat().st_size
+    with open(db, "r+b") as f:  # страницы 1–16 (схема, meta) целы, дальше — мусор
+        f.seek(16 * 4096)
+        f.write(bytes(range(256)) * ((size - 16 * 4096) // 256))
+
+
+def _big_project(root) -> Workspace:
+    for i in range(150):
+        body = "\n".join(f"def func_{i}_{j}(x):\n    return helper_{j}(x)\n" for j in range(20))
+        (root / f"m{i}.py").write_text(body, encoding="utf-8")
+    ws = Workspace(root)
+    with ProjectIndex(ws) as ix:
+        ix.refresh()
+    return ws
+
+
+def test_corrupted_data_pages_are_detected_and_index_recreated(tmp_path):
+    import sqlite3
+
+    from gigacrew.project.index import is_corruption
+
+    ws = _big_project(tmp_path)
+    _corrupt_pages(ws)
+    with ProjectIndex(ws) as ix:
+        assert ix.is_complete()  # заголовок и meta целы — повреждение не видно сразу
+        with pytest.raises(sqlite3.DatabaseError) as error:
+            ix.find_symbols("func_1_1")
+        assert is_corruption(error.value)
+        ix.discard()
+        assert not ix.is_complete()
+        assert ix.refresh().added == 150
+        assert ix.find_symbols("func_1_19")[1] == 1
+    assert not is_corruption(sqlite3.OperationalError("database is locked"))
+
+
+def test_index_command_rebuilds_corrupted_index(tmp_path, capsys):
+    from gigacrew.cli.indexing import run_indexing
+    from gigacrew.ui.console import Console
+
+    ws = _big_project(tmp_path)
+    _corrupt_pages(ws)
+    result = run_indexing(ProjectIndex(ws), Console(no_color=True))
+    assert result is not None and result[1].files == 150
+    assert "повреждён" in capsys.readouterr().out
+    with ProjectIndex(ws) as ix:
+        assert ix.find_symbols("func_1_19")[1] == 1
+
+
+# ---------------- запросы, где верное и ошибочное поведение различаются ---------------- #
+def test_subtree_refresh_does_not_touch_sibling_with_same_prefix(tmp_path):
+    # Соседний каталог с тем же началом имени (app2 рядом с app) — не часть поддерева.
+    _make(tmp_path, "app/a.py", "def a(): pass\n")
+    _make(tmp_path, "app2/b.py", "def b(): pass\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        stats = ix.refresh(tmp_path / "app")
+        assert stats.removed == 0
+        assert _paths(ix) == ["app/a.py", "app2/b.py"]
+        assert [e.path for e in ix.files_under("app")] == ["app/a.py"]
+
+
+def test_edit_that_keeps_the_size_is_reindexed(tmp_path):
+    # Переименование foo → bar размер не меняет: изменение видно только по mtime.
+    p = _make(tmp_path, "m.py", "def foo(): pass\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        st = p.stat()
+        p.write_text("def bar(): pass\n", encoding="utf-8")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        assert p.stat().st_size == st.st_size
+        assert ix.refresh().updated == 1
+        assert ix.find_symbols("bar")[1] == 1 and ix.find_symbols("foo")[1] == 0
+
+
+def test_qualified_query_filters_by_owner(tmp_path):
+    _make(
+        tmp_path, "m.py", "class A:\n    def run(self): pass\nclass B:\n    def run(self): pass\n"
+    )
+    _make(tmp_path, "n.py", "class Outer:\n    class Inner:\n        def run(self): pass\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        hits, total = ix.find_symbols("A.run")
+        assert total == 1 and hits[0].symbol.qualname == "A.run"
+        assert [h.symbol.qualname for h in ix.definitions("B.run")] == ["B.run"]
+        # владелец — и по концу имени вложенного класса
+        assert [h.symbol.qualname for h in ix.find_symbols("Inner.run")[0]] == ["Outer.Inner.run"]
+
+
+def test_definitions_are_exact_names_not_substrings(tmp_path):
+    _make(tmp_path, "m.py", "def run(): pass\ndef run_all(): pass\n\nrun_all()\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        assert [h.symbol.name for h in ix.definitions("run")] == ["run"]
+        assert [h.symbol.name for h in ix.definitions("RUN")] == ["run"]
+        assert ix.find_refs("run").total == 0  # run_all() — не использование run
+        assert ix.find_refs("run_all").total == 1
+
+
+def test_like_wildcards_in_query_are_literal(tmp_path):
+    _make(tmp_path, "m.py", "def get_x(): pass\ndef getax(): pass\ndef p100x(): pass\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        hits, total = ix.find_symbols("get_x")
+        assert total == 1 and hits[0].symbol.name == "get_x"
+        assert ix.find_symbols("100%")[1] == 0 and ix.find_symbols("p1%x")[1] == 0
+
+
+def test_prefix_match_ranks_before_substring(tmp_path):
+    _make(tmp_path, "m.py", "def aget(): pass\ndef get_item(): pass\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        assert [h.symbol.name for h in ix.find_symbols("get")[0]] == ["get_item", "aget"]

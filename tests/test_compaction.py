@@ -263,3 +263,34 @@ def test_summarize_keeps_latest_request_when_old_chunks_dropped(meta):
     assert "файл 11" in last  # свежая переписка — на месте
     for request in provider.summary_requests:
         assert estimate_tokens(request["messages"]) <= 2_500
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "blacklist"])
+def test_summarize_bills_a_paid_reply_it_rejects(finish_reason):
+    # Ответ оплачен, даже если он непригоден: on_usage получает расход каждого вызова.
+    usage = Usage(prompt_tokens=700, completion_tokens=30)
+    reply = AssistantTurn(
+        message=Message(role="assistant", content="обры"),
+        finish_reason=finish_reason,
+        usage=usage,
+    )
+    provider = ScriptedProvider(summaries=[reply])
+    usages = []
+    with pytest.raises(CompactionError):
+        summarize(
+            provider,
+            _messages(1),
+            model="M",
+            temperature=0.2,
+            input_budget=20_000,
+            max_chars=900,
+            on_usage=usages.append,
+        )
+    assert usages == [usage]
+
+
+def test_summarize_without_anything_to_fold_makes_no_request():
+    provider = ScriptedProvider()
+    with pytest.raises(CompactionError, match="нечего"):
+        summarize(provider, [], model="M", temperature=0.2, input_budget=20_000, max_chars=900)
+    assert provider.summary_requests == []

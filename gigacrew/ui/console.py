@@ -33,7 +33,8 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+import unicodedata
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import IO
@@ -121,11 +122,65 @@ def sanitize(text: str) -> str:
     return _CONTROL_RE.sub("", text.replace("\r\n", "\n"))
 
 
-# Невидимые символы: управляющие, смена направления текста, нулевой ширины. В команде,
-# которую подтверждает пользователь, их нельзя убирать молча — она выполнится с ними.
-_INVISIBLE_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏‪-‮⁠-⁤⁦-⁩﻿]")
+class _SafeConsole(RichConsole):
+    """Консоль Rich, которая не пропускает в терминал управляющие символы из текста.
+
+    Rich (``Text``) убирает лишь BEL/BS/VT/FF/CR, а ESC и C1 оставляет. Очистка на
+    месте каждой печати то и дело забывалась (имя инструмента от модели, заголовок
+    превью, описание скилла), поэтому здесь — одна точка на весь вывод: из текста
+    сегментов убирается всё, кроме ``\\n`` и ``\\t``. Свои последовательности Rich
+    (цвет — в стилях, курсор живой области — в сегментах ``control``) не трогаются.
+    Через неё же идёт и просмотрщик (``pager``). Старая консоль Windows печатает в
+    обход неё, но ESC-последовательности она и не исполняет.
+    """
+
+    def _render_buffer(self, buffer: Iterable[Segment]) -> str:
+        return super()._render_buffer(
+            Segment(_CONTROL_RE.sub("", s.text), s.style)
+            if s.control is None and _CONTROL_RE.search(s.text)
+            else s
+            for s in buffer
+        )
+
+
+# Невидимые символы: управляющие, смена направления текста, нулевой ширины и прочие
+# невидимые. В команде или правке, которую подтверждает пользователь, их нельзя ни
+# убирать молча, ни печатать как есть — выполнится или запишется текст с ними.
+# Кандидаты — всё, кроме печатного ASCII, \n и \t; невидимые среди них — по категории
+# Юникода (управляющие, форматирующие — в том числе смена направления, теги —,
+# разделители строк и абзацев, половинки суррогатных пар) и по свойству
+# Default_Ignorable_Code_Point (мягкий перенос, заполнители хангыля, селекторы вариантов).
+_INVISIBLE_CANDIDATE_RE = re.compile(r"[^\t\n\x20-\x7e]")
+_INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+_IGNORABLE_RE = re.compile(
+    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￸\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+)
+_INVISIBLE_MARK_RE = re.compile(r"⟨U\+[0-9A-F]{4,6}⟩")
 # Многострочная команда длиннее — с номерами строк.
 _NUMBER_LINES_FROM = 4
+
+
+def _invisible(text: str) -> Iterator[re.Match[str]]:
+    """Невидимые символы строки по порядку."""
+    for m in _INVISIBLE_CANDIDATE_RE.finditer(text):
+        char = m.group()
+        if unicodedata.category(char) in _INVISIBLE_CATEGORIES or _IGNORABLE_RE.match(char):
+            yield m
+
+
+def _mark(char: str) -> str:
+    return f"⟨U+{ord(char):04X}⟩"
+
+
+def mark_invisible(text: str) -> str:
+    """Текст с видимыми невидимыми символами (``⟨U+202E⟩``); ``\\r\\n`` — как ``\\n``."""
+    text = text.replace("\r\n", "\n")
+    out, pos = [], 0
+    for m in _invisible(text):
+        out += [text[pos : m.start()], _mark(m.group())]
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def visible_text(text: str, *, numbered: bool | None = None, palette: Palette = MINT) -> Text:
@@ -140,9 +195,9 @@ def visible_text(text: str, *, numbered: bool | None = None, palette: Palette = 
         if numbered:
             out.append(f"{i:>{width}} │ ", style=palette.dim)
         pos = 0
-        for m in _INVISIBLE_RE.finditer(line):
+        for m in _invisible(line):
             out.append(line[pos : m.start()])
-            out.append(f"⟨U+{ord(m.group()):04X}⟩", style=f"bold {palette.danger}")
+            out.append(_mark(m.group()), style=f"bold {palette.danger}")
             pos = m.end()
         out.append(line[pos:])
         if i < len(lines):
@@ -326,7 +381,7 @@ class Console(AgentEvents):
         width: int | None = None,
         auto_refresh: bool = True,
     ):
-        self._c = RichConsole(
+        self._c = _SafeConsole(
             no_color=no_color,
             highlight=False,
             emoji=False,
@@ -359,6 +414,17 @@ class Console(AgentEvents):
         self._sub_activity = ""
         self._sub_wrapping = False
         self._sub_steps: list[_Step] = []
+        self._keyboard_only = False  # отвечать на вопросы — только с терминала (-p)
+
+    def keyboard_only(self) -> None:
+        """Вопросы (подтверждения, выбор чата) — только с клавиатуры: ввод не с
+        терминала — ответа нет. Для ``-p``: stdin там не канал ввода (запрос — аргумент),
+        и строка «y» или «a» из перенаправленных в него данных не должна ничего
+        подтверждать. В REPL ввод не с терминала — это и запросы, и ответы."""
+        self._keyboard_only = True
+
+    def _no_keyboard(self) -> bool:
+        return self._keyboard_only and not _stdin_is_terminal()
 
     def set_interrupt_keys(
         self,
@@ -1144,6 +1210,9 @@ class Console(AgentEvents):
         bar = self._bar(dangerous=dangerous)
         long_preview = self._confirm_head(call, preview, bar)
         labeled = []
+        where = _command_dir(call, preview)
+        if where:  # где выполнится команда — тоже часть того, что подтверждается
+            labeled.append(("каталог", p.muted, Text(where, style=f"bold {p.fg}")))
         if call.reason:
             label = "почему опасно" if dangerous else "почему спрашиваю"
             style = f"bold {p.danger}" if dangerous else p.muted
@@ -1192,15 +1261,14 @@ class Console(AgentEvents):
         return ConfirmResult(Approval.NO, feedback=raw.strip())
 
     def _diff_panel(self, preview: Display) -> Panel:
-        syntax = Syntax(
-            sanitize(preview.text).rstrip(),
-            "diff",
-            theme="ansi_dark",
-            background_color="default",
-            word_wrap=True,
-        )
+        # Невидимые символы правки — видимыми (как в команде), с подсветкой диффа.
+        code = mark_invisible(preview.text).rstrip()
+        body = Syntax(code, "diff", theme="ansi_dark", background_color="default").highlight(code)
+        body.rstrip()
+        body.no_wrap, body.overflow = False, "fold"  # длинные строки — переносом
+        body.highlight_regex(_INVISIBLE_MARK_RE, f"bold {self._p.danger}")
         return Panel(
-            syntax,
+            body,
             title=Text(preview.title or "изменения", style=self._p.fg),
             title_align="left",
             box=ROUNDED,
@@ -1260,11 +1328,23 @@ class Console(AgentEvents):
         feedback: bool = False,
         view: bool = False,
     ) -> str | None:
-        """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода)."""
+        """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода, ввод не
+        с терминала там, где отвечать можно только с клавиатуры)."""
         self._flush_group()
         self.stop_live()
         p = self._p
         bar = self._bar(dangerous=dangerous)
+        if self._no_keyboard():
+            self._out(
+                Text.assemble(
+                    bar,
+                    (f"{question} ", f"bold {p.fg}"),
+                    ("— ответить можно только с клавиатуры, а ввод не с терминала: ", p.muted),
+                    ("нет", f"bold {p.fg}"),
+                )
+            )
+            self._blank = False
+            return None
         notes = []
         if always is not None:
             notes.append(f"a — {always}")
@@ -1432,6 +1512,9 @@ class Console(AgentEvents):
         self.stop_live()
         if not chats:
             return None
+        if self._no_keyboard():
+            self.warn("выбрать чат можно только с клавиатуры (или по id: -r ID) — начат новый")
+            return None
         if self._live_ok and _stdin_is_terminal():
             try:
                 from gigacrew.ui.chat_picker import pick_chat
@@ -1577,6 +1660,15 @@ class Console(AgentEvents):
             if detail:
                 lines.append(self._fit(Text(f"  {detail}", style=p.dim)))
         return lines
+
+
+def _command_dir(call: ToolCallInfo, preview: Display | None) -> str:
+    """Каталог, где выполнится команда, если не корень проекта: превью команды
+    подписано «команда · <каталог>». Пусто — в корне (или это не команда)."""
+    if call.kind is not ToolKind.COMMAND or preview is None:
+        return ""
+    head, sep, where = preview.title.partition(" · ")
+    return where.strip() if sep and head == "команда" else ""
 
 
 def _exchange_starts(messages: Sequence[Message]) -> list[int]:

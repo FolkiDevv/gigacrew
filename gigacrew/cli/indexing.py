@@ -10,7 +10,13 @@ from __future__ import annotations
 import contextlib
 from contextlib import AbstractContextManager
 
-from gigacrew.project.index import INDEX_ERRORS, IndexStats, ProjectIndex, RefreshStats
+from gigacrew.project.index import (
+    INDEX_ERRORS,
+    IndexStats,
+    ProjectIndex,
+    RefreshStats,
+    is_corruption,
+)
 from gigacrew.project.workspace import Workspace
 from gigacrew.ui.console import Console
 from gigacrew.ui.format import plural
@@ -51,10 +57,20 @@ def run_indexing(
     guard = interrupt if interrupt is not None else contextlib.nullcontext()
     try:
         with guard, ui.progress("индексирую проект", lambda: _files(scanned)):
-            refreshed = (
-                index.rebuild(progress=progress) if rebuild else index.refresh(progress=progress)
-            )
-            stats = index.stats()
+            try:
+                refreshed = (
+                    index.rebuild(progress=progress)
+                    if rebuild
+                    else index.refresh(progress=progress)
+                )
+                stats = index.stats()
+            except INDEX_ERRORS as e:
+                if not is_corruption(e):
+                    raise
+                ui.warn(f"индекс проекта повреждён ({e}) — строю заново")
+                index.discard()
+                refreshed = index.refresh(progress=progress)
+                stats = index.stats()
     except KeyboardInterrupt:
         ui.warn(
             f"построение индекса прервано (просмотрено: {_files(scanned)}, сделанное "

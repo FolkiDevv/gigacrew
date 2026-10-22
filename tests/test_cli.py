@@ -144,6 +144,40 @@ def test_permissions_command_lists_forgets_and_shows_log(tmp_path, capsys):
     assert "использование" in _out(capsys)
 
 
+def test_permissions_forget_rejects_bad_numbers(tmp_path, capsys):
+    from gigacrew.agent.decisions import DecisionMemory
+    from gigacrew.safety import classify
+
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    ui = Console(no_color=True)
+    agent = Agent(ScriptedProvider(), build_default_registry(), cfg, ui, decisions=memory)
+    commands = default_commands()
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands)
+    memory.approve(classify("pytest -q", root=tmp_path))
+    memory.approve(classify("ruff check .", root=tmp_path))
+    commands.dispatch("/permissions forget 0", ctx)  # не «последнее» (pop(-1))
+    assert "нет разрешения №0" in _out(capsys) and len(memory.rules) == 2
+    for word in ("²", "abc", "-1"):  # «²».isdigit() — да, но int() его не разберёт
+        commands.dispatch(f"/permissions forget {word}", ctx)
+        assert "использование: /permissions" in _out(capsys)
+    assert len(memory.rules) == 2
+
+
+def test_repl_survives_errors_in_commands(cli_env, capsys):
+    agent, ui, commands, _, _ = cli_env
+
+    def broken(_ctx, _arg):
+        raise RuntimeError("команда сломалась")
+
+    commands.register(SlashCommand("/broken", "ломается", broken))
+    read = _reader("/broken", "/permissions forget ²", "/exit")
+    assert run_repl(agent, ui, commands, read_input=read, index_on_start=False) == 0
+    out = _out(capsys)
+    assert "внутренняя ошибка в /broken: RuntimeError: команда сломалась" in out
+    assert "использование: /permissions" in out and "до встречи!" in out
+
+
 # ------------------------------- REPL ------------------------------- #
 def _reader(*items):
     queue = list(items)
@@ -692,6 +726,19 @@ def test_test_context_reports_failed_save(tmp_path, oneshot, capsys, monkeypatch
     assert "не сохранён" in out and "записано в" not in out
 
 
+@pytest.mark.parametrize("flag", ["-p", "--prompt", "--test-context"])
+@pytest.mark.parametrize("value", ["", "  "])
+def test_empty_prompt_or_model_is_an_error(tmp_path, oneshot, capsys, flag, value):
+    # -p "$TASK" с пустой переменной — ошибка, а не REPL, который в CI сразу выходит с 0
+    provider = WindowProvider(8_192, [text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, f"{flag}={value}") == 1
+    out = _flat(capsys)
+    shown = "-p" if flag == "--prompt" else flag
+    assert f"{shown}: пустое значение" in out and "gigacrew>" not in out
+    assert provider.requests == [] and provider.measured == []
+
+
 def test_oneshot_does_not_measure_unknown_window(tmp_path, oneshot, capsys, monkeypatch):
     """Замер оплачивается — в -p (в том числе в CI) он не делается, только подсказка."""
     provider = WindowProvider(8_192, [text_turn("ok")])
@@ -701,6 +748,11 @@ def test_oneshot_does_not_measure_unknown_window(tmp_path, oneshot, capsys, monk
     assert provider.measured == []
     assert "окно контекста M1 не замерено — считаем 32k" in out
     assert "gigacrew --test-context M1" in out
+    # и с -y: -y — согласие на правки и команды, не на оплату замера в каждом запуске CI
+    provider = WindowProvider(8_192, [text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, "-m", "M1", "-y", "-p", "x") == 0
+    assert provider.measured == [] and "gigacrew --test-context M1" in _flat(capsys)
     monkeypatch.setenv("GIGACREW_CONTEXT_TOKENS", "8000")  # явный бюджет — и подсказка не нужна
     oneshot(WindowProvider(8_192, [text_turn("ok")]))
     assert _main(tmp_path, "-m", "M2", "-p", "x") == 0
@@ -1162,3 +1214,97 @@ def test_repl_warns_about_tls_for_the_backend_token(tmp_path, capsys):
     agent._cfg = replace(agent.config, provider="gigacode", access_key=None)
     run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
     assert "ключ или токен можно перехватить" in _flat(capsys)
+
+
+@pytest.mark.parametrize("piped", ["a\nещё данные\n", "y\n", "да\n"])
+def test_oneshot_does_not_take_approvals_from_piped_stdin(
+    tmp_path, oneshot, capsys, monkeypatch, piped
+):
+    import io
+
+    from gigacrew.agent.decisions import DecisionMemory
+
+    # stdin в -p — не канал ввода (запрос — аргумент): строка «a» или «y» из pipe не
+    # подтверждает команду и не сохраняет разрешение.
+    monkeypatch.setattr("sys.stdin", io.StringIO(piped))
+    monkeypatch.setenv("GIGACREW_REVIEWER_MODEL", "nope")
+    command = "python3 -c \"open('made', 'w')\""  # выполняет код — спрашивается
+    oneshot(ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")]))
+    assert _main(tmp_path, "-p", "сделай") == 0
+    assert not (tmp_path / "made").exists()
+    assert "ответить можно только с клавиатуры" in _flat(capsys)
+    memory, _ = DecisionMemory.load(tmp_path)
+    assert memory.rules == []
+    assert [e["decision"] for e in memory.recent()] == ["no_answer"]
+
+
+def test_oneshot_resume_picker_needs_keyboard(tmp_path, oneshot, capsys, monkeypatch):
+    import io
+
+    oneshot(ScriptedProvider([text_turn("a")]))
+    assert _main(tmp_path, "-p", "первый") == 0
+    monkeypatch.setattr("sys.stdin", io.StringIO("1\n"))
+    provider = ScriptedProvider([text_turn("b")])
+    oneshot(provider)
+    assert _main(tmp_path, "-r", "-p", "новый") == 0
+    assert _history(provider) == [("user", "новый")]  # чат не выбран из pipe
+    assert "выбрать чат можно только с клавиатуры" in _flat(capsys)
+
+
+def test_repl_turn_and_autosave_with_file_name_not_in_utf8(repl_env, capsys):
+    import json
+    import os
+
+    # Имя из архива в cp1251: Python декодирует его в одиночные суррогаты. Ни запрос к
+    # модели (httpx кодирует тело в UTF-8), ни сохранение чата не должны на этом падать.
+    agent, ui, commands, ctx, provider = repl_env
+    root = os.fsencode(agent.workspace.root)
+    with open(root + b"/\xee\xf2\xf7\xb8\xf2.txt", "wb") as f:
+        f.write(b"x")
+    provider._turns = [tool_turn("list_dir", {"path": "."}), text_turn("готово")]
+    read = _reader("что в проекте?", "/exit")
+    assert run_repl(agent, ui, commands, read_input=read, chats=ctx.chats) == 0
+    for request in provider.requests:
+        for message in request["messages"]:
+            json.dumps(message.model_dump(), ensure_ascii=False).encode("utf-8")
+    assert "�����.txt" in provider.requests[0]["messages"][0].content
+    assert "�����.txt" in provider.requests[-1]["messages"][-1].content
+    (chat,) = ctx.chats.store.recent()
+    assert chat.requests == 1 and chat.preview == "готово"
+    assert "не сохранён" not in _out(capsys)
+
+
+def test_yes_does_not_approve_dangerous_commands_but_yes_all_does(tmp_path, oneshot):
+    # -y — правки и команды без вопросов, кроме опасных; --yes-all — и опасные.
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "x").write_text("1", encoding="utf-8")
+    remove = [tool_turn("run_shell", {"command": "rm -rf build"}), text_turn("ок")]
+    oneshot(ScriptedProvider(list(remove)))
+    assert _main(tmp_path, "-y", "-p", "почисти", "--no-save") == 0
+    assert (tmp_path / "build" / "x").exists()  # опасная — спросили, ответа нет
+    oneshot(ScriptedProvider(list(remove)))
+    assert _main(tmp_path, "--yes-all", "-p", "почисти", "--no-save") == 0
+    assert not (tmp_path / "build").exists()
+
+
+def test_hooks_reload_honours_hook_trust(tmp_path, capsys):
+    import json
+
+    from gigacrew.project.settings import HookEvent
+
+    ws = Workspace(tmp_path)
+    ws.settings_file.parent.mkdir(parents=True, exist_ok=True)
+    hook = {"type": "command", "command": "./check.sh"}
+    settings = {"hooks": {"PreToolUse": [{"matcher": "run_shell", "hooks": [hook]}]}}
+    ws.settings_file.write_text(json.dumps(settings), encoding="utf-8")
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, auto_approve=True)
+    ui = Console(no_color=True)
+    agent = Agent(ScriptedProvider(), build_default_registry(), cfg, ui)
+    commands = default_commands()
+    # хуки проекта — команды из репозитория: без подтверждения (и без терминала) — нет
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands, trust_hooks=False)
+    commands.dispatch("/hooks reload", ctx)
+    assert not agent.hooks.has(HookEvent.PRE_TOOL_USE, "run_shell")
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands, trust_hooks=True)
+    commands.dispatch("/hooks reload", ctx)
+    assert agent.hooks.has(HookEvent.PRE_TOOL_USE, "run_shell")
