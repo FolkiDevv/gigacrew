@@ -35,7 +35,6 @@ from pathlib import Path
 from gigacrew.project.files import glob_match, is_excluded, walk_files
 from gigacrew.project.symbols import Symbol, extract, language_of, module_parts
 from gigacrew.project.workspace import Workspace
-from gigacrew.safety.paths import is_secret_entry
 
 SCHEMA_VERSION = 3  # 3 — tree-sitter: другие языки с диапазонами и вызовами
 INDEX_FILE_NAME = "index.sqlite3"
@@ -390,6 +389,10 @@ class ProjectIndex:
         ``progress`` получает число просмотренных файлов. Прерывание (в т.ч. Ctrl+C)
         откатывает только незафиксированную пачку изменений.
         """
+        # Импорт здесь: safety.bash загружает gigacrew.project (treesitter), а с ним и
+        # этот модуль — импорт на уровне модуля замкнул бы цикл.
+        from gigacrew.safety.paths import is_secret_entry
+
         started = time.monotonic()
         db = self._db
         base = self.root if base is None else base
