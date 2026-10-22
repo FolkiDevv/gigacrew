@@ -702,3 +702,125 @@ def test_hidden_or_dynamic_code_is_marked_dangerous(root, command):
     """Спросить И пометить опасным: человек должен посмотреть внимательно."""
     verdict = classify(command, root=root)
     assert verdict.level is DANGER, verdict.reason
+
+
+# ------------------------------ Python ------------------------------- #
+@pytest.fixture
+def venv_site(root):
+    venv = root / ".venv"
+    site = venv / "lib" / "python3.13" / "site-packages"
+    site.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (venv / "bin").mkdir()
+    (venv / "bin" / "python").symlink_to("/usr/bin/python3")
+    return site
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "import _virtualenv",
+        "import _distutils_hack",
+        "import __editable___pkg_1_0_finder; __editable___pkg_1_0_finder.install()",
+        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') "
+        "== 'local'; enabled and __import__('_distutils_hack').add_shim(); ",
+    ],
+)
+def test_standard_pth_lines_are_trusted(root, venv_site, line):
+    (venv_site / "std.pth").write_text(line + "\n")
+    assert level(".venv/bin/python -c 'print(1)'", root) is READ
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # код, дописанный после разрешённого начала строки
+        "import _virtualenv; __import__('os').system('id')",
+        "import _distutils_hack; __import__('os').system('id')",
+        "import __editable___pkg_finder; __editable___pkg_finder.install(); import os",
+        "import __editable___pkg_finder; __editable___pkg_finder.install(os.system('id'))",
+        "import __editable___a_finder; __editable___b_finder.install()",
+        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; os.system('id')",
+        "import os; os.system('id')",
+    ],
+)
+def test_pth_with_appended_code_is_exec(root, venv_site, line):
+    (venv_site / "evil.pth").write_text(line + "\n")
+    for command in (
+        ".venv/bin/python -c 'print(1)'",
+        ".venv/bin/python -m platform",
+        ".venv/bin/python -m json.tool package.json",
+    ):
+        verdict = classify(command, root=root)
+        assert verdict.level is EXEC, (command, verdict.reason)
+
+
+def test_sitecustomize_in_venv_is_exec(root, venv_site):
+    assert level(".venv/bin/python -c 'print(1)'", root) is READ
+    (venv_site / "sitecustomize.py").write_text("import os; os.system('id')\n")
+    assert level(".venv/bin/python -c 'print(1)'", root) is EXEC
+
+
+def test_python_startup_code_on_pythonpath(root):
+    lib = root / "lib"
+    lib.mkdir()
+    (lib / "json.py").write_text("print('evil')\n")
+    # -P убирает только каталог запуска: PYTHONPATH действует
+    assert level("PYTHONPATH=lib python3 -P -c 'import json'", root) is EXEC
+    assert level("PYTHONPATH=lib python3 -c 'import json'", root) is EXEC
+    assert level("PYTHONPATH=lib python3 -I -c 'import json'", root) is READ
+    assert level("PYTHONPATH=lib python3 -E -c 'print(1)'", root) is READ
+    # sitecustomize/usercustomize из PYTHONPATH site импортирует при старте
+    site = root / "site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text("import os; os.system('id')\n")
+    assert level("PYTHONPATH=site python3 -c 'print(1)'", root) is EXEC
+    assert level("PYTHONPATH=site python3 -P -c 'print(1)'", root) is EXEC
+    assert level("PYTHONPATH=site python3 -m json.tool package.json", root) is EXEC
+    assert level("PYTHONPATH=site python3 -I -c 'print(1)'", root) is READ
+    assert level("PYTHONPATH=site python3 -S -c 'print(1)'", root) is READ
+    assert level("python3 -c 'print(1)'", root) is READ  # каталог запуска — не PYTHONPATH
+
+
+def test_stdlib_shadowing_in_run_directory_is_exec(root):
+    (root / "json.py").write_text("print('evil')\n")
+    assert level("python3 -c 'print(1)'", root) is EXEC
+    assert level("python3 -I -c 'print(1)'", root) is READ
+    assert level("python3 -P -c 'print(1)'", root) is READ
+    # -I не делает «чтением» сторонний код
+    (root / "numpy").mkdir()
+    (root / "numpy" / "__init__.py").write_text("")
+    assert level("python3 -c 'import numpy'", root) is EXEC
+    assert level("python3 -I -c 'import numpy'", root) is EXEC
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        ("python3 -m json.tool package.json /tmp/o.json", DANGER),
+        ("python3 -m json.tool package.json .git/config", DANGER),
+        ("python3 -m json.tool package.json out.json", WRITE),
+        ("python3 -m json.tool package.json", READ),
+        ("python3 -W ignore -c 'print(1)'", READ),
+        ("python3 -X dev -c 'print(1)'", READ),
+        ("python3 -Wignore -c 'print(1)'", READ),
+        ("python3 --foo -c 'print(1)'", None),
+        ("python3 -Z -c 'print(1)'", None),
+        ("python3 /tmp/x.py", None),
+    ],
+)
+def test_python_flags_and_module_outputs(root, command, expected):
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, (command, verdict.reason)
+
+
+def test_python_script_signature_follows_content(root):
+    import hashlib
+
+    script = root / "uses_pkg.py"
+    script.write_text("import pkg\n")
+    first = classify("python3 uses_pkg.py", root=root).parts[0].signature
+    digest = hashlib.sha256(b"import pkg\n").hexdigest()[:12]
+    assert first == f"python uses_pkg.py#{digest}"
+    script.write_text("import pkg\nimport pkg\n")
+    assert classify("python3 uses_pkg.py", root=root).parts[0].signature != first

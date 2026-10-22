@@ -3385,11 +3385,29 @@ _PY_MODULE_LEVELS: dict[str, tuple[CommandLevel | None, str]] = {
     "pickletools": (READ, "pickletools"),
     "calendar": (READ, "calendar"),
 }
+# Стандартные строки .pth (virtualenv, setuptools: distutils и editable-установка) —
+# целиком: код, дописанный после разрешённого начала, исполнялся бы при каждом запуске.
 _VENV_PTH_OK = re.compile(
-    r"^(import _virtualenv|import _distutils_hack.*|"
-    r"import __editable___[\w.]+_finder; __editable___[\w.]+_finder\.install\(.*\)|"
-    r"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; .*)$"
+    r"(import _virtualenv|import _distutils_hack(; _distutils_hack\.add_shim\(\))?|"
+    r"import (__editable___\w+_finder); \3\.install\(\)|"
+    r"import os; var = 'SETUPTOOLS_USE_DISTUTILS'; "
+    r"enabled = os\.environ\.get\(var, '(local|stdlib)'\) == 'local'; "
+    r"enabled and __import__\('_distutils_hack'\)\.add_shim\(\); ?)\s*"
 )
+# Модули, которые site импортирует при старте из любого каталога sys.path.
+_STARTUP_MODULES = ("sitecustomize", "usercustomize")
+
+
+def _startup_module(directory: Path) -> str | None:
+    """sitecustomize/usercustomize (файл или пакет) в каталоге."""
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.partition(".")[0] in _STARTUP_MODULES:
+            return entry
+    return None
 
 
 def _interpreter_ok(env: Env, prog: str) -> Part | None:
@@ -3414,8 +3432,11 @@ def _interpreter_ok(env: Env, prog: str) -> Part | None:
             except OSError:
                 return Part(EXEC, f"{prog}: .pth окружения не прочитан")
             for line in lines:
-                if line.startswith(("import ", "import\t")) and not _VENV_PTH_OK.match(line):
+                if line.startswith(("import ", "import\t")) and not _VENV_PTH_OK.fullmatch(line):
                     return Part(EXEC, f"{prog}: {pth.name} исполняет код при запуске")
+        startup = _startup_module(site)
+        if startup is not None:
+            return Part(EXEC, f"{prog}: {startup} в окружении исполняется при запуске")
     return None
 
 
@@ -3427,14 +3448,16 @@ def _venv_root(interpreter: Path) -> Path | None:
 
 
 def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
-    from gigacrew.safety.python import analyze
+    from gigacrew.safety.python import analyze, shadowed_stdlib
 
     code: str | None = None
     script: Path | None = None
     module: str | None = None
     module_args: list[Word] = []
     script_args: list[Word] = []
-    isolated = False
+    # -I: без PYTHONPATH и без каталога запуска в sys.path; -P — только без каталога
+    # запуска (PYTHONPATH действует); -E — только без PYTHONPATH; -S — без site.
+    no_path0 = ignore_env = no_site = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -3450,8 +3473,11 @@ def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
             j = 0
             while j < len(letters):
                 ch = letters[j]
-                if ch in "IP":
-                    isolated = True
+                if ch == "I":
+                    no_path0 = ignore_env = True
+                no_path0 = no_path0 or ch == "P"
+                ignore_env = ignore_env or ch == "E"
+                no_site = no_site or ch == "S"
                 if ch == "c":
                     code = letters[j + 1 :] or (args[i + 1].value if i + 1 < len(args) else "")
                     if not letters[j + 1 :]:
@@ -3493,9 +3519,17 @@ def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
     path_dirs, bad = _pythonpath_dirs(env, cmd)
     if bad is not None:
         return bad
+    if ignore_env:
+        path_dirs = ()
+    for d in () if no_site else path_dirs:
+        startup = _startup_module(d)
+        if startup is not None:  # site импортирует его при старте из PYTHONPATH
+            found = Part(EXEC, f"{prog}: {startup} в PYTHONPATH исполняется при запуске")
+            trust = found if trust is None else _combine(trust, found)
+            break
     if module is not None:
         if module == "pip":
-            return _pip(env, f"{prog} -m pip", module_args)
+            return _combine(_pip(env, f"{prog} -m pip", module_args), trust)
         known = _PY_MODULE_LEVELS.get(module)
         if known is not None:
             level, signature = known
@@ -3555,10 +3589,17 @@ def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
         root=env.root,
         cwd=env.cwd,
         script=(env.dir / script).resolve() if script is not None else None,
-        path_dirs=() if isolated else path_dirs,
+        path_dirs=path_dirs,
     )
     part = Part(result.level, result.reason)
-    if isolated and result.level is CommandLevel.EXEC and "подменит модуль" in result.reason:
+    # Без каталога запуска в sys.path затенение в нём не действует — но только если
+    # стандартную библиотеку не затеняет и каталог из PYTHONPATH.
+    if (
+        no_path0
+        and result.level is CommandLevel.EXEC
+        and "подменит модуль" in result.reason
+        and not any(shadowed_stdlib(d) for d in path_dirs)
+    ):
         part = Part(READ, "python: только чтение и вычисления")
     if script is not None and part.level in (CommandLevel.EXEC, CommandLevel.READ):
         rel = os.path.relpath((env.dir / script).resolve(), env.root)
