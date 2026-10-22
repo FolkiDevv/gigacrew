@@ -58,7 +58,25 @@ dependencies = [
 
 [dependency-groups]
 # Ставится `uv sync` по умолчанию (PEP 735). Только для разработки — в пакет не попадает.
-dev = ["pytest>=7.0", "pytest-timeout>=2.3", "ruff>=0.5"]
+# Набор проверок — по образцу wemake-django-template (см. `make lint`).
+dev = [
+    # Тесты
+    "pytest>=9.1",
+    "pytest-randomly>=5.0",
+    "pytest-timeout>=2.4",
+    # Стиль, форматирование, типы, архитектура
+    "ruff>=0.17",
+    "wemake-python-styleguide>=1.8",
+    "mypy>=2.4",
+    "import-linter>=2.15",
+    # Опечатки, YAML, .env, зависимости
+    "codespell>=2.4",
+    "typos>=1.51",
+    "yamllint>=1.38",
+    "dotenv-linter>=0.9",
+    "deptry>=0.25",
+    "pip-audit>=2.10",
+]
 
 [project.scripts]
 gigacrew = "gigacrew.cli:main"
@@ -72,15 +90,142 @@ Repository = "https://github.com/FolkiDevv/gigacrew"
 module-root = ""
 
 [tool.ruff]
+# Настройки — по образцу wemake-django-template (https://docs.astral.sh/ruff/settings),
+# с поправками на проект: строка 100 символов и двойные кавычки — устоявшийся стиль кода.
+preview = true
 line-length = 100
 target-version = "py313"
 
+[tool.ruff.format]
+docstring-code-format = true
+
 [tool.ruff.lint]
-# E,F — pyflakes/pycodestyle; I — isort; UP — pyupgrade; B — bugbear; W — warnings.
-select = ["E", "F", "I", "UP", "B", "W"]
+select = [
+    "A",     # flake8-builtins
+    "ASYNC", # flake8-async
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "C90",   # mccabe
+    "COM",   # flake8-commas
+    "D",     # pydocstyle
+    "DTZ",   # flake8-datetimez
+    "E",     # pycodestyle
+    "ERA",   # flake8-eradicate
+    "EXE",   # flake8-executable
+    "F",     # pyflakes
+    "FA",    # flake8-future-annotations
+    "FBT",   # flake8-boolean-trap
+    "FLY",   # flynt
+    "FURB",  # refurb
+    "G",     # flake8-logging-format
+    "I",     # isort
+    "ICN",   # flake8-import-conventions
+    "ISC",   # flake8-implicit-str-concat
+    "LOG",   # flake8-logging
+    "N",     # pep8-naming
+    "PERF",  # perflint
+    "PIE",   # flake8-pie
+    "PL",    # pylint
+    "PT",    # flake8-pytest-style
+    "PTH",   # flake8-use-pathlib
+    "Q",     # flake8-quotes
+    "RET",   # flake8-return
+    "RSE",   # flake8-raise
+    "RUF",   # ruff
+    "S",     # flake8-bandit
+    "SIM",   # flake8-simplify
+    "SLF",   # flake8-self
+    "SLOT",  # flake8-slots
+    "T100",  # flake8-debugger
+    "TRY",   # tryceratops
+    "UP",    # pyupgrade
+    "W",     # pycodestyle
+    "YTT",   # flake8-2020
+]
+ignore = [
+    "A005",    # имена модулей могут совпадать с модулями stdlib (gigacrew.tools.shell…)
+    # Правила документации, которые шаблон тоже не проверяет:
+    "D100",
+    "D104",
+    "D106",
+    "D203",
+    "D212",
+    "D401",
+    "D404",
+    "D405",
+    "ISC001",  # конфликтует с `ruff format`
+    "ISC003",  # явная конкатенация строк предпочтительнее неявной
+    "PLR09",   # сложность проверяет wemake-python-styleguide
+    "PLR2004", # магические числа проверяет wemake-python-styleguide (WPS432)
+    "PLR6301", # метод без self не обязан становиться staticmethod/classmethod
+    "PLW0717", # длину тела try проверяет wemake-python-styleguide (WPS229)
+    "RUF067",  # логику в `__init__.py` проверяет wemake-python-styleguide (WPS412)
+    "TRY003",  # длинные сообщения исключений — нормально
+    "RUF105",  # `# noqa`, а не `# ruff: ...`
+    "RUF106",
+    "RUF201",
+    # Проект: запуск git, оболочки и LSP-серверов — суть инструмента.
+    "S404",
+]
+# Коды wemake-python-styleguide (flake8): ruff не считает их `noqa` лишними.
+external = ["WPS"]
+# Комментарии и строки — на русском: однобуквенные слова «с», «у», «о», «а»… и типографика
+# (–, −, ×, ❯) — не подмена латиницы.
+allowed-confusables = [
+    "а", "б", "в", "г", "е", "к", "м", "н", "о", "р", "с", "т", "у", "х", "з",
+    "А", "В", "Е", "З", "К", "М", "Н", "О", "Р", "С", "Т", "У", "Х",
+    "–", "−", "×", "❯",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["E501"]
+"tests/*.py" = [
+    "S101",   # assert — суть теста
+    "D1",     # имя теста — его описание: длинные имена вместо docstring
+    "SLF001", # тесты «белого ящика» смотрят во внутреннее состояние
+    "S105",   # поддельные токены и пароли — данные теста
+    "S106",
+    "S107",
+    "S108",   # пути /tmp/… — данные для классификатора путей
+    "S603",   # тесты запускают git и интерпретатор во временных каталогах
+    "S607",
+]
+
+[tool.mypy]
+# https://mypy.readthedocs.io/en/latest/config_file.html — как в wemake-django-template.
+enable_error_code = [
+    "truthy-bool",
+    "truthy-iterable",
+    "redundant-expr",
+    "unused-awaitable",
+    "ignore-without-code",
+    "possibly-undefined",
+    "redundant-self",
+    "explicit-override",
+    "unimported-reveal",
+    "deprecated",
+    "exhaustive-match",
+]
+strict = true
+extra_checks = true
+strict_equality_for_none = true
+warn_unreachable = true
+explicit_package_bases = true
+# Тесты импортируют общие модули из tests/ без пакета (fakes, behavior…), как pytest
+# в режиме prepend.
+mypy_path = ["$MYPY_CONFIG_FILE_DIR", "$MYPY_CONFIG_FILE_DIR/tests"]
+files = ["gigacrew", "tests"]
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
 
 [tool.pytest.ini_options]
 markers = [
@@ -88,3 +233,55 @@ markers = [
     "eval: поведенческие сценарии на живых моделях — дорого, запуск через make eval (tests/test_behavior_live.py)",
 ]
 testpaths = ["tests"]
+# Строгость — как в wemake-django-template: опечатка в маркере или настройке — ошибка,
+# xfail, который вдруг прошёл, — тоже. Порядок тестов случайный (pytest-randomly).
+addopts = ["--strict-markers", "--strict-config"]
+xfail_strict = true
+
+[tool.deptry]
+known_first_party = ["gigacrew"]
+
+[tool.deptry.per_rule_ignores]
+# Грамматики tree-sitter загружаются по имени (importlib, gigacrew/project/treesitter.py).
+DEP002 = [
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-go",
+    "tree-sitter-rust",
+    "tree-sitter-java",
+    "tree-sitter-kotlin",
+    "tree-sitter-c-sharp",
+    "tree-sitter-ruby",
+    "tree-sitter-php",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-bash",
+    "tree-sitter-scala",
+    "tree-sitter-swift",
+]
+
+[tool.codespell]
+# https://github.com/codespell-project/codespell
+skip = "*.lock,.venv,.git,.*_cache,htmlcov,.coverage,coverage.xml"
+# Опечатки, которые проверяют тесты (ввод пользователя с ошибкой), и имена программ.
+ignore-words-list = "alph,deplyo,hlep,ture"
+
+[tool.typos]
+# https://github.com/crate-ci/typos
+files.extend-exclude = ["*.lock", ".venv", ".*_cache", "htmlcov", ".coverage", "coverage.xml"]
+default.extend-ignore-re = [
+    "\\b[0-9a-f]{7,40}\\b", # хеши коммитов
+]
+
+[tool.typos.default.extend-words]
+# Имена пакетов, функций и флагов: certifi, os.spawnve, `rg -iz`, `nl -ba`.
+certifi = "certifi"
+spawnve = "spawnve"
+iz = "iz"
+ba = "ba"
+# Опечатки, которые проверяют тесты (ввод пользователя с ошибкой).
+alph = "alph"
+deplyo = "deplyo"
+hlep = "hlep"
+ture = "ture"

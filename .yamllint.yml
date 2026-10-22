@@ -1,0 +1,15 @@
+---
+# https://yamllint.readthedocs.io — по образцу wemake-django-template (default, строгий
+# режим `-s`), с поправками под проект.
+extends: default
+
+ignore: |
+  .venv/
+
+rules:
+  # Как у кода и .editorconfig — 100 символов.
+  line-length:
+    max: 100
+  # `on:` в GitHub Actions — ключ, а не булево значение.
+  truthy:
+    check-keys: false
