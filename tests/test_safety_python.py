@@ -268,6 +268,28 @@ def test_writes_into_gigacode_data(root, code, expected):
     assert result.level is expected, result.reason
 
 
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        # sys.path под другим именем — всё тот же sys.path
+        ("from sys import path; path.insert(0, '/tmp'); import json", DANGER),
+        ("import sys; p = sys.path; p.append('/tmp')", DANGER),
+        ("import sys as s; s.path.extend(['/tmp'])", DANGER),
+        ("import sys; sys.path += ['/tmp']", DANGER),
+        ("import sys\ndef f(p):\n    p.append('/tmp')\nf(sys.path)", None),
+        ("import random, sys; random.shuffle(sys.path)", None),
+        # читать sys.path — можно
+        ("import sys; print(sys.path)", READ),
+        ("import sys; print('\\n'.join(sys.path), len(sys.path), '/tmp' in sys.path)", READ),
+        ("import sys\nfor p in sys.path:\n    print(p)", READ),
+        ("from sys import path; print(path)", READ),
+    ],
+)
+def test_sys_path_changes(root, code, expected):
+    result = analyze(code, root=root)
+    assert result.level is expected, result.reason
+
+
 def test_secret_files_ask(root):
     (root / ".env").write_text("TOKEN=1\n")
     assert analyze("print(open('.env').read())", root=root).level is None

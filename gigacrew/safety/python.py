@@ -1316,8 +1316,8 @@ def _is_alias(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> bool:
     return all(isinstance(t, ast.Name) and ctx.modules.get(t.id) == resolved for t in targets)
 
 
-# Модули с функциями записи и процессов: переданный куда-то модуль — не проследить.
-_ESCAPING_MODULES = frozenset({*_MODULE_ATTRS, "pathlib"})
+# Модули с функциями записи и процессов (и sys.path): переданное куда-то — не проследить.
+_ESCAPING_MODULES = frozenset({*_MODULE_ATTRS, "pathlib", "sys.path"})
 # Атрибуты, которые проверяются в месте вызова: как значения — проверяем вызов с
 # аргументами, известными только при выполнении.
 _REF_ATTRS = _PATH_WRITERS | _PATH_READERS | _PATH_LISTERS | _DANGER_METHODS | {"open", "format"}
@@ -1394,11 +1394,7 @@ def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
                         ctx.flag(Level.DANGER, f"{module}.{attr} — импорт при выполнении")
                     else:
                         ctx.flag(None, f"{module}.{attr} не проверен классификатором")
-            if (
-                isinstance(node.value, ast.Attribute)
-                and node.value.attr == "path"
-                and _resolve_module(node.value.value, ctx) == "sys"
-            ):
+            if module == "sys.path":  # и from sys import path, и p = sys.path
                 ctx.flag(Level.DANGER, "изменение sys.path — подмена модулей")
         elif isinstance(node, ast.Name):
             if node.id in _DYNAMIC_BUILTINS:
