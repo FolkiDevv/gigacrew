@@ -538,6 +538,64 @@ def test_tool_end_called_on_ctrl_c(tmp_path):
     assert _kinds(events)[-2:] == ["tool_start", "tool_end"]
 
 
+class _InterruptAfterRun(RecordingEvents):
+    """Ctrl+C/Esc (асинхронный SIGINT) приходит, когда инструмент уже отработал."""
+
+    def __init__(self, at: str):
+        super().__init__()
+        self.at = at
+
+    def on_tool_end(self, call):
+        super().on_tool_end(call)
+        if self.at == "tool_end":
+            raise KeyboardInterrupt
+
+    def on_tool_result(self, call, result, *, previewed):
+        super().on_tool_result(call, result, previewed=previewed)
+        if self.at == "tool_result":
+            raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize("at", ["tool_end", "tool_result"])
+def test_interrupt_after_tool_ran_keeps_its_result(tmp_path, at):
+    from gigacrew.agent.decisions import DecisionMemory
+
+    script = _script(tmp_path)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    events = _InterruptAfterRun(at)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, yes_all=True)
+    provider = ScriptedProvider([tool_turn("run_shell", {"command": script})])
+    agent = Agent(provider, build_default_registry(), cfg, events, decisions=memory)
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    # действие совершено: модель видит результат, а не «прервано, результата нет»
+    [result] = _function_results(agent)
+    assert "built" in result and result != INTERRUPTED_NOTE
+    lines = [json.loads(line) for line in memory.journal_path.read_text().splitlines()]
+    assert [x["event"] for x in lines] == ["decision", "outcome"]
+    assert lines[1]["ok"] is True and "interrupted" not in lines[1]
+    _assert_well_formed(agent.conversation.messages)
+
+
+def test_interrupt_during_tool_run_is_journaled_as_interrupted(tmp_path, monkeypatch):
+    from gigacrew.agent.decisions import DecisionMemory
+    from gigacrew.tools.shell import RunShellTool
+
+    def interrupted(self, params, ctx):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(RunShellTool, "run", interrupted)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, yes_all=True)
+    provider = ScriptedProvider([tool_turn("run_shell", {"command": _script(tmp_path)})])
+    agent = Agent(provider, build_default_registry(), cfg, RecordingEvents(), decisions=memory)
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    assert _function_results(agent) == [INTERRUPTED_NOTE]
+    outcome = json.loads(memory.journal_path.read_text().splitlines()[-1])
+    assert outcome["event"] == "outcome" and outcome["interrupted"] is True
+
+
 def test_rejected_tool_is_not_started(tmp_path):
     tool = FakeTool()
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])

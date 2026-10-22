@@ -1576,34 +1576,46 @@ class Agent:
         error = ""
         plan_writes = self._plan.writes if self._plan is not None else 0
         started = time.monotonic()
+        journaled = False
         self._events.on_tool_start(call)
         try:
-            result = tool.run(params, self._ctx)
-        except ToolError as e:
-            error = str(e)
-        except Exception as e:  # неожиданная ошибка — не роняем агента
-            error = f"внутренняя ошибка выполнения: {e}"
-        except BaseException:  # Ctrl+C: исход в журнале — «прервано»
-            self._journal_end(journal, interrupted=True, duration=time.monotonic() - started)
-            raise
-        finally:
-            self._events.on_tool_end(call)
-        self._journal_end(journal, result=result, error=error, duration=time.monotonic() - started)
-        if result is None:
-            return self._fail(call, error or "инструмент не вернул результат", note=note)
+            try:
+                result = tool.run(params, self._ctx)
+            except ToolError as e:
+                error = str(e)
+            except Exception as e:  # неожиданная ошибка — не роняем агента
+                error = f"внутренняя ошибка выполнения: {e}"
+            finally:
+                self._events.on_tool_end(call)
+            self._journal_end(
+                journal, result=result, error=error, duration=time.monotonic() - started
+            )
+            journaled = True
+            if result is None:
+                return self._fail(call, error or "инструмент не вернул результат", note=note)
 
-        if result.ok and risk >= RiskLevel.WRITE:
-            result.changed = True  # UI и журнал суб-агента видят изменение
-        self._events.on_tool_result(call, result, previewed=previewed)
-        content = result.as_function_content()
-        try:
+            if result.ok and risk >= RiskLevel.WRITE:
+                result.changed = True  # UI и журнал суб-агента видят изменение
+            self._events.on_tool_result(call, result, previewed=previewed)
             feedback = self._post_tool_hooks(name, hook_fields, result)
         except BaseException:
-            # Инструмент уже выполнен: модель должна знать результат, даже если хук прерван.
-            self._conversation.add_function_result(name, _with_note(content, note))
+            # Ctrl+C/Esc во время работы инструмента — в журнале «прервано». Пришёл уже
+            # после неё (показ результата, хук PostToolUse) — действие совершено: модель
+            # должна знать настоящий результат, а не «прервано, результата нет».
+            if not journaled:
+                self._journal_end(
+                    journal,
+                    result=result,
+                    interrupted=result is None,
+                    duration=time.monotonic() - started,
+                )
+            if result is not None:
+                self._conversation.add_function_result(
+                    name, _with_note(result.as_function_content(), note)
+                )
             raise
         self._conversation.add_function_result(
-            name, _with_note(content, _join_notes(feedback, note))
+            name, _with_note(result.as_function_content(), _join_notes(feedback, note))
         )
         if result.ok:
             self._attach_instructions(tool, params)
