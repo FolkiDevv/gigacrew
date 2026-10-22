@@ -421,3 +421,23 @@ def test_escaped_child_is_not_reported_as_stopped(ctx):
         assert not res.killed_background and res.escaped_output
     finally:
         os.kill(pid, signal.SIGKILL)
+
+
+@posix_only
+def test_shell_says_when_escaped_child_could_not_be_stopped(ctx):
+    # run_shell: модель и пользователь узнают, что фоновый процесс продолжает работать.
+    import shutil
+    import signal
+
+    if not shutil.which("setsid"):
+        pytest.skip("нет setsid")
+    pidfile = ctx.root / "pid"
+    res = _sh(ctx, f"setsid sh -c 'echo $$ > {pidfile}; exec sleep 30' & sleep 0.3; echo started")
+    pid = int(pidfile.read_text())
+    try:
+        assert "started" in res.content
+        assert "остановить не удалось" in res.content
+        assert "остановлены" not in res.content
+        assert "остановить не удалось" in res.summary  # пользователь видит итог вызова
+    finally:
+        os.kill(pid, signal.SIGKILL)

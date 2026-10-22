@@ -137,6 +137,13 @@ class RunShellTool(Tool):
         else:
             head = f"exit code: {res.returncode}"
             summary = f"$ {params.command[:60]} → код {res.returncode}"
+        if res.escaped_output:
+            # Потомок ушёл из группы команды (setsid) и держит вывод: killpg его не достал.
+            notes.append(
+                "фоновый процесс, ушедший из группы команды (setsid), остановить не удалось: "
+                "он продолжает работать, его вывод сюда больше не попадёт"
+            )
+            summary += " · фоновый процесс остановить не удалось"
         note_text = "".join(f"\n[{n}]" for n in notes)
         content = f"{head}{note_text}\n{combined or '(пустой вывод)'}"
         ok = res.returncode == 0 and not res.timed_out
