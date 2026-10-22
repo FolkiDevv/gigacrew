@@ -748,6 +748,11 @@ def test_oneshot_does_not_measure_unknown_window(tmp_path, oneshot, capsys, monk
     assert provider.measured == []
     assert "окно контекста M1 не замерено — считаем 32k" in out
     assert "gigacrew --test-context M1" in out
+    # и с -y: -y — согласие на правки и команды, не на оплату замера в каждом запуске CI
+    provider = WindowProvider(8_192, [text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, "-m", "M1", "-y", "-p", "x") == 0
+    assert provider.measured == [] and "gigacrew --test-context M1" in _flat(capsys)
     monkeypatch.setenv("GIGACREW_CONTEXT_TOKENS", "8000")  # явный бюджет — и подсказка не нужна
     oneshot(WindowProvider(8_192, [text_turn("ok")]))
     assert _main(tmp_path, "-m", "M2", "-p", "x") == 0

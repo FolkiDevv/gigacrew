@@ -143,8 +143,10 @@ def ensure_context_window(
     """Предлагает замерить окно текущей модели агента, если оно неизвестно.
 
     Замер оплачивается (проба размером до окна модели), поэтому без ``-y`` он
-    только с согласия пользователя; не интерактивно (``-p``, ввод не с терминала)
-    — не замеряется, выводится подсказка про ``--test-context``. Отказ запоминается
+    только с согласия пользователя; без ``-y`` при вводе не с терминала и в ``-p``
+    (``interactive=False``) даже с ``-y`` — не замеряется, выводится подсказка про
+    ``--test-context``: ``-y`` — согласие на правки и команды, а не на оплату замера
+    при каждом запуске в CI, где замеры не сохраняются между запусками. Отказ запоминается
     в ``declined`` до конца сессии. Не нужен при явном бюджете
     (``GIGACREW_CONTEXT_TOKENS``), при ``GIGACREW_AUTO_MEASURE=0`` и у провайдера
     без замера. Отмена или ошибка — работаем с окном по умолчанию.
@@ -161,10 +163,11 @@ def ensure_context_window(
         return
     fallback = format_tokens(DEFAULT_CONTEXT_WINDOW)
     later = f"замерить: gigacrew --test-context {model}"
+    # Спросить некого (с -y и не нужно) или -p: замер оплачивается, в -p — никогда.
+    if not interactive or not (agent.config.auto_approve or ui.interactive()):
+        ui.system(f"окно контекста {model} не замерено — считаем {fallback}; {later}")
+        return
     if not agent.config.auto_approve:
-        if not interactive or not ui.interactive():
-            ui.system(f"окно контекста {model} не замерено — считаем {fallback}; {later}")
-            return
         question = (
             f"Окно контекста модели {model} не замерено. Замерить? Пробные запросы "
             f"оплачиваются — до размера окна модели (≤{format_tokens(MAX_CONTEXT_WINDOW)} ток.)"
