@@ -10,6 +10,7 @@ import pytest
 from gigacrew.project.settings import (
     DEFAULT_HOOK_TIMEOUT,
     MAX_HOOK_TIMEOUT,
+    MIN_HOOK_TIMEOUT,
     HookCommand,
     HookEvent,
     HookGroup,
@@ -103,6 +104,8 @@ def test_timeout_default_and_clamp(tmp_path):
                             {"type": "command", "command": "e", "timeout": float("inf")},
                             {"type": "command", "command": "f", "timeout": float("nan")},
                             {"type": "command", "command": "g", "timeout": 10**400},
+                            {"type": "command", "command": "h", "timeout": 0},
+                            {"type": "command", "command": "i", "timeout": -5},
                         ]
                     }
                 ]
@@ -112,9 +115,15 @@ def test_timeout_default_and_clamp(tmp_path):
     settings, warnings = load_settings(ws)
     timeouts = [h.timeout for h in settings.commands(HookEvent.STOP)]
     assert timeouts == [DEFAULT_HOOK_TIMEOUT, 5, MAX_HOOK_TIMEOUT] + [DEFAULT_HOOK_TIMEOUT] * 3 + [
-        MAX_HOOK_TIMEOUT
+        MAX_HOOK_TIMEOUT,
+        MIN_HOOK_TIMEOUT,
+        MIN_HOOK_TIMEOUT,
     ]
-    assert len(warnings) == 5
+    # Каждое предупреждение — о своей команде (c…i) и с подставленным значением.
+    assert len(warnings) == 7
+    for j, warning in enumerate(warnings, start=2):
+        assert f"hooks[{j}]" in warning
+    assert f"взято {MIN_HOOK_TIMEOUT}" in warnings[-1] and "timeout -5" in warnings[-1]
 
 
 @pytest.mark.parametrize(
@@ -178,6 +187,25 @@ def test_fingerprint_only_for_project_hooks(tmp_path):
     assert len(first) == 64
     _write(ws.local_settings_file, _hooks("Stop", "echo changed"))
     assert project_fingerprint(load_settings(ws)[0]) != first
+
+
+@pytest.mark.parametrize(
+    ("file", "changed"),
+    [
+        ("settings", _hooks("PreToolUse", "echo", ".*")),  # matcher шире
+        ("settings", _hooks("PreRequest", "echo", "never")),  # другое событие
+        ("settings", _hooks("PreToolUse", "echo", "never", timeout=5)),  # таймаут
+        ("local", _hooks("PreToolUse", "echo", "never")),  # другой файл
+    ],
+)
+def test_fingerprint_covers_matcher_event_timeout_and_file(tmp_path, file, changed):
+    ws = Workspace(tmp_path)
+    _write(ws.settings_file, _hooks("PreToolUse", "echo", "never"))
+    before = project_fingerprint(load_settings(ws)[0])
+    if file == "local":
+        ws.settings_file.unlink()
+    _write(ws.settings_file if file == "settings" else ws.local_settings_file, changed)
+    assert project_fingerprint(load_settings(ws)[0]) not in ("", before)
 
 
 def test_fingerprint_ignores_user_hooks(tmp_path):

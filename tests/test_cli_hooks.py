@@ -120,6 +120,17 @@ def test_oneshot_skips_untrusted_user_hooks(tmp_path, oneshot, capsys):
     assert _log(tmp_path) == []
 
 
+def test_oneshot_skips_both_untrusted_owners(tmp_path, oneshot, capsys):
+    _write(user_settings_file(), _logging_hooks(tmp_path))
+    _write(Workspace(tmp_path).settings_file, _logging_hooks(tmp_path))
+    oneshot(ScriptedProvider([text_turn("ок")]))
+    assert _main(tmp_path) == 0
+    out = _text(capsys.readouterr().out)
+    assert "хуки пользователя и проекта" in out
+    assert "~/.gigacode/settings.json, .gigacode/settings.json" in out
+    assert _log(tmp_path) == []
+
+
 def test_oneshot_trusted_user_hooks_run(tmp_path, oneshot):
     _write(user_settings_file(), _logging_hooks(tmp_path))
     _trust_user_hooks(tmp_path)
@@ -280,6 +291,22 @@ def test_trust_prompt_declined(tmp_path, monkeypatch):
     runner = load_hooks(ws, ui, interactive=True)
     assert [h.command for h in runner.settings.commands(HookEvent.STOP)] == ["true"]
     assert not runner.has(HookEvent.SESSION_START)
+
+
+@pytest.mark.parametrize("interactive", [True, False])
+@pytest.mark.parametrize("owners", [("user",), ("project",), ("user", "project")])
+def test_unconfirmed_hooks_of_every_owner_are_skipped(tmp_path, monkeypatch, owners, interactive):
+    # Отказ (или -p) выключает хуки всех неподтверждённых владельцев, а не только первого.
+    ws = Workspace(tmp_path)
+    files = {"user": user_settings_file(), "project": ws.settings_file}
+    for owner in owners:
+        _write(
+            files[owner], {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": owner}]}]}}
+        )
+    ui = Console(no_color=True)
+    monkeypatch.setattr(ui, "ask", lambda q, dangerous=False: False)
+    runner = load_hooks(ws, ui, interactive=interactive)
+    assert runner.settings.commands(HookEvent.STOP) == []
 
 
 # ------------------------------- REPL ------------------------------- #

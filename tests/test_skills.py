@@ -16,6 +16,7 @@ from gigacrew.cli.commands import CommandContext, default_commands, expand_skill
 from gigacrew.cli.repl import run_repl
 from gigacrew.config import Config
 from gigacrew.project.skills import (
+    MAX_SKILL_BYTES,
     SkillCatalog,
     discover_skills,
     parse_skill,
@@ -101,6 +102,21 @@ def test_discover_project_and_user_skills(tmp_path, _isolated_home):
         ("notes", "заметки", "user"),
     ]
     assert user_skills_dir() == _isolated_home / ".gigacode" / "skills"
+
+
+def test_project_skill_overrides_user_skill_ignoring_case(tmp_path):
+    project = tmp_path / "proj"
+    _skill(user_skills_dir(), "Deploy", "---\ndescription: пользовательский\n---\nx\n")
+    _project_skill(project, "deploy", "проектный")
+    skills = discover_skills(Workspace(project))
+    assert [(s.name, s.description, s.source) for s in skills] == [
+        ("deploy", "проектный", "project")
+    ]
+
+
+def test_oversized_skill_is_ignored(tmp_path):
+    path = _skill(tmp_path, "big", "---\nname: big\n---\n" + "x" * MAX_SKILL_BYTES)
+    assert parse_skill(path) is None
 
 
 def test_old_gigacrew_folder_is_not_used(tmp_path):
