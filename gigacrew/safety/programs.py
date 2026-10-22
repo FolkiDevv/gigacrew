@@ -2499,23 +2499,38 @@ def _go(env: Env, args: list[Word]) -> Part:
     return _unknown(f"go {sub}: подкоманда не проверена")
 
 
+def _make_jobs(args: list[Word]) -> list[Word]:
+    """У -j/-l значение необязательно: `make -j test` — цель test, `make -j 4` — четыре
+    задания. Число после них склеивается с флагом (`-j4`), иначе флаг — без значения."""
+    out: list[Word] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        if (
+            a.static
+            and nxt is not None
+            and nxt.static
+            and re.fullmatch(r"\d+(\.\d+)?", nxt.value)
+            and (
+                # в `-Cj 4` j — значение -C, а не флаг
+                (re.fullmatch(r"-[a-zA-Z]*[jl]", a.value) and not set(a.value[1:-1]) & set("CfoWI"))
+                or a.value in ("--jobs", "--load-average")
+            )
+        ):
+            sep = "=" if a.value.startswith("--") else ""
+            out.append(Word(a.value + sep + nxt.value, a.raw))
+            i += 2
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
 def _make(env: Env, args: list[Word]) -> Part:
     rest, found = _options(
-        args,
-        (
-            "-C",
-            "--directory",
-            "-f",
-            "--file",
-            "--makefile",
-            "-j",
-            "--jobs",
-            "-l",
-            "--load-average",
-            "-o",
-            "-W",
-            "-I",
-        ),
+        _make_jobs(args),
+        ("-C", "--directory", "-f", "--file", "--makefile", "-o", "-W", "-I"),
     )
     dirs = [w for n, w in found if n in ("-C", "--directory")]
     makefiles = [w for n, w in found if n in ("-f", "--file", "--makefile")]
@@ -2526,13 +2541,17 @@ def _make(env: Env, args: list[Word]) -> Part:
     targets = [p.value for p in pos if p.static and "=" not in p.value]
     if any(not p.static for p in pos):
         return _unknown("make: цель известна только при выполнении")
-    if any("=" in p.value for p in pos if p.static):
-        assigned = [p.value.split("=", 1)[0] for p in pos if "=" in p.value]
-        for n in assigned:
-            if _DANGER_ENV.match(n) or n in ("SHELL", "MAKE"):
-                return _danger(f"make {n}=…: подмена программ")
-    if _has(_flagset(flags), "-n", "--dry-run", "--just-print", "-p", "--print-data-base", "-q"):
-        return _read("make -n: только показ команд")
+    assigned = [p for p in pos if "=" in p.value]
+    for a in assigned:
+        n = a.value.split("=", 1)[0]
+        if _DANGER_ENV.match(n) or n in ("SHELL", "MAKE"):
+            return _danger(f"make {n}=…: подмена программ")
+    bad = _check_exec_args(env, assigned, "make")  # `make test PYTHON=/tmp/x/python`
+    if bad is not None:
+        return bad
+    # -n/-q/-p — не «только чтение»: make всё равно разбирает Makefile ($(shell …),
+    # пересборка включаемых файлов) и выполняет строки рецептов с «+» и $(MAKE), а -p
+    # после вывода базы собирает цели как обычно. Оценка — как у запуска make.
     if any(_DEPLOY.search(t) or t in ("install", "uninstall", "push") for t in targets):
         return _danger(f"make {' '.join(targets)}: установка или публикация")
     if targets and all(
@@ -2546,6 +2565,7 @@ def _make(env: Env, args: list[Word]) -> Part:
         )
         or dirs
         or makefiles
+        or assigned  # переменные меняют рецепты: только точная команда
     ):
         return _exec(f"{signature}: цели Makefile (код проекта)", None)
     return _exec(f"{signature}: цели Makefile (код проекта)", signature)

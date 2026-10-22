@@ -479,6 +479,40 @@ def test_script_signature_changes_with_content(root):
     assert classify("./check.sh --flag", root=root).signatures == ()  # с аргументами — точно
 
 
+def test_make_dry_run_still_runs_makefile_code(root):
+    # GNU make разбирает Makefile ($(shell …)) и выполняет «+»-рецепты и при -n/-q, а -p
+    # после вывода базы собирает цели как обычно
+    (root / "Makefile").write_text("X := $(shell touch pwned)\nall:\n\t+touch built\n")
+    for command in ("make -n", "make -p", "make -q", "make --dry-run", "make -n test"):
+        verdict = classify(command, root=root)
+        assert verdict.level is EXEC, (command, verdict.reason)
+        assert verdict.signatures == (), command  # только точная команда
+    assert classify("make test", root=root).signatures == ("make test",)
+
+
+@pytest.mark.parametrize(
+    "command, expected, signatures",
+    [
+        ("make -j 4 test", EXEC, ("make test",)),
+        ("make -j8 test", EXEC, ("make test",)),
+        ("make --jobs 4 test", EXEC, ("make test",)),
+        # у -j значение необязательно: следующее слово — цель
+        ("make -j test", EXEC, ("make test",)),
+        ("make -j install", DANGER, ()),
+        ("make -j deploy", DANGER, ()),
+        # переменные в аргументах меняют рецепты
+        ("make test PYTHON=python3", EXEC, ()),
+        ("make test PYTHON=/tmp/evil", None, ()),
+        ("make SHELL=./x test", DANGER, ()),
+        ("make MAKE=./x test", DANGER, ()),
+    ],
+)
+def test_make_arguments(root, command, expected, signatures):
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, (command, verdict.reason)
+    assert verdict.signatures == signatures, command
+
+
 def test_npm_script_must_exist(root):
     assert level("npm run lint", root) is None  # нет в package.json
     assert level("npm run deploy", root) is DANGER
