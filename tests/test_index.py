@@ -349,3 +349,59 @@ def test_recursive_call_on_definition_line_is_a_reference(tmp_path):
         ix.refresh()
         hits = ix.find_refs("fact").hits
         assert [(h.line, h.kind, h.scope) for h in hits] == [(1, "call", "fact")]
+
+
+def _corrupt_pages(ws: Workspace) -> None:
+    """Порча страниц данных при целых заголовке и meta (сбой диска, запись наполовину)."""
+    import sqlite3
+
+    db = ws.index_dir / INDEX_FILE_NAME
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # страницы — в основной файл
+    conn.close()
+    size = db.stat().st_size
+    with open(db, "r+b") as f:  # страницы 1–16 (схема, meta) целы, дальше — мусор
+        f.seek(16 * 4096)
+        f.write(bytes(range(256)) * ((size - 16 * 4096) // 256))
+
+
+def _big_project(root) -> Workspace:
+    for i in range(150):
+        body = "\n".join(f"def func_{i}_{j}(x):\n    return helper_{j}(x)\n" for j in range(20))
+        (root / f"m{i}.py").write_text(body, encoding="utf-8")
+    ws = Workspace(root)
+    with ProjectIndex(ws) as ix:
+        ix.refresh()
+    return ws
+
+
+def test_corrupted_data_pages_are_detected_and_index_recreated(tmp_path):
+    import sqlite3
+
+    from gigacrew.project.index import is_corruption
+
+    ws = _big_project(tmp_path)
+    _corrupt_pages(ws)
+    with ProjectIndex(ws) as ix:
+        assert ix.is_complete()  # заголовок и meta целы — повреждение не видно сразу
+        with pytest.raises(sqlite3.DatabaseError) as error:
+            ix.find_symbols("func_1_1")
+        assert is_corruption(error.value)
+        ix.discard()
+        assert not ix.is_complete()
+        assert ix.refresh().added == 150
+        assert ix.find_symbols("func_1_19")[1] == 1
+    assert not is_corruption(sqlite3.OperationalError("database is locked"))
+
+
+def test_index_command_rebuilds_corrupted_index(tmp_path, capsys):
+    from gigacrew.cli.indexing import run_indexing
+    from gigacrew.ui.console import Console
+
+    ws = _big_project(tmp_path)
+    _corrupt_pages(ws)
+    result = run_indexing(ProjectIndex(ws), Console(no_color=True))
+    assert result is not None and result[1].files == 150
+    assert "повреждён" in capsys.readouterr().out
+    with ProjectIndex(ws) as ix:
+        assert ix.find_symbols("func_1_19")[1] == 1
