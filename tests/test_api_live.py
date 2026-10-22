@@ -37,8 +37,11 @@ def test_simple_completion(provider):
 
 
 def test_models_listing(provider):
+    """Список — чат-модели шлюза, и модель тестов среди них."""
     models = provider.list_models()
-    assert models
+    assert provider.model in models, f"{provider.model} нет в списке моделей: {models}"
+    assert all(isinstance(m, str) and m for m in models)
+    assert len(set(models)) == len(models)
 
 
 def test_streaming_text(provider):
@@ -65,8 +68,11 @@ def test_streaming_tool_call(provider):
     )
     assert turn.finish_reason == "function_call"
     assert turn.wants_tool
-    assert turn.message.function_calls[0].name == "get_weather"
-    assert "city" in turn.message.function_calls[0].arguments
+    fc = turn.message.function_calls[0]
+    assert fc.name == "get_weather"
+    assert "сочи" in str(fc.arguments.get("city", "")).lower()
+    # вызов из потока можно вернуть в историю: id и состояние пришли и здесь
+    assert fc.id and turn.message.state_id
 
 
 WEATHER_TOOL = ToolSpec(
@@ -96,7 +102,7 @@ def test_single_tool_call(provider):
     fc = turn.message.function_calls[0]
     assert fc.name == "get_weather"
     assert isinstance(fc.arguments, dict)
-    assert "city" in fc.arguments
+    assert "москв" in str(fc.arguments.get("city", "")).lower()
     # API возвращает id вызова и непрозрачный идентификатор состояния инструментов
     assert fc.id
     assert turn.message.state_id
@@ -125,7 +131,7 @@ def test_multistep_with_tool_result(provider):
             )
         )
     turn2 = provider.complete(messages, tools=[WEATHER_TOOL])
-    assert turn2.finish_reason == "stop"
+    assert turn2.finish_reason == "stop" and not turn2.wants_tool
     # модель должна использовать переданное значение температуры
     assert "17" in turn2.message.content
 
@@ -146,6 +152,8 @@ def test_parallel_calls_round_trip(provider):
     if len(calls) < 2:
         pytest.skip(f"модель сделала {len(calls)} вызов(а) — параллельность не проверена")
     assert len({c.id for c in calls}) == len(calls), "у вызовов должны быть разные id"
+    cities = " ".join(str(c.arguments.get("city", "")) for c in calls).lower()
+    assert "москв" in cities and "казан" in cities, cities
     messages.append(turn1.message)
     for i, call in enumerate(calls):
         city = call.arguments.get("city", "?")
@@ -158,8 +166,10 @@ def test_parallel_calls_round_trip(provider):
             )
         )
     turn2 = provider.stream(messages, tools=[WEATHER_TOOL])
-    assert turn2.finish_reason == "stop"
-    assert turn2.message.content.strip()
+    assert turn2.finish_reason == "stop" and not turn2.wants_tool
+    # результаты обоих вызовов дошли до модели: в сравнении — обе температуры
+    temperatures = [str(10 + i) for i in range(len(calls))]
+    assert all(t in turn2.message.content for t in temperatures), turn2.message.content
 
 
 def test_tool_choice_none_answers_with_text(provider):
@@ -169,7 +179,8 @@ def test_tool_choice_none_answers_with_text(provider):
         tools=[WEATHER_TOOL],
         tool_choice="none",
     )
-    assert not turn.wants_tool
+    assert not turn.wants_tool and turn.message.function_calls == []
+    assert turn.finish_reason == "stop"
     assert turn.message.content.strip()
 
 

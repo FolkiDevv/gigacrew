@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from dataclasses import replace
 
 import pytest
@@ -46,8 +48,18 @@ def test_end_to_end_mini_task(live_config, tmp_path):
     target = tmp_path / "greet.py"
     assert target.exists(), "агент должен был создать greet.py"
     text = target.read_text(encoding="utf-8")
-    assert "def greet" in text, f"в файле нет функции greet:\n{text}"
-    assert "print" in text
+    # файл делает то, что просили: запуск печатает приветствие
+    run = subprocess.run(
+        [sys.executable, str(target)], capture_output=True, text=True, timeout=30, cwd=tmp_path
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == "Привет, Мир!", f"вывод: {run.stdout!r}\n{text}"
+    # и агент сам выполнил команду: в истории — run_shell и её вывод
+    shell = [
+        m for m in agent.conversation.messages if m.role == "function" and m.name == "run_shell"
+    ]
+    assert shell, "агент не запускал команду"
+    assert any("Привет, Мир!" in m.content for m in shell), [m.content for m in shell]
 
 
 def test_agent_reads_and_edits_existing_file(live_config, tmp_path):
@@ -66,7 +78,9 @@ def test_agent_reads_and_edits_existing_file(live_config, tmp_path):
         provider.close()
 
     text = (tmp_path / "version.txt").read_text(encoding="utf-8")
-    assert "2.0.0" in text, f"версия не обновлена:\n{text}"
+    assert text == "version = 2.0.0\n", f"ожидалась точечная правка версии:\n{text}"
+    calls = [c.name for m in agent.conversation.messages for c in m.function_calls]
+    assert "read_file" in calls and "edit_file" in calls, calls
 
 
 def test_agent_continues_after_tool_call(live_config):
