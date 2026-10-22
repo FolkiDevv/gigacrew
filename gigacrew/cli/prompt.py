@@ -167,14 +167,22 @@ class SlashCommandCompleter(Completer):
 class LazyFileHistory(FileHistory):
     """История в ``.gigacode/history``; папка создаётся при первом сохранении.
 
-    Если записать не удалось (проект только для чтения), история остаётся в памяти
-    до конца сессии — ошибка не должна закрывать REPL.
+    Если записать не удалось (проект только для чтения, история — симлинк из
+    репозитория), история остаётся в памяти до конца сессии — ошибка не должна
+    закрывать REPL.
     """
 
     def __init__(self, workspace: Workspace):
         self._workspace = workspace
         self._persist = True
         super().__init__(workspace.history_file)
+
+    def load_history_strings(self) -> Iterable[str]:
+        # Симлинк на месте папки или файла истории принёс репозиторий: это не наша история
+        # (писать по нему не даст Workspace.ensure_data_dir).
+        if self._workspace.data_dir.is_symlink() or Path(self.filename).is_symlink():
+            return []
+        return super().load_history_strings()
 
     def store_string(self, string: str) -> None:
         if not self._persist:

@@ -90,6 +90,35 @@ def test_ensure_data_dir_creates_gitignore_idempotently(tmp_path):
     assert gi.read_text(encoding="utf-8") == "# мой\n*\n!keep\n"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+@pytest.mark.parametrize("entry", ["", ".gitignore", "chats", "index", "plans", "history"])
+def test_ensure_data_dir_refuses_symlinks_out_of_it(tmp_path, entry):
+    """Репозиторий может принести симлинк на месте .gigacode или её служебной записи (git
+    восстанавливает симлинки при клоне): gigacrew не пишет по нему за пределы проекта."""
+    root, outside = tmp_path / "proj", tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    ws = Workspace(root)
+    if not entry:
+        ws.data_dir.symlink_to(outside, target_is_directory=True)
+    else:
+        ws.data_dir.mkdir()
+        target = outside if entry in ("chats", "index", "plans") else outside / "victim"
+        (ws.data_dir / entry).symlink_to(target)  # .gitignore — висячий симлинк
+    with pytest.raises(OSError, match="симлинк"):
+        ws.ensure_data_dir()
+    assert list(outside.iterdir()) == []
+
+
+def test_ensure_data_dir_keeps_regular_entries(tmp_path):
+    ws = Workspace(tmp_path)
+    for path in (ws.chats_dir, ws.index_dir):
+        path.mkdir(parents=True)
+    ws.history_file.write_text("+a\n", encoding="utf-8")
+    assert ws.ensure_data_dir() == ws.data_dir
+    assert (ws.data_dir / ".gitignore").is_file()
+
+
 # ------------------------------ glob_match ------------------------------ #
 @pytest.mark.parametrize(
     "path, pattern, expected",
