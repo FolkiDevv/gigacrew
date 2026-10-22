@@ -3,9 +3,15 @@
 Источники настроек (в порядке приоритета):
   1. Явные аргументы командной строки (передаются в Config.load()).
   2. Переменные окружения.
-  3. Файл .env в корне проекта.
-  4. Файл .env в текущей директории (если она не корень проекта).
-  5. Значения по умолчанию.
+  3. Файл пользователя ``~/.gigacode/.env`` (общий для всех проектов).
+  4. Файл .env в корне проекта.
+  5. Файл .env в текущей директории (если она не корень проекта).
+  6. Значения по умолчанию.
+
+Файлы .env проекта и текущей директории — содержимое репозитория, поэтому настройки
+безопасности (адреса API, проверка TLS, корневые сертификаты, каталог GigaCode,
+клиентский сертификат — :data:`SECURITY_KEYS`) из них не берутся: только из окружения
+и файла пользователя.
 
 Файлы .env читаются в отдельный словарь и НЕ попадают в ``os.environ`` — иначе
 секреты унаследовали бы все процессы, которые запускает агент.
@@ -25,6 +31,7 @@ from pathlib import Path
 import httpx
 
 from gigacrew.permissions import PermissionMode, parse_mode
+from gigacrew.project.workspace import user_data_dir
 
 
 class ConfigError(ValueError):
@@ -71,27 +78,90 @@ def _dotenv_value(raw: str) -> str:
     return _INLINE_COMMENT_RE.split(value, maxsplit=1)[0].rstrip()
 
 
-def load_environment(
+# Настройки безопасности: их задают только окружение и ~/.gigacode/.env, но не .env проекта
+# (или текущей папки) — это содержимое репозитория, его может прислать кто угодно.
+#   * GIGACREW_API_URL — куда идут токен, клиентский сертификат и код проекта (у бэкенда
+#     GigaCode — и адрес его конфигурации, из которой берётся адрес чата);
+#   * GIGACREW_AUTH_URL — куда уходит Basic-ключ OAuth;
+#   * GIGACREW_VERIFY_SSL, GIGACREW_CA_BUNDLE — кому верить как серверу;
+#   * GIGACODE_HOME — откуда берутся токен официального CLI и его доверенные корни (certs/);
+#   * GIGACREW_CERT, GIGACREW_KEY — чьим сертификатом подписаны запросы: с чужим запросы
+#     и код проекта ушли бы под учётной записью автора репозитория.
+# Ключ доступа (GIGACREW_ACCESS_KEY) из .env проекта по-прежнему читается: на чужой адрес
+# его уже не отправить. User-Agent и scope ничего не перенаправляют, модель и режим
+# разрешений — обычные настройки (режим из .env может лишь ужесточить работу).
+SECURITY_KEYS: tuple[str, ...] = (
+    "GIGACREW_API_URL",
+    "GIGACREW_AUTH_URL",
+    "GIGACREW_VERIFY_SSL",
+    "GIGACREW_CA_BUNDLE",
+    "GIGACODE_HOME",
+    "GIGACREW_CERT",
+    "GIGACREW_KEY",
+)
+USER_ENV_HINT = "~/.gigacode/.env"
+
+
+def user_env_file() -> Path:
+    """``~/.gigacode/.env`` — настройки пользователя, общие для всех проектов (доверенные)."""
+    return user_data_dir() / ".env"
+
+
+@dataclass(frozen=True)
+class Environment:
+    """Сводное окружение и настройки безопасности, пропущенные в .env проекта."""
+
+    values: dict[str, str]
+    ignored: tuple[tuple[str, str], ...] = ()  # (ключ, файл .env)
+
+
+def collect_environment(
     root: Path,
     *,
     environ: Mapping[str, str] | None = None,
     cwd: Path | None = None,
-) -> dict[str, str]:
-    """Сводное окружение: environ > <root>/.env > <cwd>/.env.
+    trusted_dotenv: bool = False,
+) -> Environment:
+    """Сводное окружение: environ > ~/.gigacode/.env > <root>/.env > <cwd>/.env.
 
+    Из ``<root>/.env`` и ``<cwd>/.env`` настройки безопасности (:data:`SECURITY_KEYS`) не
+    берутся; ``trusted_dotenv`` — берутся (собственный .env разработчиков gigacrew для
+    live-тестов). Пропущенные возвращаются, только если итоговое значение другое.
     Порядок детерминирован; одинаковые пути читаются один раз.
     """
     environ = os.environ if environ is None else environ
     cwd = (cwd or Path.cwd()).resolve()
     root = root.resolve()
+    user_file = user_env_file()
     merged: dict[str, str] = {}
+    skipped: list[tuple[str, str, str]] = []
     # От младшего источника к старшему: каждый следующий перекрывает предыдущий.
     sources = [cwd / ".env"] if cwd != root else []
     sources.append(root / ".env")
     for path in sources:
-        merged.update(read_dotenv(path))
+        if path == user_file:
+            continue  # проект — сам ~/.gigacode: файл прочитается ниже, как доверенный
+        for key, value in read_dotenv(path).items():
+            if key in SECURITY_KEYS and not trusted_dotenv:
+                if value.strip():
+                    skipped.append((key, str(path), value))
+                continue
+            merged[key] = value
+    merged.update(read_dotenv(user_file))
     merged.update(environ)
-    return merged
+    ignored = tuple((key, path) for key, path, value in skipped if merged.get(key) != value)
+    return Environment(merged, ignored)
+
+
+def load_environment(
+    root: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+    trusted_dotenv: bool = False,
+) -> dict[str, str]:
+    """Сводное окружение (см. :func:`collect_environment`)."""
+    return collect_environment(root, environ=environ, cwd=cwd, trusted_dotenv=trusted_dotenv).values
 
 
 def _env_bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
@@ -282,6 +352,9 @@ class Config:
     subagent_max_steps: int = 25
     subagent_context_share: float = 0.8
     subagent_timeout: int = 600
+    # Настройки безопасности, которые .env проекта задавал, но они пропущены:
+    # (ключ, файл) — для предупреждения при запуске (:attr:`ignored_env_warning`).
+    ignored_env: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def load(
@@ -296,13 +369,19 @@ class Config:
         save_chats: bool = True,
         environ: Mapping[str, str] | None = None,
         cwd: Path | None = None,
+        trusted_dotenv: bool = False,
     ) -> Config:
         """Собирает конфигурацию. Некорректные значения → :class:`ConfigError`.
 
         ``environ``/``cwd`` подменяются в тестах (по умолчанию — os.environ и Path.cwd()).
+        ``trusted_dotenv`` — брать из .env проекта и настройки безопасности
+        (:func:`collect_environment`).
         """
         root = Path(project_root or cwd or Path.cwd()).resolve()
-        env = load_environment(root, environ=environ, cwd=cwd)
+        collected = collect_environment(
+            root, environ=environ, cwd=cwd, trusted_dotenv=trusted_dotenv
+        )
+        env = collected.values
 
         access_key = env.get("GIGACREW_ACCESS_KEY") or None
         cert = env.get("GIGACREW_CERT") or None
@@ -355,6 +434,20 @@ class Config:
             )
             / 100,
             subagent_timeout=_env_int(env, "GIGACREW_SUBAGENT_TIMEOUT", 600, minimum=10),
+            ignored_env=collected.ignored,
+        )
+
+    @property
+    def ignored_env_warning(self) -> str | None:
+        """Предупреждение о пропущенных настройках безопасности из .env проекта."""
+        if not self.ignored_env:
+            return None
+        keys = list(dict.fromkeys(key for key, _ in self.ignored_env))
+        files = list(dict.fromkeys(path for _, path in self.ignored_env))
+        return (
+            f"в {', '.join(files)} не действуют настройки безопасности: {', '.join(keys)} — "
+            "их может прислать репозиторий. Задайте их в переменных окружения или в "
+            f"{USER_ENV_HINT} (файл пользователя, общий для всех проектов)"
         )
 
     @property
@@ -456,8 +549,8 @@ class Config:
         if self.provider == "gigacode":
             if not self.base_url:
                 raise RuntimeError(
-                    "Не задан адрес бэкенда GigaCode. Укажите GIGACREW_API_URL в .env или "
-                    "переменных окружения. См. .env.example."
+                    "Не задан адрес бэкенда GigaCode. Укажите GIGACREW_API_URL в переменных "
+                    "окружения или ~/.gigacode/.env (не в .env проекта). См. .env.example."
                 )
             if not self.user_agent:
                 raise RuntimeError(
@@ -467,17 +560,18 @@ class Config:
             return
         if self.auth_mode == "none":
             raise RuntimeError(
-                "Не заданы реквизиты API. Укажите либо GIGACREW_ACCESS_KEY (OAuth), "
-                "либо пару GIGACREW_CERT и GIGACREW_KEY (mTLS) в .env или переменных "
-                "окружения. См. .env.example."
+                "Не заданы реквизиты API. Укажите либо GIGACREW_ACCESS_KEY (OAuth) в .env или "
+                "переменных окружения, либо пару GIGACREW_CERT и GIGACREW_KEY (mTLS) в "
+                "переменных окружения или ~/.gigacode/.env. См. .env.example."
             )
         if not self.base_url:
             raise RuntimeError(
-                "Не задан адрес API. Укажите GIGACREW_API_URL в .env или переменных "
-                "окружения. См. .env.example."
+                "Не задан адрес API. Укажите GIGACREW_API_URL в переменных окружения или "
+                "~/.gigacode/.env (не в .env проекта). См. .env.example."
             )
         if self.auth_mode == "oauth" and not self.auth_url:
             raise RuntimeError(
                 "Не задан адрес выдачи токена. Для схемы OAuth укажите GIGACREW_AUTH_URL "
-                "в .env или переменных окружения. См. .env.example."
+                "в переменных окружения или ~/.gigacode/.env (не в .env проекта). "
+                "См. .env.example."
             )

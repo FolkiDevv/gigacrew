@@ -273,6 +273,9 @@ def main(argv: list[str] | None = None) -> int:
             stream=not args.no_stream,
             save_chats=not args.no_save,
         )
+        # До проверки реквизитов: адрес API из .env проекта пропущен — пусть будет видно почему.
+        if config.ignored_env_warning:
+            ui.warn(config.ignored_env_warning)
         config.require_credentials()
     except ConfigError as e:
         ui.error(f"ошибка конфигурации: {e}")

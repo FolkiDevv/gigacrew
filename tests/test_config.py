@@ -534,3 +534,93 @@ def test_mtls_verifies_server_by_default(tmp_path, _certifi_roots):
     env["GIGACREW_VERIFY_SSL"] = "0"
     context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
     assert context.verify_mode == ssl.CERT_NONE
+
+
+# ------------------- настройки безопасности из .env проекта ------------------- #
+_SECURITY = (
+    "GIGACREW_API_URL=https://collector.test/v1\n"
+    "GIGACREW_AUTH_URL=https://collector.test/oauth\n"
+    "GIGACREW_VERIFY_SSL=0\n"
+    "GIGACREW_CA_BUNDLE={bundle}\n"
+    "GIGACODE_HOME={home}\n"
+    "GIGACREW_CERT=repo.pem\n"
+    "GIGACREW_KEY=repo.key\n"
+)
+
+
+def test_project_dotenv_cannot_set_security_settings(tmp_path):
+    """Закоммиченный .env репозитория не перенаправит ключ на чужой адрес, не выключит
+    проверку TLS и не подложит свои корни или токен; ключ доступа и прочие настройки — можно."""
+    import certifi
+
+    root, cwd = tmp_path / "repo", tmp_path / "repo" / "sub"
+    _env_file(
+        root,
+        _SECURITY.format(bundle=certifi.where(), home=root)
+        + "GIGACREW_ACCESS_KEY=k\nGIGACREW_MODEL=M\nGIGACREW_TIMEOUT=7\nGIGACREW_MODE=plan\n",
+    )
+    _env_file(cwd, "GIGACREW_AUTH_URL=https://other.test/oauth\nGIGACREW_TEMPERATURE=1\n")
+    cfg = Config.load(project_root=root, environ={}, cwd=cwd)
+    assert (cfg.base_url, cfg.auth_url, cfg.ca_bundle, cfg.gigacode_home) == ("", None, None, None)
+    assert cfg.verify_ssl and (cfg.cert, cfg.key) == (None, None)
+    assert (cfg.access_key, cfg.model, cfg.timeout, cfg.mode.value) == ("k", "M", 7, "plan")
+    assert cfg.temperature == 1.0
+    keys = {key for key, _ in cfg.ignored_env}
+    assert keys == {
+        "GIGACREW_API_URL",
+        "GIGACREW_AUTH_URL",
+        "GIGACREW_VERIFY_SSL",
+        "GIGACREW_CA_BUNDLE",
+        "GIGACODE_HOME",
+        "GIGACREW_CERT",
+        "GIGACREW_KEY",
+    }
+    assert ("GIGACREW_AUTH_URL", str(cwd.resolve() / ".env")) in cfg.ignored_env
+    text = cfg.ignored_env_warning
+    assert "GIGACREW_AUTH_URL" in text and "~/.gigacode/.env" in text
+
+
+def test_user_dotenv_and_environment_are_trusted(tmp_path, _isolated_home):
+    """Настройки безопасности задаются окружением или ~/.gigacode/.env; файл пользователя
+    важнее .env проекта, окружение — важнее всего."""
+    root = tmp_path / "repo"
+    _env_file(root, "GIGACREW_AUTH_URL=https://collector.test/oauth\nGIGACREW_MODEL=repo-M\n")
+    _env_file(
+        _isolated_home / ".gigacode",
+        "GIGACREW_AUTH_URL=https://auth.mine/oauth\nGIGACREW_VERIFY_SSL=0\n"
+        "GIGACREW_MODEL=user-M\nGIGACREW_API_URL=https://api.mine/v1\n",
+    )
+    cfg = Config.load(project_root=root, environ={}, cwd=root)
+    assert cfg.auth_url == "https://auth.mine/oauth" and not cfg.verify_ssl
+    assert cfg.base_url == "https://api.mine/v1"
+    assert cfg.model == "user-M"  # файл пользователя важнее .env проекта и для обычных настроек
+    assert [key for key, _ in cfg.ignored_env] == ["GIGACREW_AUTH_URL"]
+    env = {"GIGACREW_AUTH_URL": "https://auth.env/oauth"}
+    assert (
+        Config.load(project_root=root, environ=env, cwd=root).auth_url == env["GIGACREW_AUTH_URL"]
+    )
+    # то же значение, что задано доверенно, — не повод для предупреждения
+    _env_file(root, "GIGACREW_AUTH_URL=https://auth.mine/oauth\n")
+    cfg = Config.load(project_root=root, environ={}, cwd=root)
+    assert cfg.ignored_env == () and cfg.ignored_env_warning is None
+
+
+def test_trusted_dotenv_reads_security_settings(tmp_path):
+    """Явный доверенный режим — для собственного .env разработчиков (live-тесты)."""
+    _env_file(tmp_path, "GIGACREW_AUTH_URL=https://auth.dev/oauth\nGIGACREW_VERIFY_SSL=0\n")
+    env = load_environment(tmp_path, environ={}, cwd=tmp_path, trusted_dotenv=True)
+    assert env["GIGACREW_AUTH_URL"] == "https://auth.dev/oauth"
+    assert "GIGACREW_AUTH_URL" not in load_environment(tmp_path, environ={}, cwd=tmp_path)
+    cfg = Config.load(project_root=tmp_path, environ={}, cwd=tmp_path, trusted_dotenv=True)
+    assert cfg.auth_url == "https://auth.dev/oauth" and not cfg.verify_ssl
+    assert cfg.ignored_env == ()
+
+
+def test_main_warns_about_ignored_project_settings(tmp_path, oneshot, capsys):
+    from fakes import ScriptedProvider, text_turn
+
+    _env_file(tmp_path, "GIGACREW_AUTH_URL=https://collector.test/oauth\nGIGACREW_KEY=x\n")
+    oneshot(ScriptedProvider([text_turn("ok")]))
+    assert main(["-C", str(tmp_path), "-p", "x", "--no-color", "--no-stream"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "GIGACREW_AUTH_URL, GIGACREW_KEY" in out and "~/.gigacode/.env" in out
