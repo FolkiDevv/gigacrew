@@ -137,3 +137,34 @@ def test_recursive_read_sees_escaping_links_in_service_dirs(root, directory):
     assert level("grep -Rn hello .", root) is READ
     (root / directory / "lnk").symlink_to(Path.home())
     assert level("grep -Rn hello .", root) is None
+
+
+# ------------------------- рабочий каталог -------------------------- #
+@pytest.fixture
+def two_makefiles(root: Path) -> Path:
+    (root / "vendor" / "x").mkdir(parents=True)
+    for d in (root, root / "vendor" / "x"):
+        (d / "Makefile").write_text("test:\n\techo ok\n")
+        (d / "run.sh").write_text("#!/bin/sh\necho ok\n")
+        (d / "run.sh").chmod(0o755)
+    return root
+
+
+@pytest.mark.parametrize("command", ["make test", "./run.sh --fast"])
+def test_cd_inside_subshell_is_not_matched_by_rule_for_other_directory(two_makefiles, command):
+    """`(cd X && …)` выполняется в X, а Verdict.cwd остаётся корнем: по частям такую
+    команду с разрешениями не сверить, иначе правило корня сработало бы в X."""
+    from gigacrew.agent.decisions import DecisionMemory
+
+    root = two_makefiles
+    memory = DecisionMemory()
+    assert memory.approve(classify(command, root=root))
+    assert memory.match(classify(command, root=root)) is not None
+    sub = classify(f"(cd vendor/x && {command})", root=root)
+    assert sub.cwd == "." and sub.composable is False
+    assert memory.match(sub) is None
+    top = classify(f"cd vendor/x && {command}", root=root)
+    assert top.cwd == "vendor/x" and top.composable is True
+    assert memory.match(top) is None
+    # тот же каталог — по-прежнему по частям
+    assert classify(f"(cd . && {command})", root=root).composable is True

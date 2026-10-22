@@ -149,7 +149,10 @@ def _classify(
         )
     level = worst(*(p.level for p in everything))
     reason = _reason(level, everything)
-    composable = not writes and not problems and bool(parts)
+    # Часть, выполняемая не в script.cwd (`(cd X && make test)`), сверялась бы с
+    # разрешениями другого каталога: память решений ищет их по Verdict.cwd.
+    same_dir = all(cmd.cwd == script.cwd for cmd in script.commands)
+    composable = not writes and not problems and bool(parts) and same_dir
     return Verdict(level, reason, script.cwd, script.rest, tuple(parts), composable)
 
 
