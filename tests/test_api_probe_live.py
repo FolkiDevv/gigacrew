@@ -77,7 +77,7 @@ SAMPLING = {
 def api():
     if not MODELS:
         pytest.skip("не заданы модели")
-    config = Config.load(project_root=REPO_ROOT, model=MODELS[0])
+    config = Config.load(project_root=REPO_ROOT, trusted_dotenv=True, model=MODELS[0])
     if config.provider != "api":
         pytest.skip("пробы шлюза — для API v2 (GIGACREW_PROVIDER=api)")
     try:

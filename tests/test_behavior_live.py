@@ -82,7 +82,7 @@ def eval_session():
     Окна читаются до того, как фикстура ``_isolated_home`` подменит домашнюю папку
     (фикстуры сессии создаются раньше фикстур теста).
     """
-    config = Config.load(project_root=REPO_ROOT, model=MODELS[0])
+    config = Config.load(project_root=REPO_ROOT, trusted_dotenv=True, model=MODELS[0])
     if config.provider != "api":
         pytest.skip("eval — для API v2 (GIGACREW_PROVIDER=api)")
     try:
