@@ -63,6 +63,11 @@ def _fence(text: str) -> str:
     return "`" * max(3, longest + 1)
 
 
+def _one_line(text: str) -> str:
+    """Причина разбора одной строкой: она может цитировать пути и имена из команды."""
+    return " ".join(text.split())
+
+
 def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> str:
     """Текст запроса рецензенту: запросы пользователя, команда, факты разбора."""
     lines = ["# The user's requests (oldest first)"]
@@ -80,13 +85,16 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
         fence,
         "",
         "# Static analysis",
-        f"Overall: {_level(verdict.level)} — {verdict.reason or 'no details'}",
+        f"Overall: {_level(verdict.level)} — {_one_line(verdict.reason) or 'no details'}",
     ]
     parts = [p for p in verdict.parts if p.level is not CommandLevel.READ]
     if parts:
+        # Текст части — из команды (с переводами строк в кавычках) и стоит вне ограждения:
+        # строкой JSON, чтобы не начать в запросе свой раздел («# The user's requests»).
         lines.append("Parts that are not read-only:")
         lines += [
-            f"- {clip_middle(p.text or '?', PART_CLIP)}: {_level(p.level)} — {p.reason}"
+            f"- {json.dumps(clip_middle(p.text or '?', PART_CLIP), ensure_ascii=False)}: "
+            f"{_level(p.level)} — {_one_line(p.reason)}"
             for p in parts
         ]
     lines.append(
@@ -97,12 +105,16 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
 
 
 def parse_review(text: str) -> tuple[bool, str]:
-    """Решение из ответа модели: первый JSON-объект с полем ``allow``.
+    """Решение из ответа модели: JSON-объект с полем ``allow``.
 
     Модели нередко оборачивают JSON в блок кода или пишут текст вокруг — это не ошибка.
-    Объекта нет — :class:`ReviewError`.
+    Объекта нет — :class:`ReviewError`. Объектов с разными ``allow`` несколько (рецензент
+    процитировал объект из команды и ответил другим) — тоже: какой из них решение, не
+    понять, а ошибка — в осторожную сторону. Согласных объектов несколько — причина
+    последнего.
     """
     decoder = json.JSONDecoder()
+    found: list[tuple[bool, str]] = []
     for match in re.finditer(r"\{", text):
         try:
             obj, _ = decoder.raw_decode(text, match.start())
@@ -116,9 +128,13 @@ def parse_review(text: str) -> tuple[bool, str]:
         if not isinstance(allow, bool):
             continue
         reason = " ".join(str(obj.get("reason") or "").split())
-        return allow, reason[:300]
+        found.append((allow, reason[:300]))
     snippet = " ".join(text.split())[:120]
-    raise ReviewError(f"ответ рецензента не разобран: {snippet or '(пусто)'}")
+    if not found:
+        raise ReviewError(f"ответ рецензента не разобран: {snippet or '(пусто)'}")
+    if len({allow for allow, _ in found}) > 1:
+        raise ReviewError(f"противоречивый ответ рецензента: {snippet}")
+    return found[-1]
 
 
 def review_command(

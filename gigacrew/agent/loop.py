@@ -545,6 +545,11 @@ class Agent:
             self._plan.path = self._plan_path(value)
             self._plan.dirty = False
 
+    @property
+    def _session_chat_id(self) -> str:
+        """Id чата для хуков и журнала решений: у суб-агента своего чата нет — основного."""
+        return self._parent.chat_id if self._parent is not None else self._chat_id
+
     def _plan_path(self, chat_id: str) -> Path:
         return self._workspace.plans_dir / f"{chat_id}.md"
 
@@ -623,7 +628,7 @@ class Agent:
         """
         if not self._hooks.has(event, target):
             return HookResult()
-        chat_id = self._parent.chat_id if self._parent is not None else self._chat_id
+        chat_id = self._session_chat_id
         payload = {
             "session_id": chat_id,
             "transcript_path": str(self._workspace.chats_dir / f"{chat_id}.json"),
@@ -1443,20 +1448,23 @@ class Agent:
                 and verdict.level >= CommandLevel.WRITE
             ):
                 decision = Decision.BLOCK  # план: изменяющая команда, а не проверка
-            if (
-                decision is Decision.ALLOW
-                and source == "yes_flag"
-                and self.mode is PermissionMode.PLAN
-                and verdict is not None
-                and verdict.level is None
-            ):
-                # план: -y не ручается за непроверенную команду — решает пользователь
-                decision = Decision.ASK
-            # Хук — после уточнений по вердикту: allow не снимает запрет режима плана.
+            unverified = verdict is not None and verdict.level is None
+            if decision is Decision.ALLOW and source == "yes_flag" and unverified:
+                # -y не ручается за команду, которую классификатор не проверил: в плане
+                # решает пользователь, в «авто» — как без -y (рецензент, затем пользователь).
+                # Выполнять всё без вопроса обещает только --yes-all — и только в «авто».
+                if self.mode is PermissionMode.PLAN:
+                    decision = Decision.ASK
+                elif not self._cfg.yes_all:
+                    decision = Decision.REVIEW
+            # Хук — после уточнений по вердикту: allow не снимает запрет режима плана
+            # и, как -y, не ручается за непроверенную команду.
             hooked = apply_hook(decision, risk, pre.decision)
             if hooked is Decision.ALLOW and decision is not Decision.ALLOW:
-                source = "hook"
-            decision = hooked
+                if not unverified:
+                    decision, source = hooked, "hook"
+            else:
+                decision = hooked
             asking = (Decision.ASK, Decision.REVIEW)
             # Хук требует спросить — сохранённые разрешения и «всегда» не действуют.
             if decision in asking and verdict is not None and pre.decision != "ask":
@@ -1464,7 +1472,14 @@ class Agent:
                 if rule is not None:
                     decision, source = Decision.ALLOW, f"rule:{rule.id}"
                     self._events.on_notice(f"разрешено сохранённым правилом: {rule.describe()}")
-            if decision in asking and key in self._session_allowed and pre.decision != "ask":
+            if (
+                decision in asking
+                and key in self._session_allowed
+                and pre.decision != "ask"
+                and risk < RiskLevel.DANGEROUS
+                # план, как и сохранённые правила, не разрешает непроверенную команду
+                and not (self.mode is PermissionMode.PLAN and unverified)
+            ):
                 decision, source = Decision.ALLOW, "session"  # «всегда» до конца сессии
             if decision is Decision.REVIEW:
                 decision, review, review_note = self._review_command(call, params, verdict, check)
@@ -1528,8 +1543,9 @@ class Agent:
                     f"gigacrew ждёт подтверждения: {name} {call.summary}".strip(),
                 )
                 answer = _confirm_result(self._events.confirm(asked, preview, dangerous=dangerous))
-                if answer.approval is Approval.ALWAYS and pre.decision == "ask":
-                    # Хук спрашивает каждый раз — «всегда» не запомнить.
+                if answer.approval is Approval.ALWAYS and (pre.decision == "ask" or dangerous):
+                    # «Всегда» не запомнить — значит, «да» один раз: хук спрашивает каждый
+                    # раз, опасное не запоминается (интерфейс «всегда» для него не предлагает).
                     answer = replace(answer, approval=Approval.YES)
                 if verdict is not None:
                     journal = self._journal_start(
@@ -1542,7 +1558,7 @@ class Agent:
                         source="user",
                         review=review,
                     )
-                if answer.approval is Approval.ALWAYS and not dangerous:
+                if answer.approval is Approval.ALWAYS:
                     self._allow_always(asked, key, verdict)
                 elif answer.approval is not Approval.YES:
                     model_text = REJECTED_NOTE
@@ -1565,34 +1581,46 @@ class Agent:
         error = ""
         plan_writes = self._plan.writes if self._plan is not None else 0
         started = time.monotonic()
+        journaled = False
         self._events.on_tool_start(call)
         try:
-            result = tool.run(params, self._ctx)
-        except ToolError as e:
-            error = str(e)
-        except Exception as e:  # неожиданная ошибка — не роняем агента
-            error = f"внутренняя ошибка выполнения: {e}"
-        except BaseException:  # Ctrl+C: исход в журнале — «прервано»
-            self._journal_end(journal, interrupted=True, duration=time.monotonic() - started)
-            raise
-        finally:
-            self._events.on_tool_end(call)
-        self._journal_end(journal, result=result, error=error, duration=time.monotonic() - started)
-        if result is None:
-            return self._fail(call, error or "инструмент не вернул результат", note=note)
+            try:
+                result = tool.run(params, self._ctx)
+            except ToolError as e:
+                error = str(e)
+            except Exception as e:  # неожиданная ошибка — не роняем агента
+                error = f"внутренняя ошибка выполнения: {e}"
+            finally:
+                self._events.on_tool_end(call)
+            self._journal_end(
+                journal, result=result, error=error, duration=time.monotonic() - started
+            )
+            journaled = True
+            if result is None:
+                return self._fail(call, error or "инструмент не вернул результат", note=note)
 
-        if result.ok and risk >= RiskLevel.WRITE:
-            result.changed = True  # UI и журнал суб-агента видят изменение
-        self._events.on_tool_result(call, result, previewed=previewed)
-        content = result.as_function_content()
-        try:
+            if result.ok and risk >= RiskLevel.WRITE:
+                result.changed = True  # UI и журнал суб-агента видят изменение
+            self._events.on_tool_result(call, result, previewed=previewed)
             feedback = self._post_tool_hooks(name, hook_fields, result)
         except BaseException:
-            # Инструмент уже выполнен: модель должна знать результат, даже если хук прерван.
-            self._conversation.add_function_result(name, _with_note(content, note))
+            # Ctrl+C/Esc во время работы инструмента — в журнале «прервано». Пришёл уже
+            # после неё (показ результата, хук PostToolUse) — действие совершено: модель
+            # должна знать настоящий результат, а не «прервано, результата нет».
+            if not journaled:
+                self._journal_end(
+                    journal,
+                    result=result,
+                    interrupted=result is None,
+                    duration=time.monotonic() - started,
+                )
+            if result is not None:
+                self._conversation.add_function_result(
+                    name, _with_note(result.as_function_content(), note)
+                )
             raise
         self._conversation.add_function_result(
-            name, _with_note(content, _join_notes(feedback, note))
+            name, _with_note(result.as_function_content(), _join_notes(feedback, note))
         )
         if result.ok:
             self._attach_instructions(tool, params)
@@ -1660,7 +1688,11 @@ class Agent:
             if child._stop_level >= 2:  # повторный Esc: оборвать суб-агента, ход идёт дальше
                 return aborted_report(spec, events.trail)
             # Ctrl+C: ход останавливается, но модель узнает, что успел сделать суб-агент.
-            self._conversation.add_function_result("task", interrupted_note(spec, events.trail))
+            # Ответ — тому вызову (task или explore), что его запустил: он первый без ответа.
+            pending = self._conversation.pending_calls()
+            self._conversation.add_function_result(
+                pending[0].name if pending else "task", interrupted_note(spec, events.trail)
+            )
             raise
         finally:
             with self._stop_lock:
@@ -1817,7 +1849,7 @@ class Agent:
                     "risk": risk.name,
                     "mode": self.mode.value,
                     "agent": self._subagent.name if self._subagent is not None else "main",
-                    "chat": self._chat_id,
+                    "chat": self._session_chat_id,
                     "model": self._model,
                     "decision": decision,
                     "source": source or "auto",
