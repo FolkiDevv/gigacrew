@@ -113,3 +113,63 @@ def test_each_block_is_rendered_once_with_one_block_of_context(monkeypatch):
     for ch in doc:
         stream.feed(ch)
     assert sizes and max(sizes) < 40  # контекст — один блок, а не весь префикс
+
+
+_FENCE_DOCS = {
+    "longer_fence_around_shorter": "Код:\n\n````md\n```\ninner\n```\n````\n\nпосле\n",
+    "tilde_fence": "~~~\ncode ```\n~~~~\n\nпосле\n",
+    "indented_fence": "  ```\n  x\n   ```\nпосле\n",
+    "fence_closed_with_trailing_spaces": "```\na\n```   \n# H\n",
+    "not_a_closing_fence": "```\n``` x\n````\nпосле\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FENCE_DOCS))
+def test_streaming_code_fences_equals_full_render(name):
+    doc = _FENCE_DOCS[name]
+    full = MarkdownStream(_console()).render(doc)
+    assert _streamed(doc, list(doc)) == full
+    for seed in range(3):
+        assert _streamed(doc, _random_chunks(doc, seed)) == full
+
+
+def _parsed_chars(monkeypatch) -> list[int]:
+    from gigacrew.ui import markdown_stream
+
+    sizes: list[int] = []
+    parse = markdown_stream.block_start_lines
+    monkeypatch.setattr(
+        markdown_stream, "block_start_lines", lambda src: (sizes.append(len(src)), parse(src))[1]
+    )
+    return sizes
+
+
+def test_long_answer_is_parsed_in_linear_time(monkeypatch):
+    # Каждый перевод строки разбирал весь ответ заново — O(n²) на длинных ответах.
+    sizes = _parsed_chars(monkeypatch)
+    doc = "".join(f"Абзац номер {i}: немного текста.\n\n" for i in range(300))
+    stream = MarkdownStream(_console())
+    for line in doc.splitlines(keepends=True):
+        stream.feed(line)
+    stream.finish()
+    assert sum(sizes) < 5 * len(doc)
+
+
+def test_long_open_code_block_is_not_reparsed_and_tail_is_bounded(monkeypatch):
+    sizes = _parsed_chars(monkeypatch)
+    body = "".join(f"print({i})\n" for i in range(1000))
+    stream = MarkdownStream(_console())
+    stream.feed("Код:\n\n```python\n")
+    for line in body.splitlines(keepends=True):
+        stream.feed(line)
+    assert sum(sizes) < 5 * len(body)  # внутри блока кода новых блоков быть не может
+    rendered: list[int] = []
+    render = stream.render
+    monkeypatch.setattr(stream, "render", lambda src: (rendered.append(len(src)), render(src))[1])
+    tail = ["".join(s.text for s in line).strip() for line in stream.tail_lines()]
+    tail = [line for line in tail if line]
+    assert tail[-2:] == ["print(998)", "print(999)"]
+    assert max(rendered) < len(body) // 4  # во временной области — только конец блока
+    lines = stream.feed("```\n\nКонец.\n") + stream.finish()
+    plain = ["".join(s.text for s in line) for line in lines]
+    assert any("print(0)" in line for line in plain)  # окончательно — весь блок
