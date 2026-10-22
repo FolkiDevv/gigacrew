@@ -117,6 +117,18 @@ class ChatStore:
     def exists(self, chat_id: str) -> bool:
         return self._path(chat_id).exists()
 
+    def version(self, chat_id: str) -> tuple[int, int, int] | None:
+        """Версия файла чата: inode, время изменения, размер (None — файла нет).
+
+        Запись атомарна (новый файл + ``os.replace``), поэтому каждая запись — из
+        этой сессии или из другой — меняет inode.
+        """
+        try:
+            st = self._path(chat_id).stat()
+        except OSError:
+            return None
+        return st.st_ino, st.st_mtime_ns, st.st_size
+
     def _path(self, chat_id: str) -> Path:
         if not _ID_RE.match(chat_id):
             raise ChatStoreError(f"некорректный id чата: {chat_id!r}")
@@ -264,6 +276,11 @@ class ChatRecorder:
 
     Если записать не удалось (проект только для чтения), сохранение отключается до
     конца сессии, а :meth:`save` один раз возвращает текст предупреждения.
+
+    Один чат могут продолжить две сессии (два терминала с ``gigacrew -c``): каждая
+    пишет файл целиком, и вторая затёрла бы ходы первой. Поэтому запоминается
+    версия файла после своей записи (или при продолжении); если к следующей записи
+    файл изменила другая сессия, диалог сохраняется новым чатом — с предупреждением.
     """
 
     def __init__(self, store: ChatStore, *, enabled: bool = True):
@@ -271,6 +288,7 @@ class ChatRecorder:
         self.enabled = enabled
         self._chat_id = store.new_id()
         self._created_at: datetime | None = None
+        self._version: tuple[int, int, int] | None = None  # файла после своей записи
         self.title = ""  # заголовок продолженного чата (пусто — новый)
 
     @property
@@ -280,19 +298,34 @@ class ChatRecorder:
     def start_new(self) -> None:
         self._chat_id = self.store.new_id()
         self._created_at = None
+        self._version = None
         self.title = ""
 
     def switch_to(self, info: ChatInfo) -> None:
         """Дальнейшие сохранения идут в этот (продолженный) чат."""
         self._chat_id = info.id
         self._created_at = info.created_at
+        self._version = self.store.version(info.id)
         self.title = info.title
 
     def save(self, conversation: Conversation, *, model: str = "") -> str | None:
-        """Сохраняет диалог; возвращает предупреждение, если запись не удалась."""
+        """Сохраняет диалог; возвращает предупреждение, если запись не удалась или
+        диалог пришлось сохранить новым чатом."""
         if not self.enabled or not any(m.is_request for m in conversation.messages):
             return None
+        warning = None
         try:
+            if self._created_at is not None and self._version is not None:
+                current = self.store.version(self._chat_id)
+                if current is not None and current != self._version:
+                    # Чат изменила другая сессия: не затирать её ходы — новый чат.
+                    old = self._chat_id
+                    self._chat_id = self.store.new_id()
+                    self._created_at = None
+                    warning = (
+                        f"чат {old} изменила другая сессия gigacrew — чтобы не затереть её "
+                        f"ходы, этот диалог сохранён отдельным чатом {self._chat_id}"
+                    )
             if self._created_at is None:
                 # Первая запись нового чата: id не должен затереть чужой чат
                 # (другое окно gigacrew, начатое в ту же секунду).
@@ -305,4 +338,5 @@ class ChatRecorder:
             self.enabled = False
             return f"чат не сохранён, автосохранение отключено: {e}"
         self._created_at = info.created_at
-        return None
+        self._version = self.store.version(self._chat_id)
+        return warning

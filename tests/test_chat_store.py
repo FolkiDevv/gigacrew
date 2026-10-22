@@ -290,3 +290,33 @@ def test_recorder_serialization_error_warns_once(store, monkeypatch):
     warning = rec.save(_conv())
     assert warning and "surrogates not allowed" in warning
     assert rec.enabled is False and rec.save(_conv()) is None
+
+
+def test_two_sessions_continuing_one_chat_do_not_lose_turns(store):
+    # Два терминала с `gigacrew -c`: второй сохранивший не затирает ход первого, а
+    # продолжает в новом чате и предупреждает.
+    ChatRecorder(store).save(_conv("запрос 1"))
+    (info,) = store.recent()
+    a, b = ChatRecorder(store), ChatRecorder(store)
+    a.switch_to(store.load(info.id).info)
+    b.switch_to(store.load(info.id).info)
+    conv_a, conv_b = store.load(info.id).conversation, store.load(info.id).conversation
+    conv_a.add_user("A: допиши docs")
+    assert a.save(conv_a) is None and a.chat_id == info.id
+    conv_b.add_user("B: допиши тесты")
+    warning = b.save(conv_b)
+    assert warning is not None and info.id in warning and b.chat_id in warning
+    assert b.chat_id != info.id
+    requests = [m.content for m in store.load(info.id).conversation.messages if m.is_request]
+    assert requests == ["запрос 1", "A: допиши docs"]  # ход A сохранён
+    forked = store.load(b.chat_id)
+    assert [m.content for m in forked.conversation.messages if m.is_request] == [
+        "запрос 1",
+        "B: допиши тесты",
+    ]
+    # дальше каждый пишет в свой чат без предупреждений
+    conv_b.add_user("B: ещё")
+    assert b.save(conv_b) is None
+    conv_a.add_user("A: ещё")
+    assert a.save(conv_a) is None and a.chat_id == info.id
+    assert len(store.recent()) == 2
