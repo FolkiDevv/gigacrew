@@ -13,6 +13,7 @@ from gigacrew.project.files import (
     TREE_TRUNCATED,
     build_file_tree,
     glob_match,
+    is_git_internal,
     is_secret_file,
     is_secret_path,
     is_within,
@@ -149,6 +150,18 @@ def test_sibling_with_root_prefix_is_outside(tmp_path):
     (root / "link.txt").symlink_to(evil / "secret.txt")
     assert not is_within(root.resolve(), evil / "secret.txt")
     assert [p.name for p in walk_files(root)] == ["in.txt"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_git_internal_by_path_as_given(tmp_path):
+    # nested/.git — симлинк на обычный каталог: путь через .git — внутренности git, даже
+    # если после раскрытия симлинка компонента .git в нём нет
+    root = tmp_path.resolve()
+    (root / "nested" / "plain").mkdir(parents=True)
+    (root / "nested" / ".git").symlink_to(root / "nested" / "plain")
+    resolved = (root / "nested" / ".git" / "config").resolve()
+    assert is_git_internal(root, resolved, "nested/.git/config")
+    assert not is_git_internal(root, resolved)
 
 
 @pytest.mark.parametrize(

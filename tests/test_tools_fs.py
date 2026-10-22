@@ -908,6 +908,27 @@ def test_nested_repository_git_dir_is_not_writable(ctx):
     assert w.run(w.parse({"path": "docs/HEAD", "content": "y"}), ctx).ok
 
 
+@pytest.mark.parametrize(
+    "order",
+    [
+        ("config", "objects/.keep", "refs/.keep", "HEAD"),
+        ("HEAD", "config", "refs/heads/main", "objects/info/x"),
+        ("objects/x", "HEAD", "config", "refs/x"),
+    ],
+)
+def test_git_dir_cannot_be_built_file_by_file(ctx, order):
+    """Каталог git нельзя собрать по файлу: запись, которая завершила бы раскладку
+    (HEAD, objects/, refs/), отклоняется в любом порядке — иначе config, записанный
+    первым, стал бы настройкой репозитория, который git найдёт в этом каталоге."""
+    w = WriteFileTool()
+    *first, last = order
+    for name in first:
+        assert w.run(w.parse({"path": f"sub/{name}", "content": "x\n"}), ctx).ok
+    with pytest.raises(ToolError, match="Внутренности git"):
+        w.preview(w.parse({"path": f"sub/{last}", "content": "x\n"}), ctx)
+    assert not (ctx.root / "sub" / last).exists()
+
+
 # ------------------------------ файлы с секретами ------------------------------ #
 def _decide(tool, params, ctx, mode="auto", **kw):
     from gigacrew.permissions import PermissionMode, decide
