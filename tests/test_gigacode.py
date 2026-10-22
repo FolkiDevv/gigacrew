@@ -546,6 +546,30 @@ def test_stream_shown_text_is_not_retried_after_a_drop(tmp_path):
     assert deltas == ["Сводка, часть 1"] and backend.count(CHAT) == 1
 
 
+class _CutAfterEnd(httpx.SyncByteStream):
+    """Ответ дошёл до конца (вызов, finish_reason, usage), а соединение закрыто нечисто."""
+
+    def __iter__(self):
+        yield _tool_call("run_shell", {"command": "pytest"}).removesuffix(b"data: [DONE]\n\n")
+        yield _sse({"choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 3}})
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete body")
+
+
+def test_unclean_close_after_the_end_keeps_the_answer(tmp_path):
+    """Обрыв после окончания ответа — ответ целиком: иначе показанный текст стал бы
+    ошибкой, а не показанный ответ ушёл бы повтором и был бы оплачен дважды."""
+    cut = httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_CutAfterEnd())
+    backend = Backend(chat=[cut])
+    provider = _provider(backend, tmp_path)
+    provider.connect()
+    turn = provider.stream(_msgs(), [TOOL])
+    assert turn.finish_reason == "function_call" and turn.usage.prompt_tokens == 12
+    assert turn.message.function_calls == [
+        FunctionCall(name="run_shell", arguments={"command": "pytest"}, id="c1")
+    ]
+    assert backend.count(CHAT) == 1
+
+
 def test_model_without_stream_gets_a_whole_answer(tmp_path):
     whole = httpx.Response(
         200,

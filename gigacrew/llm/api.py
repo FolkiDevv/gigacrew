@@ -403,26 +403,31 @@ class ApiProvider(HttpProvider):
         ``tool_state_id``, ``finish_reason`` и ``usage``. Поток, где не пришло окончание
         ответа (событие ``response.message.done``, маркер ``[DONE]``, причина завершения
         или расход токенов), — незавершённый: шлюз закрыл соединение посреди ответа.
+        Обрыв соединения уже после окончания ответа — не ошибка: ответ получен целиком.
         """
         builder = _TurnBuilder()
         done = False
-        for event, data in iter_sse_events(resp.iter_lines()):
-            if data.strip() == "[DONE]":
-                done = True
-                break
-            try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(chunk, dict):
-                continue
-            error = _stream_error(event, chunk)
-            if error is not None:
-                raise ApiError(f"API вернул ошибку в потоке: {error}")
-            done = done or event == "response.message.done"
-            piece = builder.add(chunk)
-            if piece:
-                emit(piece)
+        try:
+            for event, data in iter_sse_events(resp.iter_lines()):
+                if data.strip() == "[DONE]":
+                    done = True
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                error = _stream_error(event, chunk)
+                if error is not None:
+                    raise ApiError(f"API вернул ошибку в потоке: {error}")
+                done = done or event == "response.message.done"
+                piece = builder.add(chunk)
+                if piece:
+                    emit(piece)
+        except httpx.TransportError:
+            if not (done or builder.finished):
+                raise
         return builder.turn(complete=done or builder.finished)
 
     def list_models(self) -> list[str]:

@@ -87,6 +87,58 @@ def test_stream_broken_after_first_chunk_is_not_retried():
     p.close()
 
 
+class _CutAfterDone(httpx.SyncByteStream):
+    """Событие окончания ответа пришло, потом соединение закрыто нечисто."""
+
+    def __iter__(self):
+        yield _event(_text("Запускаю тесты")).encode()
+        done = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_state_id": "S",
+                    "content": [
+                        {
+                            "function_call": {
+                                "id": "c1",
+                                "name": "run_shell",
+                                "arguments": {"command": "pytest"},
+                            }
+                        }
+                    ],
+                }
+            ],
+            "finish_reason": "function_call",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        yield _event(done, "response.message.done").encode()
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete body")
+
+
+@pytest.mark.parametrize("shown", [False, True])
+def test_unclean_close_after_done_keeps_the_answer(shown):
+    """Обрыв после окончания ответа — ответ целиком, без ошибки и без повтора."""
+    chat_calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        chat_calls.append(request)
+        return httpx.Response(200, stream=_CutAfterDone())
+
+    deltas: list[str] = []
+    p = _provider(handler)
+    turn = p.stream(_msgs(), on_delta=deltas.append if shown else None)
+    assert turn.finish_reason == "function_call" and turn.message.state_id == "S"
+    assert turn.message.function_calls == [
+        FunctionCall(name="run_shell", arguments={"command": "pytest"}, id="c1")
+    ]
+    assert turn.usage.prompt_tokens == 10
+    assert deltas == (["Запускаю тесты"] if shown else [])
+    assert len(chat_calls) == 1
+    p.close()
+
+
 class _SilentStream(httpx.SyncByteStream):
     """Тело ответа: отдаёт кусок, потом модель молчит дольше ожидания чтения."""
 
