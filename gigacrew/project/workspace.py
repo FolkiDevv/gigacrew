@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,15 @@ GITIGNORED_DATA: tuple[str, ...] = (
     "/index/",
     f"/{HISTORY_FILE_NAME}",
     f"/{LOCAL_SETTINGS_FILE_NAME}",
+)
+# Что gigacrew пишет в .gigacode/ сам (ty.log — журнал gigacrew.project.semantic).
+_OWN_ENTRIES: tuple[str, ...] = (
+    "chats",
+    "plans",
+    "index",
+    HISTORY_FILE_NAME,
+    ".gitignore",
+    "ty.log",
 )
 _GITIGNORE_BODY = (
     "# Создано gigacrew: рабочие данные агента и settings.local.json не коммитятся,\n"
@@ -116,9 +126,23 @@ class Workspace:
         """Создаёт ``.gigacode/`` с ``.gitignore`` (идемпотентно) и возвращает путь.
 
         Существующий ``.gitignore`` не перезаписывается — пользователь мог его изменить.
+        Через эту проверку проходит всё, что gigacrew пишет в папку сам (история ввода,
+        чаты, индекс, планы, журнал ty): если ``.gigacode`` или одна из этих записей —
+        симлинк, — ``OSError``, и запись не идёт. Репозиторий может принести такой симлинк
+        (git восстанавливает их при клоне), и запись ушла бы за пределы проекта — например,
+        введённые запросы дописывались бы в чужой файл.
         """
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        gitignore = self.data_dir / ".gitignore"
-        if not gitignore.exists():
-            gitignore.write_text(_GITIGNORE_BODY, encoding="utf-8")
-        return self.data_dir
+        data_dir = self.data_dir
+        if data_dir.is_symlink():
+            raise OSError(f"{data_dir} — симлинк: gigacrew не пишет по нему")
+        data_dir.mkdir(parents=True, exist_ok=True)
+        for name in _OWN_ENTRIES:
+            if (data_dir / name).is_symlink():
+                raise OSError(f"{data_dir / name} — симлинк: gigacrew не пишет по нему")
+        try:
+            fd = os.open(data_dir / ".gitignore", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            return data_dir
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_GITIGNORE_BODY)
+        return data_dir

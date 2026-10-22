@@ -15,7 +15,10 @@
     Тело — инструкция для агента.
 
 Без ``name`` имя берётся из имени каталога. Имя должно годиться для команды REPL
-(``/release``), иначе скилл пропускается. Пользователь вызывает скилл командой
+(``/release``), иначе скилл пропускается. Каталог скилла и ``SKILL.md`` и после раскрытия
+симлинков должны лежать в своём каталоге скиллов, а скиллы проекта — ещё и в проекте:
+иначе репозиторий подсунул бы модели под видом скилла любой файл пользователя
+(``~/.ssh/…``) — инструмент ``skill`` читает без подтверждения. Пользователь вызывает скилл командой
 ``/<имя> [аргументы]``, модель — инструментом ``skill`` (список скиллов с
 описаниями — в системном промпте).
 """
@@ -28,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from gigacrew.project.files import is_within
 from gigacrew.project.workspace import SKILLS_DIR_NAME, Workspace, user_data_dir
 
 SKILL_FILE = "SKILL.md"
@@ -119,15 +123,23 @@ def parse_skill(path: Path, source: SkillSource = "project") -> Skill | None:
     return Skill(name=name, description=description, path=path, source=source)
 
 
-def _scan(directory: Path, source: SkillSource) -> list[Skill]:
+def _scan(directory: Path, source: SkillSource, within: Path | None = None) -> list[Skill]:
+    """Скиллы ``directory``; ``within`` — где ещё должен лежать раскрытый каталог (проект).
+
+    Сам каталог скиллов может быть симлинком (dotfiles), но скилл, раскрытый за его
+    пределы, — не скилл.
+    """
     try:
+        root = directory.resolve()
         entries = sorted(directory.iterdir())
     except OSError:  # каталога нет или он нечитаем
+        return []
+    if within is not None and not is_within(within, root):
         return []
     skills = []
     for entry in entries:
         path = entry / SKILL_FILE
-        if path.is_file():
+        if is_within(root, entry) and is_within(root, path) and path.is_file():
             skill = parse_skill(path, source)
             if skill is not None:
                 skills.append(skill)
@@ -143,7 +155,8 @@ def discover_skills(workspace: Workspace, user_dir: Path | None = None) -> list[
     """Скиллы пользователя и проекта (проектный важнее), по имени без учёта регистра."""
     user_dir = user_skills_dir() if user_dir is None else user_dir
     found: dict[str, Skill] = {}
-    for skill in (*_scan(user_dir, "user"), *_scan(workspace.skills_dir, "project")):
+    project = _scan(workspace.skills_dir, "project", within=workspace.root)
+    for skill in (*_scan(user_dir, "user"), *project):
         found[skill.name.casefold()] = skill
     return sorted(found.values(), key=lambda s: s.name.casefold())
 

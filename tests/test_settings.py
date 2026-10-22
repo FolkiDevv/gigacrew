@@ -10,6 +10,7 @@ import pytest
 from gigacrew.project.settings import (
     DEFAULT_HOOK_TIMEOUT,
     MAX_HOOK_TIMEOUT,
+    MIN_HOOK_TIMEOUT,
     HookCommand,
     HookEvent,
     HookGroup,
@@ -103,6 +104,8 @@ def test_timeout_default_and_clamp(tmp_path):
                             {"type": "command", "command": "e", "timeout": float("inf")},
                             {"type": "command", "command": "f", "timeout": float("nan")},
                             {"type": "command", "command": "g", "timeout": 10**400},
+                            {"type": "command", "command": "h", "timeout": 0},
+                            {"type": "command", "command": "i", "timeout": -5},
                         ]
                     }
                 ]
@@ -112,9 +115,15 @@ def test_timeout_default_and_clamp(tmp_path):
     settings, warnings = load_settings(ws)
     timeouts = [h.timeout for h in settings.commands(HookEvent.STOP)]
     assert timeouts == [DEFAULT_HOOK_TIMEOUT, 5, MAX_HOOK_TIMEOUT] + [DEFAULT_HOOK_TIMEOUT] * 3 + [
-        MAX_HOOK_TIMEOUT
+        MAX_HOOK_TIMEOUT,
+        MIN_HOOK_TIMEOUT,
+        MIN_HOOK_TIMEOUT,
     ]
-    assert len(warnings) == 5
+    # Каждое предупреждение — о своей команде (c…i) и с подставленным значением.
+    assert len(warnings) == 7
+    for j, warning in enumerate(warnings, start=2):
+        assert f"hooks[{j}]" in warning
+    assert f"взято {MIN_HOOK_TIMEOUT}" in warnings[-1] and "timeout -5" in warnings[-1]
 
 
 @pytest.mark.parametrize(
@@ -146,12 +155,54 @@ def test_bad_entries_warn_and_skip(tmp_path, content, fragment):
     assert [h.command for h in settings.commands(HookEvent.STOP)] == ["echo ok"]
 
 
+@pytest.mark.parametrize("command", ["echo hi\u0000", "echo \ud800"], ids=["nul", "surrogate"])
+def test_command_that_cannot_run_is_skipped(tmp_path, command):
+    ws = Workspace(tmp_path)
+    data = json.dumps(_hooks("Stop", command))  # \u0000 и \ud800 — как в файле
+    _write(ws.settings_file, data)
+    _write(ws.local_settings_file, _hooks("Stop", "echo ok"))
+    settings, warnings = load_settings(ws)
+    assert [h.command for h in settings.commands(HookEvent.STOP)] == ["echo ok"]
+    assert len(warnings) == 1 and "hooks[0]" in warnings[0] and "command" in warnings[0]
+
+
+def test_deeply_nested_settings_file_is_skipped(tmp_path):
+    ws = Workspace(tmp_path)
+    _write(ws.settings_file, "[" * 200_000 + "]" * 200_000)
+    settings, warnings = load_settings(ws)
+    assert settings == HookSettings()
+    assert len(warnings) == 1 and "не удалось прочитать" in warnings[0]
+
+
 def test_disable_all_hooks(tmp_path):
     ws = Workspace(tmp_path)
     _write(ws.settings_file, _hooks("Stop", "echo"))
     _write(user_settings_file(), {"disableAllHooks": True})
     settings, _ = load_settings(ws)
     assert settings.disabled and not settings.has(HookEvent.STOP)
+
+
+@pytest.mark.parametrize("file", ["settings", "local"])
+def test_project_disable_all_hooks_turns_off_only_project_hooks(tmp_path, file):
+    # Файл проекта приходит с репозиторием: выключить хуки пользователя он не может.
+    ws = Workspace(tmp_path)
+    _write(user_settings_file(), _hooks("PreToolUse", "guard", "run_shell"))
+    project = ws.settings_file if file == "settings" else ws.local_settings_file
+    _write(project, {"disableAllHooks": True, **_hooks("Stop", "echo project")})
+    _write(ws.settings_file if file == "local" else ws.local_settings_file, _hooks("Stop", "x"))
+    settings, warnings = load_settings(ws)
+    assert warnings == [] and not settings.disabled and settings.project_disabled
+    assert [h.command for h in settings.commands(HookEvent.PRE_TOOL_USE, "run_shell")] == ["guard"]
+    assert not settings.has(HookEvent.STOP) and settings.project_groups == ()
+
+
+@pytest.mark.parametrize("value", ["true", 1, "yes"])
+def test_disable_all_hooks_must_be_boolean(tmp_path, value):
+    ws = Workspace(tmp_path)
+    _write(user_settings_file(), {"disableAllHooks": value, **_hooks("Stop", "echo")})
+    settings, warnings = load_settings(ws)
+    assert not settings.disabled and settings.has(HookEvent.STOP)
+    assert len(warnings) == 1 and "disableAllHooks" in warnings[0]
 
 
 def test_without_project_keeps_user_hooks(tmp_path):
@@ -178,6 +229,25 @@ def test_fingerprint_only_for_project_hooks(tmp_path):
     assert len(first) == 64
     _write(ws.local_settings_file, _hooks("Stop", "echo changed"))
     assert project_fingerprint(load_settings(ws)[0]) != first
+
+
+@pytest.mark.parametrize(
+    ("file", "changed"),
+    [
+        ("settings", _hooks("PreToolUse", "echo", ".*")),  # matcher шире
+        ("settings", _hooks("PreRequest", "echo", "never")),  # другое событие
+        ("settings", _hooks("PreToolUse", "echo", "never", timeout=5)),  # таймаут
+        ("local", _hooks("PreToolUse", "echo", "never")),  # другой файл
+    ],
+)
+def test_fingerprint_covers_matcher_event_timeout_and_file(tmp_path, file, changed):
+    ws = Workspace(tmp_path)
+    _write(ws.settings_file, _hooks("PreToolUse", "echo", "never"))
+    before = project_fingerprint(load_settings(ws)[0])
+    if file == "local":
+        ws.settings_file.unlink()
+    _write(ws.settings_file if file == "settings" else ws.local_settings_file, changed)
+    assert project_fingerprint(load_settings(ws)[0]) not in ("", before)
 
 
 def test_fingerprint_ignores_user_hooks(tmp_path):

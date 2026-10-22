@@ -41,6 +41,19 @@ def test_read_dotenv_inline_comments_and_quotes(tmp_path):
     }
 
 
+def test_read_dotenv_with_bom_keeps_first_setting(tmp_path):
+    # UTF-8 с BOM пишут PowerShell 5 и старый Блокнот: первая настройка не теряется
+    (tmp_path / ".env").write_bytes("GIGACREW_VERIFY_SSL=1\nB=2\n".encode("utf-8-sig"))
+    assert read_dotenv(tmp_path / ".env") == {"GIGACREW_VERIFY_SSL": "1", "B": "2"}
+    assert Config.load(project_root=tmp_path, environ={}, cwd=tmp_path).verify_ssl is True
+
+
+def test_undecodable_dotenv_is_a_config_error(tmp_path):
+    (tmp_path / ".env").write_bytes(b"\xff\xfe=1\n")
+    with pytest.raises(ConfigError, match=r"\.env"):
+        Config.load(project_root=tmp_path, environ={}, cwd=tmp_path)
+
+
 def test_priority_environ_over_root_over_cwd(tmp_path):
     root, cwd = tmp_path / "proj", tmp_path / "cwd"
     _env_file(root, "GIGACREW_MODEL=from-root\nGIGACREW_SCOPE=root-scope\n")
@@ -88,8 +101,28 @@ def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
     ],
 )
 def test_bad_values_raise_config_error(tmp_path, env):
-    with pytest.raises(ConfigError):
+    (name,) = env  # ошибка называет ту переменную, что задана неверно
+    with pytest.raises(ConfigError, match=name):
         Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("env", "field", "value"),
+    [
+        ({"GIGACREW_TEMPERATURE": "0"}, "temperature", 0.0),
+        ({"GIGACREW_TEMPERATURE": "2"}, "temperature", 2.0),
+        ({"GIGACREW_COMPACT_THRESHOLD": "10"}, "compact_threshold", 0.10),
+        ({"GIGACREW_COMPACT_THRESHOLD": "95"}, "compact_threshold", 0.95),
+        ({"GIGACREW_SUBAGENT_CONTEXT": "10"}, "subagent_context_share", 0.10),
+        ({"GIGACREW_SUBAGENT_CONTEXT": "95"}, "subagent_context_share", 0.95),
+        ({"GIGACREW_SUBAGENT_TIMEOUT": "10"}, "subagent_timeout", 10),
+        ({"GIGACREW_TIMEOUT": "1"}, "timeout", 1),
+        ({"GIGACREW_RATE_LIMIT_WAIT": "0"}, "rate_limit_wait", 0),
+    ],
+)
+def test_bounds_are_inclusive(tmp_path, env, field, value):
+    cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+    assert getattr(cfg, field) == value
 
 
 def test_main_reports_config_error(tmp_path, monkeypatch, capsys):
@@ -124,6 +157,12 @@ def test_endpoints_and_model_have_no_defaults(tmp_path, monkeypatch, capsys):
         cfg.require_credentials()
     # mTLS адрес выдачи токена не нужен
     Config(cert="c.pem", key="c.key", base_url="https://api.test/v1").require_credentials()
+    # половина пары — не mTLS: понятная ошибка, а не сбой при сборке TLS
+    for half in ({"cert": "c.pem"}, {"key": "c.key"}):
+        cfg = Config(base_url="https://api.test/v1", **half)
+        assert cfg.auth_mode == "none"
+        with pytest.raises(RuntimeError, match="GIGACREW_CERT и GIGACREW_KEY"):
+            cfg.require_credentials()
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GIGACREW_ACCESS_KEY", "dummy")

@@ -16,8 +16,9 @@ from pydantic import BaseModel, Field
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.files import GIT_DIR_NAME, glob_match, is_git_internal, walk_files
 from gigacrew.project.workspace import DATA_DIR_NAME
-from gigacrew.security import RiskLevel, resolve_in_root
-from gigacrew.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
+from gigacrew.safety.paths import Scope, scope_of_path
+from gigacrew.security import RiskLevel, SandboxError, resolve_in_root
+from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
 
 # Жёсткий предел размера читаемого файла (дальше — только search_content).
 MAX_READ_BYTES = 20_000_000
@@ -33,6 +34,52 @@ def _rel(ctx: ToolContext, path: Path) -> str:
         return str(path.relative_to(ctx.root))
     except ValueError:
         return str(path)
+
+
+# --------------------------------------------------------------------------- #
+# Файлы с секретами
+# --------------------------------------------------------------------------- #
+# Из .env gigacrew берёт свои настройки (config.load_environment): ключ доступа, адреса
+# API, проверку TLS. Правка без вопроса увела бы ключ и запросы на чужой адрес при
+# следующем запуске — поэтому её подтверждает пользователь всегда, даже с -y.
+CONFIG_FILE_NAME = ".env"
+SECRET_READ_NOTE = (
+    "Файл с секретами (ключи, пароли, токены) инструменты не читают: {path}. Если его "
+    "содержимое действительно нужно, спросите пользователя или прочитайте его через "
+    "run_shell — такая команда требует подтверждения."
+)
+_SECRET_SCOPES = (Scope.SECRET, Scope.SECRET_OUTSIDE, Scope.DYNAMIC)
+
+
+def is_secret_target(root: Path, path: Path) -> bool:
+    """Файл с ключами или учётными данными — по тому же правилу, что у классификатора
+    команд (``cat .env`` там — непроверенная команда): ``.env*``, ``*.pem``, ``id_rsa``,
+    ``.npmrc``, ``credentials.json``, всё в ``.ssh/``, ``.aws/``… Симлинк проверяется и
+    по цели; путь, который не раскрыть, считается секретом."""
+    return scope_of_path(path, root) in _SECRET_SCOPES
+
+
+def _write_assessment(ctx: ToolContext, path: str) -> Assessment:
+    """Оценка записи в ``path``: план — без риска, настройки gigacrew (.env) — как опасная
+    операция (``-y`` и хук не снимают вопрос), другие секреты — с вопросом в режиме «авто»
+    (вид OTHER: правка без вопроса — только для обычных файлов проекта)."""
+    if _is_plan_file(ctx, path):
+        return Assessment(RiskLevel.SAFE)  # план — данные агента: в любом режиме без вопроса
+    try:
+        p = resolve_in_root(ctx.root, path)
+    except SandboxError:
+        return Assessment(RiskLevel.WRITE)  # откажет сама запись
+    if p.name.casefold() == CONFIG_FILE_NAME:
+        return Assessment(
+            RiskLevel.DANGEROUS,
+            reason=f"{_rel(ctx, p)} — настройки gigacrew: ключ доступа, адреса API, проверка TLS",
+            kind=ToolKind.OTHER,
+        )
+    if is_secret_target(ctx.root, p):
+        return Assessment(
+            RiskLevel.WRITE, reason=f"файл с секретами ({_rel(ctx, p)})", kind=ToolKind.OTHER
+        )
+    return Assessment(RiskLevel.WRITE)
 
 
 # --------------------------------------------------------------------------- #
@@ -252,19 +299,20 @@ def make_diff(old: str, new: str, path: str) -> str:
     return "".join(line if line.endswith("\n") else f"{line}\n{_NO_NEWLINE}" for line in diff)
 
 
-def _unescape_simple(s: str) -> str:
-    """Разэкранирует частые последовательности (\\n, \\t, \\", \\') без условий.
+# Последовательности двойной экранизации: ``\r\n`` — один перевод строки (текст
+# сравнивается в виде с ``\n``), ``\\`` — обратная косая черта. Разбор — за один проход
+# слева направо: в ``\\n`` экранирована косая черта, а ``n`` — обычная буква.
+_ESCAPE_RE = re.compile(r"\\r\\n|\\([nt\"'\\])")
+_ESCAPES = {"n": "\n", "t": "\t", '"': '"', "'": "'", "\\": "\\"}
+
+
+def _unescape(s: str) -> str:
+    """Разэкранирует частые последовательности (\\n, \\t, \\", \\', \\\\) без условий.
 
     Используется как один из вариантов-кандидатов при поиске old_string —
     применяется только если разэкранированная форма реально нашлась в файле.
     """
-    return (
-        s.replace("\\r\\n", "\n")
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace('\\"', '"')
-        .replace("\\'", "'")
-    )
+    return _ESCAPE_RE.sub(lambda m: _ESCAPES[m.group(1)] if m.group(1) else "\n", s)
 
 
 _LINE_NUM_RE = re.compile(r"^\s*\d+\t")
@@ -287,33 +335,32 @@ def _strip_line_numbers(s: str) -> str:
     return "\n".join(_LINE_NUM_RE.sub("", ln) for ln in lines)
 
 
+_NUMBERED_LINE_RE = re.compile(r"^\d+\t")
+
+
 def repair_escaped_content(content: str) -> tuple[str, bool]:
     """Чинит «двойную экранизацию», которую иногда выдаёт модель.
 
     Слабые модели порой кладут в write_file одну физическую строку, где все
     переносы — это литералы ``\\n`` (а кавычки — ``\\"``), иногда ещё и с
     префиксами номеров строк (``1\\timport ...``), скопированными из подсказки.
-    Такой контент однозначно битый: ноль настоящих переносов при множестве
-    литеральных ``\\n``. В этом случае разэкранируем и снимаем нумерацию.
+    Чинится только однозначный случай: ни одного настоящего переноса, не меньше двух
+    литеральных ``\\n`` и либо текст кончается литеральным ``\\n`` (файл с переводом
+    строки в конце, экранированный ещё раз), либо все строки — с номерами. Однострочный
+    код или JSON без такого хвоста (``print("a\\nb\\nc")``) верен как есть и не меняется.
 
     Возвращает (исправленный_текст, был_ли_ремонт).
     """
-    if content.count("\n") == 0 and content.count("\\n") >= 2:
-        fixed = (
-            content.replace("\\r\\n", "\n")
-            .replace("\\n", "\n")
-            .replace("\\t", "\t")
-            .replace('\\"', '"')
-            .replace("\\'", "'")
-            .replace("\\\\", "\\")
-        )
-        lines = fixed.split("\n")
-        nonempty = [ln for ln in lines if ln.strip()]
-        if nonempty and all(re.match(r"^\d+\t", ln) for ln in nonempty):
-            lines = [re.sub(r"^\d+\t", "", ln) for ln in lines]
-            fixed = "\n".join(lines)
-        return fixed, True
-    return content, False
+    if "\n" in content or content.count("\\n") < 2:
+        return content, False
+    fixed = _unescape(content)
+    lines = fixed.split("\n")
+    nonempty = [ln for ln in lines if ln.strip()]
+    if nonempty and all(_NUMBERED_LINE_RE.match(ln) for ln in nonempty):
+        return "\n".join(_NUMBERED_LINE_RE.sub("", ln) for ln in lines), True
+    if not fixed.endswith("\n"):
+        return content, False
+    return fixed, True
 
 
 def _numbered_excerpt(text: str, max_lines: int = 60) -> str:
@@ -491,6 +538,8 @@ class ReadFileTool(Tool):
             raise ToolError(f"Это директория, а не файл: {params.path}")
         if not p.is_file():  # FIFO/сокет/устройство — чтение может заблокироваться
             raise ToolError(f"Не обычный файл (FIFO, сокет или устройство): {params.path}")
+        if is_secret_target(ctx.root, p):
+            raise ToolError(SECRET_READ_NOTE.format(path=params.path))
         if p.stat().st_size > MAX_READ_BYTES:
             raise ToolError(
                 f"Файл слишком большой (>{MAX_READ_BYTES} байт). Используйте search_content."
@@ -583,9 +632,11 @@ class WriteFileTool(Tool):
     Params = WriteFileParams
     kind = ToolKind.EDIT
 
+    def assess(self, params: WriteFileParams, ctx: ToolContext) -> Assessment:
+        return _write_assessment(ctx, params.path)
+
     def risk(self, params: WriteFileParams, ctx: ToolContext) -> RiskLevel:
-        # План — данные агента, а не проект: пишется в любом режиме без вопроса.
-        return RiskLevel.SAFE if _is_plan_file(ctx, params.path) else RiskLevel.WRITE
+        return self.assess(params, ctx).risk
 
     def _prepare(
         self, params: WriteFileParams, ctx: ToolContext
@@ -654,8 +705,11 @@ class EditFileTool(Tool):
     Params = EditFileParams
     kind = ToolKind.EDIT
 
+    def assess(self, params: EditFileParams, ctx: ToolContext) -> Assessment:
+        return _write_assessment(ctx, params.path)
+
     def risk(self, params: EditFileParams, ctx: ToolContext) -> RiskLevel:
-        return RiskLevel.SAFE if _is_plan_file(ctx, params.path) else RiskLevel.WRITE
+        return self.assess(params, ctx).risk
 
     def _compute(self, params: EditFileParams, ctx: ToolContext):
         p = _writable_path(ctx, params.path)
@@ -682,11 +736,11 @@ class EditFileTool(Tool):
         # фрагментам и берём первое, которое реально находится в файле — это
         # безопасно: преобразованная форма применяется, только если совпала.
         def both(s):
-            return _strip_line_numbers(_unescape_simple(s))
+            return _strip_line_numbers(_unescape(s))
 
         transforms = [
             lambda s: s,  # как прислано
-            _unescape_simple,  # снять экранизацию \n/\"
+            _unescape,  # снять экранизацию \n/\"
             _strip_line_numbers,  # снять префиксы номеров строк
             both,  # и то, и другое
         ]
@@ -716,10 +770,14 @@ class EditFileTool(Tool):
                 new = old[: match.start] + replacement + old[match.end :]
                 return p, file, new, 1
 
-        # Не найдено — даём модели контекст файла, чтобы скопировать точно.
+        # Не найдено — даём модели контекст файла, чтобы скопировать точно. Файл с
+        # секретами не показываем: ошибка превью уходит модели до вопроса пользователю.
+        missing = "old_string не найден в файле (ни точно, ни с поправкой на пробелы)."
+        if is_secret_target(ctx.root, p):
+            raise ToolError(f"{missing} Это файл с секретами — его содержимое не показывается.")
         raise ToolError(
-            "old_string не найден в файле (ни точно, ни с поправкой на пробелы). "
-            "Скопируйте фрагмент дословно из содержимого ниже:\n\n" + _numbered_excerpt(old)
+            f"{missing} Скопируйте фрагмент дословно из содержимого ниже:\n\n"
+            + _numbered_excerpt(old)
         )
 
     def preview(self, params: EditFileParams, ctx: ToolContext) -> Display | None:

@@ -107,6 +107,22 @@ def test_history_file_is_private(tmp_path):
     assert (ws.data_dir / "history").stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_history_does_not_follow_symlink_shipped_with_repo(tmp_path):
+    # .gigacode/history -> ../README.md: введённое (вставленные секреты) не дописывается в
+    # файл репозитория и не читается из него
+    readme = tmp_path / "README.md"
+    readme.write_text("+чужая строка\n", encoding="utf-8")
+    ws = Workspace(tmp_path)
+    ws.data_dir.mkdir()
+    ws.history_file.symlink_to(readme)
+    history = LazyFileHistory(ws)
+    assert list(history.load_history_strings()) == []
+    history.append_string("export API_TOKEN=sk-live-123")
+    assert readme.read_text(encoding="utf-8") == "+чужая строка\n"
+    assert list(history.get_strings()) == ["export API_TOKEN=sk-live-123"]  # в памяти
+
+
 def test_history_write_errors_are_swallowed(tmp_path):
     class ReadOnly(Workspace):
         def ensure_data_dir(self):

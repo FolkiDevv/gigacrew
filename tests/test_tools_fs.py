@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from gigacrew.security import SandboxError
@@ -71,6 +73,25 @@ def test_edit_ambiguous_without_replace_all(ctx):
         e.run(e.parse({"path": "d.txt", "old_string": "a", "new_string": "b"}), ctx)
 
 
+@pytest.mark.parametrize("trailing", ["", "  "], ids=["indent", "rstrip"])
+def test_edit_tolerant_match_must_be_unique(ctx, trailing):
+    # одинаковые блоки в двух функциях: несторогое совпадение тоже должно быть единственным
+    text = f"def a():\n    x = 1{trailing}\n    y = 2\ndef b():\n    x = 1{trailing}\n    y = 2\n"
+    (ctx.root / "u.py").write_text(text, encoding="utf-8")
+    old = "x = 1\ny = 2" if not trailing else "    x = 1\n    y = 2"
+    with pytest.raises(ToolError, match="не найден"):
+        _edit(ctx, "u.py", old, old.replace("1", "9"))
+    assert (ctx.root / "u.py").read_text() == text
+
+
+def test_edit_same_old_and_new_is_refused(ctx):
+    (ctx.root / "s.txt").write_text("a\n", encoding="utf-8")
+    mtime = (ctx.root / "s.txt").stat().st_mtime_ns
+    with pytest.raises(ToolError, match="совпадают"):
+        _edit(ctx, "s.txt", "a", "a")
+    assert (ctx.root / "s.txt").stat().st_mtime_ns == mtime
+
+
 def test_edit_replace_all(ctx):
     w = WriteFileTool()
     w.run(w.parse({"path": "d.txt", "content": "a\na\n"}), ctx)
@@ -99,7 +120,7 @@ def test_edit_tolerant_trailing_whitespace(ctx):
         ctx,
     )
     assert res.ok
-    assert "return 2" in (ctx.root / "t.py").read_text()
+    assert (ctx.root / "t.py").read_text() == "def f():\n    return 2\n"
 
 
 def test_edit_tolerant_indentation(ctx):
@@ -135,7 +156,20 @@ def test_edit_with_double_escaped_old_string(ctx):
         ctx,
     )
     assert res.ok
-    assert "return 22" in (ctx.root / "m.py").read_text()
+    assert (ctx.root / "m.py").read_text() == "def a():\n    return 1\n\ndef b():\n    return 22\n"
+
+
+def test_edit_double_escaped_keeps_escapes_inside_strings(ctx):
+    # двойная экранизация фрагмента с \n внутри строки: \\n — экранированная \ и n,
+    # а не перевод строки (разэкранирование — за один проход слева направо)
+    (ctx.root / "p.py").write_text('def f():\n    print("done")\n', encoding="utf-8")
+    _edit(
+        ctx,
+        "p.py",
+        'def f():\\n    print(\\"done\\")',
+        'def f():\\n    print(\\"done\\\\n\\")',
+    )
+    assert (ctx.root / "p.py").read_text() == 'def f():\n    print("done\\n")\n'
 
 
 def test_edit_old_string_with_line_number_prefixes(ctx):
@@ -231,6 +265,32 @@ def test_repair_leaves_normal_content_untouched():
     fixed2, repaired2 = repair_escaped_content(code)
     assert repaired2 is False
     assert fixed2 == code
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'print("a\\nb\\nc")',  # одна строка Python — верна как есть
+        '{"greeting":"Hello\\nWorld","bye":"See\\nyou","q":"say \\"hi\\""}',  # JSON
+        "printf 'a\\nb'",  # один литерал \n
+        "echo ok\\n",  # один литерал, пусть и в конце, — не повод переписывать файл
+        'x = "a\\n"\ny = "b\\n"\nz = "c\\n"\n',  # настоящие переносы и три литерала
+    ],
+    ids=["one-line-code", "minified-json", "single-escape", "single-trailing", "multiline"],
+)
+def test_repair_leaves_valid_content_untouched(ctx, content):
+    assert repair_escaped_content(content) == (content, False)
+    w = WriteFileTool()
+    res = w.run(w.parse({"path": "v.txt", "content": content}), ctx)
+    assert "автокоррекция" not in res.summary
+    assert (ctx.root / "v.txt").read_bytes() == content.encode("utf-8")
+
+
+def test_repair_decodes_escaped_backslash_in_one_pass():
+    # задуманный файл: print("a\n") с переводом строки внутри строкового литерала
+    intended = 'print("a\\n")\nx = 1\n'
+    broken = json.dumps(intended)[1:-1]  # модель экранировала всё ещё раз
+    assert repair_escaped_content(broken) == (intended, True)
 
 
 def test_write_file_autorepairs_escaped(ctx):
@@ -565,6 +625,16 @@ def test_edit_keeps_crlf_line_endings(ctx):
     assert (ctx.root / "t.txt").read_bytes() == b"x\r\ny\r\nc\r\n"
 
 
+def test_edit_cr_only_file(ctx):
+    # старые файлы Mac: многострочный фрагмент от модели — с \n
+    (ctx.root / "mac.txt").write_bytes(b"a\rb\rc\r")
+    _edit(ctx, "mac.txt", "a\nb", "A\nB")
+    assert (ctx.root / "mac.txt").read_bytes() == b"A\rB\rc\r"
+    (ctx.root / "mix.txt").write_bytes(b"a\rb\r\nc\r")
+    assert "приведены к CR" in _edit(ctx, "mix.txt", "c", "C").content
+    assert (ctx.root / "mix.txt").read_bytes() == b"a\rb\rC\r"
+
+
 def test_write_over_crlf_file_keeps_its_line_endings(ctx):
     (ctx.root / "w.bat").write_bytes(b"@echo off\r\necho 1\r\n")
     w = WriteFileTool()
@@ -711,16 +781,22 @@ def test_edit_tolerant_does_not_add_blank_lines(ctx):
 
 # ------------------------- не-UTF-8, бинарные, не файлы ------------------------- #
 @pytest.mark.parametrize(
-    "data", [b"\x89PNG\r\n\x1a\n\x00\x00", "привет, мир\n".encode("cp1251")], ids=["bin", "cp1251"]
+    ("data", "error"),
+    [
+        (b"abc\0def\n", "Бинарный"),  # NUL при верном UTF-8 (например, UTF-16LE с ASCII)
+        (b"\x89PNG\r\n\x1a\n\x00\x00", "Бинарный"),
+        ("привет, мир\n".encode("cp1251"), "не в UTF-8"),
+    ],
+    ids=["nul", "png", "cp1251"],
 )
-def test_write_and_edit_refuse_binary_and_non_utf8(ctx, data):
+def test_write_and_edit_refuse_binary_and_non_utf8(ctx, data, error):
     (ctx.root / "f.dat").write_bytes(data)
     w, e = WriteFileTool(), EditFileTool()
     write = w.parse({"path": "f.dat", "content": "новое\n"})
-    edit = e.parse({"path": "f.dat", "old_string": "x", "new_string": "y"})
+    edit = e.parse({"path": "f.dat", "old_string": "abc", "new_string": "y"})
     for tool, params in ((w, write), (e, edit)):
         for call in (tool.preview, tool.run):
-            with pytest.raises(ToolError, match="Бинарный|не в UTF-8"):
+            with pytest.raises(ToolError, match=error):
                 call(params, ctx)
     assert (ctx.root / "f.dat").read_bytes() == data
 
@@ -830,3 +906,166 @@ def test_nested_repository_git_dir_is_not_writable(ctx):
     (ctx.root / "docs").mkdir()
     (ctx.root / "docs" / "HEAD").write_text("x", encoding="utf-8")
     assert w.run(w.parse({"path": "docs/HEAD", "content": "y"}), ctx).ok
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        ("config", "objects/.keep", "refs/.keep", "HEAD"),
+        ("HEAD", "config", "refs/heads/main", "objects/info/x"),
+        ("objects/x", "HEAD", "config", "refs/x"),
+    ],
+)
+def test_git_dir_cannot_be_built_file_by_file(ctx, order):
+    """Каталог git нельзя собрать по файлу: запись, которая завершила бы раскладку
+    (HEAD, objects/, refs/), отклоняется в любом порядке — иначе config, записанный
+    первым, стал бы настройкой репозитория, который git найдёт в этом каталоге."""
+    w = WriteFileTool()
+    *first, last = order
+    for name in first:
+        assert w.run(w.parse({"path": f"sub/{name}", "content": "x\n"}), ctx).ok
+    with pytest.raises(ToolError, match="Внутренности git"):
+        w.preview(w.parse({"path": f"sub/{last}", "content": "x\n"}), ctx)
+    assert not (ctx.root / "sub" / last).exists()
+
+
+# ------------------------------ файлы с секретами ------------------------------ #
+def _decide(tool, params, ctx, mode="auto", **kw):
+    from gigacrew.permissions import PermissionMode, decide
+
+    assessment = tool.assess(params, ctx)
+    kw.setdefault("auto_approve", False)
+    return decide(PermissionMode(mode), assessment.risk, assessment.kind or tool.kind, **kw)
+
+
+@pytest.mark.parametrize("path", [".env", "sub/.env", ".ENV", "link.txt"])
+def test_env_write_always_asks(ctx, path):
+    """.env — настройки самого gigacrew (ключ, адреса API, TLS): правка — только с
+    подтверждения, в любом режиме и даже с -y или разрешением хука."""
+    import os
+
+    from gigacrew.permissions import Decision
+    from gigacrew.security import RiskLevel
+
+    if path == "link.txt":
+        if os.name == "nt":
+            pytest.skip("симлинки")
+        (ctx.root / ".env").write_text("GIGACREW_API_URL=https://api.test\n", encoding="utf-8")
+        (ctx.root / "link.txt").symlink_to(ctx.root / ".env")
+    w, e = WriteFileTool(), EditFileTool()
+    calls = [
+        (w, w.parse({"path": path, "content": "GIGACREW_API_URL=https://evil.test\n"})),
+        (e, e.parse({"path": path, "old_string": "api.test", "new_string": "evil.test"})),
+    ]
+    for tool, params in calls:
+        assessment = tool.assess(params, ctx)
+        assert assessment.risk is RiskLevel.DANGEROUS
+        assert ".env" in assessment.reason.casefold()
+        assert _decide(tool, params, ctx) is Decision.ASK
+        assert _decide(tool, params, ctx, auto_approve=True) is Decision.ASK
+        assert _decide(tool, params, ctx, auto_approve=True, hook="allow") is Decision.ASK
+        assert _decide(tool, params, ctx, mode="plan") is Decision.BLOCK
+
+
+@pytest.mark.parametrize("path", [".env.local", ".npmrc", "deploy.pem", ".ssh/config"])
+def test_secret_file_write_asks_in_auto_mode(ctx, path):
+    from gigacrew.permissions import Decision
+
+    w = WriteFileTool()
+    params = w.parse({"path": path, "content": "x\n"})
+    assert "секрет" in w.assess(params, ctx).reason
+    assert _decide(w, params, ctx) is Decision.ASK  # правка обычного файла — без вопроса
+    assert _decide(w, params, ctx, auto_approve=True) is Decision.ALLOW  # -y — как у run_shell
+
+
+def test_ordinary_and_template_files_are_plain_edits(ctx):
+    from gigacrew.permissions import Decision
+
+    w = WriteFileTool()
+    for path in (".env.example", "src/env.py", "environment.md"):
+        params = w.parse({"path": path, "content": "x\n"})
+        assert w.assess(params, ctx).reason == ""
+        assert _decide(w, params, ctx) is Decision.ALLOW
+
+
+def test_env_edit_in_auto_mode_is_confirmed(tmp_path):
+    """Сквозной путь: модель правит .env в режиме «авто» с -y — пользователя спрашивают."""
+    from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
+
+    from gigacrew.agent.loop import Agent
+    from gigacrew.config import Config
+    from gigacrew.tools.base import build_default_registry
+
+    env = tmp_path / ".env"
+    env.write_text("GIGACREW_AUTH_URL=https://auth.test/oauth\n", encoding="utf-8")
+    edit = {"path": ".env", "old_string": "auth.test", "new_string": "evil.test"}
+    provider = ScriptedProvider([tool_turn("edit_file", edit), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, auto_approve=True)
+    Agent(provider, build_default_registry(), cfg, events).run_turn("поправь адрес")
+    assert len(events.confirms) == 1 and events.confirms[0][2]  # как опасная операция
+    assert env.read_text(encoding="utf-8") == "GIGACREW_AUTH_URL=https://auth.test/oauth\n"
+
+
+@pytest.mark.parametrize(
+    "path", [".env", ".Env.Local", "deploy.pem", ".npmrc", "credentials.json", ".ssh/id_rsa"]
+)
+def test_read_file_refuses_secret_files(ctx, path):
+    target = ctx.root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("TOKEN=s3cr3t\n", encoding="utf-8")
+    r = ReadFileTool()
+    with pytest.raises(ToolError, match="секрет") as err:
+        r.run(r.parse({"path": path}), ctx)
+    assert "s3cr3t" not in str(err.value) and "run_shell" in str(err.value)
+
+
+def test_read_file_refuses_symlink_to_secret_and_reads_template(ctx):
+    import os
+
+    (ctx.root / ".env").write_text("TOKEN=s3cr3t\n", encoding="utf-8")
+    (ctx.root / ".env.example").write_text("TOKEN=\n", encoding="utf-8")
+    r = ReadFileTool()
+    assert "TOKEN=" in r.run(r.parse({"path": ".env.example"}), ctx).content
+    if os.name == "nt":
+        pytest.skip("симлинки")
+    (ctx.root / "settings.txt").symlink_to(ctx.root / ".env")
+    with pytest.raises(ToolError, match="секрет"):
+        r.run(r.parse({"path": "settings.txt"}), ctx)
+
+
+def test_search_skips_and_refuses_secret_files(ctx):
+    from gigacrew.tools.search import SearchContentTool
+
+    for path in ("src/a.py", ".env", ".ENV.local", ".npmrc", "deploy.pem", "credentials.json"):
+        target = ctx.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("needle=s3cr3t\n", encoding="utf-8")
+    (ctx.root / ".env.example").write_text("needle=\n", encoding="utf-8")
+    s = SearchContentTool()
+    out = s.run(s.parse({"pattern": "needle"}), ctx).content
+    assert sorted(ln.split(":", 1)[0] for ln in out.splitlines()) == [".env.example", "src/a.py"]
+    for path in (".env", ".npmrc"):  # явно названный файл с секретами — тоже нет
+        with pytest.raises(ToolError, match="секрет") as err:
+            s.run(s.parse({"pattern": "needle", "path": path}), ctx)
+        assert "s3cr3t" not in str(err.value)
+
+
+def test_edit_not_found_in_secret_file_shows_no_content(ctx):
+    """Неудачная правка показывает модели файл — но не файл с секретами (ошибка превью
+    уходит модели до вопроса о подтверждении)."""
+    (ctx.root / ".env").write_text("TOKEN=s3cr3t\n", encoding="utf-8")
+    with pytest.raises(ToolError, match="не найден") as err:
+        _edit(ctx, ".env", "MISSING=1", "MISSING=2")
+    assert "s3cr3t" not in str(err.value)
+
+
+def test_search_ignore_case(ctx):
+    from gigacrew.tools.search import SearchContentTool
+
+    (ctx.root / "a.txt").write_text("Needle\n", encoding="utf-8")
+    s = SearchContentTool()
+    assert (
+        s.run(s.parse({"pattern": "needle", "ignore_case": True}), ctx).content == "a.txt:1:Needle"
+    )
+    assert s.run(s.parse({"pattern": "needle"}), ctx).content == "(совпадений не найдено)"

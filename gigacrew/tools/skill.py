@@ -4,7 +4,8 @@
 загружает этим инструментом и следует ему. ``file`` — дополнительный файл из
 каталога скилла (справка, шаблон): скиллы пользователя лежат в ``~/.gigacode``,
 вне корня проекта, и read_file до них не дотянется. Выйти за пределы каталога
-скилла нельзя.
+скилла нельзя, в том числе симлинком: сам каталог и ``SKILL.md`` проверяет поиск
+скиллов, файлы — :func:`~gigacrew.security.resolve_in_root`.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from gigacrew.errors import SandboxError
+from gigacrew.project.files import is_within
 from gigacrew.project.skills import (
     SKILL_FILE,
     Skill,
@@ -38,11 +40,17 @@ class SkillParams(BaseModel):
 
 
 def _skill_files(skill: Skill) -> list[str]:
-    """Файлы каталога скилла (кроме SKILL.md), не больше :data:`MAX_LISTED_FILES`."""
+    """Файлы каталога скилла (кроме SKILL.md), не больше :data:`MAX_LISTED_FILES`.
+
+    Симлинки за пределы каталога не показываются: прочитать их всё равно нельзя.
+    """
     files: list[str] = []
+    root = skill.directory.resolve()
     for path in sorted(skill.directory.rglob("*")):
         rel = path.relative_to(skill.directory).as_posix()
-        if rel == SKILL_FILE or not path.is_file() or rel.startswith("."):
+        if rel == SKILL_FILE or rel.startswith(".") or not path.is_file():
+            continue
+        if not is_within(root, path):
             continue
         if len(files) == MAX_LISTED_FILES:
             files.append("…")

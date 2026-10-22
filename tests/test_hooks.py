@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from fakes import RecordingEvents
 
-from gigacrew.agent.hooks import HOOK_OUTPUT_LIMIT, NO_REASON, HookRunner
+from gigacrew.agent.hooks import HOOK_OUTPUT_LIMIT, NO_REASON, HookRunner, short_command
 from gigacrew.project.settings import HookCommand, HookEvent, HookGroup, HookSettings
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="команды хуков — через /bin/sh")
@@ -68,6 +68,59 @@ def test_exit_2_blocks_with_stderr_and_stops_other_hooks(tmp_path):
     assert not marker.exists()
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        HookEvent.PRE_REQUEST,
+        HookEvent.USER_PROMPT_SUBMIT,
+        HookEvent.STOP,
+        HookEvent.SUBAGENT_STOP,
+    ],
+)
+def test_block_stops_other_hooks_where_it_has_effect(tmp_path, event):
+    marker = tmp_path / "second-ran"
+    second = _script(tmp_path, f"open({str(marker)!r}, 'w')", "b.py")
+    result, _ = _run(_runner(event, "echo нет >&2; exit 2", second), event, tmp_path)
+    assert result.blocked and result.reason == "нет"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "event",
+    [HookEvent.SESSION_START, HookEvent.SESSION_END, HookEvent.PRE_COMPACT, HookEvent.NOTIFICATION],
+)
+def test_exit_2_cannot_block_events_that_have_nothing_to_block(tmp_path, event):
+    # Код 2 у SessionStart и прочих — не блокировка: остальные хуки идут, stderr виден.
+    marker = tmp_path / "second-ran"
+    second = _script(tmp_path, f"open({str(marker)!r}, 'w'); print('контекст')", "b.py")
+    result, events = _run(_runner(event, "echo сломался >&2; exit 2", second), event, tmp_path)
+    assert not result.blocked and marker.exists()
+    assert result.context == (["контекст"] if event is HookEvent.SESSION_START else [])
+    ((level, text),) = events.notices
+    assert level == "warn" and "кодом 2" in text and "сломался" in text
+
+
+def test_json_block_cannot_block_session_start(tmp_path):
+    cmd = _script(tmp_path, "print(json.dumps({'decision': 'block', 'reason': 'нельзя'}))")
+    result, events = _run(_runner(HookEvent.SESSION_START, cmd), HookEvent.SESSION_START, tmp_path)
+    assert not result.blocked
+    assert [level for level, _ in events.notices] == ["warn"] and "нельзя" in events.notices[0][1]
+
+
+def test_post_tool_use_collects_feedback_of_every_hook(tmp_path):
+    # Линтер с кодом 2 не отменяет форматтер после него; модели — замечания всех хуков.
+    marker = tmp_path / "formatter-ran"
+    lint = "echo 'E501 строка длинная' >&2; exit 2"
+    other = "echo 'F401 лишний импорт' >&2; exit 2"
+    fmt = _script(tmp_path, f"open({str(marker)!r}, 'w')", "fmt.py")
+    result, events = _run(
+        _runner(HookEvent.POST_TOOL_USE, lint, other, fmt), HookEvent.POST_TOOL_USE, tmp_path
+    )
+    assert marker.exists() and result.blocked
+    assert result.reason == "E501 строка длинная\n\nF401 лишний импорт"
+    assert events.notices == []
+
+
 def test_exit_2_without_stderr_has_default_reason(tmp_path):
     result, _ = _run(_runner(HookEvent.STOP, "exit 2"), HookEvent.STOP, tmp_path)
     assert result.blocked and result.reason == NO_REASON
@@ -120,6 +173,35 @@ def test_pre_tool_use_json(tmp_path, output, decision, blocked, reason):
     cmd = _script(tmp_path, f"print(json.dumps({output!r}))")
     result, _ = _run(_runner(HookEvent.PRE_TOOL_USE, cmd), HookEvent.PRE_TOOL_USE, tmp_path)
     assert (result.decision, result.blocked, result.reason) == (decision, blocked, reason)
+
+
+def test_unparsed_json_decision_is_reported_and_asks(tmp_path):
+    # Решение и строка лога в stdout: JSON не разобрать — хук не должен молча «разрешить».
+    deny = {"hookSpecificOutput": {"permissionDecision": "deny"}}
+    cmd = _script(tmp_path, f"print(json.dumps({deny!r})); print('проверено')")
+    result, events = _run(_runner(HookEvent.PRE_TOOL_USE, cmd), HookEvent.PRE_TOOL_USE, tmp_path)
+    assert result.decision == "ask" and not result.blocked
+    ((level, text),) = events.notices
+    assert level == "warn" and "JSON" in text and short_command(cmd) in text
+
+
+def test_unparsed_json_is_reported_for_other_events(tmp_path):
+    cmd = 'echo \'{"decision": "block",\''
+    result, events = _run(_runner(HookEvent.STOP, cmd), HookEvent.STOP, tmp_path)
+    assert not result.blocked and result.decision is None
+    assert [level for level, _ in events.notices] == ["warn"]
+    plain, events = _run(_runner(HookEvent.STOP, "echo готово"), HookEvent.STOP, tmp_path)
+    assert events.notices == []  # простой текст — не повод для предупреждения
+
+
+@pytest.mark.parametrize("command", ["echo hi\x00", "echo \ud800"], ids=["nul", "surrogate"])
+def test_unlaunchable_command_warns_instead_of_crashing(tmp_path, command):
+    result, events = _run(
+        _runner(HookEvent.SESSION_START, command), HookEvent.SESSION_START, tmp_path
+    )
+    assert not result.blocked
+    ((level, text),) = events.notices
+    assert level == "warn" and "не запустился" in text
 
 
 def test_ask_wins_over_allow(tmp_path):
