@@ -103,6 +103,7 @@ from gigacrew.safety import CommandLevel, Verdict
 from gigacrew.security import RiskLevel
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 from gigacrew.tools.plan import PlanReview, review_plan
+from gigacrew.tools.process import quote_reminder_tags
 from gigacrew.tools.questions import Answer, Question
 from gigacrew.tools.task import SUBAGENTS, SubagentSpec
 
@@ -205,6 +206,15 @@ USER_STOP_REASON = "Пользователь остановил суб-аген�
 
 def _with_note(content: str, note: str | None) -> str:
     return f"{content}\n\n{note}" if note else content
+
+
+def _tool_text(content: str, note: str | None = None) -> str:
+    """Результат вызова для истории: тег заметок в нём — цитата, затем заметка harness'а.
+
+    Содержимое файла, найденные строки, текст ошибки (цитата из файла) не должны выдать
+    себя за ``<system-reminder>``, который системный промпт велит выполнять.
+    """
+    return _with_note(quote_reminder_tags(content), note)
 
 
 def _reminder(note: str) -> str:
@@ -1616,11 +1626,11 @@ class Agent:
                 )
             if result is not None:
                 self._conversation.add_function_result(
-                    name, _with_note(result.as_function_content(), note)
+                    name, _tool_text(result.as_function_content(), note)
                 )
             raise
         self._conversation.add_function_result(
-            name, _with_note(result.as_function_content(), _join_notes(feedback, note))
+            name, _tool_text(result.as_function_content(), _join_notes(feedback, note))
         )
         if result.ok:
             self._attach_instructions(tool, params)
@@ -1914,7 +1924,7 @@ class Agent:
         result = ToolResult(content=error, ok=False, summary=summary)
         self._events.on_tool_result(call, result, previewed=False)
         content = model_text or f"ОШИБКА: {error}"
-        self._conversation.add_function_result(call.name, _with_note(content, note))
+        self._conversation.add_function_result(call.name, _tool_text(content, note))
         return ToolOutcome(ok=False)
 
     def call_info(self, call: FunctionCall) -> ToolCallInfo:

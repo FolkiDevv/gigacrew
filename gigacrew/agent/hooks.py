@@ -25,7 +25,12 @@ from typing import Any, Literal
 
 from gigacrew.agent.events import AgentEvents
 from gigacrew.project.settings import HookCommand, HookEvent, HookSettings
-from gigacrew.tools.process import ProcessResult, run_process, truncate_middle
+from gigacrew.tools.process import (
+    ProcessResult,
+    quote_reminder_tags,
+    run_process,
+    truncate_middle,
+)
 
 BLOCK_EXIT_CODE = 2
 # Сколько символов вывода хука уходит модели (контекст, причина блокировки).
@@ -264,7 +269,8 @@ def _first_line(text: str) -> str:
 
 
 def _text(value: object) -> str:
-    return value.strip() if isinstance(value, str) else ""
+    # Строку из JSON run_process не цитировал: «\u003csystem-reminder>» — тег после разбора.
+    return quote_reminder_tags(value.strip()) if isinstance(value, str) else ""
 
 
 def _json_object(text: str) -> dict[str, Any] | None:
