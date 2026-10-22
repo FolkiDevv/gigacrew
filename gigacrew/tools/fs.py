@@ -299,19 +299,20 @@ def make_diff(old: str, new: str, path: str) -> str:
     return "".join(line if line.endswith("\n") else f"{line}\n{_NO_NEWLINE}" for line in diff)
 
 
-def _unescape_simple(s: str) -> str:
-    """Разэкранирует частые последовательности (\\n, \\t, \\", \\') без условий.
+# Последовательности двойной экранизации: ``\r\n`` — один перевод строки (текст
+# сравнивается в виде с ``\n``), ``\\`` — обратная косая черта. Разбор — за один проход
+# слева направо: в ``\\n`` экранирована косая черта, а ``n`` — обычная буква.
+_ESCAPE_RE = re.compile(r"\\r\\n|\\([nt\"'\\])")
+_ESCAPES = {"n": "\n", "t": "\t", '"': '"', "'": "'", "\\": "\\"}
+
+
+def _unescape(s: str) -> str:
+    """Разэкранирует частые последовательности (\\n, \\t, \\", \\', \\\\) без условий.
 
     Используется как один из вариантов-кандидатов при поиске old_string —
     применяется только если разэкранированная форма реально нашлась в файле.
     """
-    return (
-        s.replace("\\r\\n", "\n")
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace('\\"', '"')
-        .replace("\\'", "'")
-    )
+    return _ESCAPE_RE.sub(lambda m: _ESCAPES[m.group(1)] if m.group(1) else "\n", s)
 
 
 _LINE_NUM_RE = re.compile(r"^\s*\d+\t")
@@ -334,33 +335,32 @@ def _strip_line_numbers(s: str) -> str:
     return "\n".join(_LINE_NUM_RE.sub("", ln) for ln in lines)
 
 
+_NUMBERED_LINE_RE = re.compile(r"^\d+\t")
+
+
 def repair_escaped_content(content: str) -> tuple[str, bool]:
     """Чинит «двойную экранизацию», которую иногда выдаёт модель.
 
     Слабые модели порой кладут в write_file одну физическую строку, где все
     переносы — это литералы ``\\n`` (а кавычки — ``\\"``), иногда ещё и с
     префиксами номеров строк (``1\\timport ...``), скопированными из подсказки.
-    Такой контент однозначно битый: ноль настоящих переносов при множестве
-    литеральных ``\\n``. В этом случае разэкранируем и снимаем нумерацию.
+    Чинится только однозначный случай: ни одного настоящего переноса, не меньше двух
+    литеральных ``\\n`` и либо текст кончается литеральным ``\\n`` (файл с переводом
+    строки в конце, экранированный ещё раз), либо все строки — с номерами. Однострочный
+    код или JSON без такого хвоста (``print("a\\nb\\nc")``) верен как есть и не меняется.
 
     Возвращает (исправленный_текст, был_ли_ремонт).
     """
-    if content.count("\n") == 0 and content.count("\\n") >= 2:
-        fixed = (
-            content.replace("\\r\\n", "\n")
-            .replace("\\n", "\n")
-            .replace("\\t", "\t")
-            .replace('\\"', '"')
-            .replace("\\'", "'")
-            .replace("\\\\", "\\")
-        )
-        lines = fixed.split("\n")
-        nonempty = [ln for ln in lines if ln.strip()]
-        if nonempty and all(re.match(r"^\d+\t", ln) for ln in nonempty):
-            lines = [re.sub(r"^\d+\t", "", ln) for ln in lines]
-            fixed = "\n".join(lines)
-        return fixed, True
-    return content, False
+    if "\n" in content or content.count("\\n") < 2:
+        return content, False
+    fixed = _unescape(content)
+    lines = fixed.split("\n")
+    nonempty = [ln for ln in lines if ln.strip()]
+    if nonempty and all(_NUMBERED_LINE_RE.match(ln) for ln in nonempty):
+        return "\n".join(_NUMBERED_LINE_RE.sub("", ln) for ln in lines), True
+    if not fixed.endswith("\n"):
+        return content, False
+    return fixed, True
 
 
 def _numbered_excerpt(text: str, max_lines: int = 60) -> str:
@@ -736,11 +736,11 @@ class EditFileTool(Tool):
         # фрагментам и берём первое, которое реально находится в файле — это
         # безопасно: преобразованная форма применяется, только если совпала.
         def both(s):
-            return _strip_line_numbers(_unescape_simple(s))
+            return _strip_line_numbers(_unescape(s))
 
         transforms = [
             lambda s: s,  # как прислано
-            _unescape_simple,  # снять экранизацию \n/\"
+            _unescape,  # снять экранизацию \n/\"
             _strip_line_numbers,  # снять префиксы номеров строк
             both,  # и то, и другое
         ]
