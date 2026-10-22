@@ -87,7 +87,8 @@ def test_destructive_commands_are_dangerous(command):
 
 
 @pytest.mark.parametrize(
-    "command", ["git push origin main", "git branch -d merged", "git stash list", "find . -name x"]
+    "command",
+    ["git push origin main", "git branch -d merged", "git stash list", "find . -name x"],
 )
 def test_ordinary_commands_are_not_dangerous(command):
     # Регэксп — только список опасного: WRITE значит «опасного не узнал», а не «проверено».
@@ -115,7 +116,8 @@ def _assess(tmp_path, command: str, **ctx_kw):
 )
 def test_run_shell_risk_follows_classifier(tmp_path, command, level, risk):
     assessment = _assess(tmp_path, command)
-    assert assessment.verdict.level is level and assessment.risk is risk
+    assert assessment.verdict.level is level
+    assert assessment.risk is risk
 
 
 def test_run_shell_read_needs_confirmation_when_safe_commands_off(tmp_path):
@@ -125,5 +127,6 @@ def test_run_shell_read_needs_confirmation_when_safe_commands_off(tmp_path):
 def test_run_shell_over_long_command_is_dangerous(tmp_path):
     # Длиннее MAX_COMMAND классификатор не разбирает, а регэксп опасного тут не узнаёт.
     assessment = _assess(tmp_path, "touch x  # " + "a" * MAX_COMMAND)
-    assert assessment.verdict.level is None and assessment.risk is RiskLevel.DANGEROUS
+    assert assessment.verdict.level is None
+    assert assessment.risk is RiskLevel.DANGEROUS
     assert assessment.reason == "не удалось проверить: слишком длинная команда"

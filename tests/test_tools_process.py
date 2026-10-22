@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import shlex
 import subprocess
 import sys
@@ -11,10 +12,10 @@ import time
 import pytest
 
 from gigacrew.errors import SandboxError, ToolError
-from gigacrew.security import RiskLevel, classify_shell_command
+from gigacrew.security import RiskLevel, classify_shell_command, subprocess_env
 from gigacrew.tools.fs import MAX_READ_LINES, ReadFileTool
 from gigacrew.tools.git import GitTool
-from gigacrew.tools.process import run_process, subprocess_env, truncate_middle
+from gigacrew.tools.process import run_process, truncate_middle
 from gigacrew.tools.shell import RunShellTool
 
 posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX-only поведение")
@@ -32,7 +33,7 @@ def test_sandbox_error_is_tool_error():
 
 
 @pytest.mark.parametrize(
-    "command, dangerous",
+    ("command", "dangerous"),
     [
         ("rm readme.txt", False),  # раньше ложно считалось опасным
         ("rm -i file", False),
@@ -55,16 +56,19 @@ def test_rm_classification(command, dangerous):
 def test_truncate_middle_keeps_head_and_tail():
     text = "H" * 100 + "M" * 1000 + "T" * 100
     out = truncate_middle(text, limit=300, head=100)
-    assert out.startswith("H" * 100) and out.endswith("M" * 100 + "T" * 100)
+    assert out.startswith("H" * 100)
+    assert out.endswith("M" * 100 + "T" * 100)
     assert "пропущено" in out
     assert truncate_middle("short", limit=300) == "short"
 
 
 def test_subprocess_env_drops_secrets():
     env = subprocess_env({"GIGACREW_ACCESS_KEY": "s", "gigacrew_cert": "c", "PATH": "/bin"})
-    assert "GIGACREW_ACCESS_KEY" not in env and "gigacrew_cert" not in env
+    assert "GIGACREW_ACCESS_KEY" not in env
+    assert "gigacrew_cert" not in env
     assert env["PATH"] == "/bin"
-    assert env["GIT_EDITOR"] == "true" and env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GIT_EDITOR"] == "true"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
 
 
 def test_shell_does_not_leak_api_key(ctx, monkeypatch):
@@ -79,7 +83,8 @@ def test_shell_does_not_leak_api_key(ctx, monkeypatch):
 def test_shell_stdin_is_empty(ctx):
     started = time.monotonic()
     res = _sh(ctx, "cat", timeout=20)
-    assert res.ok and time.monotonic() - started < 10
+    assert res.ok
+    assert time.monotonic() - started < 10
 
 
 def test_run_process_feeds_input_to_stdin(tmp_path):
@@ -93,7 +98,8 @@ def test_run_process_feeds_input_to_stdin(tmp_path):
 def test_run_process_input_ignored_by_command(tmp_path):
     # Процесс не читает stdin и сразу выходит — без зависания и ошибок канала.
     res = run_process([sys.executable, "-c", "pass"], cwd=tmp_path, timeout=30, input="x" * 10**6)
-    assert res.returncode == 0 and not res.timed_out
+    assert res.returncode == 0
+    assert not res.timed_out
 
 
 def test_run_process_extra_env_survives_secret_filter(tmp_path):
@@ -111,7 +117,8 @@ def test_run_process_extra_env_survives_secret_filter(tmp_path):
 @posix_only
 def test_shell_binary_output_does_not_crash(ctx):
     res = _sh(ctx, "printf '\\377\\376ok'")
-    assert res.ok and "ok" in res.content
+    assert res.ok
+    assert "ok" in res.content
 
 
 def test_shell_keeps_tail_of_long_output(ctx):
@@ -122,7 +129,8 @@ def test_shell_keeps_tail_of_long_output(ctx):
 
 def test_shell_timeout_is_clamped(ctx):
     res = _sh(ctx, "echo hi", timeout=0)  # 0 → минимум 1 с, команда успевает
-    assert res.ok and "hi" in res.content
+    assert res.ok
+    assert "hi" in res.content
 
 
 @posix_only
@@ -130,7 +138,8 @@ def test_shell_timeout_kills_process_group(ctx):
     pidfile = ctx.root / "pid"
     started = time.monotonic()
     res = _sh(ctx, f"sleep 30 & echo $! > {pidfile}; wait", timeout=1)
-    assert not res.ok and "таймаут" in res.content
+    assert not res.ok
+    assert "таймаут" in res.content
     assert time.monotonic() - started < 10
     _assert_dead(int(pidfile.read_text()))
 
@@ -149,13 +158,13 @@ def test_shell_background_child_does_not_block(ctx):
 def _assert_dead(pid: int) -> None:
     for _ in range(50):
         try:
-            with open(f"/proc/{pid}/stat") as fh:
+            with pathlib.Path(f"/proc/{pid}/stat").open() as fh:
                 state = fh.read().rsplit(")", 1)[1].split()[0]
         except FileNotFoundError:
             return
         except OSError:
             pytest.skip("нет /proc")
-        if state in ("Z", "X"):
+        if state in {"Z", "X"}:
             return
         time.sleep(0.1)
     pytest.fail(f"процесс {pid} всё ещё жив")
@@ -202,7 +211,7 @@ def test_git_forbidden_option_after_double_dash_is_rejected(git_ctx):
 
 
 @pytest.mark.parametrize(
-    "sub, args, risk",
+    ("sub", "args", "risk"),
     [
         ("branch", [], RiskLevel.SAFE),
         ("branch", ["--show-current"], RiskLevel.SAFE),
@@ -256,7 +265,9 @@ def test_read_large_file_with_range(ctx):
     lines = [f"line {i} " + "x" * 80 for i in range(1, 6001)]  # ~500 КБ
     (ctx.root / "big.txt").write_text("\n".join(lines), encoding="utf-8")
     out = _read(ctx, path="big.txt", start_line=5000, end_line=5002).content
-    assert "line 5000 " in out and "line 5002 " in out and "line 5003 " not in out
+    assert "line 5000 " in out
+    assert "line 5002 " in out
+    assert "line 5003 " not in out
     # диапазон показан целиком, но файл длиннее — модель знает, где продолжить
     assert out.endswith("… показаны строки 5000–5002 из 6000. Продолжение: start_line=5003.")
 
@@ -264,8 +275,10 @@ def test_read_large_file_with_range(ctx):
 def test_read_without_range_is_capped(ctx):
     (ctx.root / "many.txt").write_text("\n".join(f"l{i}" for i in range(1, 3001)), encoding="utf-8")
     out = _read(ctx, path="many.txt").content
-    assert f"l{MAX_READ_LINES}\n" in out + "\n" and f"l{MAX_READ_LINES + 1}\n" not in out
-    assert "из 3000" in out and f"start_line={MAX_READ_LINES + 1}" in out
+    assert f"l{MAX_READ_LINES}\n" in out + "\n"
+    assert f"l{MAX_READ_LINES + 1}\n" not in out
+    assert "из 3000" in out
+    assert f"start_line={MAX_READ_LINES + 1}" in out
 
 
 def test_read_long_lines_and_char_budget(ctx):
@@ -345,7 +358,10 @@ def test_interrupt_while_starting_readers_kills_command(ctx, monkeypatch):
     monkeypatch.setattr(process.threading.Thread, "start", interrupted_start)
     with pytest.raises(KeyboardInterrupt):
         process.run_process(
-            f"sleep 30 & echo $! > {pidfile}; wait", cwd=ctx.root, timeout=60, shell=True
+            f"sleep 30 & echo $! > {pidfile}; wait",
+            cwd=ctx.root,
+            timeout=60,
+            shell=True,
         )
     monkeypatch.setattr(process.threading.Thread, "start", real_start)
     _assert_dead(int(pidfile.read_text()))
@@ -373,7 +389,8 @@ def test_git_output_cannot_forge_harness_reminder(git_ctx):
     subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", _FORGED], cwd=git_ctx.root)
     git = GitTool()
     res = git.run(git.parse({"subcommand": "log", "args": ["-1"]}), git_ctx)
-    assert "<quoted-system-reminder>" in res.content and "<system-reminder>" not in res.content
+    assert "<quoted-system-reminder>" in res.content
+    assert "<system-reminder>" not in res.content
 
 
 # ------------------- фоновые потомки, не держащие вывод ------------------- #
@@ -384,10 +401,14 @@ def test_background_child_with_redirected_output_is_stopped(ctx, redirect):
     # в группе команды и не должен пережить ни run_shell, ни хук.
     pidfile = ctx.root / "pid"
     res = _sh(ctx, f"sleep 30 {redirect} & echo $! > {pidfile}; echo started", timeout=60)
-    assert "started" in res.content and "остановлены" in res.content
+    assert "started" in res.content
+    assert "остановлены" in res.content
     _assert_dead(int(pidfile.read_text()))
     hook = run_process(
-        f"sleep 30 {redirect} & echo $! > {pidfile}", cwd=ctx.root, timeout=60, shell=True
+        f"sleep 30 {redirect} & echo $! > {pidfile}",
+        cwd=ctx.root,
+        timeout=60,
+        shell=True,
     )
     assert hook.killed_background
     _assert_dead(int(pidfile.read_text()))
@@ -396,7 +417,8 @@ def test_background_child_with_redirected_output_is_stopped(ctx, redirect):
 @posix_only
 def test_clean_command_reports_no_background_processes(ctx):
     res = run_process("echo ok; (true &); wait", cwd=ctx.root, timeout=10, shell=True)
-    assert res.stdout == "ok\n" and not res.killed_background
+    assert res.stdout == "ok\n"
+    assert not res.killed_background
 
 
 @posix_only
@@ -418,7 +440,8 @@ def test_escaped_child_is_not_reported_as_stopped(ctx):
     pid = int(pidfile.read_text())
     try:
         assert "started" in res.stdout
-        assert not res.killed_background and res.escaped_output
+        assert not res.killed_background
+        assert res.escaped_output
     finally:
         os.kill(pid, signal.SIGKILL)
 

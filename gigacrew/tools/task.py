@@ -48,23 +48,21 @@ EXPLORE = SubagentSpec(
         "status/diff/log, read-only shell commands. Returns a digest with paths and line "
         "numbers. For a research question prefer the explore tool"
     ),
-    tools=frozenset(
-        {
-            "read_file",
-            "list_dir",
-            "find_files",
-            "search_content",
-            "find_symbol",
-            "find_references",
-            "goto_definition",
-            "call_hierarchy",
-            "file_outline",
-            "repo_map",
-            "skill",
-            "git",  # изменяющие подкоманды блокирует read_only
-            "run_shell",  # только команды, признанные классификатором «только чтение»
-        }
-    ),
+    tools=frozenset({
+        "read_file",
+        "list_dir",
+        "find_files",
+        "search_content",
+        "find_symbol",
+        "find_references",
+        "goto_definition",
+        "call_hierarchy",
+        "file_outline",
+        "repo_map",
+        "skill",
+        "git",  # изменяющие подкоманды блокирует read_only
+        "run_shell",  # только команды, признанные классификатором «только чтение»
+    }),
     read_only=True,
 )
 GENERAL = SubagentSpec(
@@ -100,7 +98,7 @@ class TaskParams(BaseModel):
             "A complete brief — the subagent does NOT see this conversation: the goal and "
             "the concrete question(s); known starting points (paths, names, strings, "
             "errors); what is out of scope; what to return and when to stop."
-        )
+        ),
     )
     description: str = Field(
         "",
@@ -114,7 +112,7 @@ class ExploreParams(BaseModel):
             "What to find out about the code, as one full question, e.g. 'How is a "
             "request authenticated: where are credentials checked and where is the "
             "session created?'"
-        )
+        ),
     )
     hints: str = Field(
         "",
@@ -125,7 +123,7 @@ class ExploreParams(BaseModel):
     )
 
 
-class ExploreTool(Tool):
+class ExploreTool(Tool[ExploreParams]):
     name = "explore"
     description = (
         "Investigates the codebase to answer a question and returns a short report with "
@@ -153,7 +151,7 @@ class ExploreTool(Tool):
         return ctx.run_subagent(EXPLORE.name, task_title("", question), brief)
 
 
-class TaskTool(Tool):
+class TaskTool(Tool[TaskParams]):
     name = "task"
     description = (
         "Hands a self-contained subtask to a subagent that works in its own context and "
@@ -179,7 +177,7 @@ class TaskTool(Tool):
         if agent not in SUBAGENTS:
             raise ToolError(
                 f"неизвестный суб-агент {params.subagent_type.strip()!r}; "
-                f"доступны: {', '.join(SUBAGENTS)}."
+                f"доступны: {', '.join(SUBAGENTS)}.",
             )
         prompt = params.prompt.strip()
         if not prompt:

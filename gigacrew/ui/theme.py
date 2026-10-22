@@ -66,8 +66,9 @@ MINT_ANSI = Palette(
 
 def palette_for(color_system: str | None) -> Palette:
     """Палитра для цветовой системы терминала — как её называет rich
-    (``truecolor``, ``256``, ``standard``, ``windows``; None — без цвета)."""
-    return MINT_ANSI if color_system in ("standard", "windows") else MINT
+    (``truecolor``, ``256``, ``standard``, ``windows``; None — без цвета).
+    """
+    return MINT_ANSI if color_system in {"standard", "windows"} else MINT
 
 
 ICON_TOOL = "●"

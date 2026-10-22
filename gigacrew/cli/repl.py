@@ -12,9 +12,10 @@
 
 from __future__ import annotations
 
-from gigacrew import __version__
+from importlib import metadata
+
 from gigacrew.agent.chat_store import ChatInfo, ChatRecorder
-from gigacrew.agent.hooks import PromptBlocked
+from gigacrew.agent.hooks import PromptBlockedError
 from gigacrew.agent.loop import Agent
 from gigacrew.cli.commands import (
     CommandContext,
@@ -63,7 +64,9 @@ def autosave(chats: ChatRecorder | None, agent: Agent, ui: Console) -> None:
 
 
 def esc_interrupt_for(
-    ui: Console, interrupt: EscInterrupt | None = None, agent: Agent | None = None
+    ui: Console,
+    interrupt: EscInterrupt | None = None,
+    agent: Agent | None = None,
 ) -> EscInterrupt:
     """Прерывание ходов клавишей Esc (если stdin — терминал) + подсказка в индикаторе.
 
@@ -111,7 +114,8 @@ def run_repl(
     проекта и ``~/.gigacode/skills``, перечитываются перед каждым вводом.
 
     Хуки SessionStart — перед первым вводом, SessionEnd — при выходе (Ctrl+D, ``/exit``);
-    ``trust_hooks`` (``--trust-hooks``) — для ``/hooks reload``."""
+    ``trust_hooks`` (``--trust-hooks``) — для ``/hooks reload``.
+    """
     if interrupt is None:
         interrupt = EscInterrupt(enabled=None if read_input is None else False)
     esc = esc_interrupt_for(ui, interrupt, agent)
@@ -132,7 +136,7 @@ def run_repl(
         skills=lambda: [(skill.command, skill.description) for skill in skills],
     )
     ui.banner(
-        version=__version__,
+        version=metadata.version("gigacrew"),
         model=agent.model,
         root=str(agent.workspace.root),
         hints=[(name, desc) for name, desc in BANNER_HINTS if commands.get(name) is not None],
@@ -220,7 +224,7 @@ def _loop(
             with esc:
                 agent.run_turn(line)
             ui.print()
-        except PromptBlocked as e:
+        except PromptBlockedError as e:
             ui.stop_live()
             ui.warn(f"запрос отклонён хуком UserPromptSubmit: {e.reason}")
         except LLMError as e:

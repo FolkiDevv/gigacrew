@@ -48,8 +48,9 @@ ENV = load_environment(REPO_ROOT)
 MODELS = eval_models(ENV)
 MODEL_PARAMS = MODELS or [
     pytest.param(
-        None, marks=pytest.mark.skip(reason="не заданы GIGACREW_EVAL_MODELS и GIGACREW_TEST_MODEL")
-    )
+        None,
+        marks=pytest.mark.skip(reason="не заданы GIGACREW_EVAL_MODELS и GIGACREW_TEST_MODEL"),
+    ),
 ]
 FINDINGS: dict[str, dict[str, Any]] = {}
 
@@ -122,7 +123,8 @@ def test_reasoning_and_tool_state(api, model):
     finding = FINDINGS.setdefault(model, {})
     messages = [Message(role="user", content=WEATHER_PROMPT)]
     status, data, error = _post(
-        api, api._payload(messages, [WEATHER_TOOL], model=model, temperature=1.0)
+        api,
+        api._payload(messages, [WEATHER_TOOL], model=model, temperature=1.0),
     )
     assert data is not None, f"первый шаг не прошёл ({status}): {error}"
     turn = ApiProvider._parse_response(data)
@@ -140,10 +142,16 @@ def test_reasoning_and_tool_state(api, model):
     stateless = turn.message.model_copy(update={"state_id": None})
     variants = {
         "with_state": api._payload(
-            [*messages, turn.message, *results], [WEATHER_TOOL], model=model, temperature=1.0
+            [*messages, turn.message, *results],
+            [WEATHER_TOOL],
+            model=model,
+            temperature=1.0,
         ),
         "without_state": api._payload(
-            [*messages, stateless, *results], [WEATHER_TOOL], model=model, temperature=1.0
+            [*messages, stateless, *results],
+            [WEATHER_TOOL],
+            model=model,
+            temperature=1.0,
         ),
     }
     if reasoning:
@@ -182,7 +190,8 @@ def test_sampling_options(api, model):
 @pytest.mark.parametrize("model", MODEL_PARAMS)
 def test_text_stream_reaches_the_end(api, model):
     """Поток без окончания (``done``, ``finish_reason``, ``usage``) gigacrew считает
-    оборванным. Здесь — что присылает шлюз на обычный короткий ответ."""
+    оборванным. Здесь — что присылает шлюз на обычный короткий ответ.
+    """
     finding = FINDINGS.setdefault(model, {})
     prompt = [Message(role="user", content="Ответь одним словом: столица Франции?")]
     turn = api.stream(prompt, model=model, temperature=1.0)

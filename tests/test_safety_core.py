@@ -38,7 +38,8 @@ def level(command: str, root: Path, **kw) -> CommandLevel | None:
 @pytest.mark.parametrize("command", ["touch a\u202eb", "git checkout -- .\u200b", "ls\x1b[2K"])
 def test_hidden_characters_in_long_command_are_danger(root, command):
     """Длинная команда не разбирается, но невидимые символы в ней — всё равно опасно:
-    иначе хвост из 10 000 символов прятал бы подмену текста."""
+    иначе хвост из 10 000 символов прятал бы подмену текста.
+    """
     padded = command + "  # " + "x" * MAX_COMMAND
     verdict = classify(padded, root=root)
     assert verdict.level is DANGER, verdict.reason
@@ -89,7 +90,8 @@ def test_backticks_that_are_not_substitutions_stay_read(root, command):
 )
 def test_variables_in_heredoc_body_are_checked_like_arguments(root, command):
     """Тело heredoc/herestring программа выведет, как echo — аргумент: переменная из
-    окружения может быть секретом."""
+    окружения может быть секретом.
+    """
     assert level('echo "$GITHUB_TOKEN"', root) is None
     verdict = classify(command, root=root)
     assert verdict.level is None and not verdict.composable, verdict.reason
@@ -122,7 +124,8 @@ def test_heredoc_body_without_secret_variables_stays_read(root, command):
 def test_variable_assigned_earlier_to_a_static_value_is_not_a_secret(root, command):
     """Переменная, которой команда сама раньше присвоила постоянное значение, — не секрет
     из окружения: вывести её можно без вопроса (присваивать — только безвредные имена,
-    другие меняют окружение следующих команд)."""
+    другие меняют окружение следующих команд).
+    """
     assert level("TZ=UTC; echo hi", root) is READ
     assert level("echo $TZ", root) is None
     verdict = classify(command, root=root)
@@ -176,7 +179,7 @@ def test_assigned_variable_is_trusted_only_when_certainly_static(root, command):
     ],
 )
 def test_recursive_read_sees_secrets_in_service_dirs(root, secret):
-    """grep -r и find не пропускают build, node_modules, .venv: секреты там прочитаются."""
+    """Grep -r и find не пропускают build, node_modules, .venv: секреты там прочитаются."""
     (root / secret).parent.mkdir(parents=True, exist_ok=True)
     (root / "build").mkdir(exist_ok=True)
     (root / "build" / "out.txt").write_text("hello\n")
@@ -208,7 +211,8 @@ def two_makefiles(root: Path) -> Path:
 @pytest.mark.parametrize("command", ["make test", "./run.sh --fast"])
 def test_cd_inside_subshell_is_not_matched_by_rule_for_other_directory(two_makefiles, command):
     """`(cd X && …)` выполняется в X, а Verdict.cwd остаётся корнем: по частям такую
-    команду с разрешениями не сверить, иначе правило корня сработало бы в X."""
+    команду с разрешениями не сверить, иначе правило корня сработало бы в X.
+    """
     from gigacrew.agent.decisions import DecisionMemory
 
     root = two_makefiles
@@ -216,10 +220,12 @@ def test_cd_inside_subshell_is_not_matched_by_rule_for_other_directory(two_makef
     assert memory.approve(classify(command, root=root))
     assert memory.match(classify(command, root=root)) is not None
     sub = classify(f"(cd vendor/x && {command})", root=root)
-    assert sub.cwd == "." and sub.composable is False
+    assert sub.cwd == "."
+    assert sub.composable is False
     assert memory.match(sub) is None
     top = classify(f"cd vendor/x && {command}", root=root)
-    assert top.cwd == "vendor/x" and top.composable is True
+    assert top.cwd == "vendor/x"
+    assert top.composable is True
     assert memory.match(top) is None
     # тот же каталог — по-прежнему по частям
     assert classify(f"(cd . && {command})", root=root).composable is True
@@ -240,26 +246,31 @@ def test_edits_only_requires_every_part_and_every_redirect_to_be_an_edit(root):
     assert not classify("sed -i s/a/b/ a.txt && pip install x", root=root).edits_only
     # только уровень WRITE (T1-S2): опасное и «не знаю» — не правки
     danger = classify("sed -i 's/a/b/' a.txt > ../x", root=root)
-    assert danger.level is DANGER and not danger.edits_only
+    assert danger.level is DANGER
+    assert not danger.edits_only
     unknown = classify("sed -i 's/a/b/' a.txt > $OUT", root=root)
-    assert unknown.level is None and not unknown.edits_only
+    assert unknown.level is None
+    assert not unknown.edits_only
 
 
 def test_cd_followed_by_newline_is_not_a_working_directory(root):
     """Перевод строки после cd — как «;»: следующая команда выполнится и там, где cd
-    не сработал (T1-U7)."""
+    не сработал (T1-U7).
+    """
     for sep in ("; ", "\n"):
         verdict = classify(f"cd src{sep}cat ../a.txt", root=root)
         assert verdict.cwd == "." and verdict.level is None, verdict.reason
     assert classify("cd src && cat ../a.txt", root=root).level is READ
     only = classify("cd src", root=root)
-    assert only.cwd == "src" and only.command == ""
+    assert only.cwd == "src"
+    assert only.command == ""
     assert classify("cd src\n", root=root).cwd == "src"
 
 
 def test_problems_make_command_not_composable(root):
     """Фон и циклы — не части для сверки: разрешение `pytest` не распространяется на
-    `pytest &` и цикл (T1-S14)."""
+    `pytest &` и цикл (T1-S14).
+    """
     from gigacrew.agent.decisions import DecisionMemory
 
     memory = DecisionMemory()
@@ -272,7 +283,8 @@ def test_problems_make_command_not_composable(root):
 
 # ----------------------- невидимые символы -------------------------- #
 @pytest.mark.parametrize(
-    "ch", ["\r", "\x0b", "\x0c", "\x7f", "\x9b", "\u2066", "\u2067", "\u2069", "\ufeff"]
+    "ch",
+    ["\r", "\x0b", "\x0c", "\x7f", "\x9b", "\u2066", "\u2067", "\u2069", "\ufeff"],
 )
 def test_control_and_bidi_characters_are_danger(root, ch):
     """Возврат каретки, C1, изоляция направления (Trojan Source), BOM (T1-S17, T1-S18)."""
@@ -298,7 +310,8 @@ def repo(root: Path) -> Path:
 @pytest.mark.parametrize("op", [">", ">>", ">|", "&>", "&>>", ">&"])
 def test_output_redirect_operators_write(repo, op):
     """Каждый оператор вывода в файл — запись: в проекте WRITE, снаружи и в .git — DANGER
-    (T1-S4, T1-S5)."""
+    (T1-S4, T1-S5).
+    """
     assert level(f"echo x {op} out.txt", repo) is WRITE
     assert level(f"echo x {op} ~/.bashrc", repo) is DANGER
     assert level(f"echo x {op} ../outside.txt", repo) is DANGER
@@ -350,7 +363,8 @@ def test_ansi_c_string_is_dynamic(root):
 
 def test_backticks_in_heredoc_make_body_dynamic(root):
     """Тело heredoc с `…` или $ без кавычек у разделителя — не статичное: интерпретатор
-    получит результат подстановки (T1-S16)."""
+    получит результат подстановки (T1-S16).
+    """
     from gigacrew.safety import bash as shell
 
     for command, static in [
@@ -369,7 +383,8 @@ def test_backticks_in_heredoc_make_body_dynamic(root):
 # ------------------------------ пути -------------------------------- #
 def test_globs_take_the_worst_match(root):
     """Шаблон — худшее из совпадений: ключ среди файлов делает `cat *` не чтением
-    (T1-S10, T1-U10)."""
+    (T1-S10, T1-U10).
+    """
     assert level("cat *.txt", root) is READ
     (root / "id_rsa").write_text("k")
     (root / "k.pem").write_text("k")
@@ -431,7 +446,7 @@ def test_secret_walk_overflow_counts_as_secret(root):
 
 # ------------------------------- git -------------------------------- #
 @pytest.mark.parametrize(
-    "key, value",
+    ("key", "value"),
     [
         ("core.fsmonitor", "./fsmon.sh"),
         ("filter.x.clean", "sh -c id"),
@@ -446,7 +461,8 @@ def test_secret_walk_overflow_counts_as_secret(root):
 )
 def test_git_read_with_program_in_repo_config_asks(repo, key, value):
     """Чтение git — READ, только пока настройки репозитория не запускают программ
-    (T1-S11, T1-S12)."""
+    (T1-S11, T1-S12).
+    """
     from gigacrew.safety.gitconfig import repo_config_runs_programs
 
     assert level("git status", repo) is READ
@@ -458,7 +474,8 @@ def test_git_read_with_program_in_repo_config_asks(repo, key, value):
 
 def test_git_fsmonitor_disabled_and_global_config_are_fine(repo):
     """core.fsmonitor=false ничего не запускает; глобальные настройки — пользователя,
-    их не проверяем (HOME в тестах — временный)."""
+    их не проверяем (HOME в тестах — временный).
+    """
     from gigacrew.safety.gitconfig import repo_config_runs_programs
 
     subprocess.run(["git", "config", "core.fsmonitor", "false"], cwd=repo, check=True)
@@ -469,7 +486,7 @@ def test_git_fsmonitor_disabled_and_global_config_are_fine(repo):
 
 
 def test_git_config_that_cannot_be_read_is_unknown(repo):
-    """git не прочитал настройки — неизвестно, что запустится (T1-S13)."""
+    """Git не прочитал настройки — неизвестно, что запустится (T1-S13)."""
     from gigacrew.safety.gitconfig import repo_config_runs_programs
 
     (repo / ".git" / "config").write_text("[core\n broken")

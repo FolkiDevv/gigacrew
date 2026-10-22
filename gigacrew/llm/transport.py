@@ -18,7 +18,7 @@ from typing import Any, Self
 import httpx
 
 from gigacrew.config import Config
-from gigacrew.llm.base import LLMError, LLMProvider, PromptTooLong
+from gigacrew.llm.base import LLMError, LLMProvider, PromptTooLongError
 from gigacrew.llm.types import AssistantTurn, Message, ToolChoice, ToolSpec, Usage
 
 
@@ -90,7 +90,8 @@ def error_body(resp: httpx.Response) -> str:
 def connection_error(exc: httpx.HTTPError) -> str:
     """Текст ошибки транспорта для пользователя. Запрос, отвергнутый до отправки
     (``LocalProtocolError``), — без текста исключения: h11 цитирует в нём значение
-    заголовка, а это ключ или токен."""
+    заголовка, а это ключ или токен.
+    """
     if isinstance(exc, httpx.LocalProtocolError):
         return (
             "Ошибка соединения с API: запрос отвергнут до отправки (недопустимый заголовок "
@@ -101,7 +102,8 @@ def connection_error(exc: httpx.HTTPError) -> str:
 
 def raise_if_cert_rejected(exc: BaseException) -> None:
     """Сетевая ошибка из-за того, что сертификат сервера не прошёл проверку TLS, —
-    :class:`ApiError` с подсказкой сразу: повтор тут не поможет."""
+    :class:`ApiError` с подсказкой сразу: повтор тут не поможет.
+    """
     seen: set[int] = set()
     cause: BaseException | None = exc
     while cause is not None and id(cause) not in seen:
@@ -110,7 +112,7 @@ def raise_if_cert_rejected(exc: BaseException) -> None:
             raise ApiError(
                 f"сертификат сервера не прошёл проверку TLS ({reason}): укажите корневой "
                 "сертификат сервера (PEM) в GIGACREW_CA_BUNDLE; GIGACREW_VERIFY_SSL=0 "
-                "выключает проверку, но тогда ключ или токен можно перехватить"
+                "выключает проверку, но тогда ключ или токен можно перехватить",
             ) from exc
         seen.add(id(cause))
         cause = cause.__cause__ or cause.__context__
@@ -250,7 +252,8 @@ class HttpProvider(LLMProvider):
         headers: Mapping[str, str] | None = None,
     ):
         """``transport`` — подмена HTTP-транспорта (``httpx.MockTransport`` в тестах);
-        ``headers`` — заголовки всех запросов клиента."""
+        ``headers`` — заголовки всех запросов клиента.
+        """
         self._cfg = config
         # В режиме mTLS verify — это SSL-контекст с клиентским сертификатом;
         # иначе — булев флаг проверки серверного сертификата или контекст с CA.
@@ -265,7 +268,8 @@ class HttpProvider(LLMProvider):
         # файл), байты не идут. Авторизация, список моделей и замер окна — по обычному
         # timeout: долгая проба при замере и означает «не помещается».
         self._chat_timeout = httpx.Timeout(
-            config.timeout, read=max(config.timeout, config.read_timeout)
+            config.timeout,
+            read=max(config.timeout, config.read_timeout),
         )
         self._max_retries = 5  # повторы при транзиентных сбоях (сеть/5xx)
         self._rate_limit_wait = config.rate_limit_wait  # ожидание при 429, с на запрос
@@ -290,7 +294,8 @@ class HttpProvider(LLMProvider):
     # ------------------------------------------------------------------ #
     def _before_request(self, kind: str, reason: str = "request") -> bool:
         """Вызвать ``request_hook`` перед запросом. True — он вызывался (провайдер может
-        перечитать авторизацию); отказ — :class:`ApiError`."""
+        перечитать авторизацию); отказ — :class:`ApiError`.
+        """
         hook = self.request_hook
         if hook is None:
             return False
@@ -412,7 +417,7 @@ class HttpProvider(LLMProvider):
             return resp
 
         raise ApiError(
-            f"Сетевая ошибка при обращении к API (после {attempts} попыток): {last_exc}"
+            f"Сетевая ошибка при обращении к API (после {attempts} попыток): {last_exc}",
         ) from last_exc
 
     @staticmethod
@@ -422,7 +427,7 @@ class HttpProvider(LLMProvider):
             data = resp.json()
         except ValueError as e:
             raise ApiError(
-                f"API вернул не-JSON ответ ({resp.status_code}): {error_body(resp)}"
+                f"API вернул не-JSON ответ ({resp.status_code}): {error_body(resp)}",
             ) from e
         if not isinstance(data, dict):
             raise ApiError(f"Неожиданный формат ответа API: {str(data)[:500]}")
@@ -507,13 +512,16 @@ class HttpProvider(LLMProvider):
         return resp
 
     def _reject_reasoning(
-        self, model: str, status: int, on_notice: Callable[[str], None] | None
+        self,
+        model: str,
+        status: int,
+        on_notice: Callable[[str], None] | None,
     ) -> None:
         """Шлюз не принял запрос с рассуждениями, а без них принял: дальше — без них."""
         self._no_reasoning.add(model)
         if on_notice is not None:
             on_notice(
-                f"шлюз не принял рассуждения модели {model} в запросе ({status}) — дальше без них"
+                f"шлюз не принял рассуждения модели {model} в запросе ({status}) — дальше без них",
             )
 
     def _send_chat(
@@ -523,9 +531,12 @@ class HttpProvider(LLMProvider):
         on_notice: Callable[[str], None] | None = None,
     ) -> httpx.Response:
         """Отправка запроса чата: молчание модели дольше ожидания чтения — не больше
-        :data:`SILENT_ATTEMPTS` попыток."""
+        :data:`SILENT_ATTEMPTS` попыток.
+        """
         return self._request_with_retry(
-            do_request, silent_attempts=SILENT_ATTEMPTS, on_notice=on_notice
+            do_request,
+            silent_attempts=SILENT_ATTEMPTS,
+            on_notice=on_notice,
         )
 
     def _silence_message(self) -> str:
@@ -540,12 +551,13 @@ class HttpProvider(LLMProvider):
     # ------------------------------------------------------------------ #
     def _send_probe(self, do_request: Callable[[], httpx.Response]) -> httpx.Response:
         """Отправка пробы. Огромный запрос может упереться в таймаут шлюза: долгие
-        повторы бессмысленны — обрыв уже отправляемого запроса и есть «не помещается»."""
+        повторы бессмысленны — обрыв уже отправляемого запроса и есть «не помещается».
+        """
         try:
             return self._request_with_retry(do_request, attempts=PROBE_ATTEMPTS)
         except ApiError as e:
             if isinstance(e.__cause__, OVERSIZE_EXC):
-                raise PromptTooLong(None, str(e)) from e
+                raise PromptTooLongError(None, str(e)) from e
             raise
 
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
@@ -555,7 +567,7 @@ class HttpProvider(LLMProvider):
         if status in UNAVAILABLE_STATUS:
             raise ApiError(f"API временно недоступен ({status}): {error_body(resp)}")
         if status >= 500 or (status >= 400 and status not in NOT_SIZE_STATUS):
-            raise PromptTooLong(status, resp.text)
+            raise PromptTooLongError(status, resp.text)
         if status >= 400:
             raise ApiError(f"API вернул {status}: {error_body(resp)}")
         usage = self._probe_usage(resp)
@@ -620,7 +632,11 @@ class HttpProvider(LLMProvider):
             refresh = False
             try:
                 with self._client.stream(
-                    "POST", url, json=payload, headers=headers, timeout=self._chat_timeout
+                    "POST",
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self._chat_timeout,
                 ) as resp:
                     if resp.status_code == 401 and self._refreshable and not refreshed:
                         resp.read()
@@ -679,5 +695,5 @@ class HttpProvider(LLMProvider):
 
         raise ApiError(
             f"Сетевая ошибка при потоковом обращении к API (после "
-            f"{self._max_retries} попыток): {last_exc}"
+            f"{self._max_retries} попыток): {last_exc}",
         ) from last_exc

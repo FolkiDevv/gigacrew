@@ -169,7 +169,12 @@ def render(state: ChoiceState, width: int = 80) -> list[tuple[str, str]]:
 
 
 def choose(
-    question: Question, index: int, total: int, *, no_color: bool = False, **io: Any
+    question: Question,
+    index: int,
+    total: int,
+    *,
+    no_color: bool = False,
+    **io: Any,
 ) -> Answer | None:
     """Задаёт один вопрос; None — пользователь отказался отвечать.
 

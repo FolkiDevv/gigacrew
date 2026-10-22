@@ -37,7 +37,8 @@ def test_manual_plan_takes_everything():
     _turn(conv, "первый", ["a"])
     _turn(conv, "второй", ["b"])
     plan = plan_compaction(conv, keep_tokens=0)
-    assert plan is not None and plan.upto == len(conv)
+    assert plan is not None
+    assert plan.upto == len(conv)
     assert plan.messages == list(conv.messages)
 
     conv.set_summary(Summary("сводка", plan.upto))
@@ -90,7 +91,8 @@ def test_render_message_clips_results_and_shows_calls():
     assert render_message(call) == '## Assistant\nчитаю\n→ call read_file({"path": "a.py"})'
     result = render_message(Message(role="function", name="run_shell", content="A" * 10_000))
     assert result.startswith("## Result of run_shell\nAAA")
-    assert "chars cut" in result and len(result) < 2_200
+    assert "chars cut" in result
+    assert len(result) < 2_200
     assert render_message(Message(role="user", content="привет")) == "## User\nпривет"
     note = Message(role="user", content="план одобрен", meta=True)
     assert render_message(note) == "## gigacrew (harness note)\nплан одобрен"
@@ -99,7 +101,8 @@ def test_render_message_clips_results_and_shows_calls():
 def test_clip_middle_keeps_head_and_tail():
     text = "начало " + "x" * 1000 + " конец"
     clipped = clip_middle(text, 100)
-    assert clipped.startswith("начало") and clipped.endswith("конец")
+    assert clipped.startswith("начало")
+    assert clipped.endswith("конец")
     assert clip_middle("коротко", 100) == "коротко"
 
 
@@ -107,7 +110,8 @@ def test_chunk_entries_split_by_budget():
     entries = ["a" * 1500, "b" * 1500, "c" * 1500]  # ~500 токенов каждая
     assert chunk_entries(entries, 1_100) == [entries[:2], entries[2:]]
     (huge,) = chunk_entries(["z" * 30_000], 600)  # больше бюджета — обрезается
-    assert len(huge) == 1 and len(huge[0]) < 1_900
+    assert len(huge) == 1
+    assert len(huge[0]) < 1_900
 
 
 # ------------------------------ резюме ------------------------------ #
@@ -128,10 +132,12 @@ def test_summarize_single_request_without_tools():
     )
     assert text == "итог"
     (request,) = provider.summary_requests
-    assert request["model"] == "M" and request["temperature"] == 0.1
+    assert request["model"] == "M"
+    assert request["temperature"] == 0.1
     system, user = request["messages"]
     assert system.content == COMPACT_PROMPT
-    assert "запрос 0" in user.content and "сохрани имена файлов" in user.content
+    assert "запрос 0" in user.content
+    assert "сохрани имена файлов" in user.content
     assert provider.requests == []  # запросы суммаризации — без инструментов
 
 
@@ -151,24 +157,38 @@ def test_summarize_chains_chunks_and_keeps_only_recent():
     )
     assert len(provider.summary_requests) == MAX_INPUT_CHUNKS
     first, second = (r["messages"][1].content for r in provider.summary_requests[:2])
-    assert "старая сводка" in first and "omitted" in first
-    assert "запрос 2" in first and "запрос 0" not in first  # старые куски отброшены
+    assert "старая сводка" in first
+    assert "omitted" in first
+    assert "запрос 2" in first
+    assert "запрос 0" not in first
     assert "сводка 0" in second  # резюме обновляется итеративно
-    assert text == f"сводка {MAX_INPUT_CHUNKS - 1}" and len(usages) == MAX_INPUT_CHUNKS
+    assert text == f"сводка {MAX_INPUT_CHUNKS - 1}"
+    assert len(usages) == MAX_INPUT_CHUNKS
 
 
 def test_summarize_clips_long_summary():
     provider = ScriptedProvider(summaries=[text_turn("я" * 5_000)])
     text = summarize(
-        provider, _messages(1), model="M", temperature=0.2, input_budget=20_000, max_chars=1_000
+        provider,
+        _messages(1),
+        model="M",
+        temperature=0.2,
+        input_budget=20_000,
+        max_chars=1_000,
     )
-    assert len(text) < 1_100 and text.endswith("(краткое содержание обрезано)")
+    assert len(text) < 1_100
+    assert text.endswith("(краткое содержание обрезано)")
 
 
 def test_summarize_tells_model_the_size_limit():
     provider = ScriptedProvider(summaries=[text_turn("итог")])
     summarize(
-        provider, _messages(1), model="M", temperature=0.2, input_budget=20_000, max_chars=1_400
+        provider,
+        _messages(1),
+        model="M",
+        temperature=0.2,
+        input_budget=20_000,
+        max_chars=1_400,
     )
     user = provider.summary_requests[0]["messages"][1].content
     assert "at most 1400 characters (~200 words)" in user
@@ -180,11 +200,17 @@ def test_summarize_clips_by_line_keeping_current_state():
     )
     provider = ScriptedProvider(summaries=[text_turn(reply)])
     text = summarize(
-        provider, _messages(1), model="M", temperature=0.2, input_budget=20_000, max_chars=500
+        provider,
+        _messages(1),
+        model="M",
+        temperature=0.2,
+        input_budget=20_000,
+        max_chars=500,
     )
     body, mark = text.rsplit("\n", 1)
     assert text.startswith("Текущее состояние: правлю loop.py, дальше — тесты.")
-    assert len(body) <= 500 and mark == "…(краткое содержание обрезано)"
+    assert len(body) <= 500
+    assert mark == "…(краткое содержание обрезано)"
     assert body.split("\n")[-1].endswith("подробности")  # строка не оборвана на полуслове
 
 
@@ -200,7 +226,12 @@ def test_summarize_rejects_unusable_reply(reply):
     provider = ScriptedProvider(summaries=[reply])
     with pytest.raises(CompactionError):
         summarize(
-            provider, _messages(1), model="M", temperature=0.2, input_budget=20_000, max_chars=900
+            provider,
+            _messages(1),
+            model="M",
+            temperature=0.2,
+            input_budget=20_000,
+            max_chars=900,
         )
 
 
@@ -209,7 +240,7 @@ def test_summarize_reports_paid_usage_before_failure():
         summaries=[
             text_turn("сводка", Usage(prompt_tokens=700, completion_tokens=30)),
             LLMError("x"),
-        ]
+        ],
     )
     usages = []
     with pytest.raises(LLMError):
@@ -257,8 +288,11 @@ def test_summarize_keeps_latest_request_when_old_chunks_dropped(meta):
     summarize(provider, messages, model="M", temperature=0.2, input_budget=2_500, max_chars=600)
     assert len(provider.summary_requests) == MAX_INPUT_CHUNKS
     first = provider.summary_requests[0]["messages"][1].content
-    assert "ТЕКУЩАЯ ЗАДАЧА" in first and "omitted" in first
-    assert "запрос 0" not in first and "файл 05" not in first and "файл 06" in first
+    assert "ТЕКУЩАЯ ЗАДАЧА" in first
+    assert "omitted" in first
+    assert "запрос 0" not in first
+    assert "файл 05" not in first
+    assert "файл 06" in first
     last = provider.summary_requests[-1]["messages"][1].content
     assert "файл 11" in last  # свежая переписка — на месте
     for request in provider.summary_requests:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from gigacrew.project.workspace import Workspace
@@ -43,7 +45,8 @@ def _outline(ctx, path):
 
 def test_registered_in_default_registry():
     reg = build_default_registry()
-    assert "find_symbol" in reg and "file_outline" in reg
+    assert "find_symbol" in reg
+    assert "file_outline" in reg
 
 
 def test_find_symbol_lists_definitions(ctx):
@@ -214,7 +217,7 @@ def test_corrupted_index_is_recreated_by_the_next_call(tmp_path):
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.close()
     size = db.stat().st_size
-    with open(db, "r+b") as f:  # страницы 1–16 (схема, meta) целы, дальше — мусор
+    with pathlib.Path(db).open("r+b") as f:  # страницы 1–16 (схема, meta) целы, дальше — мусор
         f.seek(16 * 4096)
         f.write(bytes(range(256)) * ((size - 16 * 4096) // 256))
     with ProjectIndex(ctx.workspace) as ix:

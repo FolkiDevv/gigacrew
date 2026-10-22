@@ -1,3 +1,4 @@
-"""gigacrew — консольный помощник для работы с кодом проекта."""
+"""gigacrew — консольный помощник для работы с кодом проекта.
 
-__version__ = "0.8.1"
+Версия — в pyproject.toml (``importlib.metadata.version("gigacrew")``).
+"""

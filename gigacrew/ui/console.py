@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence, Generator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import IO
@@ -68,7 +68,7 @@ from gigacrew.agent.hooks import short_command
 from gigacrew.llm.types import FunctionCall, Message
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolResult
-from gigacrew.tools.questions import Answer, Question, QuestionsUnavailable
+from gigacrew.tools.questions import Answer, Question, QuestionsUnavailableError
 from gigacrew.ui import banner as banner_art
 from gigacrew.ui.format import (
     chat_size,
@@ -123,7 +123,7 @@ def sanitize(text: str) -> str:
 
 
 class _SafeConsole(RichConsole):
-    """Консоль Rich, которая не пропускает в терминал управляющие символы из текста.
+    r"""Консоль Rich, которая не пропускает в терминал управляющие символы из текста.
 
     Rich (``Text``) убирает лишь BEL/BS/VT/FF/CR, а ESC и C1 оставляет. Очистка на
     месте каждой печати то и дело забывалась (имя инструмента от модели, заголовок
@@ -153,7 +153,7 @@ class _SafeConsole(RichConsole):
 _INVISIBLE_CANDIDATE_RE = re.compile(r"[^\t\n\x20-\x7e]")
 _INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
 _IGNORABLE_RE = re.compile(
-    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￸\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+    "[­͏؜ᅟᅠ឴឵᠋-᠏\u200b-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￸\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]",
 )
 _INVISIBLE_MARK_RE = re.compile(r"⟨U\+[0-9A-F]{4,6}⟩")
 # Многострочная команда длиннее — с номерами строк.
@@ -173,7 +173,7 @@ def _mark(char: str) -> str:
 
 
 def mark_invisible(text: str) -> str:
-    """Текст с видимыми невидимыми символами (``⟨U+202E⟩``); ``\\r\\n`` — как ``\\n``."""
+    r"""Текст с видимыми невидимыми символами (``⟨U+202E⟩``); ``\\r\\n`` — как ``\\n``."""
     text = text.replace("\r\n", "\n")
     out, pos = [], 0
     for m in _invisible(text):
@@ -185,7 +185,8 @@ def mark_invisible(text: str) -> str:
 
 def visible_text(text: str, *, numbered: bool | None = None, palette: Palette = MINT) -> Text:
     """Текст как есть, но с видимыми невидимыми символами (``⟨U+202E⟩``) и, у длинного
-    многострочного, номерами строк. Ничего не обрезается: длинные строки переносятся."""
+    многострочного, номерами строк. Ничего не обрезается: длинные строки переносятся.
+    """
     lines = text.replace("\r\n", "\n").split("\n")
     if numbered is None:
         numbered = len(lines) >= _NUMBER_LINES_FROM
@@ -420,7 +421,8 @@ class Console(AgentEvents):
         """Вопросы (подтверждения, выбор чата) — только с клавиатуры: ввод не с
         терминала — ответа нет. Для ``-p``: stdin там не канал ввода (запрос — аргумент),
         и строка «y» или «a» из перенаправленных в него данных не должна ничего
-        подтверждать. В REPL ввод не с терминала — это и запросы, и ответы."""
+        подтверждать. В REPL ввод не с терминала — это и запросы, и ответы.
+        """
         self._keyboard_only = True
 
     def _no_keyboard(self) -> bool:
@@ -446,7 +448,8 @@ class Console(AgentEvents):
 
     def set_mode_hint(self, hint: Callable[[], str] | None) -> None:
         """Режим разрешений в индикаторе хода; перечитывается при каждой отрисовке,
-        поэтому смена режима во время хода (Shift+Tab) видна сразу."""
+        поэтому смена режима во время хода (Shift+Tab) видна сразу.
+        """
         self._mode_hint = hint
 
     def _turn_hint(self) -> str:
@@ -561,7 +564,7 @@ class Console(AgentEvents):
             live.stop()
 
     @contextlib.contextmanager
-    def progress(self, title: str, detail: Callable[[], str] | None = None) -> Iterator[None]:
+    def progress(self, title: str, detail: Callable[[], str] | None = None) -> Generator[None]:
         """Индикатор долгой операции вне хода агента (например, построения индекса).
 
         ``detail`` перечитывается при каждой отрисовке («1234 файлов»). Вне
@@ -610,7 +613,7 @@ class Console(AgentEvents):
                     ("режим   ", p.muted),
                     (mode_badge(mode), f"bold {self._mode_color(mode)}"),
                     ("   Shift+Tab — сменить", p.dim),
-                )
+                ),
             )
         info = Group(*rows)
         if self._c.width < _BANNER_MIN_WIDTH:
@@ -632,12 +635,14 @@ class Console(AgentEvents):
         if auto_approve:
             self.warn(
                 "авто-подтверждение включено (-y): изменения применяются без вопросов, "
-                "опасные команды — с вопросом (--yes-all — и они без вопроса)"
+                "опасные команды — с вопросом (--yes-all — и они без вопроса)",
             )
         self.print()
 
     def help(
-        self, commands: Sequence[tuple[str, str]], keys: Sequence[tuple[str, str]] = ()
+        self,
+        commands: Sequence[tuple[str, str]],
+        keys: Sequence[tuple[str, str]] = (),
     ) -> None:
         """Справка: таблица команд и клавиш."""
         table = Table.grid(padding=(0, 2))
@@ -738,7 +743,8 @@ class Console(AgentEvents):
     # --------------------------- инструменты ---------------------------- #
     def _find(self, call: ToolCallInfo, steps: Sequence[_Step] = ()) -> _Step | None:
         """Шаг вызова: тот же объект или (для копии с подробностями вопроса) последний
-        шаг без результата с тем же именем и описанием."""
+        шаг без результата с тем же именем и описанием.
+        """
         candidates = list(steps)
         if not candidates:
             if self._group is not None:
@@ -825,7 +831,8 @@ class Console(AgentEvents):
 
     def _detail(self, call: ToolCallInfo, result: ToolResult) -> str:
         """Итог удачного шага: у команды — последняя строка вывода (итог тестов, сборки),
-        у прочего — размер вывода, код выхода или итог без цели."""
+        у прочего — размер вывода, код выхода или итог без цели.
+        """
         shown = result.display
         if shown is not None and shown.kind == "text":
             lines = [x.strip() for x in shown.text.splitlines() if x.strip()]
@@ -867,7 +874,8 @@ class Console(AgentEvents):
 
     def _step_lines(self, step: _Step) -> list[Text]:
         """Шаг одной строкой: ● что сделано  ✔ итог · время; под ней — рецензент и,
-        если шаг упал, последние строки вывода."""
+        если шаг упал, последние строки вывода.
+        """
         p = self._p
         call, result = step.call, step.result
         assert result is not None
@@ -923,7 +931,8 @@ class Console(AgentEvents):
         ok = [s for s in steps if s.result is not None and s.result.ok]
         failed = [s for s in steps if s.result is not None and not s.result.ok]
         head = Text.assemble(
-            (f"{ICON_TOOL} ", p.ok if ok else p.danger), ("Изучил код", f"bold {p.fg}")
+            (f"{ICON_TOOL} ", p.ok if ok else p.danger),
+            ("Изучил код", f"bold {p.fg}"),
         )
         rest = _read_counts([s.call for s in ok])
         seconds = sum(s.seconds for s in steps)
@@ -957,7 +966,8 @@ class Console(AgentEvents):
                 line = self._edit_line(last.call, last.result)  # type: ignore[arg-type]
                 if len(ok) > 1:
                     line = Text.assemble(
-                        (f"{ICON_TOOL} ", p.ok), (f"Изменил {_target(last.call)}", f"bold {p.fg}")
+                        (f"{ICON_TOOL} ", p.ok),
+                        (f"Изменил {_target(last.call)}", f"bold {p.fg}"),
                     )
                     added, removed = next(iter(files.values()))
                     line.append("  ")
@@ -973,7 +983,7 @@ class Console(AgentEvents):
             ("  ", ""),
         )
         head.append_text(
-            self._stat(sum(a for a, _ in files.values()), sum(r for _, r in files.values()))
+            self._stat(sum(a for a, _ in files.values()), sum(r for _, r in files.values())),
         )
         lines = [head]
         width = max(len(path) for path in files)
@@ -1020,7 +1030,8 @@ class Console(AgentEvents):
                     row.append_text(self._stat(*stat))
                 else:
                     row.append(
-                        sanitize(result.summary or ""), style=p.dim if result.ok else p.danger
+                        sanitize(result.summary or ""),
+                        style=p.dim if result.ok else p.danger,
                     )
             rows.append(self._fit(row))
         return rows
@@ -1061,11 +1072,15 @@ class Console(AgentEvents):
         if self._sub is None:
             return
         self._start_live(
-            self._view(self._subagent_label, hint=self._subagent_hint, started=self._sub_started)
+            self._view(self._subagent_label, hint=self._subagent_hint, started=self._sub_started),
         )
 
     def on_subagent_activity(
-        self, info: SubagentInfo, activity: str, *, wrapping_up: bool = False
+        self,
+        info: SubagentInfo,
+        activity: str,
+        *,
+        wrapping_up: bool = False,
     ) -> None:
         self._sub_activity = activity
         self._sub_wrapping = wrapping_up
@@ -1076,7 +1091,12 @@ class Console(AgentEvents):
         self._sub_steps.append(_Step(call))
 
     def on_subagent_tool_result(
-        self, info: SubagentInfo, call: ToolCallInfo, result: ToolResult, *, previewed: bool
+        self,
+        info: SubagentInfo,
+        call: ToolCallInfo,
+        result: ToolResult,
+        *,
+        previewed: bool,
     ) -> None:
         step = self._find(call, self._sub_steps) if self._sub_steps else None
         if step is None:
@@ -1137,7 +1157,7 @@ class Console(AgentEvents):
         self.system(
             f"✂ контекст сжат: ~{format_tokens(result.before_tokens)} → "
             f"~{format_tokens(result.after_tokens)} ток. · в краткое содержание свёрнуто "
-            f"{n} {plural(n, 'сообщение', 'сообщения', 'сообщений')}"
+            f"{n} {plural(n, 'сообщение', 'сообщения', 'сообщений')}",
         )
 
     def on_hook_start(self, event: str, command: str) -> None:
@@ -1174,7 +1194,8 @@ class Console(AgentEvents):
 
     def _confirm_head(self, call: ToolCallInfo, preview: Display | None, bar: tuple[str, str]):
         """Что спрашивается — первой строкой вопроса. Однострочное превью команды
-        показывается здесь же, как выполнится (с видимыми невидимыми символами)."""
+        показывается здесь же, как выполнится (с видимыми невидимыми символами).
+        """
         p = self._p
         text = preview.text.rstrip("\n") if preview is not None else ""
         if preview is not None and preview.kind != "diff" and text.strip() and "\n" not in text:
@@ -1196,7 +1217,11 @@ class Console(AgentEvents):
         return self._exact_block(preview, border=bar[1])  # type: ignore[arg-type]
 
     def confirm(
-        self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
+        self,
+        call: ToolCallInfo,
+        preview: Display | None,
+        *,
+        dangerous: bool,
     ) -> ConfirmResult:
         step = self._find(call)
         if step is not None and self._group is not None and self._in_group(step):
@@ -1242,7 +1267,11 @@ class Console(AgentEvents):
                 always = "не спрашивать этот вызов до конца сессии"
         while True:
             raw = self._question_raw(
-                question, dangerous=dangerous, always=always, feedback=True, view=long_preview
+                question,
+                dangerous=dangerous,
+                always=always,
+                feedback=True,
+                view=long_preview,
             )
             if raw is None:
                 return ConfirmResult(Approval.NO, answered=False)
@@ -1329,7 +1358,8 @@ class Console(AgentEvents):
         view: bool = False,
     ) -> str | None:
         """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода, ввод не
-        с терминала там, где отвечать можно только с клавиатуры)."""
+        с терминала там, где отвечать можно только с клавиатуры).
+        """
         self._flush_group()
         self.stop_live()
         p = self._p
@@ -1341,7 +1371,7 @@ class Console(AgentEvents):
                     (f"{question} ", f"bold {p.fg}"),
                     ("— ответить можно только с клавиатуры, а ввод не с терминала: ", p.muted),
                     ("нет", f"bold {p.fg}"),
-                )
+                ),
             )
             self._blank = False
             return None
@@ -1383,7 +1413,7 @@ class Console(AgentEvents):
         self._flush_group()
         self.stop_live()
         if not _stdin_is_terminal():
-            raise QuestionsUnavailable("ввод не с клавиатуры")
+            raise QuestionsUnavailableError("ввод не с клавиатуры")
         p = self._p
         answers: list[Answer] = []
         with self._input_guard():
@@ -1397,7 +1427,7 @@ class Console(AgentEvents):
                             (f"{ICON_TOOL} ", p.dim),
                             (sanitize(question.text), p.muted),
                             ("  пользователь отказался отвечать", p.dim),
-                        )
+                        ),
                     )
                     return None
                 self._emit(self._answered(question, answer))
@@ -1408,7 +1438,9 @@ class Console(AgentEvents):
         """Строка ленты после ответа: вопрос серым, ответ ярким."""
         p = self._p
         line = Text.assemble(
-            (f"{ICON_TOOL} ", p.ok), (sanitize(question.text), p.muted), ("  ", "")
+            (f"{ICON_TOOL} ", p.ok),
+            (sanitize(question.text), p.muted),
+            ("  ", ""),
         )
         for i, label in enumerate(answer.selected):
             if i:
@@ -1439,7 +1471,7 @@ class Console(AgentEvents):
                 box=ROUNDED,
                 border_style=p.dim,
                 padding=(1, 2),
-            )
+            ),
         )
 
     def _ask_one(self, question: Question, index: int, total: int) -> Answer | None:
@@ -1472,8 +1504,10 @@ class Console(AgentEvents):
         label = (question.custom_label or "Свой ответ…").rstrip("…")
         self._out(
             Text.assemble(
-                bar, (f"  {custom}. ", p.muted), (f"{label} (или просто напишите текст)", p.fg)
-            )
+                bar,
+                (f"  {custom}. ", p.muted),
+                (f"{label} (или просто напишите текст)", p.fg),
+            ),
         )
         hint = "номера через пробел" if question.multi_select else "номер"
         while True:
@@ -1577,7 +1611,7 @@ class Console(AgentEvents):
             earlier = messages[: starts[0]]
             size = chat_size(sum(1 for m in earlier if m.is_request), len(earlier))
             self.print(
-                Text(f"  … раньше: {size} — сохранены в чате, на экран не выводятся", style=p.dim)
+                Text(f"  … раньше: {size} — сохранены в чате, на экран не выводятся", style=p.dim),
             )
         for k, start in enumerate(starts):
             end = starts[k + 1] if k + 1 < len(starts) else len(messages)
@@ -1625,7 +1659,8 @@ class Console(AgentEvents):
 
     def _history_lines(self, calls: Sequence[ToolCallInfo]) -> list[Text]:
         """Шаги из истории: подряд идущие чтения и правки — одной строкой, как в ленте;
-        не больше :data:`RESUME_CALLS` строк, ранние — счётчиком."""
+        не больше :data:`RESUME_CALLS` строк, ранние — счётчиком.
+        """
         p = self._p
         entries: list[list[ToolCallInfo]] = []
         for call in calls:
@@ -1664,7 +1699,8 @@ class Console(AgentEvents):
 
 def _command_dir(call: ToolCallInfo, preview: Display | None) -> str:
     """Каталог, где выполнится команда, если не корень проекта: превью команды
-    подписано «команда · <каталог>». Пусто — в корне (или это не команда)."""
+    подписано «команда · <каталог>». Пусто — в корне (или это не команда).
+    """
     if call.kind is not ToolKind.COMMAND or preview is None:
         return ""
     head, sep, where = preview.title.partition(" · ")

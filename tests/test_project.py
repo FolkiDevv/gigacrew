@@ -106,7 +106,8 @@ def test_ensure_data_dir_creates_gitignore_idempotently(tmp_path):
 @pytest.mark.parametrize("entry", ["", ".gitignore", "chats", "index", "plans", "history"])
 def test_ensure_data_dir_refuses_symlinks_out_of_it(tmp_path, entry):
     """Репозиторий может принести симлинк на месте .gigacode или её служебной записи (git
-    восстанавливает симлинки при клоне): gigacrew не пишет по нему за пределы проекта."""
+    восстанавливает симлинки при клоне): gigacrew не пишет по нему за пределы проекта.
+    """
     root, outside = tmp_path / "proj", tmp_path / "outside"
     root.mkdir()
     outside.mkdir()
@@ -115,7 +116,7 @@ def test_ensure_data_dir_refuses_symlinks_out_of_it(tmp_path, entry):
         ws.data_dir.symlink_to(outside, target_is_directory=True)
     else:
         ws.data_dir.mkdir()
-        target = outside if entry in ("chats", "index", "plans") else outside / "victim"
+        target = outside if entry in {"chats", "index", "plans"} else outside / "victim"
         (ws.data_dir / entry).symlink_to(target)  # .gitignore — висячий симлинк
     with pytest.raises(OSError, match="симлинк"):
         ws.ensure_data_dir()
@@ -133,7 +134,7 @@ def test_ensure_data_dir_keeps_regular_entries(tmp_path):
 
 # ------------------------------ glob_match ------------------------------ #
 @pytest.mark.parametrize(
-    "path, pattern, expected",
+    ("path", "pattern", "expected"),
     [
         ("a.py", "*.py", True),
         ("src/x/a.py", "*.py", True),  # без '/' — по имени файла
@@ -236,7 +237,8 @@ def test_file_tree_shows_dotfiles_hides_service_dirs(tmp_path):
     _make(tmp_path, ".git/HEAD")
     _make(tmp_path, ".gigacode/chats/1.json")
     tree = build_file_tree(tmp_path)
-    assert "src/" in tree and "main.py" in tree
+    assert "src/" in tree
+    assert "main.py" in tree
     assert ".github/" in tree
     for hidden in ("node_modules", ".git/", ".gigacode"):
         assert hidden not in tree
@@ -260,7 +262,9 @@ def test_file_tree_marks_unexpanded_directories(tmp_path):
     for d in range(5):
         _make(tmp_path, f"d{d}/sub/x.py")
     tree = build_file_tree(tmp_path, max_entries=7)
-    assert "d0/" in tree and "  sub/ …" in tree and tree.endswith(TREE_TRUNCATED)
+    assert "d0/" in tree
+    assert "  sub/ …" in tree
+    assert tree.endswith(TREE_TRUNCATED)
 
 
 def test_empty_directory_does_not_hide_siblings_from_the_budget(tmp_path):
@@ -296,8 +300,10 @@ def test_load_instructions_order_and_truncation(tmp_path):
     (tmp_path / "GIGACREW.md").write_text("x" * 50, encoding="utf-8")
     docs = load_instructions(tmp_path, max_chars=10)
     assert [d.name for d in docs] == ["GIGACREW.md", "GIGACREW.local.md"]
-    assert docs[0].truncated and docs[0].content == "x" * 10
-    assert docs[1].content == "личное" and not docs[1].truncated
+    assert docs[0].truncated
+    assert docs[0].content == "x" * 10
+    assert docs[1].content == "личное"
+    assert not docs[1].truncated
 
 
 def test_load_instructions_missing_and_empty(tmp_path):
@@ -346,8 +352,10 @@ def test_instruction_total_limit_prefers_higher_priority(tmp_path):
     (tmp_path / "AGENTS.md").write_text("a" * 50, encoding="utf-8")
     (tmp_path / "GIGACREW.md").write_text("d" * 50, encoding="utf-8")
     agents, own = load_instructions(tmp_path, max_total=70)
-    assert own.content == "d" * 50 and not own.truncated
-    assert agents.content == "a" * 20 and agents.truncated
+    assert own.content == "d" * 50
+    assert not own.truncated
+    assert agents.content == "a" * 20
+    assert agents.truncated
 
 
 def test_oversized_instructions_point_to_file(tmp_path):
@@ -375,7 +383,8 @@ def test_nested_instructions_found_outside_in_once(tmp_path):
     assert nested.add_paths(["pkg/api", "pkg/api/handlers.py", "pkg"]) == []  # уже проверены
     assert len(nested.files) == 2
     nested.reset()
-    assert nested.files == () and len(nested.add_paths(["pkg/api"])) == 2  # каталог как путь
+    assert nested.files == ()
+    assert len(nested.add_paths(["pkg/api"])) == 2
 
 
 def test_nested_instructions_skip_ignored_dirs_and_outside_paths(tmp_path):
@@ -386,7 +395,7 @@ def test_nested_instructions_skip_ignored_dirs_and_outside_paths(tmp_path):
     _make(tmp_path, "src/GIGACREW.local.md", "моё")  # сам файл в .gitignore — не важно
     nested = NestedInstructions(tmp_path)
     found = nested.add_paths(
-        ["node_modules/lib/x.js", "build/out.js", ".gigacode/x", "../x", "/etc/passwd", "", "src"]
+        ["node_modules/lib/x.js", "build/out.js", ".gigacode/x", "../x", "/etc/passwd", "", "src"],
     )
     assert [d.name for d in found] == ["src/GIGACREW.local.md"]
     assert nested.add_paths(["README.md", "."]) == []  # корень — уже в системном промпте
@@ -400,9 +409,9 @@ def test_nested_instructions_prompt_limits(tmp_path):
     ]
     prompt = nested_instructions_prompt(docs)
     assert "Instructions of directory a (a/AGENTS.md):\nправило a" in prompt
-    assert (
-        "bbbb" not in prompt and "Too large for the context" in prompt and "b/AGENTS.md" in prompt
-    )
+    assert "bbbb" not in prompt
+    assert "Too large for the context" in prompt
+    assert "b/AGENTS.md" in prompt
 
 
 def test_nested_instructions_budget_is_shared(tmp_path):
@@ -410,11 +419,15 @@ def test_nested_instructions_budget_is_shared(tmp_path):
     # они больше — последние перечисляются путями.
     docs = [InstructionFile(f"d{i}/AGENTS.md", str(i) * 8_000) for i in range(4)]
     prompt = nested_instructions_prompt(docs)
-    assert "0" * 8_000 in prompt and "1" * 8_000 in prompt
-    assert "2" * 8_000 not in prompt and "3" * 8_000 not in prompt
+    assert "0" * 8_000 in prompt
+    assert "1" * 8_000 in prompt
+    assert "2" * 8_000 not in prompt
+    assert "3" * 8_000 not in prompt
     skipped = prompt.split("Too large for the context")[1]
-    assert "d2/AGENTS.md" in skipped and "d3/AGENTS.md" in skipped
-    assert "d0/AGENTS.md" not in skipped and "d1/AGENTS.md" not in skipped
+    assert "d2/AGENTS.md" in skipped
+    assert "d3/AGENTS.md" in skipped
+    assert "d0/AGENTS.md" not in skipped
+    assert "d1/AGENTS.md" not in skipped
 
 
 def test_system_prompt_contains_project_context(tmp_path):
@@ -423,7 +436,8 @@ def test_system_prompt_contains_project_context(tmp_path):
     prompt = build_system_prompt(Workspace(tmp_path))
     assert str(tmp_path.resolve()) in prompt
     assert "важная заметка" in prompt
-    assert "Project structure" in prompt and "main.py" in prompt
+    assert "Project structure" in prompt
+    assert "main.py" in prompt
 
 
 def test_system_prompt_points_large_projects_to_index_tools(tmp_path):

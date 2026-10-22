@@ -14,7 +14,7 @@ from gigacrew.tools.plan import (
     ExitPlanModeTool,
     review_plan,
 )
-from gigacrew.tools.questions import Answer, QuestionsUnavailable
+from gigacrew.tools.questions import Answer, QuestionsUnavailableError
 
 PLAN = "## План\n1. Поправить `a.py`\n2. Прогнать тесты"
 PLAN_REL = ".gigacode/plans/chat1.md"
@@ -69,12 +69,16 @@ def test_approval_switches_mode(tmp_path):
     session = _Session([Answer((APPROVE,))])
     result = _run(tmp_path, session)
     assert session.mode is mode
-    assert result.ok and "одобрил план" in result.content and mode.label in result.content
+    assert result.ok
+    assert "одобрил план" in result.content
+    assert mode.label in result.content
     # одобренный план (в итоговой редакции) — в результате: модель выполняет его
-    assert PLAN in result.content and PLAN_REL in result.content
+    assert PLAN in result.content
+    assert PLAN_REL in result.content
     (question,) = session.asked[0]
     # план — в рамке, путь к файлу — в её подписи; свой ответ — замечания к плану
-    assert question.body == PLAN and question.source == PLAN_REL
+    assert question.body == PLAN
+    assert question.source == PLAN_REL
     assert question.custom_label == "Замечания…"
     assert question.header == "План"
     assert [o.label for o in question.options] == [APPROVE]
@@ -86,9 +90,11 @@ def test_feedback_keeps_planning(tmp_path):
     result = _run(tmp_path, session)
     assert session.mode is PermissionMode.PLAN
     assert result.summary == "план на доработку"
-    assert "«без новых зависимостей»" in result.content and "exit_plan_mode" in result.content
+    assert "«без новых зависимостей»" in result.content
+    assert "exit_plan_mode" in result.content
     # правки — точечно в файле, а не новым планом целиком
-    assert "edit_file" in result.content and PLAN_REL in result.content
+    assert "edit_file" in result.content
+    assert PLAN_REL in result.content
     assert not session.plan.dirty  # пользователь эту версию видел
 
 
@@ -96,16 +102,19 @@ def test_decline_keeps_planning(tmp_path):
     session = _Session(None)
     result = _run(tmp_path, session)
     assert session.mode is PermissionMode.PLAN
-    assert result.content == DECLINED_NOTE and result.summary == "план не одобрен"
+    assert result.content == DECLINED_NOTE
+    assert result.summary == "план не одобрен"
 
 
-@pytest.mark.parametrize("session", [_Session(QuestionsUnavailable()), _Session(ask=False)])
+@pytest.mark.parametrize("session", [_Session(QuestionsUnavailableError()), _Session(ask=False)])
 def test_nobody_to_approve(tmp_path, session):
     result = _run(tmp_path, session)
     assert session.mode is PermissionMode.PLAN
-    assert result.ok and result.content == NO_APPROVER_NOTE.format(path=PLAN_REL)
+    assert result.ok
+    assert result.content == NO_APPROVER_NOTE.format(path=PLAN_REL)
     # отдать план дальше нельзя — он «отправлен»: harness не напоминает о нём снова
-    assert not session.plan.dirty and session.plan.reviews == 1
+    assert not session.plan.dirty
+    assert session.plan.reviews == 1
 
 
 @pytest.mark.parametrize(
@@ -114,7 +123,7 @@ def test_nobody_to_approve(tmp_path, session):
         ([Answer((APPROVE,))], "approved", True),
         ([Answer(custom="ещё тесты")], "revise", True),
         (None, "declined", False),
-        (QuestionsUnavailable(), "no_approver", False),
+        (QuestionsUnavailableError(), "no_approver", False),
     ],
 )
 def test_review_outcomes(tmp_path, answers, outcome, continues):
@@ -122,11 +131,15 @@ def test_review_outcomes(tmp_path, answers, outcome, continues):
     session = _Session(answers)
     shown: list[int] = []
     review = review_plan(
-        session.context(tmp_path), session.plan, on_show=lambda: shown.append(len(session.asked))
+        session.context(tmp_path),
+        session.plan,
+        on_show=lambda: shown.append(len(session.asked)),
     )
-    assert review.outcome == outcome and review.continues is continues
+    assert review.outcome == outcome
+    assert review.continues is continues
     assert shown == [0]  # перед вопросом пользователю
-    assert session.plan.reviews == 1 and not session.plan.dirty
+    assert session.plan.reviews == 1
+    assert not session.plan.dirty
 
 
 @pytest.mark.parametrize("plan", [None, "  \n "])
@@ -138,7 +151,9 @@ def test_review_of_missing_plan_shows_nothing(tmp_path, plan):
     context = session.context(tmp_path)
     with pytest.raises(ToolError):
         review_plan(context, session.plan, on_show=lambda: shown.append(True))
-    assert shown == [] and session.asked == [] and session.plan.reviews == 0
+    assert shown == []
+    assert session.asked == []
+    assert session.plan.reviews == 0
 
 
 def test_outside_plan_mode_is_an_error(tmp_path):
@@ -159,7 +174,8 @@ def test_missing_or_empty_plan_file_is_an_error(tmp_path, plan):
     session = _Session([Answer((APPROVE,))])
     with pytest.raises(ToolError, match="План не записан") as e:
         _run(tmp_path, session, plan=plan)
-    assert PLAN_REL in str(e.value) and "write_file" in str(e.value)
+    assert PLAN_REL in str(e.value)
+    assert "write_file" in str(e.value)
     assert session.asked == []
 
 
@@ -182,13 +198,16 @@ def test_plan_argument_fills_empty_plan_file(tmp_path):
     result = tool.run(tool.parse({"plan": PLAN}), context)
     assert (tmp_path / PLAN_REL).read_text(encoding="utf-8") == PLAN
     (question,) = session.asked[0]
-    assert question.body == PLAN and result.ok and session.mode is PermissionMode.AUTO
+    assert question.body == PLAN
+    assert result.ok
+    assert session.mode is PermissionMode.AUTO
     assert session.plan.writes == 1
 
 
 def test_plan_argument_does_not_replace_shown_plan(tmp_path):
     """Файл с прошлого показа не менялся, в аргументе — другой текст: не показывать старый
-    план и не стирать его пересказом, а попросить поправить файл."""
+    план и не стирать его пересказом, а попросить поправить файл.
+    """
     _write_plan(tmp_path)
     session = _Session([Answer((APPROVE,))])
     context = session.context(tmp_path)
@@ -196,8 +215,10 @@ def test_plan_argument_does_not_replace_shown_plan(tmp_path):
     tool = ExitPlanModeTool()
     with pytest.raises(ToolError, match="не менялся") as e:
         tool.run(tool.parse({"plan": "план в двух словах"}), context)
-    assert PLAN_REL in str(e.value) and "edit_file" in str(e.value)
-    assert (tmp_path / PLAN_REL).read_text(encoding="utf-8") == PLAN and session.asked == []
+    assert PLAN_REL in str(e.value)
+    assert "edit_file" in str(e.value)
+    assert (tmp_path / PLAN_REL).read_text(encoding="utf-8") == PLAN
+    assert session.asked == []
     tool.run(tool.parse({"plan": f"{PLAN}\n"}), context)  # тот же план — просто показ
     assert session.asked[0][0].body == PLAN
 

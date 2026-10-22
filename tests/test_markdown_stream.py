@@ -94,7 +94,8 @@ def test_tail_is_cached_and_separated():
     assert stream.feed("Первый\n\nВторой\n")  # первый абзац уже окончателен
     tail = stream.tail_lines()
     assert tail is stream.tail_lines()  # без изменений — без перерендера
-    assert tail[0] == [] and "Второй" in "".join(s.text for s in tail[1])
+    assert tail[0] == []
+    assert "Второй" in "".join(s.text for s in tail[1])
 
 
 def test_empty_answer():
@@ -112,7 +113,8 @@ def test_each_block_is_rendered_once_with_one_block_of_context(monkeypatch):
     monkeypatch.setattr(stream, "render", lambda src: (sizes.append(len(src)), render(src))[1])
     for ch in doc:
         stream.feed(ch)
-    assert sizes and max(sizes) < 40  # контекст — один блок, а не весь префикс
+    assert sizes
+    assert max(sizes) < 40
 
 
 _FENCE_DOCS = {
@@ -139,7 +141,9 @@ def _parsed_chars(monkeypatch) -> list[int]:
     sizes: list[int] = []
     parse = markdown_stream.block_start_lines
     monkeypatch.setattr(
-        markdown_stream, "block_start_lines", lambda src: (sizes.append(len(src)), parse(src))[1]
+        markdown_stream,
+        "block_start_lines",
+        lambda src: (sizes.append(len(src)), parse(src))[1],
     )
     return sizes
 

@@ -1,6 +1,7 @@
 """Офлайн-тесты суб-агентов: инструмент task, изоляция контекста, разрешения, остановка,
 ограничители. Родитель и суб-агент берут ходы из одной очереди ScriptedProvider —
-по порядку обращений к модели."""
+по порядку обращений к модели.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from fakes import (
     tools_turn,
 )
 
-import gigacrew.agent.loop as loop
+from gigacrew.agent import loop
 from gigacrew.agent.events import TurnStats
 from gigacrew.agent.guard import LoopGuard
 from gigacrew.agent.prompts import SUBAGENT_PROMPTS
@@ -48,7 +49,10 @@ def _agent(provider, tmp_path: Path, *, events=None, registry=None, **cfg_kw) ->
     cfg_kw.setdefault("auto_approve", True)
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, **cfg_kw)
     return loop.Agent(
-        provider, registry or build_default_registry(), cfg, events or RecordingEvents()
+        provider,
+        registry or build_default_registry(),
+        cfg,
+        events or RecordingEvents(),
     )
 
 
@@ -109,7 +113,7 @@ def test_explore_runs_in_own_context(tmp_path):
             tool_turn("search_content", {"pattern": "def foo"}),
             text_turn("foo определена в a.py:1"),
             text_turn("Нашёл: a.py:1"),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
@@ -117,7 +121,8 @@ def test_explore_runs_in_own_context(tmp_path):
 
     child = provider.requests[1]
     system, *history = child["messages"]
-    assert "subagent" in system.content and "Agent explore" in system.content
+    assert "subagent" in system.content
+    assert "Agent explore" in system.content
     assert "ask_user" not in system.content
     assert [(m.role, m.content) for m in history] == [("user", "найди функцию foo")]
     names = {spec.name for spec in child["tools"]}
@@ -128,7 +133,8 @@ def test_explore_runs_in_own_context(tmp_path):
     # у основного агента — только отчёт, без шагов суб-агента
     messages = agent.conversation.messages
     results = _results(messages)
-    assert len(results) == 1 and "foo определена в a.py:1" in results[0]
+    assert len(results) == 1
+    assert "foo определена в a.py:1" in results[0]
     assert all(m.name != "search_content" for m in messages)
     _assert_well_formed(messages)
 
@@ -146,7 +152,7 @@ def test_task_schema_and_registry():
     assert "task" in reg
     assert set(EXPLORE.tools) <= {tool.name for tool in reg}
     assert set(SUBAGENTS) == set(SUBAGENT_PROMPTS)
-    assert SUBAGENT_EXCLUDED <= {tool.name for tool in reg}
+    assert {tool.name for tool in reg} >= SUBAGENT_EXCLUDED
     params = reg.get("task").spec().parameters
     assert params["required"] == ["subagent_type", "prompt"]
 
@@ -158,7 +164,7 @@ def test_task_accepts_old_parameter_name(tmp_path, key):
             tool_turn("task", {key: "Explore", "prompt": "где foo?"}),
             text_turn("в a.py"),
             text_turn("ок"),
-        ]
+        ],
     )
     events = RecordingEvents()
     _agent(provider, tmp_path, events=events).run_turn("x")
@@ -170,7 +176,7 @@ def test_task_accepts_old_parameter_name(tmp_path, key):
 
 def test_subagent_cannot_spawn_subagents(tmp_path):
     provider = ScriptedProvider(
-        [_task("general"), _task("explore"), text_turn("сам"), text_turn("ок")]
+        [_task("general"), _task("explore"), text_turn("сам"), text_turn("ок")],
     )
     agent = _agent(provider, tmp_path)
     agent.run_turn("x")
@@ -199,7 +205,7 @@ def test_empty_description_uses_prompt(tmp_path):
             tool_turn("task", {"agent": "explore", "prompt": "\nпосчитай файлы\nподробно"}),
             text_turn("3"),
             text_turn("ок"),
-        ]
+        ],
     )
     events = RecordingEvents()
     _agent(provider, tmp_path, events=events).run_turn("x")
@@ -225,7 +231,7 @@ def test_explore_cannot_change_even_with_yes_all(tmp_path):
             tool_turn("git", {"subcommand": "commit", "args": ["-m", "x"]}),
             text_turn("не могу"),
             text_turn("ок"),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, yes_all=True)
@@ -238,26 +244,27 @@ def test_explore_cannot_change_even_with_yes_all(tmp_path):
 
 
 def test_explore_unsupported_git_subcommand_is_not_called_a_change(tmp_path):
-    """git blame через инструмент git: подсказка про run_shell, а не «изменения запрещены»."""
+    """Git blame через инструмент git: подсказка про run_shell, а не «изменения запрещены»."""
     provider = ScriptedProvider(
         [
             _task(),
             tool_turn("git", {"subcommand": "blame", "args": ["a.py"]}),
             text_turn("итог"),
             text_turn("ок"),
-        ]
+        ],
     )
     agent = _agent(provider, tmp_path)
     agent.run_turn("x")
     child_result = _results(provider.requests[2]["messages"])[-1]
     assert child_result != READ_ONLY_BLOCKED_NOTE
-    assert "не поддерживается" in child_result and "run_shell" in child_result
+    assert "не поддерживается" in child_result
+    assert "run_shell" in child_result
 
 
 @pytest.mark.parametrize("sub", ["push", "merge"])
 def test_explore_changing_git_subcommand_is_still_a_blocked_change(tmp_path, sub):
     provider = ScriptedProvider(
-        [_task(), tool_turn("git", {"subcommand": sub}), text_turn("итог"), text_turn("ок")]
+        [_task(), tool_turn("git", {"subcommand": sub}), text_turn("итог"), text_turn("ок")],
     )
     agent = _agent(provider, tmp_path)
     agent.run_turn("x")
@@ -275,15 +282,17 @@ def test_general_edits_without_asking_in_auto_mode(tmp_path):
             tool_turn("write_file", {"path": "b.txt", "content": "new\n"}),
             text_turn("создал b.txt"),
             text_turn("ок"),
-        ]
+        ],
     )
     events = RecordingEvents(confirm_answer=False)
     agent = _agent(provider, tmp_path, events=events, auto_approve=False)
     agent.run_turn("x")
-    assert events.confirms == [] and agent.mode is PermissionMode.AUTO
+    assert events.confirms == []
+    assert agent.mode is PermissionMode.AUTO
     assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "new\n"
     report = _results(agent.conversation.messages)[0]
-    assert "создал b.txt" in report and "Changed files: b.txt" in report
+    assert "создал b.txt" in report
+    assert "Changed files: b.txt" in report
     assert events.results[-1][1].changed
 
 
@@ -297,14 +306,16 @@ def test_delegation_rules_only_for_main_agent():
 
 def test_research_goes_to_explore_first():
     """Исследование — через explore без просьбы пользователя: правило стоит до «How to
-    work», с примерами; точечный поиск — самому; в режиме плана — explore первым шагом."""
+    work», с примерами; точечный поиск — самому; в режиме плана — explore первым шагом.
+    """
     from gigacrew.agent.prompts import PLAN_MODE_PROMPT, SYSTEM_PROMPT
 
     research = SYSTEM_PROMPT.index("# Research and subagents")
     assert research < SYSTEM_PROMPT.index("# How to work")
     rules = SYSTEM_PROMPT[research : SYSTEM_PROMPT.index("# How to work")]
     assert "IMPORTANT: to research the code, call explore instead of searching yourself" in rules
-    assert "pinpoint lookup" in rules and rules.count('\n- "') == 3  # три примера
+    assert "pinpoint lookup" in rules
+    assert rules.count('\n- "') == 3
     assert "Use it instead of searching yourself" in ExploreTool.description
     step = PLAN_MODE_PROMPT[PLAN_MODE_PROMPT.index("1. ") : PLAN_MODE_PROMPT.index("2. ")]
     assert "start with explore: 1–3 calls in one response" in step
@@ -329,16 +340,18 @@ def test_explore_tool_runs_read_only_subagent(tmp_path):
             tool_turn("write_file", {"path": "b.py", "content": "x"}),  # заблокировано
             text_turn("foo в a.py:1, возвращает 1"),
             text_turn("foo возвращает 1"),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, auto_approve=True)
     assert agent.run_turn("что возвращает foo?") == "foo возвращает 1"
     brief = provider.requests[1]["messages"][1].content
-    assert brief.startswith(question) and "Already known / out of scope: смотри a.py" in brief
+    assert brief.startswith(question)
+    assert "Already known / out of scope: смотри a.py" in brief
     assert not (tmp_path / "b.py").exists()  # суб-агент только читает
     info = next(p for k, p in events.events if k == "subagent_start")
-    assert info.name == "explore" and info.description == "Где определена foo"
+    assert info.name == "explore"
+    assert info.description == "Где определена foo"
     call = next(p for k, p in events.events if k == "tool_call")
     assert call.summary == "Где определена foo и что она возвращает?"
     report = _results(agent.conversation.messages)[0]
@@ -370,7 +383,8 @@ def test_report_without_text_is_marked_for_user():
     assert result.summary.endswith("исчерпан лимит шагов · без отчёта")
 
     result = subagent_report(EXPLORE, "итог", stats, SubagentTrail())
-    assert result.ok and "без отчёта" not in result.summary
+    assert result.ok
+    assert "без отчёта" not in result.summary
 
 
 def test_rejected_operations_listed_in_report(tmp_path):
@@ -380,7 +394,7 @@ def test_rejected_operations_listed_in_report(tmp_path):
             tool_turn("run_shell", {"command": "pip install requests"}),
             text_turn("не дали"),
             text_turn("ок"),
-        ]
+        ],
     )
     agent = _agent(provider, tmp_path, events=RecordingEvents(False), auto_approve=False)
     agent.run_turn("x")
@@ -405,7 +419,7 @@ def test_parent_mode_change_reaches_running_subagent(tmp_path):
             tool_turn("fake_write", {"path": "2"}),
             text_turn("готово"),
             text_turn("ок"),
-        ]
+        ],
     )
     agent = _agent(provider, tmp_path, registry=_registry_with_fake(tool))
     holder["agent"] = agent
@@ -413,19 +427,22 @@ def test_parent_mode_change_reaches_running_subagent(tmp_path):
     assert tool.runs == 1  # второй вызов заблокирован режимом плана
     last = provider.requests[3]["messages"]
     assert _results(last)[-1] == SUBAGENT_PLAN_BLOCKED_NOTE
-    assert "# Plan mode" in last[0].content and "exit_plan_mode" not in last[0].content
+    assert "# Plan mode" in last[0].content
+    assert "exit_plan_mode" not in last[0].content
 
 
 def test_explore_gets_no_plan_mode_rules(tmp_path):
     """Explore и так только читает: правила режима плана обещали бы ему тесты с
-    подтверждением, а у него они заблокированы."""
+    подтверждением, а у него они заблокированы.
+    """
     provider = ScriptedProvider(
-        [_task("explore"), text_turn("итог"), text_turn("ок"), text_turn("OK")]
+        [_task("explore"), text_turn("итог"), text_turn("ок"), text_turn("OK")],
     )
     agent = _agent(provider, tmp_path, mode=PermissionMode.PLAN)
     agent.run_turn("x")
     child_system = provider.requests[1]["messages"][0].content
-    assert "Agent explore" in child_system and "# Plan mode" not in child_system
+    assert "Agent explore" in child_system
+    assert "# Plan mode" not in child_system
     assert "Plan mode is on" not in provider.requests[1]["messages"][-1].content
 
 
@@ -436,12 +453,13 @@ def test_subagent_answer_in_plan_mode_gets_no_self_check(tmp_path):
             text_turn("foo — в a.py"),  # ответ суб-агента: самопроверки нет
             text_turn("foo лежит в a.py"),  # ответ основного агента
             text_turn("OK"),  # его самопроверка
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, mode=PermissionMode.PLAN)
     assert agent.run_turn("где foo?") == "foo лежит в a.py"
-    assert provider.calls == 4 and events.stats[-1].self_checks == 1
+    assert provider.calls == 4
+    assert events.stats[-1].self_checks == 1
     after_subagent = provider.requests[2]["messages"]
     assert after_subagent[-1].role == "function"  # отчёт суб-агента, не самопроверка
     assert provider.requests[3]["messages"][-1].meta
@@ -479,7 +497,7 @@ def test_subagent_tokens_billed_to_parent(tmp_path):
             ),
             text_turn("r", Usage(prompt_tokens=5_000, completion_tokens=5)),
             text_turn("ок", Usage(prompt_tokens=7_200, completion_tokens=2)),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
@@ -496,7 +514,7 @@ def test_ctrl_c_in_subagent_stops_turn_and_keeps_trail(tmp_path):
             _task("general", "создай b.txt"),
             tool_turn("write_file", {"path": "b.txt", "content": "new\n"}),
             KeyboardInterrupt(),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
@@ -506,9 +524,11 @@ def test_ctrl_c_in_subagent_stops_turn_and_keeps_trail(tmp_path):
     _assert_well_formed(messages)
     assert agent.conversation.pending_calls() == []
     note = _results(messages)[-1]
-    assert "interrupted by the user (Ctrl+C)" in note and "Changed files: b.txt" in note
+    assert "interrupted by the user (Ctrl+C)" in note
+    assert "Changed files: b.txt" in note
     kinds = _kinds(events)
-    assert "subagent_end" in kinds and kinds[-1] == "tool_end"
+    assert "subagent_end" in kinds
+    assert kinds[-1] == "tool_end"
 
 
 @pytest.mark.parametrize(
@@ -523,7 +543,7 @@ def test_ctrl_c_in_subagent_answers_the_call_that_started_it(tmp_path, call):
     # Результат — под именем и id того вызова (explore или task), что запустил суб-агента.
     (tmp_path / "a.py").write_text("def foo(): ...\n")
     provider = ScriptedProvider(
-        [call, tool_turn("read_file", {"path": "a.py"}), KeyboardInterrupt()]
+        [call, tool_turn("read_file", {"path": "a.py"}), KeyboardInterrupt()],
     )
     agent = _agent(provider, tmp_path)
     with pytest.raises(KeyboardInterrupt):
@@ -549,7 +569,7 @@ def test_subagent_decisions_are_journaled_under_the_chat(tmp_path):
             tool_turn("run_shell", {"command": "./build.sh"}),
             text_turn("собрано"),
             text_turn("готово"),
-        ]
+        ],
     )
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, yes_all=True)
     agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents(), decisions=memory)
@@ -575,7 +595,11 @@ def test_llm_error_in_subagent_reported_to_model(tmp_path):
 def test_other_kind_changes_kept_in_trail_on_ctrl_c(tmp_path):
     # изменяющий вызов не-EDIT вида (как git commit) — тоже в журнале суб-агента
     provider = ScriptedProvider(
-        [_task("general", "закоммить"), tool_turn("fake_write", {"path": "x"}), KeyboardInterrupt()]
+        [
+            _task("general", "закоммить"),
+            tool_turn("fake_write", {"path": "x"}),
+            KeyboardInterrupt(),
+        ],
     )
     agent = _agent(provider, tmp_path, registry=_registry_with_fake(FakeTool()))
     with pytest.raises(KeyboardInterrupt):
@@ -590,15 +614,17 @@ def test_llm_error_after_changes_keeps_trail(tmp_path):
             tool_turn("write_file", {"path": "b.txt", "content": "x\n"}),
             LLMError("сбой сети"),
             text_turn("продолжаю"),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
     assert agent.run_turn("x") == "продолжаю"
     result = _results(agent.conversation.messages)[0]
-    assert "model error: сбой сети" in result and "Changed files: b.txt" in result
+    assert "model error: сбой сети" in result
+    assert "Changed files: b.txt" in result
     task_result = events.results[-1][1]
-    assert not task_result.ok and task_result.changed
+    assert not task_result.ok
+    assert task_result.changed
 
 
 def test_parent_repeat_guard_sees_subagent_changes(tmp_path):
@@ -613,7 +639,7 @@ def test_parent_repeat_guard_sees_subagent_changes(tmp_path):
             shell,
             shell,
             text_turn("ок"),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
@@ -643,11 +669,14 @@ def test_esc_soft_stop_wraps_up_and_parent_continues(tmp_path):
             tool_turn("fake_write", {}),
             text_turn("успел половину"),
             text_turn("основной продолжает"),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(
-        provider, tmp_path, events=events, registry=_registry_with_fake(_stopping_tool(holder))
+        provider,
+        tmp_path,
+        events=events,
+        registry=_registry_with_fake(_stopping_tool(holder)),
     )
     holder["agent"] = agent
     assert agent.run_turn("x") == "основной продолжает"
@@ -659,7 +688,8 @@ def test_esc_soft_stop_wraps_up_and_parent_continues(tmp_path):
     assert wrap_request[1].content == "долгая задача"
     assert provider.requests[2]["tool_choice"] == "none"
     report = _results(agent.conversation.messages)[0]
-    assert "stopped early by the user" in report and "успел половину" in report
+    assert "stopped early by the user" in report
+    assert "успел половину" in report
     assert ("subagent_activity", ("подвожу итог", True)) in events.events
     assert events.results[-1][1].summary.endswith("остановлен пользователем")
 
@@ -683,7 +713,8 @@ class EscWhileStreaming(ScriptedProvider):
 
 def test_esc_while_subagent_streams_text_wraps_up_without_partial(tmp_path):
     """Esc посреди текста суб-агента: оборванный текст не сохраняется, запрос итога не
-    кончается репликой ассистента и содержит задачу."""
+    кончается репликой ассистента и содержит задачу.
+    """
     holder: dict = {}
     provider = EscWhileStreaming(
         [_task("explore", "найди foo"), text_turn("итог: foo в a.py"), text_turn("дальше")],
@@ -701,16 +732,19 @@ def test_esc_while_subagent_streams_text_wraps_up_without_partial(tmp_path):
     assert SUBAGENT_USER_STOP_NOTE in wrap_request[-1].content
     assert provider.requests[2]["tool_choice"] == "none"
     report = _results(agent.conversation.messages)[0]
-    assert "stopped early by the user" in report and "итог: foo в a.py" in report
+    assert "stopped early by the user" in report
+    assert "итог: foo в a.py" in report
 
 
 def test_double_esc_aborts_subagent_parent_continues(tmp_path):
     holder: dict = {}
     provider = ScriptedProvider(
-        [_task("general", "долгая задача"), tool_turn("fake_write", {}), text_turn("дальше")]
+        [_task("general", "долгая задача"), tool_turn("fake_write", {}), text_turn("дальше")],
     )
     agent = _agent(
-        provider, tmp_path, registry=_registry_with_fake(_stopping_tool(holder, times=2))
+        provider,
+        tmp_path,
+        registry=_registry_with_fake(_stopping_tool(holder, times=2)),
     )
     holder["agent"] = agent
     assert agent.run_turn("x") == "дальше"
@@ -746,7 +780,7 @@ def test_subagent_step_limit_wraps_up(tmp_path):
             tool_turn("list_dir", {}),
             text_turn("частичный итог"),
             text_turn("ок"),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, subagent_max_steps=2)
@@ -756,7 +790,8 @@ def test_subagent_step_limit_wraps_up(tmp_path):
     assert "STOP: the step limit is reached" in wrap_up["messages"][-1].content
     assert wrap_up["tool_choice"] == "none"
     report = _results(agent.conversation.messages)[0]
-    assert "the step limit is reached" in report and "частичный итог" in report
+    assert "the step limit is reached" in report
+    assert "частичный итог" in report
     assert any(level == "warn" and text.startswith("explore: ") for level, text in events.notices)
     assert events.stats[-1].stop_reason is None  # основной агент не остановлен
 
@@ -772,7 +807,7 @@ def test_subagent_without_wrap_up_text_reports_no_report(tmp_path):
             tool_turn("list_dir", {}),
             LLMError("сбой"),
             text_turn("ок"),
-        ]
+        ],
     )
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, subagent_max_steps=2)
@@ -817,7 +852,7 @@ def _context_case(tmp_path, prompt_tokens: int, *, windows=None, **cfg_kw):
             tool_turn("find_files", {"pattern": "*"}),
             text_turn("итог"),
             text_turn("ок"),
-        ]
+        ],
     )
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="M", **cfg_kw)
     agent = loop.Agent(provider, build_default_registry(), cfg, RecordingEvents(), windows=windows)
@@ -860,7 +895,7 @@ def test_subagent_context_counts_tool_results_after_last_reply(tmp_path):
             tool_turn("list_dir", {}),
             text_turn("итог"),
             text_turn("ок"),
-        ]
+        ],
     )
     windows = ModelWindows(entries={"M": {"context_window": 20_000}})  # предел 10 800
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="M")
@@ -871,7 +906,8 @@ def test_subagent_context_counts_tool_results_after_last_reply(tmp_path):
     # Запрос итога: история больше бюджета и обрезается, но задача суб-агента и его
     # последние результаты в нём остаются — иначе отчёт не о чем писать.
     wrap_up = provider.requests[2]["messages"]
-    assert wrap_up[1].role == "user" and wrap_up[1].content == "найди функцию foo"
+    assert wrap_up[1].role == "user"
+    assert wrap_up[1].content == "найди функцию foo"
     assert "строка с текстом" in wrap_up[-1].content
     assert "STOP: the context is full" in wrap_up[-1].content
     assert provider.requests[2]["tool_choice"] == "none"
@@ -879,19 +915,21 @@ def test_subagent_context_counts_tool_results_after_last_reply(tmp_path):
 
 def test_cut_reply_does_not_fill_subagent_context(tmp_path):
     """Оборванный длинный ответ не идёт в историю — и в счётчик контекста суб-агента тоже:
-    иначе повтор ложно упёрся бы в предел контекста."""
+    иначе повтор ложно упёрся бы в предел контекста.
+    """
     provider = ScriptedProvider(
         [
             _task(),
             cut_turn("длинный отчёт…", usage=Usage(prompt_tokens=1_000, completion_tokens=50_000)),
             text_turn("итог: foo в a.py"),
             text_turn("ок"),
-        ]
+        ],
     )
     agent = _agent(provider, tmp_path)
     assert agent.run_turn("x") == "ок"
     report = _results(agent.conversation.messages)[0]
-    assert "итог: foo в a.py" in report and "the context is full" not in report
+    assert "итог: foo в a.py" in report
+    assert "the context is full" not in report
 
 
 def test_subagent_time_limit(tmp_path):
@@ -926,7 +964,8 @@ def test_explore_blocked_commands_are_warned_then_stopped(tmp_path):
     assert provider.requests[5]["tool_choice"] == "none"
     assert all(c.startswith("Not executed: here run_shell runs only") for c in child[:2])
     report = _results(agent.conversation.messages)[0]
-    assert "too many failed tool calls in a row" in report and "итог" in report
+    assert "too many failed tool calls in a row" in report
+    assert "итог" in report
     notices = [text for _, text in events.notices]
     assert any("ещё одна неудача остановит ход" in text for text in notices)
 
@@ -939,7 +978,7 @@ def test_subagent_budget_pressure_note(tmp_path):
             tool_turn("find_files", {"pattern": "*"}),
             text_turn("итог"),
             text_turn("ок"),
-        ]
+        ],
     )
     agent = _agent(provider, tmp_path, subagent_max_steps=4)
     agent.run_turn("x")
@@ -970,16 +1009,19 @@ def test_guard_new_limits_off_by_default():
 
 def test_guard_context_limit_and_pressure():
     guard = LoopGuard(max_steps=100, max_failures=3, max_context=1_000)
-    assert guard.before_step(600) is None and guard.pressure(600) is None
+    assert guard.before_step(600) is None
+    assert guard.pressure(600) is None
     assert "context ~700 of 1000 tokens" in guard.pressure(700)
     stop = guard.before_step(1_000)
-    assert stop.kind == "context_limit" and "Контекст заполнен" in stop.message
+    assert stop.kind == "context_limit"
+    assert "Контекст заполнен" in stop.message
 
 
 def test_guard_time_limit_and_pressure_with_fake_clock():
     now = [0.0]
     guard = LoopGuard(max_steps=100, max_failures=3, time_limit=10, clock=lambda: now[0])
-    assert guard.before_step() is None and guard.pressure() is None
+    assert guard.before_step() is None
+    assert guard.pressure() is None
     now[0] = 7.5
     assert "time 7 of 10 s" in guard.pressure()
     now[0] = 10
@@ -993,7 +1035,8 @@ def test_guard_similar_reset_by_own_changes():
     for i in range(5):  # правки одного файла подряд — не топтание
         call = FunctionCall(name="edit_file", arguments={"path": "a", "old_string": str(i)})
         check = guard.before_tool(call)
-        assert check.warning is None and check.stop is None
+        assert check.warning is None
+        assert check.stop is None
         guard.after_tool(call, ToolOutcome(ok=True, changed=True))
     assert guard.changes == 5
 
@@ -1033,13 +1076,14 @@ def test_explore_run_is_read_only_and_not_a_change(tmp_path):
             tool_turn("search_content", {"pattern": "def foo"}),
             text_turn("foo определена в a.py:1"),
             text_turn("Нашёл: a.py:1"),
-        ]
+        ],
     )
     events = RecordingEvents()
     _agent(provider, tmp_path, events=events).run_turn("где foo?")
     names = {spec.name for spec in provider.requests[1]["tools"]}
     changing = {"write_file", "edit_file", "task", "explore", "ask_user", "exit_plan_mode"}
-    assert names and not names & changing  # явный список, а не EXPLORE.tools
+    assert names
+    assert not names & changing
     assert events.results[-1][1].changed is False
 
 
@@ -1054,6 +1098,8 @@ def test_successful_output_mentioning_rejection_is_not_a_rejection():
     events.on_tool_result(call, ToolResult(content="уже отклонено пользователем"), previewed=False)
     assert events.trail.rejected == []
     events.on_tool_result(
-        call, ToolResult(content="отклонено пользователем", ok=False), previewed=False
+        call,
+        ToolResult(content="отклонено пользователем", ok=False),
+        previewed=False,
     )
     assert events.trail.rejected == ["search_content отклонено"]

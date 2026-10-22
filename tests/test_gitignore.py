@@ -35,7 +35,7 @@ def test_empty_and_comment_lines_give_no_rule(line):
 
 
 @pytest.mark.parametrize(
-    "rules, path, is_dir, expected",
+    ("rules", "path", "is_dir", "expected"),
     [
         ("*.log", "a.log", False, True),
         ("*.log", "deep/x/a.log", False, True),  # без '/' — на любой глубине
@@ -92,7 +92,8 @@ def test_walk_files_respects_gitignore(tmp_path):
     assert _rels(tmp_path) == [".gitignore", "a.py", "src/top.txt"]
     # без учёта .gitignore видно всё (кроме служебных каталогов)
     all_rels = [p.relative_to(tmp_path).as_posix() for p in walk_files(tmp_path, gitignore=False)]
-    assert "app.log" in all_rels and "out/x.py" in all_rels
+    assert "app.log" in all_rels
+    assert "out/x.py" in all_rels
 
 
 def test_walk_files_from_subdir_keeps_parent_rules(tmp_path):
@@ -126,7 +127,8 @@ def test_file_tree_respects_gitignore(tmp_path):
     _make(tmp_path, "generated/huge.py")
     tree = build_file_tree(tmp_path)
     assert "main.py" in tree
-    assert "generated" not in tree and ".bak" not in tree
+    assert "generated" not in tree
+    assert ".bak" not in tree
 
 
 def test_find_and_search_tools_respect_gitignore(tmp_path):
@@ -137,7 +139,8 @@ def test_find_and_search_tools_respect_gitignore(tmp_path):
     found = FindFilesTool().run(FindFilesParams(pattern="*.py"), ctx)
     assert found.content == "src/a.py"
     hits = SearchContentTool().run(SearchContentParams(pattern="needle"), ctx)
-    assert "src/a.py:1" in hits.content and "dist-web" not in hits.content
+    assert "src/a.py:1" in hits.content
+    assert "dist-web" not in hits.content
 
 
 def test_is_excluded_matches_walk_decision(tmp_path):
@@ -173,7 +176,7 @@ def test_malformed_pattern_does_not_break_traversal(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "rules, path, expected",
+    ("rules", "path", "expected"),
     [
         ("/foo**bar", "foobar", True),
         ("/foo**bar", "fooXbar", True),

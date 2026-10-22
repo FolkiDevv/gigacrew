@@ -33,7 +33,8 @@ def test_pagerank_personalization_and_weights():
     assert weighted["b"] > weighted["a"]  # ранг делится по весам рёбер
     edges = {"x": {"b": 1.0}, "y": {"a": 1.0}}
     focused = pagerank(edges, ["x", "y", "a", "b"], {"y": 1.0})
-    assert focused["a"] > focused["b"] and focused["x"] == pytest.approx(0.0)
+    assert focused["a"] > focused["b"]
+    assert focused["x"] == pytest.approx(0.0)
     assert pagerank({}, []) == {}
 
 
@@ -101,7 +102,8 @@ def test_build_repo_map_respects_budget_and_shows_context(project):
     lines = full.text.splitlines()
     assert lines[:3] == ["core/engine.py:", "     1  class Engine:", "     2    def start(self):"]
     small = build_repo_map(project, max_chars=60)
-    assert len(small.text) <= 60 and small.definitions < full.definitions
+    assert len(small.text) <= 60
+    assert small.definitions < full.definitions
     # метод показывается вместе с классом, пропущенные — «⋮ ещё N»
     only_start = build_repo_map(project, focus_names=["start"], max_chars=90)
     assert "class Engine:" in only_start.text
@@ -118,7 +120,8 @@ def test_unbuilt_index_gives_no_map_in_prompt(tmp_path):
     for i in range(250):
         _make(tmp_path, f"pkg/m{i:03}.py", "def f():\n    pass\n")
     prompt = build_system_prompt(Workspace(tmp_path))
-    assert "the tree is incomplete" in prompt and "Project map" not in prompt
+    assert "the tree is incomplete" in prompt
+    assert "Project map" not in prompt
     assert not (tmp_path / ".gigacode").exists()  # промпт индекс не строит
 
 
@@ -130,7 +133,8 @@ def test_repo_map_tool(tmp_path, project):
     assert result.content.startswith("карта проекта: определений ")
     assert "core/engine.py:" in result.content
     focused = RepoMapTool().run(
-        RepoMapParams(focus=["app", "core/util.py", "Engine.start"], max_tokens=50), ctx
+        RepoMapParams(focus=["app", "core/util.py", "Engine.start"], max_tokens=50),
+        ctx,
     )
     assert focused.summary.startswith("карта: определений ")
     assert RepoMapTool().describe(RepoMapParams(focus=["app"])) == "app"
@@ -146,7 +150,8 @@ def test_system_prompt_has_repo_map_only_for_large_indexed_projects(tmp_path):
     for i in range(250):
         _make(tmp_path, f"pkg/m{i:03}.py", "from core.engine import Engine\n")
     prompt = build_system_prompt(ws)
-    assert "Project map" in prompt and "class Engine:" in prompt
+    assert "Project map" in prompt
+    assert "class Engine:" in prompt
 
 
 def test_repo_map_tool_explains_too_small_budget(tmp_path, project, monkeypatch):
@@ -206,7 +211,7 @@ def test_ranking_does_not_build_pairs_of_users_and_definers(tmp_path):
     names = ("handle_event", "to_string", "validate")
     with ProjectIndex(Workspace(tmp_path)) as ix:
         ix.refresh()
-        db = ix._db  # noqa: SLF001 — быстрее, чем индексировать 600 файлов
+        db = ix._db
         db.executemany(
             "INSERT INTO symbols VALUES (?, ?, ?, '', '', 'method', 1, 2, 1, '', '', 0)",
             [(f"h{i}.py", name, name) for i in range(n) for name in names],

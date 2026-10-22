@@ -24,7 +24,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from gigacrew.llm.base import LLMError, LLMProvider, PromptTooLong
+from gigacrew.llm.base import LLMError, LLMProvider, PromptTooLongError
 
 MAX_CONTEXT_WINDOW = 262_144  # 256K — больше окна у доступных моделей не бывает
 CALIBRATION_TOKENS = 1_000
@@ -40,7 +40,7 @@ STANDARD_WINDOWS = tuple(
         {2**k for k in range(12, 19)}
         | {8_000, 16_000, 32_000, 64_000, 100_000, 128_000, 160_000, 200_000},
         reverse=True,
-    )
+    ),
 )
 
 _NUMBER_RE = re.compile(r"\d[\d_,]*\d|\d")
@@ -94,7 +94,8 @@ class _Filler:
 
 def _tolerance(lo: int) -> int:
     """Точность замера: вилка уже 2% (но не меньше 512 токенов) — достаточно:
-    бюджет всё равно берётся от окна с запасом (``budget_for_window``)."""
+    бюджет всё равно берётся от окна с запасом (``budget_for_window``).
+    """
     return max(512, lo // 50)
 
 
@@ -105,7 +106,8 @@ def _margin(candidate: int) -> int:
 
 def _hints(detail: str, lo: int, sent: int) -> list[int]:
     """Числа из текста отказа, которые могут быть лимитом: больше подтверждённого и
-    заметно меньше отправленного (``sent``) — «you requested N tokens» сюда не попадёт."""
+    заметно меньше отправленного (``sent``) — «you requested N tokens» сюда не попадёт.
+    """
     found = set()
     for raw in _NUMBER_RE.findall(detail):
         try:
@@ -125,7 +127,8 @@ def probe_context_window(
     cap: int = MAX_CONTEXT_WINDOW,
 ) -> ProbeResult:
     """Замеряет окно ``model``. Ошибки обращения — :class:`LLMError`;
-    провайдер без поддержки замера — ``NotImplementedError``."""
+    провайдер без поддержки замера — ``NotImplementedError``.
+    """
     filler = _Filler()
     chars_per_token = _INITIAL_CHARS_PER_TOKEN
     lo = 0  # наибольший подтверждённый размер, токены
@@ -149,7 +152,7 @@ def probe_context_window(
         probes += 1
         try:
             prompt_tokens = provider.measure_prompt(text, model=model)
-        except PromptTooLong as e:
+        except PromptTooLongError as e:
             if rejected_chars is None or len(text) < rejected_chars:
                 rejected_chars = len(text)
             hints = sorted(set(hints) | set(_hints(e.detail, lo, target)), reverse=True)
@@ -163,7 +166,7 @@ def probe_context_window(
             # пробой, а пробы раздувались бы в геометрической прогрессии.
             raise LLMError(
                 f"сервер учёл {prompt_tokens} токенов из ~{target} отправленных — похоже, "
-                "он молча обрезает запрос; окно так не замерить"
+                "он молча обрезает запрос; окно так не замерить",
             )
         chars_per_token = len(text) / prompt_tokens
         lo = max(lo, prompt_tokens)

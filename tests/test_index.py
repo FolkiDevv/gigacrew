@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import sqlite3
 
 import pytest
@@ -30,7 +31,9 @@ def _bump(path, text):
 def project(tmp_path):
     _make(tmp_path, "app/agent.py", "class Agent:\n    def run_turn(self):\n        pass\n")
     _make(
-        tmp_path, "app/events.py", "class AgentEvents:\n    def on_turn_end(self):\n        pass\n"
+        tmp_path,
+        "app/events.py",
+        "class AgentEvents:\n    def on_turn_end(self):\n        pass\n",
     )
     _make(tmp_path, "web/store.ts", "export class Store {}\nexport function runTurn() {}\n")
     _make(tmp_path, "README.md", "# Проект\n## Установка\n")
@@ -62,9 +65,12 @@ def test_build_creates_data_dir_and_marks_complete(index, project):
     assert (project / ".gigacode" / "index" / INDEX_FILE_NAME).is_file()
     assert index.is_complete()
     info = index.stats()
-    assert info.files == 4 and info.symbols == 8 and info.complete
+    assert info.files == 4
+    assert info.symbols == 8
+    assert info.complete
     assert dict(info.languages) == {"python": 2, "typescript": 1, "markdown": 1}
-    assert info.updated_at is not None and info.db_bytes > 0
+    assert info.updated_at is not None
+    assert info.db_bytes > 0
 
 
 def test_incremental_refresh_reparses_only_changes(index, project, monkeypatch):
@@ -72,9 +78,12 @@ def test_incremental_refresh_reparses_only_changes(index, project, monkeypatch):
     parsed = []
     real = index_mod.extract
     monkeypatch.setattr(
-        index_mod, "extract", lambda text, lang, path: parsed.append(lang) or real(text, lang, path)
+        index_mod,
+        "extract",
+        lambda text, lang, path: parsed.append(lang) or real(text, lang, path),
     )
-    assert index.refresh().changed == 0 and parsed == []
+    assert index.refresh().changed == 0
+    assert parsed == []
 
     _bump(project / "app/agent.py", "class Agent:\n    def renamed(self):\n        pass\n")
     _make(project, "app/new.py", "def fresh():\n    pass\n")
@@ -112,10 +121,12 @@ def test_secrets_binary_large_and_ignored_files(index, project, monkeypatch):
     _make(project, "huge.py", "def huge(): pass\n" * 20)
     index.refresh()
     paths = _paths(index)
-    assert ".env" not in paths and "generated/big.py" not in paths
+    assert ".env" not in paths
+    assert "generated/big.py" not in paths
     assert index.file_entry("logo.png").status == "binary"
     big = index.file_entry("huge.py")
-    assert big.status == "large" and big.symbols == 0
+    assert big.status == "large"
+    assert big.symbols == 0
     # явное обновление исключённого каталога не протаскивает его в индекс
     index.refresh(project / "generated")
     assert "generated/big.py" not in _paths(index)
@@ -137,13 +148,15 @@ def test_interrupted_build_keeps_committed_batches(project, monkeypatch):
         assert not ix.is_complete()
         assert len(_paths(ix)) == 4  # две зафиксированные пачки по 2 файла
         stats = ix.refresh()
-        assert stats.added == 5 and ix.is_complete()
+        assert stats.added == 5
+        assert ix.is_complete()
 
 
 def test_rebuild(index, project):
     index.refresh()
     stats = index.rebuild()
-    assert stats.added == 4 and index.is_complete()
+    assert stats.added == 4
+    assert index.is_complete()
 
 
 # ------------------------------ совместимость ------------------------------ #
@@ -156,7 +169,8 @@ def test_old_schema_is_recreated(project):
         conn.execute("UPDATE meta SET value = '0' WHERE key = 'schema_version'")
     conn.close()
     with ProjectIndex(ws) as ix:
-        assert not ix.is_complete() and ix.stats().files == 0
+        assert not ix.is_complete()
+        assert ix.stats().files == 0
 
 
 def test_corrupted_database_is_recreated(project):
@@ -182,11 +196,13 @@ def test_find_symbols_qualified_kind_glob_and_limit(index):
     assert [(h.path, h.symbol.qualname) for h in hits] == [("app/agent.py", "Agent.run_turn")]
     # регистр не важен, 'function' включает методы
     hits, total = index.find_symbols("RUNTURN", kind="function")
-    assert total == 1 and hits[0].path == "web/store.ts"
+    assert total == 1
+    assert hits[0].path == "web/store.ts"
     hits, total = index.find_symbols("run", kind="function", path_glob="app/**")
     assert [h.symbol.qualname for h in hits] == ["Agent.run_turn"]
     hits, total = index.find_symbols("e", limit=1)
-    assert len(hits) == 1 and total > 1
+    assert len(hits) == 1
+    assert total > 1
     assert index.find_symbols("100%_")[1] == 0  # спецсимволы LIKE экранируются
     with pytest.raises(ValueError):
         index.find_symbols("  ")
@@ -229,7 +245,8 @@ def test_symlinks_to_secrets_and_excluded_files_are_not_indexed(index, project):
     (project / "lib_link.py").symlink_to(project / "vendor" / "lib.py")
     index.refresh()
     paths = _paths(index)
-    assert "settings.py" not in paths and "lib_link.py" not in paths
+    assert "settings.py" not in paths
+    assert "lib_link.py" not in paths
     assert index.find_symbols("SECRET")[1] == 0
     assert index.find_symbols("vendored")[1] == 0
 
@@ -285,7 +302,8 @@ def test_find_refs_ranks_by_resolution(refs_project):
     assert result.total == 6
     assert refs_project.find_refs("helper", kind="import").total == 2
     calls = refs_project.find_refs("helper", kind="call", path_glob="pkg/**", limit=1)
-    assert calls.total == 3 and len(calls.hits) == 1
+    assert calls.total == 3
+    assert len(calls.hits) == 1
     assert refs_project.find_refs("pkg.rel.go").hits == []  # без использований
     with pytest.raises(ValueError):
         refs_project.find_refs(" . ")
@@ -295,7 +313,7 @@ def test_find_refs_without_definition_searches_by_name(refs_project):
     result = refs_project.find_refs("hp")
     assert result.definitions == []
     assert [(h.path, h.line, h.resolution) for h in result.hits] == [
-        ("pkg/user.py", 5, "name_only")
+        ("pkg/user.py", 5, "name_only"),
     ]
 
 
@@ -312,7 +330,8 @@ def test_imports_resolve_to_project_files(tmp_path):
         ix.refresh()
         assert ix.resolve_module("pkg.b") == "src/pkg/b.py"
         assert ix.resolve_module("pkg") == "src/pkg/__init__.py"
-        assert ix.resolve_module("os") is None and ix.resolve_module("..x") is None
+        assert ix.resolve_module("os") is None
+        assert ix.resolve_module("..x") is None
         entries = ix.imports_of("src/pkg/a.py")
         assert [(e.module, e.name, e.target) for e in entries] == [
             ("os", "", None),
@@ -375,7 +394,7 @@ def _corrupt_pages(ws: Workspace) -> None:
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # страницы — в основной файл
     conn.close()
     size = db.stat().st_size
-    with open(db, "r+b") as f:  # страницы 1–16 (схема, meta) целы, дальше — мусор
+    with pathlib.Path(db).open("r+b") as f:  # страницы 1–16 (схема, meta) целы, дальше — мусор
         f.seek(16 * 4096)
         f.write(bytes(range(256)) * ((size - 16 * 4096) // 256))
 
@@ -416,7 +435,8 @@ def test_index_command_rebuilds_corrupted_index(tmp_path, capsys):
     ws = _big_project(tmp_path)
     _corrupt_pages(ws)
     result = run_indexing(ProjectIndex(ws), Console(no_color=True))
-    assert result is not None and result[1].files == 150
+    assert result is not None
+    assert result[1].files == 150
     assert "повреждён" in capsys.readouterr().out
     with ProjectIndex(ws) as ix:
         assert ix.find_symbols("func_1_19")[1] == 1
@@ -445,18 +465,22 @@ def test_edit_that_keeps_the_size_is_reindexed(tmp_path):
         os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
         assert p.stat().st_size == st.st_size
         assert ix.refresh().updated == 1
-        assert ix.find_symbols("bar")[1] == 1 and ix.find_symbols("foo")[1] == 0
+        assert ix.find_symbols("bar")[1] == 1
+        assert ix.find_symbols("foo")[1] == 0
 
 
 def test_qualified_query_filters_by_owner(tmp_path):
     _make(
-        tmp_path, "m.py", "class A:\n    def run(self): pass\nclass B:\n    def run(self): pass\n"
+        tmp_path,
+        "m.py",
+        "class A:\n    def run(self): pass\nclass B:\n    def run(self): pass\n",
     )
     _make(tmp_path, "n.py", "class Outer:\n    class Inner:\n        def run(self): pass\n")
     with ProjectIndex(Workspace(tmp_path)) as ix:
         ix.refresh()
         hits, total = ix.find_symbols("A.run")
-        assert total == 1 and hits[0].symbol.qualname == "A.run"
+        assert total == 1
+        assert hits[0].symbol.qualname == "A.run"
         assert [h.symbol.qualname for h in ix.definitions("B.run")] == ["B.run"]
         # владелец — и по концу имени вложенного класса
         assert [h.symbol.qualname for h in ix.find_symbols("Inner.run")[0]] == ["Outer.Inner.run"]
@@ -477,8 +501,10 @@ def test_like_wildcards_in_query_are_literal(tmp_path):
     with ProjectIndex(Workspace(tmp_path)) as ix:
         ix.refresh()
         hits, total = ix.find_symbols("get_x")
-        assert total == 1 and hits[0].symbol.name == "get_x"
-        assert ix.find_symbols("100%")[1] == 0 and ix.find_symbols("p1%x")[1] == 0
+        assert total == 1
+        assert hits[0].symbol.name == "get_x"
+        assert ix.find_symbols("100%")[1] == 0
+        assert ix.find_symbols("p1%x")[1] == 0
 
 
 def test_prefix_match_ranks_before_substring(tmp_path):

@@ -23,82 +23,74 @@ from gigacrew.project import treesitter
 __all__ = ["Command", "Redirect", "Script", "Word", "parse"]
 
 # Подстановки и раскрытия: значение слова известно только при выполнении.
-_DYNAMIC_NODES = frozenset(
-    {
-        "simple_expansion",
-        "expansion",
-        "command_substitution",
-        "process_substitution",
-        "arithmetic_expansion",
-        "ansi_c_string",  # $'…': dash и bash понимают по-разному
-        "translated_string",  # $"…"
-    }
-)
+_DYNAMIC_NODES = frozenset({
+    "simple_expansion",
+    "expansion",
+    "command_substitution",
+    "process_substitution",
+    "arithmetic_expansion",
+    "ansi_c_string",  # $'…': dash и bash понимают по-разному
+    "translated_string",  # $"…"
+})
 _SUBSTITUTIONS = frozenset({"command_substitution", "process_substitution"})
 _SUBSTITUTION_DELIMITERS = frozenset({"$(", ")", "`", "<(", ">("})
-_WORD_NODES = frozenset(
-    {
-        "word",
-        "string",
-        "raw_string",
-        "concatenation",
-        "number",
-        "simple_expansion",
-        "expansion",
-        "command_substitution",
-        "process_substitution",
-        "arithmetic_expansion",
-        "ansi_c_string",
-        "translated_string",
-    }
-)
+_WORD_NODES = frozenset({
+    "word",
+    "string",
+    "raw_string",
+    "concatenation",
+    "number",
+    "simple_expansion",
+    "expansion",
+    "command_substitution",
+    "process_substitution",
+    "arithmetic_expansion",
+    "ansi_c_string",
+    "translated_string",
+})
 # Составные операторы: внутри — обычные команды (условия, циклы, блоки).
-_CONTAINERS = frozenset(
-    {
-        "do_group",
-        "else_clause",
-        "elif_clause",
-        "case_item",
-        "if_statement",
-        "while_statement",
-        "for_statement",
-        "case_statement",
-        "negated_command",
-        "compound_statement",
-    }
-)
+_CONTAINERS = frozenset({
+    "do_group",
+    "else_clause",
+    "elif_clause",
+    "case_item",
+    "if_statement",
+    "while_statement",
+    "for_statement",
+    "case_statement",
+    "negated_command",
+    "compound_statement",
+})
 # Лексемы-разделители и ключевые слова — пропускаются.
-_TOKENS = frozenset(
-    {
-        ";",
-        ";;",
-        "&",
-        "&&",
-        "||",
-        "|",
-        "|&",
-        "(",
-        ")",
-        "{",
-        "}",
-        "!",
-        "if",
-        "then",
-        "fi",
-        "else",
-        "elif",
-        "for",
-        "in",
-        "do",
-        "done",
-        "while",
-        "until",
-        "case",
-        "esac",
-        "comment",
-        "\n",
-    }
-)
+_TOKENS = frozenset({
+    ";",
+    ";;",
+    "&",
+    "&&",
+    "||",
+    "|",
+    "|&",
+    "(",
+    ")",
+    "{",
+    "}",
+    "!",
+    "if",
+    "then",
+    "fi",
+    "else",
+    "elif",
+    "for",
+    "in",
+    "do",
+    "done",
+    "while",
+    "until",
+    "case",
+    "esac",
+    "comment",
+    "\n",
+})
 _SEPARATORS = frozenset({"&&", "||", ";", "&", "\n", "|", "|&", ";;"})
 _OUTPUT_OPS = frozenset({">", ">>", ">|", "&>", "&>>", "&>|"})
 _GLOB_CHARS = re.compile(r"[*?\[]")
@@ -115,30 +107,28 @@ _PLAIN_VALUE = re.compile(r"[\w./:,@%+=-]*")
 _ASSIGNMENTS = frozenset({"variable_assignment", "variable_assignments", "declaration_command"})
 # Встроенные команды, которые могут присвоить переменную оболочки (или выполнить то, что
 # присвоит): после них присвоенное раньше значение неизвестно.
-_SETS_VARS = frozenset(
-    {
-        "read",
-        "getopts",
-        "printf",
-        "mapfile",
-        "readarray",
-        "let",
-        "eval",
-        ".",
-        "source",
-        "declare",
-        "typeset",
-        "local",
-        "export",
-        "readonly",
-        "unset",
-        "set",
-        "command",
-        "builtin",
-        "exec",
-        "trap",
-    }
-)
+_SETS_VARS = frozenset({
+    "read",
+    "getopts",
+    "printf",
+    "mapfile",
+    "readarray",
+    "let",
+    "eval",
+    ".",
+    "source",
+    "declare",
+    "typeset",
+    "local",
+    "export",
+    "readonly",
+    "unset",
+    "set",
+    "command",
+    "builtin",
+    "exec",
+    "trap",
+})
 
 
 @dataclass(frozen=True)
@@ -146,7 +136,8 @@ class Word:
     """Слово команды. ``value`` — значение после снятия кавычек (у нестатичного слова —
     исходный текст); ``vars`` — раскрываемые переменные; ``glob`` — оболочка раскроет
     шаблон имён файлов (``*``, ``?``, ``[`` вне кавычек); ``plain`` — те из ``vars``,
-    что только подставляются как есть (``$X``, ``${X}``)."""
+    что только подставляются как есть (``$X``, ``${X}``).
+    """
 
     value: str
     raw: str = ""
@@ -160,7 +151,8 @@ class Word:
 class Redirect:
     """Перенаправление. ``target`` — файл (``>``, ``>>``, ``<``, ``&>``); у heredoc и
     herestring — ``body`` (``body_static`` — без подстановок, ``body_vars`` —
-    раскрываемые в нём переменные)."""
+    раскрываемые в нём переменные).
+    """
 
     op: str
     target: Word | None = None
@@ -176,13 +168,14 @@ class Redirect:
 
     @property
     def reads(self) -> bool:
-        return self.op in ("<", "<&") and not self.fd_dup and self.target is not None
+        return self.op in {"<", "<&"} and not self.fd_dup and self.target is not None
 
 
 @dataclass
 class Command:
     """Простая команда в контексте: рабочий каталог (от корня, POSIX), перенаправления
-    и предыдущее звено конвейера (его вывод — stdin этой команды)."""
+    и предыдущее звено конвейера (его вывод — stdin этой команды).
+    """
 
     argv: list[Word]
     assigns: list[tuple[str, Word]] = field(default_factory=list)
@@ -233,17 +226,22 @@ def _text(node) -> str:
 
 
 def _unescape_word(raw: str) -> str:
-    """Неквотированное слово: ``\\x`` → ``x``, перенос строки через ``\\`` убирается."""
-    return re.sub(r"\\(.)", lambda m: "" if m.group(1) == "\n" else m.group(1), raw, flags=re.S)
+    r"""Неквотированное слово: ``\\x`` → ``x``, перенос строки через ``\\`` убирается."""
+    return re.sub(
+        r"\\(.)",
+        lambda m: "" if m.group(1) == "\n" else m.group(1),
+        raw,
+        flags=re.DOTALL,
+    )
 
 
 def _unescape_dquoted(raw: str) -> str:
-    """Содержимое ``"…"``: ``\\`` значима только перед ``$ ` " \\`` и переводом строки."""
+    r"""Содержимое ``"…"``: ``\\`` значима только перед ``$ ` " \\`` и переводом строки."""
     return re.sub(r'\\([$`"\\\n])', lambda m: "" if m.group(1) == "\n" else m.group(1), raw)
 
 
 def _unescape_heredoc(body: str) -> str:
-    """Тело heredoc без кавычек у разделителя: ``\\$``, ``\\```, ``\\\\``, перенос через ``\\``."""
+    r"""Тело heredoc без кавычек у разделителя: ``\\$``, ``\\```, ``\\\\``, перенос через ``\\``."""
     return re.sub(r"\\([$`\\\n])", lambda m: "" if m.group(1) == "\n" else m.group(1), body)
 
 
@@ -309,7 +307,7 @@ def _has_glob(node) -> bool:
 
 def _has_brace(node) -> bool:
     """``{a,b}``/``{1..3}`` вне кавычек: bash раскроет, dash — нет."""
-    if node.type not in ("word", "concatenation"):
+    if node.type not in {"word", "concatenation"}:
         return False
     parts = list(node.children) if node.type == "concatenation" else [node]
     text = "".join(re.sub(r"\\.", "", _text(p)) if p.type == "word" else "\0" for p in parts)
@@ -331,7 +329,8 @@ class _Walker:
     # ----------------------------- слова ------------------------------ #
     def scan(self, node) -> tuple[bool, list[str]]:
         """Обойти поддерево слова: (есть ли раскрытия, имена переменных). Команды в
-        подстановках разбираются как самостоятельные (они тоже выполнятся)."""
+        подстановках разбираются как самостоятельные (они тоже выполнятся).
+        """
         dynamic = False
         names: list[str] = []
         stack = [node]
@@ -340,7 +339,7 @@ class _Walker:
             t = n.type
             if t in _DYNAMIC_NODES:
                 dynamic = True
-            if t in ("variable_name", "special_variable_name") and dynamic:
+            if t in {"variable_name", "special_variable_name"} and dynamic:
                 names.append(_text(n))
             if t in _SUBSTITUTIONS:
                 inner = [c for c in n.children if c.type not in _SUBSTITUTION_DELIMITERS]
@@ -404,7 +403,7 @@ class _Walker:
             certain = (
                 top
                 and node.type in _ASSIGNMENTS
-                and (i == 0 or items[i - 1][1] not in ("&&", "||"))
+                and (i == 0 or items[i - 1][1] not in {"&&", "||"})
                 and sep != "&"
             )
             for name, value in self.script.assigns[known:]:
@@ -447,7 +446,12 @@ class _Walker:
         return rel.as_posix() or "."
 
     def statement(
-        self, node, *, cwd: str, substituted: bool, redirects: list[Redirect] | None = None
+        self,
+        node,
+        *,
+        cwd: str,
+        substituted: bool,
+        redirects: list[Redirect] | None = None,
     ) -> list[Command]:
         """Оператор → его простые команды (последняя — источник для следующего звена конвейера)."""
         t = node.type
@@ -459,7 +463,7 @@ class _Walker:
             return self.pipeline(node, cwd=cwd, substituted=substituted)
         if t == "subshell":
             before = len(self.script.commands)
-            inner = [c for c in node.children if c.type not in ("(", ")")]
+            inner = [c for c in node.children if c.type not in {"(", ")"}]
             self.statements(inner, cwd=cwd, substituted=substituted, leading_cd=True)
             return self._attach(self.script.commands[before:], redirects)
         if t in _CONTAINERS:
@@ -512,7 +516,7 @@ class _Walker:
 
     def declaration(self, node) -> None:
         keyword = _text(node.children[0]) if node.children else ""
-        if keyword not in ("export", "local", "readonly", "declare", "typeset"):
+        if keyword not in {"export", "local", "readonly", "declare", "typeset"}:
             self.problem(f"конструкция оболочки {keyword}")
         for c in node.named_children:
             if c.type == "variable_assignment":
@@ -525,13 +529,18 @@ class _Walker:
                     self.script.assigns.append((w.value, Word("", static=False)))
 
     def redirected(
-        self, node, *, cwd: str, substituted: bool, outer: list[Redirect] | None
+        self,
+        node,
+        *,
+        cwd: str,
+        substituted: bool,
+        outer: list[Redirect] | None,
     ) -> list[Command]:
         body = None
         redirects: list[Redirect] = []
         trailing: list = []  # то, что грамматика поместила внутрь heredoc: `| python`, `&& ls`
         for c in node.children:
-            if c.type in ("file_redirect", "herestring_redirect"):
+            if c.type in {"file_redirect", "herestring_redirect"}:
                 redirect, extra = self.redirect(c)
                 redirects.append(redirect)
                 if extra:
@@ -548,14 +557,22 @@ class _Walker:
             self.problem("перенаправление без команды")
             return []
         cmds = self.statement(
-            body, cwd=cwd, substituted=substituted, redirects=redirects + list(outer or [])
+            body,
+            cwd=cwd,
+            substituted=substituted,
+            redirects=redirects + list(outer or []),
         )
         if trailing:
             cmds = self._trailing(trailing, cmds, cwd=cwd, substituted=substituted)
         return cmds
 
     def _trailing(
-        self, nodes, cmds: list[Command], *, cwd: str, substituted: bool
+        self,
+        nodes,
+        cmds: list[Command],
+        *,
+        cwd: str,
+        substituted: bool,
     ) -> list[Command]:
         """Продолжение команды, которое грамматика поместила внутрь heredoc."""
         prev = cmds[-1] if cmds else None
@@ -567,7 +584,7 @@ class _Walker:
                 if op == "&":
                     self.problem("фоновый процесс (&)")
                 continue
-            if n.type in ("file_redirect", "herestring_redirect"):
+            if n.type in {"file_redirect", "herestring_redirect"}:
                 redirect, extra = self.redirect(n)
                 if extra:
                     self.problem("слова после перенаправления")
@@ -576,7 +593,7 @@ class _Walker:
                 continue
             if n.type == "pipeline":
                 for part in n.children:
-                    if part.type in ("|", "|&"):
+                    if part.type in {"|", "|&"}:
                         continue
                     if part.type == "list":
                         # `cat <<EOF | python3 && ls`: грамматика кладёт `python3 && ls`
@@ -605,7 +622,7 @@ class _Walker:
                     result = got
                 continue
             got = self.statement(n, cwd=cwd, substituted=substituted)
-            if op in ("|", "|&") and got and prev is not None:
+            if op in {"|", "|&"} and got and prev is not None:
                 got[0].stdin = prev
             prev = got[-1] if got else prev
             result = got
@@ -616,11 +633,11 @@ class _Walker:
         op = ""
         words = []
         for c in node.children:
-            if c.type in (">", ">>", ">|", "&>", "&>>", "<", ">&", "<&", "<>", "<<<", "&>|"):
+            if c.type in {">", ">>", ">|", "&>", "&>>", "<", ">&", "<&", "<>", "<<<", "&>|"}:
                 op = c.type
             elif c.type in _WORD_NODES:
                 words.append(c)
-            elif c.type not in ("file_descriptor",):
+            elif c.type != "file_descriptor":
                 self.problem(f"перенаправление {c.type}")
         if not words:
             self.problem("перенаправление без цели")
@@ -635,7 +652,7 @@ class _Walker:
                 body_plain=first.plain,
             )
             return redirect, words[1:]
-        if op in (">&", "<&") and first.static and (first.value.isdigit() or first.value == "-"):
+        if op in {">&", "<&"} and first.static and (first.value.isdigit() or first.value == "-"):
             return Redirect(op, first, fd_dup=True), words[1:]
         if op == "<>":
             self.problem("перенаправление <>")
@@ -658,19 +675,28 @@ class _Walker:
                     plain = _plain_vars(c)
                     # `…` и $… в теле без кавычек у разделителя раскрываются оболочкой.
                     static = not dynamic and not re.search(r"(?<!\\)[`$]", body)
-            elif c.type in ("<<", "<<-", "heredoc_end", "heredoc_content"):
+            elif c.type in {"<<", "<<-", "heredoc_end", "heredoc_content"}:
                 continue
             else:
                 extra.append(c)
         if not quoted:
             body = _unescape_heredoc(body)
         redirect = Redirect(
-            "<<", body=body, body_static=static, body_vars=tuple(names), body_plain=plain
+            "<<",
+            body=body,
+            body_static=static,
+            body_vars=tuple(names),
+            body_plain=plain,
         )
         return redirect, extra
 
     def command(
-        self, node, *, cwd: str, substituted: bool, extra: list[Redirect] | None = None
+        self,
+        node,
+        *,
+        cwd: str,
+        substituted: bool,
+        extra: list[Redirect] | None = None,
     ) -> Command:
         cmd = Command(argv=[], cwd=cwd, substituted=substituted, assigned=frozenset(self._assigned))
         for c in node.children:
@@ -681,7 +707,7 @@ class _Walker:
                 cmd.argv.append(self.word(c.children[0] if c.children else c))
             elif t in _WORD_NODES:
                 cmd.argv.append(self.word(c))
-            elif t in ("file_redirect", "herestring_redirect"):
+            elif t in {"file_redirect", "herestring_redirect"}:
                 redirect, rest = self.redirect(c)
                 cmd.redirects.append(redirect)
                 cmd.argv.extend(self.word(w) for w in rest)
@@ -707,7 +733,7 @@ class _Walker:
         prev: Command | None = None
         last: list[Command] = []
         for c in node.children:
-            if c.type in ("|", "|&"):
+            if c.type in {"|", "|&"}:
                 continue
             got = self.statement(c, cwd=cwd, substituted=substituted)
             if got and prev is not None:

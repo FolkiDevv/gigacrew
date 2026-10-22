@@ -35,7 +35,8 @@ def prompt_style() -> Style:
 
 def prompt_color_depth(no_color: bool) -> ColorDepth | None:
     """Глубина цвета для prompt_toolkit: та же, что у rich. None — решает prompt_toolkit
-    (не терминал); ``PROMPT_TOOLKIT_COLOR_DEPTH`` и ``NO_COLOR`` по-прежнему главнее."""
+    (не терминал); ``PROMPT_TOOLKIT_COLOR_DEPTH`` и ``NO_COLOR`` по-прежнему главнее.
+    """
     if no_color:
         return ColorDepth.MONOCHROME
     env = ColorDepth.from_env()

@@ -63,7 +63,8 @@ class Message(BaseModel):
     @classmethod
     def _legacy_fields(cls, data: Any) -> Any:
         """Чаты, сохранённые до перехода на API v2: один ``function_call`` и
-        ``functions_state_id`` (состояние старого API в новом не действует)."""
+        ``functions_state_id`` (состояние старого API в новом не действует).
+        """
         if not isinstance(data, Mapping) or (
             "function_call" not in data and "functions_state_id" not in data
         ):

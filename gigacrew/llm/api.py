@@ -62,7 +62,8 @@ def chat_url(base_url: str) -> str:
 
 def _strict_json(value: Any) -> bool:
     """Сериализуется ли значение строгим JSON. ``json.loads`` (и ``resp.json()``) принимают
-    NaN и Infinity, а тело запроса httpx собирает без них — ValueError до отправки."""
+    NaN и Infinity, а тело запроса httpx собирает без них — ValueError до отправки.
+    """
     try:
         json.dumps(value, allow_nan=False)
     except (TypeError, ValueError):
@@ -154,7 +155,8 @@ class _TurnBuilder:
     def turn(self, *, complete: bool = True) -> AssistantTurn:
         """Ход ассистента. ``complete=False`` — поток кончился без окончания ответа:
         без причины завершения ответ без вызовов — ``"incomplete"``, а не ``"stop"``
-        (вызовы приходят только в окончании и могли потеряться)."""
+        (вызовы приходят только в окончании и могли потеряться).
+        """
         calls = list(self._calls.values())
         message = Message(
             role="assistant",
@@ -168,7 +170,9 @@ class _TurnBuilder:
             "function_call" if calls else "stop" if complete else "incomplete"
         )
         return AssistantTurn(
-            message=message, finish_reason=finish, usage=Usage.from_raw(self._usage)
+            message=message,
+            finish_reason=finish,
+            usage=Usage.from_raw(self._usage),
         )
 
 
@@ -189,7 +193,7 @@ class ApiProvider(HttpProvider):
         """``transport`` — подмена HTTP-транспорта (``httpx.MockTransport`` в тестах)."""
         if config.provider != "api":
             raise RuntimeError(
-                f"GIGACREW_PROVIDER={config.provider}: этот провайдер работает только с API v2"
+                f"GIGACREW_PROVIDER={config.provider}: этот провайдер работает только с API v2",
             )
         config.require_credentials()
         super().__init__(config, transport=transport)
@@ -213,7 +217,7 @@ class ApiProvider(HttpProvider):
         if not _CREDENTIAL.fullmatch(key):
             raise ApiError(
                 "GIGACREW_ACCESS_KEY содержит пробелы, управляющие или не-ASCII символы — "
-                "проверьте ключ (значение не показывается)"
+                "проверьте ключ (значение не показывается)",
             )
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -226,13 +230,13 @@ class ApiProvider(HttpProvider):
                 self._cfg.auth_url or "",
                 headers=headers,
                 data={"scope": self._cfg.scope} if self._cfg.scope else {},
-            )
+            ),
         )
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise ApiError(
-                f"Не удалось получить токен API ({resp.status_code}): {error_body(resp)}"
+                f"Не удалось получить токен API ({resp.status_code}): {error_body(resp)}",
             ) from e
 
         data = self._json(resp)
@@ -278,7 +282,8 @@ class ApiProvider(HttpProvider):
         (``42``, ``true``, ``[]`` — например, листинг из одного файла ``1``) —
         заворачивается в ``{"result": ...}``: отвергнутое API сообщение осталось бы
         в истории и ломало бы каждый следующий запрос этого чата. Объект с NaN или
-        Infinity — тоже текст: строгим JSON тело запроса с ним не собрать."""
+        Infinity — тоже текст: строгим JSON тело запроса с ним не собрать.
+        """
         text = content or ""
         try:
             value = json.loads(text)
@@ -303,11 +308,15 @@ class ApiProvider(HttpProvider):
 
     @classmethod
     def _messages_payload(
-        cls, messages: Sequence[Message], *, reasoning: bool = True
+        cls,
+        messages: Sequence[Message],
+        *,
+        reasoning: bool = True,
     ) -> list[dict[str, Any]]:
         """История для запроса. Результаты вызовов одного assistant-сообщения (идут
         подряд) склеиваются в одно сообщение ``role: "tool"`` с его ``tools_state_id``.
-        Рассуждения ответа — сообщение ``role: "reasoning"`` перед ним, как в ответе API."""
+        Рассуждения ответа — сообщение ``role: "reasoning"`` перед ним, как в ответе API.
+        """
         out: list[dict[str, Any]] = []
         state_id: str | None = None  # состояние assistant-сообщения перед результатами
         for msg in messages:
@@ -436,11 +445,11 @@ class ApiProvider(HttpProvider):
             lambda: self._client.get(
                 f"{self._cfg.base_url}/models",
                 headers=self._auth_headers(),
-            )
+            ),
         )
         if resp.status_code >= 400:
             raise ApiError(
-                f"Не удалось получить список моделей ({resp.status_code}): {error_body(resp)}"
+                f"Не удалось получить список моделей ({resp.status_code}): {error_body(resp)}",
             )
         models = self._json(resp).get("data") or []
         return [

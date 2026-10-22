@@ -17,7 +17,7 @@ import pytest
 from gigacrew.config import Config
 from gigacrew.llm import api
 from gigacrew.llm.api import ApiError, ApiProvider
-from gigacrew.llm.base import LLMError, PromptTooLong
+from gigacrew.llm.base import LLMError, PromptTooLongError
 from gigacrew.llm.types import FunctionCall, Message, Usage
 
 AUTH_URL = "https://auth.test/oauth"
@@ -36,7 +36,8 @@ def _provider(handler) -> ApiProvider:
 
 def _auth_response():
     return httpx.Response(
-        200, json={"access_token": "t", "expires_at": int((time.time() + 3600) * 1000)}
+        200,
+        json={"access_token": "t", "expires_at": int((time.time() + 3600) * 1000)},
     )
 
 
@@ -103,10 +104,10 @@ class _CutAfterDone(httpx.SyncByteStream):
                                 "id": "c1",
                                 "name": "run_shell",
                                 "arguments": {"command": "pytest"},
-                            }
-                        }
+                            },
+                        },
                     ],
-                }
+                },
             ],
             "finish_reason": "function_call",
             "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -129,9 +130,10 @@ def test_unclean_close_after_done_keeps_the_answer(shown):
     deltas: list[str] = []
     p = _provider(handler)
     turn = p.stream(_msgs(), on_delta=deltas.append if shown else None)
-    assert turn.finish_reason == "function_call" and turn.message.state_id == "S"
+    assert turn.finish_reason == "function_call"
+    assert turn.message.state_id == "S"
     assert turn.message.function_calls == [
-        FunctionCall(name="run_shell", arguments={"command": "pytest"}, id="c1")
+        FunctionCall(name="run_shell", arguments={"command": "pytest"}, id="c1"),
     ]
     assert turn.usage.prompt_tokens == 10
     assert deltas == (["Запускаю тесты"] if shown else [])
@@ -187,7 +189,8 @@ def _answer(request: httpx.Request) -> httpx.Response:
 
 def test_chat_waits_for_the_model_longer_than_other_requests():
     """Вызовы инструментов приходят в конце ответа: чат ждёт read_timeout, а токен и
-    замер окна — обычный timeout (долгая проба и есть «не помещается»)."""
+    замер окна — обычный timeout (долгая проба и есть «не помещается»).
+    """
     config = Config(access_key="dummy", auth_url=AUTH_URL, base_url=BASE_URL, model="M")
     assert _timeouts(_answer, config) == [
         ("auth", 120),
@@ -199,7 +202,11 @@ def test_chat_waits_for_the_model_longer_than_other_requests():
 
 def test_longer_general_timeout_is_not_shortened_for_chat():
     config = Config(
-        access_key="dummy", auth_url=AUTH_URL, base_url=BASE_URL, model="M", timeout=900
+        access_key="dummy",
+        auth_url=AUTH_URL,
+        base_url=BASE_URL,
+        model="M",
+        timeout=900,
     )
     reads = [read for kind, read in _timeouts(_answer, config) if kind != "auth"]
     assert reads == [900, 900, 900]
@@ -210,7 +217,8 @@ def test_model_silent_after_shown_text_names_the_setting():
         if str(request.url) == AUTH_URL:
             return _auth_response()
         return httpx.Response(
-            200, stream=_SilentStream(_event(_text("Сейчас запишу план")).encode())
+            200,
+            stream=_SilentStream(_event(_text("Сейчас запишу план")).encode()),
         )
 
     deltas: list[str] = []
@@ -305,7 +313,8 @@ def test_non_retryable_transport_errors_wrapped(exc):
 @pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
 def test_result_with_nan_does_not_break_the_chat(streaming):
     """Результат вызова — JSON-объект с NaN (файл, записанный json.dump): запрос уходит,
-    результат — текстом, а не ValueError до отправки на каждом следующем ходе."""
+    результат — текстом, а не ValueError до отправки на каждом следующем ходе.
+    """
     bodies: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -374,7 +383,7 @@ def _secret_provider(handler, access_key: str = SECRET_KEY) -> ApiProvider:
 def _h11_like(request: httpx.Request):
     """Как h11 отвергает недопустимое значение заголовка: значение — в тексте ошибки."""
     raise httpx.LocalProtocolError(
-        f"Illegal header value {request.headers['Authorization'].encode()!r}"
+        f"Illegal header value {request.headers['Authorization'].encode()!r}",
     )
 
 
@@ -428,7 +437,8 @@ def test_malformed_access_key_is_refused_without_echo(key):
     p = _secret_provider(handler, access_key=key)
     with pytest.raises(ApiError, match="GIGACREW_ACCESS_KEY") as e:
         p.complete(_msgs())
-    assert "U0VD" not in str(e.value) and requests == []
+    assert "U0VD" not in str(e.value)
+    assert requests == []
     p.close()
 
 
@@ -461,7 +471,8 @@ def test_malformed_access_token_is_refused_without_echo(token):
     p = _secret_provider(handler)
     with pytest.raises(ApiError, match="access_token") as e:
         p.complete(_msgs())
-    assert "SECRET" not in str(e.value) and chat == []
+    assert "SECRET" not in str(e.value)
+    assert chat == []
     p.close()
 
 
@@ -569,7 +580,8 @@ def _call_of(p: ApiProvider, kind: str):
 @pytest.mark.parametrize("kind", ["complete", "stream", "measure"])
 def test_persistent_401_refreshes_the_token_exactly_once(kind):
     """Отозванный ключ: токен обновляется один раз, потом — «API вернул 401» с телом,
-    а не бесконечный цикл обновлений или «Сетевая ошибка … : None»."""
+    а не бесконечный цикл обновлений или «Сетевая ошибка … : None».
+    """
     server = _Server(chat=lambda _r: httpx.Response(401, text="token revoked"))
     p = _provider(server)
     with pytest.raises(ApiError, match="401: token revoked"):
@@ -583,7 +595,11 @@ def test_oauth_and_chat_wire_format(streaming):
     """Запрос токена — POST с Basic-ключом, scope в теле формы и RqUID; чат — Bearer."""
     server = _Server()
     cfg = Config(
-        access_key="dummy", auth_url=AUTH_URL, base_url=BASE_URL, model="M", scope="MY_SCOPE"
+        access_key="dummy",
+        auth_url=AUTH_URL,
+        base_url=BASE_URL,
+        model="M",
+        scope="MY_SCOPE",
     )
     p = ApiProvider(cfg, transport=httpx.MockTransport(server))
     (p.stream if streaming else p.complete)(_msgs())
@@ -652,7 +668,8 @@ def test_token_is_refreshed_before_it_expires():
     p = _provider(soon)
     p.complete(_msgs())
     p.complete(_msgs())
-    assert len(soon.auth) == 2 and len(soon.chat) == 2
+    assert len(soon.auth) == 2
+    assert len(soon.chat) == 2
     p.close()
 
     later = _Server()
@@ -665,7 +682,8 @@ def test_token_is_refreshed_before_it_expires():
 
 def _auth_response_expiring(seconds: float) -> httpx.Response:
     return httpx.Response(
-        200, json={"access_token": "t", "expires_at": int((time.time() + seconds) * 1000)}
+        200,
+        json={"access_token": "t", "expires_at": int((time.time() + seconds) * 1000)},
     )
 
 
@@ -680,7 +698,7 @@ def test_token_endpoint_errors():
 
     # срок токена не разобрался — живёт 25 минут, а не истекает сразу
     odd = _Server(
-        auth=lambda _r: httpx.Response(200, json={"access_token": "t", "expires_at": "soon"})
+        auth=lambda _r: httpx.Response(200, json={"access_token": "t", "expires_at": "soon"}),
     )
     p = _provider(odd)
     p.complete(_msgs())
@@ -696,7 +714,8 @@ def test_transient_server_errors_are_retried(monkeypatch, status, streaming):
     server = _Server(chat=_then_ok(1, lambda: httpx.Response(status, text="busy")))
     p = _provider(server)
     assert (p.stream if streaming else p.complete)(_msgs()).message.content == "ok"
-    assert len(server.chat) == 2 and pauses == [1.0]
+    assert len(server.chat) == 2
+    assert pauses == [1.0]
     p.close()
 
 
@@ -706,7 +725,8 @@ def test_server_error_backoff_is_exponential(monkeypatch, streaming):
     server = _Server(chat=_then_ok(4, lambda: httpx.Response(503, text="busy")))
     p = _provider(server)
     assert (p.stream if streaming else p.complete)(_msgs()).message.content == "ok"
-    assert pauses == [1.0, 2.0, 4.0, 8.0] and len(server.chat) == 5
+    assert pauses == [1.0, 2.0, 4.0, 8.0]
+    assert len(server.chat) == 5
     p.close()
 
 
@@ -718,7 +738,8 @@ def test_persistent_server_error_reports_status_and_body(monkeypatch, streaming)
     p = _provider(server)
     with pytest.raises(ApiError, match="503: busy-body"):
         (p.stream if streaming else p.complete)(_msgs())
-    assert len(server.chat) == 5 and pauses == [1.0, 2.0, 4.0, 8.0]
+    assert len(server.chat) == 5
+    assert pauses == [1.0, 2.0, 4.0, 8.0]
     p.close()
 
 
@@ -745,7 +766,8 @@ def test_persistent_connection_failure_gives_up_after_five_attempts(monkeypatch,
     p = _provider(server)
     with pytest.raises(ApiError, match="после 5 попыток.*connection refused"):
         (p.stream if streaming else p.complete)(_msgs())
-    assert len(server.chat) == 5 and pauses == [1.0, 2.0, 4.0, 8.0]
+    assert len(server.chat) == 5
+    assert pauses == [1.0, 2.0, 4.0, 8.0]
     p.close()
 
 
@@ -810,7 +832,8 @@ def test_measure_prompt_sends_one_token_request():
     assert p.supports_measure
     assert p.measure_prompt("текст", model="M-probe") == 1234
     (body,) = bodies
-    assert body["model_options"]["max_tokens"] == 1 and body["model"] == "M-probe"
+    assert body["model_options"]["max_tokens"] == 1
+    assert body["model"] == "M-probe"
     assert body["messages"] == [{"role": "user", "content": [{"text": "текст"}]}]
     assert "tools" not in body
     p.close()
@@ -824,9 +847,10 @@ def test_measure_prompt_oversize_statuses(status):
         return httpx.Response(status, text="maximum context length is 32768 tokens")
 
     p = _provider(handler)
-    with pytest.raises(PromptTooLong) as e:
+    with pytest.raises(PromptTooLongError) as e:
         p.measure_prompt("x" * 10)
-    assert e.value.status == status and "32768" in e.value.detail
+    assert e.value.status == status
+    assert "32768" in e.value.detail
     p.close()
 
 
@@ -837,7 +861,7 @@ def test_measure_prompt_timeout_is_oversize_but_other_errors_are_not():
         raise httpx.ReadTimeout("timeout", request=request)
 
     p = _provider(timeout)
-    with pytest.raises(PromptTooLong) as e:
+    with pytest.raises(PromptTooLongError) as e:
         p.measure_prompt("x")
     assert e.value.status is None
     p.close()
@@ -850,7 +874,7 @@ def test_measure_prompt_timeout_is_oversize_but_other_errors_are_not():
     p = _provider(missing)
     with pytest.raises(ApiError) as e:
         p.measure_prompt("x")
-    assert not isinstance(e.value, PromptTooLong)
+    assert not isinstance(e.value, PromptTooLongError)
     p.close()
 
     def no_usage(request: httpx.Request) -> httpx.Response:
@@ -884,14 +908,19 @@ def _refuse(exc):
 )
 def test_measure_prompt_errors_that_are_not_about_size(chat):
     """Ошибки установки соединения, авторизация и лимит частоты — не «не помещается»:
-    иначе окно занизилось бы и сохранилось в ~/.gigacode/models.json."""
+    иначе окно занизилось бы и сохранилось в ~/.gigacode/models.json.
+    """
     cfg = Config(
-        access_key="dummy", auth_url=AUTH_URL, base_url=BASE_URL, model="M", rate_limit_wait=0
+        access_key="dummy",
+        auth_url=AUTH_URL,
+        base_url=BASE_URL,
+        model="M",
+        rate_limit_wait=0,
     )
     p = ApiProvider(cfg, transport=httpx.MockTransport(_Server(chat=chat)))
     with pytest.raises(ApiError) as e:
         p.measure_prompt("x")
-    assert not isinstance(e.value, PromptTooLong)
+    assert not isinstance(e.value, PromptTooLongError)
     p.close()
 
 
@@ -924,7 +953,7 @@ def test_list_models_keeps_only_chat_models():
                     {"id": "untyped"},
                     {"id": "Beta-72B", "type": "chat"},
                     "мусор",
-                ]
+                ],
             },
         )
 
@@ -944,7 +973,7 @@ def test_measure_prompt_token_errors_are_not_oversize():
     p = _provider(auth_timeout)
     with pytest.raises(ApiError) as e:
         p.measure_prompt("x")
-    assert not isinstance(e.value, PromptTooLong)
+    assert not isinstance(e.value, PromptTooLongError)
     p.close()
 
     auth_calls = []
@@ -960,7 +989,7 @@ def test_measure_prompt_token_errors_are_not_oversize():
     p = _provider(refresh_timeout)
     with pytest.raises(ApiError) as e:
         p.measure_prompt("x")
-    assert not isinstance(e.value, PromptTooLong)
+    assert not isinstance(e.value, PromptTooLongError)
     p.close()
 
 
@@ -976,7 +1005,8 @@ def test_measure_prompt_unavailable_gateway_is_not_oversize(status):
     p = _provider(handler)
     with pytest.raises(ApiError) as e:
         p.measure_prompt("x" * 10)
-    assert not isinstance(e.value, PromptTooLong) and "временно недоступен" in str(e.value)
+    assert not isinstance(e.value, PromptTooLongError)
+    assert "временно недоступен" in str(e.value)
     p.close()
 
 
@@ -1010,7 +1040,8 @@ def test_error_body_is_clipped():
     p = _provider(handler)
     with pytest.raises(ApiError) as e:
         p.complete(_msgs())
-    assert len(str(e.value)) < 700 and str(e.value).endswith("…")
+    assert len(str(e.value)) < 700
+    assert str(e.value).endswith("…")
     p.close()
 
 
@@ -1087,7 +1118,8 @@ def test_rate_limit_waits_longer_than_other_retries(monkeypatch, streaming):
     assert call(_msgs(), on_notice=waits.append).message.content == "ok"
     assert calls["chat"] == 7
     assert pauses == [5.0, 10.0, 20.0, 30.0, 30.0, 25.0]  # до бюджета 120 с
-    assert len(waits) == 6 and "лимит запросов шлюза (429) — жду 5 с" in waits[0]
+    assert len(waits) == 6
+    assert "лимит запросов шлюза (429) — жду 5 с" in waits[0]
     p.close()
 
 
@@ -1126,7 +1158,8 @@ def test_rate_limit_wait_can_be_turned_off(monkeypatch):
     p = ApiProvider(cfg, transport=httpx.MockTransport(handler))
     with pytest.raises(ApiError, match="429"):
         p.complete(_msgs())
-    assert pauses == [] and calls["chat"] == 1
+    assert pauses == []
+    assert calls["chat"] == 1
     p.close()
 
 
@@ -1181,10 +1214,13 @@ def test_rejected_reasoning_is_dropped_for_the_model(streaming):
     call = p.stream if streaming else p.complete
     assert call(_with_reasoning_history(), on_notice=notices.append).message.content == "ok"
     assert [_roles(b).count("reasoning") for b in bodies] == [1, 0]  # повтор — без них
-    assert len(notices) == 1 and "не принял рассуждения модели M-default" in notices[0]
+    assert len(notices) == 1
+    assert "не принял рассуждения модели M-default" in notices[0]
     # дальше эта модель — сразу без рассуждений, без лишнего запроса и уведомления
     call(_with_reasoning_history(), on_notice=notices.append)
-    assert len(bodies) == 3 and "reasoning" not in _roles(bodies[2]) and len(notices) == 1
+    assert len(bodies) == 3
+    assert "reasoning" not in _roles(bodies[2])
+    assert len(notices) == 1
     p.close()
 
 
@@ -1226,15 +1262,15 @@ def _agent_requests(tmp_path, reasoning: str, *, thoughts: bool) -> list[dict]:
                                     "id": "c1",
                                     "name": "read_file",
                                     "arguments": {"path": "a.txt"},
-                                }
-                            }
+                                },
+                            },
                         ],
-                    }
+                    },
                 ],
                 "finish_reason": "function_call",
             },
             {**_text("там hello"), "finish_reason": "stop"},
-        ]
+        ],
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1269,7 +1305,8 @@ def test_model_without_reasoning_gets_the_same_requests_in_turn_mode(tmp_path):
     """Модели без рассуждений режим turn не касается: запросы те же, что с off."""
     turn = _agent_requests(tmp_path, "turn", thoughts=False)
     off = _agent_requests(tmp_path, "off", thoughts=False)
-    assert turn == off and len(turn) == 2
+    assert turn == off
+    assert len(turn) == 2
     assert all("reasoning" not in _roles(body) for body in turn)
 
 

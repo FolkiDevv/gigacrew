@@ -69,7 +69,7 @@ CASES = [
         0,
         id="no-models",
         marks=pytest.mark.skip(reason="не заданы GIGACREW_EVAL_MODELS и GIGACREW_TEST_MODEL"),
-    )
+    ),
 ]
 
 _SESSIONS: list[EvalSession] = []

@@ -131,7 +131,7 @@ class FileFacts:
 
 
 def split_lines(text: str) -> list[str]:
-    """Строки как их нумеруют ``ast``, tree-sitter и LSP: разрыв — только ``\\n``,
+    r"""Строки как их нумеруют ``ast``, tree-sitter и LSP: разрыв — только ``\\n``,
     ``\\r\\n`` или ``\\r``. ``str.splitlines`` режет ещё и по ``\\f``, ``\\v``,
     ``\\u2028``… — номера строк после таких символов разъезжаются.
     """
@@ -151,7 +151,7 @@ def module_parts(path: str) -> list[str] | None:
     (``src/``) не угадывается: модули сопоставляются файлам по суффиксу пути.
     """
     p = PurePosixPath(path)
-    if p.suffix not in (".py", ".pyi"):
+    if p.suffix not in {".py", ".pyi"}:
         return None
     parts = list(p.parent.parts)
     if p.stem != "__init__":
@@ -265,18 +265,18 @@ def _python_symbols(tree: ast.Module, lines: list[str]) -> list[Symbol]:
                 continue
             elif depth == 0 and isinstance(node, (ast.Assign, ast.AnnAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for t in targets:
-                    if isinstance(t, ast.Name) and t.id.isupper() and len(t.id) > 1:
-                        out.append(
-                            Symbol(
-                                name=t.id,
-                                kind="constant",
-                                line=node.lineno,
-                                end_line=node.end_lineno,
-                                signature=clip_signature(lines[node.lineno - 1]),
-                                col=_char_col(_line(lines, t.lineno), t.col_offset),
-                            )
-                        )
+                out.extend(
+                    Symbol(
+                        name=t.id,
+                        kind="constant",
+                        line=node.lineno,
+                        end_line=node.end_lineno,
+                        signature=clip_signature(lines[node.lineno - 1]),
+                        col=_char_col(_line(lines, t.lineno), t.col_offset),
+                    )
+                    for t in targets
+                    if isinstance(t, ast.Name) and t.id.isupper() and len(t.id) > 1
+                )
                 continue
             else:
                 continue
@@ -291,7 +291,7 @@ def _python_symbols(tree: ast.Module, lines: list[str]) -> list[Symbol]:
                     signature=signature(node),
                     doc=_doc(node),
                     col=_def_name_col(lines, node, node.name),
-                )
+                ),
             )
             if kind == "class":  # вложенные функции — шум; методы и вложенные классы — нет
                 qual = f"{parent}.{node.name}" if parent else node.name
@@ -512,7 +512,7 @@ class _RefCollector(ast.NodeVisitor):
         module = _absolute_module(node.module, node.level, self.path)
         for a in node.names:
             self.imports.append(
-                Import(module=module, name=a.name, alias=a.asname or a.name, line=node.lineno)
+                Import(module=module, name=a.name, alias=a.asname or a.name, line=node.lineno),
             )
 
 
@@ -557,7 +557,7 @@ def _markdown_symbols(text: str) -> list[Symbol]:
                 parent=stack[-1][1] if stack else "",
                 depth=len(stack),
                 signature=clip_signature(line),
-            )
+            ),
         )
         stack.append((level, title))
         if len(out) >= MAX_SYMBOLS_PER_FILE:
@@ -568,9 +568,19 @@ def _markdown_symbols(text: str) -> list[Symbol]:
 # ------------------------------ Регэкспы ------------------------------ #
 # Группы: name — имя; kind — вид (если не задан правилом); parent — владелец.
 _Rule = tuple[str, "re.Pattern[str]"]
-_NOT_NAMES = frozenset(
-    {"if", "for", "while", "switch", "catch", "return", "else", "new", "sizeof", "do", "with"}
-)
+_NOT_NAMES = frozenset({
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "return",
+    "else",
+    "new",
+    "sizeof",
+    "do",
+    "with",
+})
 _ID = r"[A-Za-z_$][\w$]*"
 
 
@@ -589,13 +599,17 @@ _JS_RULES = _rules(
     ("enum", rf"^\s*(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+(?P<name>{_ID})"),
     (
         "function",
-        rf"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>{_ID})\s*(?::[^=]+)?=\s*"
-        rf"(?:async\s+)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|{_ID}\s*=>)",
+        (
+            rf"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>{_ID})\s*(?::[^=]+)?=\s*"
+            rf"(?:async\s+)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|{_ID}\s*=>)"
+        ),
     ),
     (
         "method",
-        r"^\s+(?:(?:public|private|protected|static|readonly|async|override|get|set)\s+)*"
-        rf"(?P<name>{_ID})\s*\([^)]*\)\s*(?::\s*[^{{]+)?\{{\s*$",
+        (
+            r"^\s+(?:(?:public|private|protected|static|readonly|async|override|get|set)\s+)*"
+            rf"(?P<name>{_ID})\s*\([^)]*\)\s*(?::\s*[^{{]+)?\{{\s*$"
+        ),
     ),
 )
 _TYPES_JVM = (
@@ -627,13 +641,17 @@ _RULES: dict[str, list[_Rule]] = {
     "rust": _rules(
         (
             "function",
-            r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
-            r'(?:extern\s+"[^"]*"\s+)?fn\s+(?P<name>[A-Za-z_]\w*)',
+            (
+                r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+                r'(?:extern\s+"[^"]*"\s+)?fn\s+(?P<name>[A-Za-z_]\w*)'
+            ),
         ),
         (
             "type",
-            r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?P<kind>struct|enum|trait|union|mod|type)\s+"
-            r"(?P<name>[A-Za-z_]\w*)",
+            (
+                r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?P<kind>struct|enum|trait|union|mod|type)\s+"
+                r"(?P<name>[A-Za-z_]\w*)"
+            ),
         ),
         (
             "impl",
@@ -659,35 +677,45 @@ _RULES: dict[str, list[_Rule]] = {
     "php": _rules(
         (
             "class",
-            r"^\s*(?:(?:abstract|final|readonly)\s+)*(?P<kind>class|interface|trait|enum)\s+"
-            r"(?P<name>\w+)",
+            (
+                r"^\s*(?:(?:abstract|final|readonly)\s+)*(?P<kind>class|interface|trait|enum)\s+"
+                r"(?P<name>\w+)"
+            ),
         ),
         (
             "function",
-            r"^\s*(?:(?:public|private|protected|static|abstract|final)\s+)*function\s+&?\s*"
-            r"(?P<name>\w+)",
+            (
+                r"^\s*(?:(?:public|private|protected|static|abstract|final)\s+)*function\s+&?\s*"
+                r"(?P<name>\w+)"
+            ),
         ),
     ),
     "c": _rules(
         ("type", r"^\s*(?:typedef\s+)?(?P<kind>struct|union|enum)\s+(?P<name>[A-Za-z_]\w*)\s*\{"),
         (
             "function",
-            r"^(?!\s)(?!(?:return|else|if|while|for|switch|do)\b)[\w\s\*]*?\b"
-            r"(?P<name>[A-Za-z_]\w*)\s*\([^;]*\)\s*\{?\s*$",
+            (
+                r"^(?!\s)(?!(?:return|else|if|while|for|switch|do)\b)[\w\s\*]*?\b"
+                r"(?P<name>[A-Za-z_]\w*)\s*\([^;]*\)\s*\{?\s*$"
+            ),
         ),
     ),
     "cpp": _rules(
         (
             "type",
-            r"^\s*(?:template\s*<[^>]*>\s*)?(?:typedef\s+)?(?P<kind>class|struct|union|enum)"
-            r"(?:\s+class)?\s+(?P<name>[A-Za-z_]\w*)\s*(?::[^{;]*)?\{?\s*$",
+            (
+                r"^\s*(?:template\s*<[^>]*>\s*)?(?:typedef\s+)?(?P<kind>class|struct|union|enum)"
+                r"(?:\s+class)?\s+(?P<name>[A-Za-z_]\w*)\s*(?::[^{;]*)?\{?\s*$"
+            ),
         ),
         ("namespace", r"^\s*namespace\s+(?P<name>[A-Za-z_][\w:]*)"),
         (
             "function",
-            r"^(?!\s)(?!(?:return|else|if|while|for|switch|do)\b)[\w\s\*&:<>,~]*?\b"
-            r"(?P<name>[A-Za-z_~][\w:~]*)\s*\([^;]*\)\s*(?:const\s*)?(?:noexcept\s*)?"
-            r"(?:override\s*)?\{?\s*$",
+            (
+                r"^(?!\s)(?!(?:return|else|if|while|for|switch|do)\b)[\w\s\*&:<>,~]*?\b"
+                r"(?P<name>[A-Za-z_~][\w:~]*)\s*\([^;]*\)\s*(?:const\s*)?(?:noexcept\s*)?"
+                r"(?:override\s*)?\{?\s*$"
+            ),
         ),
     ),
     "shell": _rules(
@@ -720,7 +748,7 @@ def _regex_symbols(text: str, rules: list[_Rule]) -> list[Symbol]:
                     depth=1 if indent else 0,
                     signature=clip_signature(line),
                     col=m.start("name"),
-                )
+                ),
             )
             break
         if len(out) >= MAX_SYMBOLS_PER_FILE:

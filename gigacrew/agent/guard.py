@@ -133,7 +133,11 @@ def call_key(call: FunctionCall) -> str:
         if not (name in _COSMETIC_FIELDS and isinstance(value, str))
     }
     args = json.dumps(
-        arguments, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+        arguments,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
     )
     return f"{call.name}:{args}"
 

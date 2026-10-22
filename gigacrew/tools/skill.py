@@ -72,7 +72,7 @@ def _read(path: Path, shown: str) -> str:
     return text
 
 
-class SkillTool(Tool):
+class SkillTool(Tool[SkillParams]):
     name = "skill"
     description = (
         "Loads a skill — ready-made instructions for a typical task — by its name from "
@@ -98,7 +98,7 @@ class SkillTool(Tool):
                 path = resolve_in_root(skill.directory, params.file)
             except SandboxError:
                 raise ToolError(
-                    f"Путь '{params.file}' выходит за пределы каталога скилла {skill.name}"
+                    f"Путь '{params.file}' выходит за пределы каталога скилла {skill.name}",
                 ) from None
             shown = f"{skill.name}/{params.file}"
             if not path.is_file():
@@ -112,6 +112,6 @@ class SkillTool(Tool):
             parts.append(
                 "Files of the skill (read with the skill tool and file; commands run in the "
                 "project root, so use the directory path above):\n"
-                + "\n".join(f"- {f}" for f in files)
+                + "\n".join(f"- {f}" for f in files),
             )
         return ToolResult(content="\n\n".join(parts), summary=f"скилл {skill.name}")

@@ -74,7 +74,7 @@ def run_indexing(
     except KeyboardInterrupt:
         ui.warn(
             f"построение индекса прервано (просмотрено: {_files(scanned)}, сделанное "
-            "сохранено) — /index достроит"
+            "сохранено) — /index достроит",
         )
         return None
     except INDEX_ERRORS as e:
@@ -91,7 +91,9 @@ NOT_A_REPO_NOTE = (
 
 
 def ensure_index(
-    workspace: Workspace, ui: Console, interrupt: AbstractContextManager[object] | None = None
+    workspace: Workspace,
+    ui: Console,
+    interrupt: AbstractContextManager[object] | None = None,
 ) -> None:
     """Строит индекс, если его нет или прошлое построение не завершилось.
 
@@ -115,7 +117,7 @@ def ensure_index(
         refreshed, stats = result
         ui.system(
             f"индекс проекта: {_files(stats.files)}, {_symbols(stats.symbols)} "
-            f"({refreshed.duration_s:.1f} с)"
+            f"({refreshed.duration_s:.1f} с)",
         )
 
 

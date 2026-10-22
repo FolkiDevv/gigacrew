@@ -7,7 +7,7 @@ import re
 from pydantic import BaseModel, Field
 
 from gigacrew.project.files import glob_match, walk_files
-from gigacrew.safety.paths import is_secret_target
+from gigacrew.project.secret_paths import is_secret_target
 from gigacrew.security import resolve_in_root
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.fs import SECRET_READ_NOTE
@@ -21,7 +21,8 @@ _MAX_SNIPPET = 200
 class SearchContentParams(BaseModel):
     pattern: str = Field(description="Regular expression to search for in file contents")
     path: str = Field(
-        default=".", description="Directory or file to search in (relative to the project root)"
+        default=".",
+        description="Directory or file to search in (relative to the project root)",
     )
     glob: str | None = Field(
         default=None,
@@ -31,7 +32,7 @@ class SearchContentParams(BaseModel):
     max_results: int = Field(default=100, description="Maximum number of matches")
 
 
-class SearchContentTool(Tool):
+class SearchContentTool(Tool[SearchContentParams]):
     name = "search_content"
     read_only = True
     description = (
@@ -44,7 +45,7 @@ class SearchContentTool(Tool):
     Params = SearchContentParams
 
     def describe(self, params: SearchContentParams) -> str:
-        where = f" в {params.path}" if params.path not in ("", ".") else ""
+        where = f" в {params.path}" if params.path not in {"", "."} else ""
         return f"/{params.pattern}/{where}"
 
     def run(self, params: SearchContentParams, ctx: ToolContext) -> ToolResult:

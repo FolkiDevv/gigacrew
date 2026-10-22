@@ -15,8 +15,8 @@ from pydantic import BaseModel, Field
 
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.files import GIT_DIR_NAME, glob_match, is_git_internal, walk_files
+from gigacrew.project.secret_paths import is_secret_target
 from gigacrew.project.workspace import DATA_DIR_NAME
-from gigacrew.safety.paths import is_secret_target
 from gigacrew.security import RiskLevel, SandboxError, resolve_in_root
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
 
@@ -53,7 +53,8 @@ SECRET_READ_NOTE = (
 def _write_assessment(ctx: ToolContext, path: str) -> Assessment:
     """Оценка записи в ``path``: план — без риска, настройки gigacrew (.env) — как опасная
     операция (``-y`` и хук не снимают вопрос), другие секреты — с вопросом в режиме «авто»
-    (вид OTHER: правка без вопроса — только для обычных файлов проекта)."""
+    (вид OTHER: правка без вопроса — только для обычных файлов проекта).
+    """
     if _is_plan_file(ctx, path):
         return Assessment(RiskLevel.SAFE)  # план — данные агента: в любом режиме без вопроса
     try:
@@ -68,7 +69,9 @@ def _write_assessment(ctx: ToolContext, path: str) -> Assessment:
         )
     if is_secret_target(ctx.root, p):
         return Assessment(
-            RiskLevel.WRITE, reason=f"файл с секретами ({_rel(ctx, p)})", kind=ToolKind.OTHER
+            RiskLevel.WRITE,
+            reason=f"файл с секретами ({_rel(ctx, p)})",
+            kind=ToolKind.OTHER,
         )
     return Assessment(RiskLevel.WRITE)
 
@@ -82,7 +85,7 @@ _EOL_NAMES = {"\n": "LF", "\r\n": "CRLF", "\r": "CR"}
 
 @dataclass(frozen=True)
 class TextFile:
-    """Текст файла с переводами строк ``\\n`` и исходное оформление файла.
+    r"""Текст файла с переводами строк ``\\n`` и исходное оформление файла.
 
     Инструменты сопоставляют, сравнивают и правят текст только в виде с ``\\n``, а
     при записи возвращают файлу его переводы строк (``eol``) и BOM — правка одной
@@ -108,7 +111,7 @@ class TextFile:
 
 
 def decode_text(raw: str) -> TextFile:
-    """Разбор текста: преобладающий перевод строки, BOM, вид с ``\\n``.
+    r"""Разбор текста: преобладающий перевод строки, BOM, вид с ``\\n``.
 
     Одиночный ``\\r`` считается переводом строки, только если он преобладает
     (старые файлы Mac); иначе это обычный символ и сохраняется как есть.
@@ -161,7 +164,7 @@ def write_atomic(path: Path, data: bytes) -> None:
                 Path(tmp).unlink(missing_ok=True)
                 path.write_bytes(data)
                 return
-        os.replace(tmp, path)
+        Path(tmp).replace(path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
@@ -169,7 +172,8 @@ def write_atomic(path: Path, data: bytes) -> None:
 
 def _replace_keeps_metadata(path: Path) -> bool:
     """Замену через новый inode можно делать без потерь: файл наш, без жёстких
-    ссылок и расширенных атрибутов (ACL хранятся в xattr)."""
+    ссылок и расширенных атрибутов (ACL хранятся в xattr).
+    """
     st = path.stat()
     if st.st_nlink > 1:
         return False
@@ -204,12 +208,12 @@ def load_existing(path: Path, shown: str) -> TextFile:
         raise ToolError(
             f"Файл не в UTF-8 (например, cp1251): {shown}. write_file/edit_file его не "
             "меняют, чтобы не испортить кодировку; перекодировать можно через run_shell "
-            "(iconv -f cp1251 -t utf-8)."
+            "(iconv -f cp1251 -t utf-8).",
         ) from None
 
 
 def _lines(text: str) -> list[str]:
-    """Строки с окончаниями — только по ``\\n``.
+    r"""Строки с окончаниями — только по ``\\n``.
 
     ``str.splitlines`` режет ещё и по ``\\x0c``, ``\\x85``, ``\\u2028`` — номера строк
     разошлись бы с ``read_file``, а строки диффа склеились бы.
@@ -260,7 +264,7 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
     if is_git_internal(ctx.root, p, path):
         raise ToolError(
             f"Внутренности git ({GIT_DIR_NAME}/) недоступны для записи: {path}. "
-            "Для операций с репозиторием используйте инструмент git."
+            "Для операций с репозиторием используйте инструмент git.",
         )
     if ctx.plan is not None and ctx.plan.is_target(p):
         return p
@@ -274,7 +278,7 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
                 f". Файл плана этого чата: {_rel(ctx, ctx.plan.path)}"
                 if ctx.plan is not None
                 else ""
-            )
+            ),
         )
     return p
 
@@ -283,9 +287,10 @@ _NO_NEWLINE = "\\ No newline at end of file\n"
 
 
 def make_diff(old: str, new: str, path: str) -> str:
-    """Unified diff двух текстов (с ``\\n``), как у git: последняя строка без
+    r"""Unified diff двух текстов (с ``\\n``), как у git: последняя строка без
     перевода строки помечается ``\\ No newline at end of file``, а не склеивается
-    со следующей строкой диффа."""
+    со следующей строкой диффа.
+    """
     diff = difflib.unified_diff(_lines(old), _lines(new), fromfile=f"a/{path}", tofile=f"b/{path}")
     return "".join(line if line.endswith("\n") else f"{line}\n{_NO_NEWLINE}" for line in diff)
 
@@ -298,7 +303,7 @@ _ESCAPES = {"n": "\n", "t": "\t", '"': '"', "'": "'", "\\": "\\"}
 
 
 def _unescape(s: str) -> str:
-    """Разэкранирует частые последовательности (\\n, \\t, \\", \\', \\\\) без условий.
+    r"""Разэкранирует частые последовательности (\\n, \\t, \\", \\', \\\\) без условий.
 
     Используется как один из вариантов-кандидатов при поиске old_string —
     применяется только если разэкранированная форма реально нашлась в файле.
@@ -310,7 +315,7 @@ _LINE_NUM_RE = re.compile(r"^\s*\d+\t")
 
 
 def _strip_line_numbers(s: str) -> str:
-    """Удаляет префиксы-номера строк (``N\\t``), если ими помечено большинство строк.
+    r"""Удаляет префиксы-номера строк (``N\\t``), если ими помечено большинство строк.
 
     read_file показывает содержимое с номерами (как ``cat -n``); слабые модели
     иногда копируют эти префиксы прямо в old_string/new_string. Снимаем их,
@@ -330,7 +335,7 @@ _NUMBERED_LINE_RE = re.compile(r"^\d+\t")
 
 
 def repair_escaped_content(content: str) -> tuple[str, bool]:
-    """Чинит «двойную экранизацию», которую иногда выдаёт модель.
+    r"""Чинит «двойную экранизацию», которую иногда выдаёт модель.
 
     Слабые модели порой кладут в write_file одну физическую строку, где все
     переносы — это литералы ``\\n`` (а кавычки — ``\\"``), иногда ещё и с
@@ -510,7 +515,7 @@ class ReadFileParams(BaseModel):
     end_line: int | None = Field(default=None, description="Last line (1-based), inclusive")
 
 
-class ReadFileTool(Tool):
+class ReadFileTool(Tool[ReadFileParams]):
     name = "read_file"
     read_only = True
     description = (
@@ -533,7 +538,7 @@ class ReadFileTool(Tool):
             raise ToolError(SECRET_READ_NOTE.format(path=params.path))
         if p.stat().st_size > MAX_READ_BYTES:
             raise ToolError(
-                f"Файл слишком большой (>{MAX_READ_BYTES} байт). Используйте search_content."
+                f"Файл слишком большой (>{MAX_READ_BYTES} байт). Используйте search_content.",
             )
         with p.open("rb") as fh:
             if b"\0" in fh.read(_BINARY_PROBE):
@@ -575,7 +580,10 @@ CP1251_NOTE = "(файл не в UTF-8 — показан как cp1251; edit_fi
 
 
 def _select_lines(
-    path: Path, start: int, end: int | None, encoding: str
+    path: Path,
+    start: int,
+    end: int | None,
+    encoding: str,
 ) -> tuple[list[tuple[int, str]], int, int | None]:
     """Строки ``start..end`` в пределах лимитов чтения.
 
@@ -613,7 +621,7 @@ class WriteFileParams(BaseModel):
     content: str = Field(description="The complete new content of the file")
 
 
-class WriteFileTool(Tool):
+class WriteFileTool(Tool[WriteFileParams]):
     name = "write_file"
     description = (
         "Creates a new file or completely overwrites an existing one with the given "
@@ -630,7 +638,9 @@ class WriteFileTool(Tool):
         return self.assess(params, ctx).risk
 
     def _prepare(
-        self, params: WriteFileParams, ctx: ToolContext
+        self,
+        params: WriteFileParams,
+        ctx: ToolContext,
     ) -> tuple[Path, TextFile | None, TextFile, bool]:
         """Путь, прежний текст и новый текст с оформлением, с которым он запишется.
 
@@ -680,11 +690,12 @@ class EditFileParams(BaseModel):
     old_string: str = Field(description="The exact fragment to replace (must be present)")
     new_string: str = Field(description="The replacement text")
     replace_all: bool = Field(
-        default=False, description="Replace all occurrences instead of exactly one"
+        default=False,
+        description="Replace all occurrences instead of exactly one",
     )
 
 
-class EditFileTool(Tool):
+class EditFileTool(Tool[EditFileParams]):
     name = "edit_file"
     description = (
         "Edits a file in place: replaces old_string with new_string. old_string must "
@@ -716,7 +727,7 @@ class EditFileTool(Tool):
             # new_string повсюду.
             raise ToolError(
                 "old_string пуст — укажите заменяемый фрагмент. Чтобы создать файл "
-                "или заменить его целиком, используйте write_file."
+                "или заменить его целиком, используйте write_file.",
             )
         if old_param == new_param:
             raise ToolError("old_string и new_string совпадают — нечего менять.")
@@ -752,7 +763,7 @@ class EditFileTool(Tool):
             if count > 1 and not params.replace_all:
                 raise ToolError(
                     f"old_string встречается {count} раз. Добавьте контекста, чтобы "
-                    "фрагмент стал уникальным, или укажите replace_all=true."
+                    "фрагмент стал уникальным, или укажите replace_all=true.",
                 )
             # Тир 2: совпадение с поправкой на пробелы/отступы (одиночная замена).
             match = _tolerant_find(old, old_string)
@@ -768,7 +779,7 @@ class EditFileTool(Tool):
             raise ToolError(f"{missing} Это файл с секретами — его содержимое не показывается.")
         raise ToolError(
             f"{missing} Скопируйте фрагмент дословно из содержимого ниже:\n\n"
-            + _numbered_excerpt(old)
+            + _numbered_excerpt(old),
         )
 
     def preview(self, params: EditFileParams, ctx: ToolContext) -> Display | None:
@@ -802,7 +813,7 @@ class ListDirParams(BaseModel):
     path: str = Field(default=".", description="Directory path (the project root by default)")
 
 
-class ListDirTool(Tool):
+class ListDirTool(Tool[ListDirParams]):
     name = "list_dir"
     read_only = True
     description = (
@@ -832,7 +843,7 @@ MAX_FIND_RESULTS = 1000
 class FindFilesParams(BaseModel):
     pattern: str = Field(
         description="Glob pattern: '*.py' — by name in any directory, 'src/**/*.ts' — by path "
-        "from the root"
+        "from the root",
     )
     max_results: int = Field(default=200, description="Maximum number of results")
 
@@ -847,7 +858,7 @@ def _check_pattern(pattern: str) -> None:
         raise ToolError("Шаблон не может содержать '..' — поиск только внутри проекта.")
 
 
-class FindFilesTool(Tool):
+class FindFilesTool(Tool[FindFilesParams]):
     name = "find_files"
     read_only = True
     description = (

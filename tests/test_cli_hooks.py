@@ -13,9 +13,9 @@ import pytest
 from fakes import ScriptedProvider, text_turn
 from test_gigacode import BASE, CHAT, CONFIG, Backend, _token_file, _write_token
 
-import gigacrew.cli.app as app
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore
 from gigacrew.agent.loop import Agent
+from gigacrew.cli import app
 from gigacrew.cli.commands import CommandContext, default_commands
 from gigacrew.cli.hooks import describe_groups, describe_hooks, load_hooks
 from gigacrew.cli.repl import run_repl
@@ -56,7 +56,7 @@ def _logging_hooks(tmp_path: Path, *, block_prompt: bool = False) -> dict:
     )
     cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
     group = [{"hooks": [{"type": "command", "command": cmd}]}]
-    return {"hooks": {event: group for event in EVENTS}}
+    return {"hooks": dict.fromkeys(EVENTS, group)}
 
 
 def _trust_user_hooks(tmp_path: Path) -> None:
@@ -205,7 +205,8 @@ def test_pre_request_before_every_gigacode_request(tmp_path, gigacode):
     _write(Workspace(tmp_path).settings_file, _request_hooks(tmp_path))
     assert _main(tmp_path, "--trust-hooks") == 0
     assert _requests_log(tmp_path) == ["config:request", "chat:request"]
-    assert gigacode.count(CONFIG) == 1 and gigacode.count(CHAT) == 1
+    assert gigacode.count(CONFIG) == 1
+    assert gigacode.count(CHAT) == 1
 
 
 def test_pre_request_refreshes_token(tmp_path, gigacode):
@@ -237,12 +238,14 @@ def test_trust_prompt_remembers_answer(tmp_path, monkeypatch, capsys):
     asked: list[str] = []
     monkeypatch.setattr(ui, "ask", lambda q, dangerous=False: asked.append(q) or True)
     runner = load_hooks(ws, ui, interactive=True)
-    assert runner.has(HookEvent.STOP) and len(asked) == 1
+    assert runner.has(HookEvent.STOP)
+    assert len(asked) == 1
     assert "hook.py" in capsys.readouterr().out  # пользователь видел команду
     load_hooks(ws, ui, interactive=True)
     assert len(asked) == 1  # подтверждено — больше не спрашиваем
     _write(
-        ws.settings_file, {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "true"}]}]}}
+        ws.settings_file,
+        {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "true"}]}]}},
     )
     load_hooks(ws, ui, interactive=True)
     assert len(asked) == 2  # хуки изменились — спрашиваем снова
@@ -320,7 +323,8 @@ def test_unconfirmed_hooks_of_every_owner_are_skipped(tmp_path, monkeypatch, own
     files = {"user": user_settings_file(), "project": ws.settings_file}
     for owner in owners:
         _write(
-            files[owner], {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": owner}]}]}}
+            files[owner],
+            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": owner}]}]}},
         )
     ui = Console(no_color=True)
     monkeypatch.setattr(ui, "ask", lambda q, dangerous=False: False)
@@ -336,7 +340,8 @@ def test_disabled_hooks_ask_nothing(tmp_path, monkeypatch):
     asked: list[str] = []
     monkeypatch.setattr(ui, "ask", lambda q, dangerous=False: asked.append(q) or True)
     runner = load_hooks(ws, ui, interactive=True)
-    assert asked == [] and not runner.has(HookEvent.STOP)
+    assert asked == []
+    assert not runner.has(HookEvent.STOP)
     assert describe_hooks(runner.settings).startswith("хуки выключены (disableAllHooks)")
 
 
@@ -353,7 +358,8 @@ def test_project_cannot_disable_trusted_user_hooks(tmp_path, monkeypatch):
     runner = load_hooks(ws, ui, interactive=True)
     assert runner.has(HookEvent.PRE_TOOL_USE, "run_shell")
     text = describe_hooks(runner.settings)
-    assert "хуки проекта выключены" in text and "guard" in text
+    assert "хуки проекта выключены" in text
+    assert "guard" in text
 
 
 # ------------------------------- REPL ------------------------------- #
@@ -372,7 +378,7 @@ def hooked_repl(tmp_path):
 
 
 def test_repl_session_hooks(tmp_path, hooked_repl):
-    agent, ui, chats, provider = hooked_repl
+    agent, ui, chats, _provider = hooked_repl
     read = _reader("привет", "/clear", "/exit")
     assert (
         run_repl(agent, ui, default_commands(), read_input=read, chats=chats, index_on_start=False)
@@ -406,7 +412,8 @@ def test_repl_prompt_blocked_keeps_running(tmp_path, capsys):
     read = _reader("пароль 123", "/exit")
     assert run_repl(agent, ui, default_commands(), read_input=read, index_on_start=False) == 0
     assert "запрос отклонён хуком UserPromptSubmit" in capsys.readouterr().out
-    assert provider.calls == 0 and len(agent.conversation) == 0
+    assert provider.calls == 0
+    assert len(agent.conversation) == 0
 
 
 def test_hooks_command_lists_and_reloads(tmp_path, capsys):
@@ -425,14 +432,16 @@ def test_hooks_command_lists_and_reloads(tmp_path, capsys):
                     {
                         "matcher": "run_shell",
                         "hooks": [{"type": "command", "command": "./check.sh"}],
-                    }
-                ]
-            }
+                    },
+                ],
+            },
         },
     )
     commands.dispatch("/hooks reload", ctx)
     out = capsys.readouterr().out
-    assert "перечитаны" in out and "PreToolUse" in out and "[run_shell] ./check.sh" in out
+    assert "перечитаны" in out
+    assert "PreToolUse" in out
+    assert "[run_shell] ./check.sh" in out
     assert agent.hooks.has(HookEvent.PRE_TOOL_USE, "run_shell")
     commands.dispatch("/hooks что-то", ctx)
     assert "использование: /hooks [reload]" in capsys.readouterr().out

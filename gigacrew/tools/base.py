@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -176,7 +176,7 @@ def _normalize_property(prop: dict[str, Any], defs: dict[str, Any] | None = None
     if variants:
         non_null = [v for v in variants if v.get("type") != "null"]
         chosen = non_null[0] if non_null else variants[0]
-        merged = {k: v for k, v in prop.items()}
+        merged = dict(prop.items())
         merged.update(chosen)
         merged.pop("title", None)
         prop = _normalize_property(merged, defs) if "$ref" in merged else merged
@@ -203,9 +203,11 @@ def _clean_schema(model: type[BaseModel]) -> dict[str, Any]:
 
 
 class Tool[P: BaseModel](ABC):
+    """Инструмент агента с моделью параметров ``P`` (см. описание модуля)."""
+
     name: str = ""
     description: str = ""
-    Params: type[BaseModel] = BaseModel
+    Params: type[P]
     # Вид инструмента для режимов разрешений (permissions.decide): правки файлов
     # (EDIT) применяются без вопроса в режиме «авто», команды (COMMAND) в нём смотрит
     # модель-рецензент и они разрешены в режиме плана; остальное изменяющее в плане
@@ -223,17 +225,17 @@ class Tool[P: BaseModel](ABC):
             parameters=_clean_schema(self.Params),
         )
 
-    def parse(self, arguments: dict[str, Any]) -> BaseModel:
+    def parse(self, arguments: dict[str, Any]) -> P:
         return self.Params.model_validate(arguments or {})
 
-    def describe(self, params: BaseModel) -> str:
+    def describe(self, params: P) -> str:
         """Краткое описание вызова для UI (путь, команда, шаблон...).
 
         Реализация по умолчанию берёт самое информативное из типичных полей;
         инструменты с особыми параметрами переопределяют метод.
         """
         d = params.model_dump()
-        if "path" in d and d["path"] not in (None, "", "."):
+        if "path" in d and d["path"] not in {None, "", "."}:
             return str(d["path"])
         if "command" in d:
             return str(d["command"])[:70]
@@ -243,7 +245,7 @@ class Tool[P: BaseModel](ABC):
             return str(d["path"])
         return ""
 
-    def paths(self, params: BaseModel) -> tuple[str, ...]:
+    def paths(self, params: P) -> tuple[str, ...]:
         """Пути проекта, с которыми работает вызов (для инструкций подкаталогов).
 
         По умолчанию — поле ``path``, если оно есть (файл или каталог).
@@ -251,11 +253,11 @@ class Tool[P: BaseModel](ABC):
         path = getattr(params, "path", None)
         return (path,) if isinstance(path, str) and path.strip() else ()
 
-    def risk(self, params: BaseModel, ctx: ToolContext) -> RiskLevel:  # noqa: ARG002
+    def risk(self, params: P, ctx: ToolContext) -> RiskLevel:
         """Уровень риска по умолчанию. Переопределяется инструментами."""
         return RiskLevel.SAFE
 
-    def assess(self, params: BaseModel, ctx: ToolContext) -> Assessment:
+    def assess(self, params: P, ctx: ToolContext) -> Assessment:
         """Оценка вызова для решения «выполнить / спросить / заблокировать».
 
         По умолчанию — только уровень риска (:meth:`risk`); инструменты с подробной
@@ -263,7 +265,7 @@ class Tool[P: BaseModel](ABC):
         """
         return Assessment(self.risk(params, ctx))
 
-    def preview(self, params: BaseModel, ctx: ToolContext) -> Display | None:  # noqa: ARG002
+    def preview(self, params: P, ctx: ToolContext) -> Display | None:
         """Что показать перед подтверждением (дифф, команда). None — нечего показывать.
 
         Вызывается только для операций, требующих подтверждения. Ошибка превью
@@ -272,33 +274,33 @@ class Tool[P: BaseModel](ABC):
         return None
 
     @abstractmethod
-    def run(self, params: BaseModel, ctx: ToolContext) -> ToolResult: ...
+    def run(self, params: P, ctx: ToolContext) -> ToolResult: ...
 
 
 class ToolRegistry:
     """Реестр инструментов: хранение, спецификации, диспетчеризация вызовов."""
 
     def __init__(self) -> None:
-        self._tools: dict[str, Tool] = {}
+        self._tools: dict[str, Tool[Any]] = {}
 
-    def register(self, tool: Tool) -> None:
+    def register(self, tool: Tool[Any]) -> None:
         if not tool.name:
             raise ValueError("Инструмент без имени")
         self._tools[tool.name] = tool
 
-    def get(self, name: str) -> Tool | None:
+    def get(self, name: str) -> Tool[Any] | None:
         return self._tools.get(name)
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Tool[Any]]:
         return iter(self._tools.values())
 
     def specs(self) -> list[ToolSpec]:
         return [t.spec() for t in self._tools.values()]
 
-    def subset(self, keep: Callable[[Tool], bool]) -> ToolRegistry:
+    def subset(self, keep: Callable[[Tool[Any]], bool]) -> ToolRegistry:
         """Новый реестр из инструментов, для которых ``keep`` истинно (порядок сохраняется)."""
         reg = ToolRegistry()
         for tool in self._tools.values():

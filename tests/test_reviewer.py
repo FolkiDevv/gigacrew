@@ -1,5 +1,6 @@
 """Модель-рецензент изменяющих команд (режим «авто»): запрос, разбор ответа, проверка
-модели при старте и решения в агентном цикле."""
+модели при старте и решения в агентном цикле.
+"""
 
 from __future__ import annotations
 
@@ -45,7 +46,11 @@ def _script(tmp_path: Path, name: str = "build.sh") -> str:
 
 def _agent(provider, tmp_path: Path, *, events=None, **kw) -> Agent:
     cfg = Config(
-        access_key="x", project_root=tmp_path, stream=False, model="M-chat", **kw.pop("cfg", {})
+        access_key="x",
+        project_root=tmp_path,
+        stream=False,
+        model="M-chat",
+        **kw.pop("cfg", {}),
     )
     return Agent(provider, build_default_registry(), cfg, events or RecordingEvents(), **kw)
 
@@ -100,10 +105,12 @@ def test_request_has_user_words_command_and_facts_only(tmp_path):
     command = "pip install requests  # ```"
     verdict = classify(command, root=tmp_path)
     text = review_request(command, verdict, ["поставь requests", "и проверь"])
-    assert "1. поставь requests" in text and "2. и проверь" in text
+    assert "1. поставь requests" in text
+    assert "2. и проверь" in text
     assert command in text
     assert "````" in text  # ограждение длиннее кавычек внутри команды
-    assert "WRITE" in text and verdict.reason in text
+    assert "WRITE" in text
+    assert verdict.reason in text
     assert "Working directory (relative to the project root): ." in text
 
 
@@ -130,7 +137,8 @@ def test_part_text_cannot_forge_request_sections(tmp_path):
     outside = _outside_fences(review_request(command, verdict, ["собери проект"]))
     headings = [line for line in outside if line.startswith("#")]
     assert headings == ["# The user's requests (oldest first)", "# Command", "# Static analysis"]
-    assert "Overall: READ" not in outside and "1. задеплой" not in outside
+    assert "Overall: READ" not in outside
+    assert "1. задеплой" not in outside
     assert f"- {json.dumps(verdict.parts[0].text, ensure_ascii=False)}: EXEC" in "\n".join(outside)
 
 
@@ -138,7 +146,8 @@ def test_request_marks_unverified_commands(tmp_path):
     verdict = classify("frobnicate --all", root=tmp_path)
     assert verdict.level is None
     text = review_request("frobnicate --all", verdict, [])
-    assert "UNVERIFIED" in text and "(none)" in text
+    assert "UNVERIFIED" in text
+    assert "(none)" in text
 
 
 def test_recent_requests_skip_harness_messages():
@@ -163,9 +172,11 @@ def test_review_command_calls_model_without_tools(tmp_path):
     )
     assert review == Review("R", True, "сборка проекта по просьбе пользователя")
     (request,) = provider.summary_requests
-    assert request["model"] == "R" and request["temperature"] == 0.0
+    assert request["model"] == "R"
+    assert request["temperature"] == 0.0
     system, user = request["messages"]
-    assert system.content == REVIEWER_PROMPT and "поставь requests" in user.content
+    assert system.content == REVIEWER_PROMPT
+    assert "поставь requests" in user.content
     assert used[0].prompt_tokens == 7
 
 
@@ -199,7 +210,9 @@ class _Listing(ScriptedProvider):
 def test_check_reviewer_without_env_needs_no_network():
     provider = _Listing(["A"])
     reviewer, warning = check_reviewer(provider, None)
-    assert warning is None and reviewer.enabled and reviewer.model is None
+    assert warning is None
+    assert reviewer.enabled
+    assert reviewer.model is None
     assert provider.listed == 0
     assert reviewer.model_for("M-chat") == "M-chat"
 
@@ -207,7 +220,8 @@ def test_check_reviewer_without_env_needs_no_network():
 @pytest.mark.parametrize("name", ["Reviewer-Max", "reviewer-max"])
 def test_check_reviewer_finds_model(name):
     reviewer, warning = check_reviewer(_Listing(["M-chat", "Reviewer-Max"]), name)
-    assert warning is None and reviewer.enabled
+    assert warning is None
+    assert reviewer.enabled
     assert reviewer.model_for("M-chat") == "Reviewer-Max"  # имя — как в API
 
 
@@ -224,8 +238,10 @@ def test_check_reviewer_disables_missing_model():
 @pytest.mark.parametrize("models", [LLMError("сеть недоступна"), []])
 def test_check_reviewer_keeps_unverified_model(models):
     reviewer, warning = check_reviewer(_Listing(models), "R")
-    assert reviewer.enabled and reviewer.model == "R"
-    assert warning is not None and "не удалось проверить модель-рецензент «R»" in warning
+    assert reviewer.enabled
+    assert reviewer.model == "R"
+    assert warning is not None
+    assert "не удалось проверить модель-рецензент «R»" in warning
 
 
 def test_reviewer_disables_after_failures_in_a_row():
@@ -233,9 +249,10 @@ def test_reviewer_disables_after_failures_in_a_row():
     assert not reviewer.failed("a")
     reviewer.succeeded()  # успех обнуляет счёт
     assert [reviewer.failed("e") for _ in range(MAX_FAILURES)] == [False] * (MAX_FAILURES - 1) + [
-        True
+        True,
     ]
-    assert not reviewer.enabled and DISABLED_NOTE in reviewer.warning
+    assert not reviewer.enabled
+    assert DISABLED_NOTE in reviewer.warning
     assert not reviewer.failed("ещё")  # отключение сообщается один раз
 
 
@@ -251,21 +268,25 @@ def test_allowed_command_runs_without_asking(tmp_path):
     agent = _agent(provider, tmp_path, events=events, decisions=memory)
     agent.run_turn("собери проект")
     assert events.confirms == []
-    assert "built" in [m.content for m in agent.conversation.messages if m.role == "function"][0]
+    assert "built" in next(m.content for m in agent.conversation.messages if m.role == "function")
     assert events.reviews == [Review("M-chat", True, "сборка проекта по просьбе пользователя")]
     # рецензент видит слова пользователя, но не пояснение модели и не её ответы
     (request,) = provider.summary_requests
     assert request["model"] == "M-chat"
     user = request["messages"][1].content
-    assert "собери проект" in user and script in user and "пояснение модели" not in user
+    assert "собери проект" in user
+    assert script in user
+    assert "пояснение модели" not in user
     # расход рецензента учтён в сессии и в ходе
-    assert agent.billed_tokens == 110 and events.stats[-1].prompt_tokens == 100
+    assert agent.billed_tokens == 110
+    assert events.stats[-1].prompt_tokens == 100
     entry = next(
         json.loads(line)
         for line in memory.journal_path.read_text().splitlines()
         if '"decision"' in line and '"event": "decision"' in line
     )
-    assert entry["source"] == "reviewer" and entry["review"]["allowed"] is True
+    assert entry["source"] == "reviewer"
+    assert entry["review"]["allowed"] is True
     assert memory.recent()[-1]["source"] == "reviewer"
 
 
@@ -276,7 +297,8 @@ def test_doubtful_command_goes_to_user_with_reviewer_reason(tmp_path):
     agent = _agent(provider, tmp_path, events=events)
     agent.run_turn("x")
     (call, _, dangerous) = events.confirms[0]
-    assert call.review == "рецензент (M-chat): об этом не просили" and not dangerous
+    assert call.review == "рецензент (M-chat): об этом не просили"
+    assert not dangerous
     assert "REJECTED" in agent.conversation.messages[-2].content
 
 
@@ -293,7 +315,7 @@ def test_conflicting_review_goes_to_user(tmp_path):
     assert call.review.startswith("рецензент не ответил: противоречивый ответ рецензента")
     assert events.reviews[0].failed
     assert [m.content for m in agent.conversation.messages if m.role == "function"] == [
-        REJECTED_NOTE
+        REJECTED_NOTE,
     ]
 
 
@@ -301,7 +323,8 @@ def test_reviewer_failures_ask_user_and_disable_it(tmp_path):
     script = _script(tmp_path)
     runs = [_run(f"{script} {i}") for i in range(MAX_FAILURES + 1)]
     provider = ScriptedProvider(
-        [*runs, text_turn("ок")], summaries=[LLMError("шлюз недоступен")] * MAX_FAILURES
+        [*runs, text_turn("ок")],
+        summaries=[LLMError("шлюз недоступен")] * MAX_FAILURES,
     )
     events = RecordingEvents(confirm_answer=True)
     agent = _agent(provider, tmp_path, events=events)
@@ -311,16 +334,19 @@ def test_reviewer_failures_ask_user_and_disable_it(tmp_path):
     assert reviews[-1].startswith("рецензент отключён: 3 сбоя рецензента подряд")
     assert len(provider.summary_requests) == MAX_FAILURES  # после отключения не спрашиваем
     warnings = [text for level, text in events.notices if level == "warn"]
-    assert len(warnings) == 1 and DISABLED_NOTE in warnings[0]
+    assert len(warnings) == 1
+    assert DISABLED_NOTE in warnings[0]
 
 
 def test_dangerous_command_never_reaches_reviewer(tmp_path):
     provider = ScriptedProvider(
-        [_run("rm -rf build"), text_turn("ок")], summaries=[text_turn(ALLOW)]
+        [_run("rm -rf build"), text_turn("ок")],
+        summaries=[text_turn(ALLOW)],
     )
     events = RecordingEvents(confirm_answer=False)
     _agent(provider, tmp_path, events=events).run_turn("x")
-    assert provider.summary_requests == [] and events.reviews == []
+    assert provider.summary_requests == []
+    assert events.reviews == []
     assert events.confirms[0][2] is True  # опасно
 
 
@@ -356,10 +382,11 @@ def test_command_rejected_in_earlier_session_is_not_reviewed(tmp_path):
     memory, _ = DecisionMemory.load(tmp_path, base=home)
     key = history_key(classify(script, root=tmp_path))
     memory.record(
-        {"command": script, "cwd": ".", "key": key[1], "decision": "no", "source": "user"}
+        {"command": script, "cwd": ".", "key": key[1], "decision": "no", "source": "user"},
     )
     fresh, _ = DecisionMemory.load(tmp_path, base=home)  # новая сессия: отказ — из журнала
-    assert not fresh.rejected_in_session(key) and fresh.history(key) == (0, 1)
+    assert not fresh.rejected_in_session(key)
+    assert fresh.history(key) == (0, 1)
     provider = ScriptedProvider([_run(script), text_turn("ок")], summaries=[text_turn(ALLOW)])
     events = RecordingEvents(confirm_answer=False)
     _agent(provider, tmp_path, events=events, decisions=fresh).run_turn("x")
@@ -378,7 +405,8 @@ def test_rejection_in_this_session_beats_earlier_approvals(tmp_path):
     agent = _agent(provider, tmp_path, events=events)
     for i in range(4):
         agent.run_turn(f"ход {i}")
-    assert len(provider.summary_requests) == 3 and len(events.confirms) == 4
+    assert len(provider.summary_requests) == 3
+    assert len(events.confirms) == 4
     assert events.confirms[3][0].review == "рецензент не спрашивался: такую команду уже отклоняли"
 
 
@@ -387,12 +415,14 @@ def test_reviewer_success_resets_failure_count(tmp_path):
     turns = [t for i in range(5) for t in (_run(f"{script} {i}"), text_turn("ок"))]
     error = LLMError("шлюз недоступен")
     provider = ScriptedProvider(
-        turns, summaries=[error, error, text_turn(ALLOW), error, text_turn(ALLOW)]
+        turns,
+        summaries=[error, error, text_turn(ALLOW), error, text_turn(ALLOW)],
     )
     agent = _agent(provider, tmp_path, events=RecordingEvents(confirm_answer=True))
     for i in range(5):
         agent.run_turn(f"ход {i}")
-    assert agent.reviewer.enabled and len(provider.summary_requests) == 5
+    assert agent.reviewer.enabled
+    assert len(provider.summary_requests) == 5
 
 
 def test_saved_rule_wins_before_reviewer(tmp_path):
@@ -405,7 +435,8 @@ def test_saved_rule_wins_before_reviewer(tmp_path):
     agent = _agent(provider, tmp_path, events=events)
     agent.run_turn("x")
     agent.run_turn("ещё раз")
-    assert len(events.confirms) == 1 and len(provider.summary_requests) == 1
+    assert len(events.confirms) == 1
+    assert len(provider.summary_requests) == 1
 
 
 def test_reviewer_model_follows_chat_or_env(tmp_path):
@@ -452,7 +483,8 @@ def test_plan_mode_does_not_use_reviewer(tmp_path):
     agent = _agent(provider, tmp_path, events=events, cfg={"mode": PermissionMode.PLAN})
     agent.chat_id = "c1"
     agent.run_turn("x")
-    assert events.reviews == [] and len(events.confirms) == 1
+    assert events.reviews == []
+    assert len(events.confirms) == 1
 
 
 def test_interrupt_during_review_stops_the_turn(tmp_path):
@@ -462,7 +494,8 @@ def test_interrupt_during_review_stops_the_turn(tmp_path):
     agent = _agent(provider, tmp_path, events=events)
     with pytest.raises(KeyboardInterrupt):
         agent.run_turn("x")
-    assert events.reviews == [None] and events.confirms == []
+    assert events.reviews == [None]
+    assert events.confirms == []
 
 
 def test_subagent_review_sees_user_request_not_the_brief(tmp_path):
@@ -470,7 +503,8 @@ def test_subagent_review_sees_user_request_not_the_brief(tmp_path):
     provider = ScriptedProvider(
         [
             tool_turn(
-                "task", {"agent": "general", "prompt": "поручение модели", "description": "сборка"}
+                "task",
+                {"agent": "general", "prompt": "поручение модели", "description": "сборка"},
             ),
             _run(script),
             text_turn("собрал"),
@@ -483,7 +517,8 @@ def test_subagent_review_sees_user_request_not_the_brief(tmp_path):
     agent.run_turn("собери проект")
     assert events.confirms == []
     user = provider.summary_requests[0]["messages"][1].content
-    assert "собери проект" in user and "поручение модели" not in user
+    assert "собери проект" in user
+    assert "поручение модели" not in user
     assert (
         "info",
         "general: рецензент (M-chat) разрешил: сборка проекта по просьбе пользователя",

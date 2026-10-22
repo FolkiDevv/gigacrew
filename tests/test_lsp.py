@@ -7,7 +7,7 @@ import textwrap
 
 import pytest
 
-from gigacrew.project.lsp import LspClient, LspError, LspTimeout
+from gigacrew.project.lsp import LspClient, LspError, LspTimeoutError
 
 # Поддельный сервер: echo, ошибка, зависание, запрос к клиенту, внезапный выход.
 FAKE_SERVER = textwrap.dedent(
@@ -60,7 +60,7 @@ FAKE_SERVER = textwrap.dedent(
             send({"jsonrpc": "2.0", "id": mid, "result": None})
         elif method == "exit":
             break
-    """
+    """,
 )
 
 
@@ -93,7 +93,7 @@ def test_server_request_is_answered_by_handler(client):
 def test_error_response_and_timeout_keep_client_usable(client):
     with pytest.raises(LspError, match="fail: плохо"):
         client.request("fail", None, timeout=5)
-    with pytest.raises(LspTimeout, match="hang: сервер не ответил"):
+    with pytest.raises(LspTimeoutError, match="hang: сервер не ответил"):
         client.request("hang", None, timeout=0.2)
     assert client.request("echo", "ещё жив", timeout=5) == "ещё жив"
 
@@ -129,11 +129,11 @@ def test_malformed_error_object_is_lsp_error(client):
 def test_stalled_server_cannot_block_requests_or_close(client):
     import time
 
-    with pytest.raises(LspTimeout):
+    with pytest.raises(LspTimeoutError):
         client.request("stall", None, timeout=0.2)
     # сервер не читает: запись в переполненный канал не должна вешать запрос
     started = time.monotonic()
-    with pytest.raises(LspTimeout):
+    with pytest.raises(LspTimeoutError):
         client.request("echo", "x" * 2_000_000, timeout=0.5)
     client.close(timeout=1)
     assert not client.alive
@@ -141,7 +141,7 @@ def test_stalled_server_cannot_block_requests_or_close(client):
 
 
 def test_interrupted_close_still_kills_server(client, monkeypatch):
-    proc = client._proc  # noqa: SLF001
+    proc = client._proc
 
     def interrupted(*args, **kwargs):
         raise KeyboardInterrupt
@@ -149,7 +149,8 @@ def test_interrupted_close_still_kills_server(client, monkeypatch):
     monkeypatch.setattr(client, "request", interrupted)
     with pytest.raises(KeyboardInterrupt):
         client.close(timeout=1)
-    assert proc.poll() is not None and not client.alive  # процесс убит, прерывание проброшено
+    assert proc.poll() is not None
+    assert not client.alive
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="группы процессов POSIX")
@@ -161,7 +162,8 @@ def test_kill_reaches_children_after_leader_exits(tmp_path):
 
     pid_file = tmp_path / "child.pid"
     proc = subprocess.Popen(
-        ["sh", "-c", f"sleep 60 & echo $! > {pid_file}; exit 0"], start_new_session=True
+        ["sh", "-c", f"sleep 60 & echo $! > {pid_file}; exit 0"],
+        start_new_session=True,
     )
     proc.wait(timeout=5)  # лидер вышел, потомок жив
     child = int(pid_file.read_text())

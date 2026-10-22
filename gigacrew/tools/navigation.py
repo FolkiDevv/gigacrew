@@ -28,10 +28,10 @@ from gigacrew.project.index import (
     SymbolHit,
 )
 from gigacrew.project.lsp import LspError
-from gigacrew.project.semantic import CallItem, Location, SemanticUnavailable, TyServer
+from gigacrew.project.secret_paths import is_secret_target
+from gigacrew.project.semantic import CallItem, Location, SemanticUnavailableError, TyServer
 from gigacrew.project.symbols import split_lines
-from gigacrew.safety.paths import is_secret_target
-from gigacrew.security import resolve_in_root
+from gigacrew.security import resolve_in_root, subprocess_env
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.index import (
     MAX_SYMBOL_RESULTS,
@@ -39,7 +39,6 @@ from gigacrew.tools.index import (
     open_index,
     refresh_note,
 )
-from gigacrew.tools.process import subprocess_env
 
 T = TypeVar("T")
 
@@ -62,7 +61,7 @@ _LABELS = {
     RESOLVED_NAME: "совпадение только по имени — может быть другое определение",
 }
 _LABELS_WITH_TY = _LABELS | {
-    RESOLVED_NAME: "совпадение только по имени, ty не подтвердил — вероятно, другое определение"
+    RESOLVED_NAME: "совпадение только по имени, ty не подтвердил — вероятно, другое определение",
 }
 
 
@@ -84,7 +83,7 @@ class _Ty:
             return None
         try:
             server = semantic.server_for(self._ctx.workspace, env=subprocess_env())
-        except SemanticUnavailable as e:
+        except SemanticUnavailableError as e:
             self.note = f"ty недоступен: {e}"
             return None
         try:
@@ -162,7 +161,7 @@ class FindReferencesParams(BaseModel):
         description=(
             "Name of the definition (exact, case-insensitive): 'ProjectIndex', 'refresh'; "
             "a class method — 'ProjectIndex.refresh'"
-        )
+        ),
     )
     kind: str | None = Field(
         default=None,
@@ -172,7 +171,8 @@ class FindReferencesParams(BaseModel):
         ),
     )
     glob: str | None = Field(
-        default=None, description="Limit to files matching a glob: '*.py' or 'src/**'"
+        default=None,
+        description="Limit to files matching a glob: '*.py' or 'src/**'",
     )
     max_results: int = Field(default=50, description="Maximum number of results")
 
@@ -192,7 +192,7 @@ def format_ref_hits(hits: list[RefHit], ctx: ToolContext, labels: dict[str, str]
     return out
 
 
-class FindReferencesTool(Tool):
+class FindReferencesTool(Tool[FindReferencesParams]):
     name = "find_references"
     read_only = True
     description = (
@@ -216,7 +216,7 @@ class FindReferencesTool(Tool):
         kind = params.kind.strip().lower() if params.kind else None
         if kind and kind not in REF_KINDS:
             raise ToolError(
-                f"Неизвестный вид использования {params.kind!r}; допустимые: {', '.join(REF_KINDS)}"
+                f"Неизвестный вид использования {params.kind!r}; допустимые: {', '.join(REF_KINDS)}",
             )
         limit = min(max(params.max_results, 1), MAX_SYMBOL_RESULTS)
         ty = _Ty(ctx)
@@ -232,7 +232,7 @@ class FindReferencesTool(Tool):
                         loc
                         for d in py_defs
                         for loc in srv.references(d.path, d.symbol.line, d.symbol.col)
-                    ]
+                    ],
                 )
                 if locations is not None:
                     hits = self._merge(index, hits, locations, py_defs, kind, params.glob)
@@ -244,7 +244,7 @@ class FindReferencesTool(Tool):
         lines = [f"определение: {definition_line(d)}" for d in result.definitions]
         if not result.definitions:
             lines.append(
-                f"(определение «{query}» в индексе не найдено — ищу использования по имени)"
+                f"(определение «{query}» в индексе не найдено — ищу использования по имени)",
             )
         if not shown:
             lines.append("(использований не найдено)")
@@ -309,7 +309,7 @@ class GotoDefinitionParams(BaseModel):
     path: str = Field(description="File relative to the project root")
     line: int = Field(description="Line number (1-based) where the name occurs")
     name: str = Field(
-        description="The name on that line: 'ProjectIndex', 'refresh' or 'self.index.refresh'"
+        description="The name on that line: 'ProjectIndex', 'refresh' or 'self.index.refresh'",
     )
 
 
@@ -338,7 +338,7 @@ def _hover_signature(hover: str) -> str:
     return "\n  ".join(line for line in lines[:MAX_HOVER_LINES] if line.strip())
 
 
-class GotoDefinitionTool(Tool):
+class GotoDefinitionTool(Tool[GotoDefinitionParams]):
     name = "goto_definition"
     read_only = True
     description = (
@@ -385,13 +385,14 @@ class GotoDefinitionTool(Tool):
                     lambda srv: (
                         srv.definition(rel, params.line, col),
                         srv.hover(rel, params.line, col),
-                    )
+                    ),
                 )
             if answer is not None:
                 locations, hover = answer
                 source = _SourceLines(ctx)
-                for loc in locations[:MAX_DEFINITION_RESULTS]:
-                    out.append(self._describe(index, loc, source))
+                out.extend(
+                    self._describe(index, loc, source) for loc in locations[:MAX_DEFINITION_RESULTS]
+                )
                 if not locations:
                     out.append("(ty не нашёл определение)")
                 signature = _hover_signature(hover)
@@ -417,7 +418,8 @@ class GotoDefinitionTool(Tool):
     @staticmethod
     def _from_index(index: ProjectIndex, rel: str, name: str, line: int) -> list[SymbolHit]:
         """Импорт этого имени в файле → определение в целевом модуле; иначе — в самом
-        файле; иначе — все определения с таким именем."""
+        файле; иначе — все определения с таким именем.
+        """
         for entry in index.imports_of(rel):
             if entry.alias != name or entry.target is None:
                 continue
@@ -437,7 +439,7 @@ class GotoDefinitionTool(Tool):
 # --------------------------------------------------------------------------- #
 class CallHierarchyParams(BaseModel):
     query: str = Field(
-        description="Function or method: 'helper', 'ProjectIndex.refresh' (exact name)"
+        description="Function or method: 'helper', 'ProjectIndex.refresh' (exact name)",
     )
     direction: str = Field(
         default="incoming",
@@ -446,7 +448,7 @@ class CallHierarchyParams(BaseModel):
     depth: int = Field(default=1, description=f"Depth of the tree: 1–{MAX_DEPTH}")
 
 
-class CallHierarchyTool(Tool):
+class CallHierarchyTool(Tool[CallHierarchyParams]):
     name = "call_hierarchy"
     read_only = True
     description = (
@@ -465,7 +467,7 @@ class CallHierarchyTool(Tool):
         if not query.strip("."):
             raise ToolError("Пустой запрос.")
         direction = params.direction.strip().lower()
-        if direction not in ("incoming", "outgoing"):
+        if direction not in {"incoming", "outgoing"}:
             raise ToolError("direction: incoming (кто вызывает) или outgoing (что вызывает)")
         depth = min(max(params.depth, 1), MAX_DEPTH)
         incoming = direction == "incoming"
@@ -475,7 +477,7 @@ class CallHierarchyTool(Tool):
             definitions = index.definitions(query)
             if not definitions:
                 raise ToolError(
-                    f"Определение «{query}» не найдено в индексе. Найдите имя через find_symbol."
+                    f"Определение «{query}» не найдено в индексе. Найдите имя через find_symbol.",
                 )
             py_defs = _python_definitions(definitions)
             tree = None
@@ -559,7 +561,11 @@ class CallHierarchyTool(Tool):
 
     # ----------------------------- по индексу ----------------------------- #
     def _index_tree(
-        self, index: ProjectIndex, definitions: list[SymbolHit], incoming: bool, depth: int
+        self,
+        index: ProjectIndex,
+        definitions: list[SymbolHit],
+        incoming: bool,
+        depth: int,
     ) -> list[str]:
         """Дерево по индексу; общий бюджет узлов на все корни и уровни."""
         lines: list[str] = []

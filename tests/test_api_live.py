@@ -29,7 +29,7 @@ def provider(live_config):
 def test_simple_completion(provider):
     """Тип 1: простой запрос-ответ."""
     turn = provider.complete(
-        [Message(role="user", content="Ответь ровно одним словом: столица России?")]
+        [Message(role="user", content="Ответь ровно одним словом: столица России?")],
     )
     assert turn.finish_reason == "stop"
     assert "Москва" in turn.message.content
@@ -72,7 +72,8 @@ def test_streaming_tool_call(provider):
     assert fc.name == "get_weather"
     assert "сочи" in str(fc.arguments.get("city", "")).lower()
     # вызов из потока можно вернуть в историю: id и состояние пришли и здесь
-    assert fc.id and turn.message.state_id
+    assert fc.id
+    assert turn.message.state_id
 
 
 WEATHER_TOOL = ToolSpec(
@@ -93,7 +94,7 @@ def test_single_tool_call(provider):
             Message(
                 role="user",
                 content="Какая погода в Москве? Обязательно вызови функцию get_weather.",
-            )
+            ),
         ],
         tools=[WEATHER_TOOL],
     )
@@ -114,24 +115,25 @@ def test_multistep_with_tool_result(provider):
         Message(
             role="user",
             content="Какая температура в Москве? Вызови get_weather, потом ответь.",
-        )
+        ),
     ]
     turn1 = provider.complete(messages, tools=[WEATHER_TOOL])
     assert turn1.wants_tool, "ожидался вызов функции на первом шаге"
 
     # кладём ход ассистента и результаты всех его вызовов
     messages.append(turn1.message)
-    for call in turn1.message.function_calls:
-        messages.append(
-            Message(
-                role="function",
-                name=call.name,
-                call_id=call.id,
-                content='{"city": "Москва", "temperature_c": 17, "condition": "ясно"}',
-            )
+    messages.extend(
+        Message(
+            role="function",
+            name=call.name,
+            call_id=call.id,
+            content='{"city": "Москва", "temperature_c": 17, "condition": "ясно"}',
         )
+        for call in turn1.message.function_calls
+    )
     turn2 = provider.complete(messages, tools=[WEATHER_TOOL])
-    assert turn2.finish_reason == "stop" and not turn2.wants_tool
+    assert turn2.finish_reason == "stop"
+    assert not turn2.wants_tool
     # модель должна использовать переданное значение температуры
     assert "17" in turn2.message.content
 
@@ -145,7 +147,7 @@ def test_parallel_calls_round_trip(provider):
                 "Узнай погоду в Москве и в Казани. Вызови get_weather для обоих городов "
                 "сразу, в одном ответе, потом сравни."
             ),
-        )
+        ),
     ]
     turn1 = provider.stream(messages, tools=[WEATHER_TOOL])
     calls = turn1.message.function_calls
@@ -163,10 +165,11 @@ def test_parallel_calls_round_trip(provider):
                 name=call.name,
                 call_id=call.id,
                 content=f'{{"city": "{city}", "temperature_c": {10 + i}}}',
-            )
+            ),
         )
     turn2 = provider.stream(messages, tools=[WEATHER_TOOL])
-    assert turn2.finish_reason == "stop" and not turn2.wants_tool
+    assert turn2.finish_reason == "stop"
+    assert not turn2.wants_tool
     # результаты обоих вызовов дошли до модели: в сравнении — обе температуры
     temperatures = [str(10 + i) for i in range(len(calls))]
     assert all(t in turn2.message.content for t in temperatures), turn2.message.content
@@ -179,7 +182,8 @@ def test_tool_choice_none_answers_with_text(provider):
         tools=[WEATHER_TOOL],
         tool_choice="none",
     )
-    assert not turn.wants_tool and turn.message.function_calls == []
+    assert not turn.wants_tool
+    assert turn.message.function_calls == []
     assert turn.finish_reason == "stop"
     assert turn.message.content.strip()
 

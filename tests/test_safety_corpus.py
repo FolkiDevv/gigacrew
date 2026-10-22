@@ -172,9 +172,9 @@ def project(tmp_path_factory) -> Path:
                     "deploy": "x",
                     "format": "prettier --write .",
                     "lint:fix": "eslint --fix .",
-                }
-            }
-        )
+                },
+            },
+        ),
     )
     return root
 
@@ -195,13 +195,14 @@ def test_dangerous_commands_are_not_exec(project, raw):
     wrong = []
     for command, label in load(raw):
         verdict = classify(command, root=project)
-        if label == 3 and verdict.level in (CommandLevel.READ, CommandLevel.EXEC):
+        if label == 3 and verdict.level in {CommandLevel.READ, CommandLevel.EXEC}:
             wrong.append((command, verdict.reason))
     assert wrong == []
 
 
 @pytest.mark.parametrize(
-    "name, raw, minimum", [("corpus", CORPUS, 0.85), ("holdout", HOLDOUT, 0.6)]
+    ("name", "raw", "minimum"),
+    [("corpus", CORPUS, 0.85), ("holdout", HOLDOUT, 0.6)],
 )
 def test_read_only_recall(project, name, raw, minimum):
     """Читающие команды в основном проходят без вопроса (иначе классификатор бесполезен)."""
@@ -213,7 +214,8 @@ def test_read_only_recall(project, name, raw, minimum):
 @pytest.mark.parametrize("raw", CORPORA)
 def test_levels_match_labels(project, raw):
     """D — ровно DANGER, R — ровно READ, X и W — не мягче метки; известные расхождения —
-    ровно с записанным уровнем."""
+    ровно с записанным уровнем.
+    """
     known = {**KNOWN_GAPS, **OVERCAUTIOUS}
     wrong = []
     for command, label in load(raw):
@@ -224,7 +226,7 @@ def test_levels_match_labels(project, raw):
                 wrong.append(("расхождение изменилось", command, got, verdict.reason))
             continue
         want = BY_LABEL[label]
-        ok = got is want if label in (0, 3) else worst(got, want) is got
+        ok = got is want if label in {0, 3} else worst(got, want) is got
         if not ok:
             wrong.append((NAMES[label], command, got, verdict.reason))
     assert wrong == []

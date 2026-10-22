@@ -15,6 +15,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from gigacrew.security import subprocess_env
+
 __all__ = ["repo_config_runs_programs", "repo_toplevel"]
 
 _TIMEOUT = 5
@@ -30,8 +32,6 @@ _LOCAL_SCOPES = frozenset({"local", "worktree", "command"})
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
     """Служебный запуск git в ``cwd``; None — git не запустился."""
-    from gigacrew.tools.process import subprocess_env
-
     try:
         return subprocess.run(
             ["git", *args],
@@ -48,7 +48,8 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
 
 def repo_toplevel(cwd: Path) -> Path | None:
     """Корень рабочего дерева репозитория, который git найдёт из ``cwd``. None — ``cwd``
-    не в рабочем дереве (или git не запустился)."""
+    не в рабочем дереве (или git не запустился).
+    """
     res = _git(cwd, "rev-parse", "--show-toplevel")
     if res is None or res.returncode != 0:
         return None
@@ -58,7 +59,8 @@ def repo_toplevel(cwd: Path) -> Path | None:
 
 def repo_config_runs_programs(cwd: Path) -> bool | None:
     """Есть ли в настройках репозитория (вокруг ``cwd``) или его подмодулей программы,
-    которые git запустит при чтении. None — не удалось выяснить (git не запустился)."""
+    которые git запустит при чтении. None — не удалось выяснить (git не запустился).
+    """
     return _runs_programs(cwd, depth=0)
 
 
@@ -80,7 +82,8 @@ def _runs_programs(cwd: Path, *, depth: int) -> bool | None:
 
 def _submodules(cwd: Path) -> list[Path] | None:
     """Рабочие деревья подмодулей репозитория (вокруг ``cwd``), в которые зайдёт git.
-    ``[]`` — подмодулей нет или ``cwd`` не в рабочем дереве; None — не удалось выяснить."""
+    ``[]`` — подмодулей нет или ``cwd`` не в рабочем дереве; None — не удалось выяснить.
+    """
     top = repo_toplevel(cwd)
     if top is None:
         return []

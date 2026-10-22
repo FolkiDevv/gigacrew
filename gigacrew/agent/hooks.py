@@ -42,24 +42,20 @@ CONTEXT_EVENTS = frozenset({HookEvent.USER_PROMPT_SUBMIT, HookEvent.SESSION_STAR
 # остальные хуки события. У PostToolUse это замечание модели: идут все хуки (линтер не
 # отменяет форматтер), замечания складываются. У остальных событий блокировать нечего:
 # код 2 — предупреждение, как прочие коды, остальные хуки идут.
-BLOCKING_EVENTS = frozenset(
-    {
-        HookEvent.PRE_REQUEST,
-        HookEvent.PRE_TOOL_USE,
-        HookEvent.USER_PROMPT_SUBMIT,
-        HookEvent.STOP,
-        HookEvent.SUBAGENT_STOP,
-    }
-)
+BLOCKING_EVENTS = frozenset({
+    HookEvent.PRE_REQUEST,
+    HookEvent.PRE_TOOL_USE,
+    HookEvent.USER_PROMPT_SUBMIT,
+    HookEvent.STOP,
+    HookEvent.SUBAGENT_STOP,
+})
 # Эти хуки идут на каждом вызове инструмента — без индикатора, иначе он мигал бы.
-QUIET_EVENTS = frozenset(
-    {
-        HookEvent.PRE_TOOL_USE,
-        HookEvent.POST_TOOL_USE,
-        HookEvent.NOTIFICATION,
-        HookEvent.PRE_REQUEST,
-    }
-)
+QUIET_EVENTS = frozenset({
+    HookEvent.PRE_TOOL_USE,
+    HookEvent.POST_TOOL_USE,
+    HookEvent.NOTIFICATION,
+    HookEvent.PRE_REQUEST,
+})
 NO_REASON = "хук не пояснил причину"
 
 
@@ -77,7 +73,7 @@ class HookResult:
         return "\n\n".join(self.context)
 
 
-class PromptBlocked(Exception):
+class PromptBlockedError(Exception):
     """Хук UserPromptSubmit отклонил запрос пользователя: ход не начинался."""
 
     def __init__(self, reason: str):
@@ -137,11 +133,17 @@ class HookRunner:
             events.on_hook_start(event.value, hook.command)
         try:
             proc = run_process(
-                hook.command, cwd=cwd, timeout=hook.timeout, shell=True, input=data, extra_env=env
+                hook.command,
+                cwd=cwd,
+                timeout=hook.timeout,
+                shell=True,
+                input=data,
+                extra_env=env,
             )
         except (OSError, ValueError) as e:  # ValueError: NUL или суррогат в команде
             events.on_notice(
-                f"хук {event} не запустился ({short_command(hook.command)}): {e}", level="warn"
+                f"хук {event} не запустился ({short_command(hook.command)}): {e}",
+                level="warn",
             )
             return None
         finally:
@@ -190,11 +192,15 @@ class HookRunner:
 
     @staticmethod
     def _unparsed(
-        event: HookEvent, hook: HookCommand, result: HookResult, events: AgentEvents
+        event: HookEvent,
+        hook: HookCommand,
+        result: HookResult,
+        events: AgentEvents,
     ) -> None:
-        """stdout похож на JSON, но не разбирается (лишняя строка, обрезка): решение хука
+        """Stdout похож на JSON, но не разбирается (лишняя строка, обрезка): решение хука
         потеряно. Молча продолжить — значит, разрешить то, что хук, возможно, запретил:
-        предупреждаем, а вызов инструмента — подтверждает пользователь."""
+        предупреждаем, а вызов инструмента — подтверждает пользователь.
+        """
         note = "вывод похож на JSON, но не разобран — ответ хука пропущен"
         if event is HookEvent.PRE_TOOL_USE:
             note = "вывод похож на JSON, но не разобран — вызов подтвердите сами"
@@ -203,10 +209,15 @@ class HookRunner:
 
     @staticmethod
     def _block(
-        event: HookEvent, hook: HookCommand, reason: str, result: HookResult, events: AgentEvents
+        event: HookEvent,
+        hook: HookCommand,
+        reason: str,
+        result: HookResult,
+        events: AgentEvents,
     ) -> None:
         """Блокировка по ответу хука — там, где ей есть что блокировать (см.
-        :data:`BLOCKING_EVENTS`); у остальных событий — предупреждение пользователю."""
+        :data:`BLOCKING_EVENTS`); у остальных событий — предупреждение пользователю.
+        """
         if event in BLOCKING_EVENTS:
             result.blocked, result.reason = True, reason
         elif event is HookEvent.POST_TOOL_USE:  # замечания всех хуков — модели

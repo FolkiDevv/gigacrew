@@ -1,5 +1,6 @@
 """Скиллы: разбор SKILL.md, поиск в .gigacode/skills и ~/.gigacode/skills, инструмент skill,
-вызов /скилл в REPL и одноразовом режиме."""
+вызов /скилл в REPL и одноразовом режиме.
+"""
 
 from __future__ import annotations
 
@@ -9,10 +10,10 @@ from pathlib import Path
 import pytest
 from fakes import ScriptedProvider, text_turn
 
-import gigacrew.cli.app as app
 from gigacrew.agent.chat_store import ChatStore
 from gigacrew.agent.loop import Agent
 from gigacrew.agent.prompts import build_project_context, skill_invocation_prompt
+from gigacrew.cli import app
 from gigacrew.cli.commands import CommandContext, default_commands, expand_skill
 from gigacrew.cli.repl import run_repl
 from gigacrew.config import Config
@@ -57,7 +58,7 @@ def test_frontmatter_values():
         "metadata:\n"
         "  owner: me\n"
         "---\n"
-        "Тело\n"
+        "Тело\n",
     )
     assert fields["name"] == "release"
     assert fields["description"] == "Выпуск: версия и тег"
@@ -86,7 +87,8 @@ def test_parse_skill_rejects_names_unfit_for_command(tmp_path, name):
 
 def test_body_strips_frontmatter(tmp_path):
     skill = parse_skill(_skill(tmp_path, "d", "---\nname: d\ndescription: x\n---\n\nШаги.\n"))
-    assert skill is not None and skill.body() == "Шаги."
+    assert skill is not None
+    assert skill.body() == "Шаги."
 
 
 # ------------------------------- поиск -------------------------------- #
@@ -111,7 +113,7 @@ def test_project_skill_overrides_user_skill_ignoring_case(tmp_path):
     _project_skill(project, "deploy", "проектный")
     skills = discover_skills(Workspace(project))
     assert [(s.name, s.description, s.source) for s in skills] == [
-        ("deploy", "проектный", "project")
+        ("deploy", "проектный", "project"),
     ]
 
 
@@ -139,7 +141,8 @@ def test_project_context_lists_skills(tmp_path):
     assert "Skills" not in build_project_context(Workspace(tmp_path))
     _project_skill(tmp_path, "deploy", "выкатка на стенд")
     context = build_project_context(Workspace(tmp_path))
-    assert "skill tool" in context and "- deploy: выкатка на стенд" in context
+    assert "skill tool" in context
+    assert "- deploy: выкатка на стенд" in context
 
 
 def test_invocation_prompt_substitutes_arguments(tmp_path):
@@ -147,7 +150,8 @@ def test_invocation_prompt_substitutes_arguments(tmp_path):
     assert skill is not None
     text = skill_invocation_prompt(skill, "Почини $ARGUMENTS.", "/fix тесты", "тесты")
     assert text.startswith("/fix тесты\n")
-    assert "Почини тесты." in text and "Arguments:" not in text
+    assert "Почини тесты." in text
+    assert "Arguments:" not in text
     text = skill_invocation_prompt(skill, "Почини всё.", "/fix  срочно", "срочно")
     assert text.rstrip().endswith("Arguments: срочно")
 
@@ -158,7 +162,8 @@ def test_skill_tool_loads_instructions_and_files(ctx):
     (ctx.root / ".gigacode" / "skills" / "deploy" / "reference.md").write_text("справка")
     tool = SkillTool()
     result = tool.run(tool.parse({"name": "deploy"}), ctx)
-    assert result.ok and "Прочитай reference.md." in result.content
+    assert result.ok
+    assert "Прочитай reference.md." in result.content
     assert "description:" not in result.content  # frontmatter не нужен модели
     assert "- reference.md" in result.content
     ref = tool.run(tool.parse({"name": "deploy", "file": "reference.md"}), ctx)
@@ -247,7 +252,8 @@ def test_skill_tool_does_not_list_or_read_files_outside_skill_dir(ctx, tmp_path)
     (skill_dir / "ref").symlink_to(secret.parent)
     tool = SkillTool()
     result = tool.run(tool.parse({"name": "deploy"}), ctx)
-    assert "- key" not in result.content and "- ref/" not in result.content
+    assert "- key" not in result.content
+    assert "- ref/" not in result.content
     for file in ("key", "ref/id_rsa"):
         with pytest.raises(ToolError, match="за пределы каталога скилла"):
             tool.run(tool.parse({"name": "deploy", "file": file}), ctx)
@@ -268,7 +274,8 @@ def test_skill_tool_truncates_large_file(ctx, monkeypatch):
     (ctx.root / ".gigacode" / "skills" / "deploy" / "big.md").write_text("я" * 50)
     tool = SkillTool()
     text = tool.run(tool.parse({"name": "deploy", "file": "big.md"}), ctx).content
-    assert text.startswith("я" * 10 + "\n…") and "обрезано" in text
+    assert text.startswith("я" * 10 + "\n…")
+    assert "обрезано" in text
 
 
 def test_skill_tool_registered():
@@ -297,7 +304,8 @@ def test_expand_skill(tmp_path):
     catalog.refresh()
     commands = default_commands()
     text = expand_skill("/deploy stage", commands, catalog)
-    assert text is not None and "Выкати stage." in text
+    assert text is not None
+    assert "Выкати stage." in text
     assert expand_skill("/help", commands, catalog) is None  # встроенная команда важнее
     assert expand_skill("/nope", commands, catalog) is None
     assert expand_skill("deploy", commands, catalog) is None
@@ -309,8 +317,10 @@ def test_repl_runs_skill_as_agent_turn(repl_env, tmp_path, capsys):
     read = _reader("/deploy stage", "/exit")
     assert run_repl(agent, ui, default_commands(), read_input=read, index_on_start=False) == 0
     first = agent.conversation.messages[0]
-    assert first.role == "user" and first.content.startswith("/deploy stage\n")
-    assert "Выкати на стенд." in first.content and "Arguments: stage" in first.content
+    assert first.role == "user"
+    assert first.content.startswith("/deploy stage\n")
+    assert "Выкати на стенд." in first.content
+    assert "Arguments: stage" in first.content
     assert "готово" in capsys.readouterr().out
 
 
@@ -341,7 +351,8 @@ def test_help_and_unknown_hint_include_skills(repl_env, tmp_path, capsys):
     ctx = CommandContext(agent=agent, ui=ui, commands=commands, skills=catalog)
     commands.dispatch("/help", ctx)
     out = capsys.readouterr().out
-    assert "/deploy [аргументы]" in out and "скилл · выкатка [на стенд]" in out
+    assert "/deploy [аргументы]" in out
+    assert "скилл · выкатка [на стенд]" in out
     assert "/resume [id]" in out  # квадратные скобки — не разметка Rich
     commands.dispatch("/deplyo", ctx)
     assert "возможно, /deploy?" in capsys.readouterr().out

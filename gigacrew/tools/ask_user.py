@@ -5,7 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
-from gigacrew.tools.questions import Answer, Question, QuestionOption, QuestionsUnavailable
+from gigacrew.tools.questions import Answer, Question, QuestionOption, QuestionsUnavailableError
 
 MAX_QUESTIONS = 4
 MIN_OPTIONS, MAX_OPTIONS = 2, 4
@@ -19,7 +19,8 @@ DECLINED_NOTE = (
 class OptionParams(BaseModel):
     label: str = Field(description="The answer option, short (1–5 words).")
     description: str = Field(
-        "", description="What this option means: the gist, pros and cons, consequences."
+        "",
+        description="What this option means: the gist, pros and cons, consequences.",
     )
 
 
@@ -30,18 +31,18 @@ class QuestionParams(BaseModel):
         description=(
             f"{MIN_OPTIONS}–{MAX_OPTIONS} answer options. An option for a custom answer is "
             "added automatically — do not add it."
-        )
+        ),
     )
     multi_select: bool = Field(False, description="true — several options can be chosen at once.")
 
 
 class AskUserParams(BaseModel):
     questions: list[QuestionParams] = Field(
-        description=f"1–{MAX_QUESTIONS} questions, asked one after another."
+        description=f"1–{MAX_QUESTIONS} questions, asked one after another.",
     )
 
 
-class AskUserTool(Tool):
+class AskUserTool(Tool[AskUserParams]):
     name = "ask_user"
     description = (
         "Asks the user questions with answer options and waits for the answers. Use it "
@@ -61,7 +62,7 @@ class AskUserTool(Tool):
     def run(self, params: AskUserParams, ctx: ToolContext) -> ToolResult:
         questions = _to_questions(params)
         if ctx.ask_user is None:
-            raise QuestionsUnavailable()
+            raise QuestionsUnavailableError
         answers = ctx.ask_user(questions)
         if answers is None:
             return ToolResult(content=DECLINED_NOTE, summary="пользователь не ответил")
@@ -82,7 +83,7 @@ def _to_questions(params: AskUserParams) -> list[Question]:
     """Проверка ограничений (не в схеме — см. CONTRIBUTING) и перевод в типы UI."""
     if not 1 <= len(params.questions) <= MAX_QUESTIONS:
         raise ToolError(
-            f"Нужно от 1 до {MAX_QUESTIONS} вопросов, передано {len(params.questions)}."
+            f"Нужно от 1 до {MAX_QUESTIONS} вопросов, передано {len(params.questions)}.",
         )
     result = []
     for i, q in enumerate(params.questions, 1):
@@ -92,7 +93,7 @@ def _to_questions(params: AskUserParams) -> list[Question]:
         labels = [o.label.strip() for o in q.options]
         if not MIN_OPTIONS <= len(labels) <= MAX_OPTIONS:
             raise ToolError(
-                f"Вопрос {i}: нужно {MIN_OPTIONS}–{MAX_OPTIONS} варианта, передано {len(labels)}."
+                f"Вопрос {i}: нужно {MIN_OPTIONS}–{MAX_OPTIONS} варианта, передано {len(labels)}.",
             )
         if not all(labels):
             raise ToolError(f"Вопрос {i}: у варианта пустая метка.")

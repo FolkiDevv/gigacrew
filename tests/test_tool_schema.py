@@ -31,7 +31,8 @@ _FORBIDDEN_KEYS = ("anyOf", "oneOf", "allOf", "$ref", "$defs", "title", "default
 
 def _walk_schema(schema: dict, where: str) -> None:
     """Каждый уровень схемы (свойства, элементы массивов): без union-типов, ссылок и
-    служебных ключей; у объекта — type object и required только из его свойств."""
+    служебных ключей; у объекта — type object и required только из его свойств.
+    """
     for key in _FORBIDDEN_KEYS:
         assert key not in schema, f"{where}: остался {key}"
     assert "type" in schema and schema["type"] != "null", f"{where}: нет одиночного type"
@@ -71,9 +72,11 @@ def test_array_field_schema():
 
 def test_nested_models_are_inlined():
     schema = build_default_registry().get("ask_user").spec().parameters
-    assert "$ref" not in str(schema) and "$defs" not in str(schema)
+    assert "$ref" not in str(schema)
+    assert "$defs" not in str(schema)
     question = schema["properties"]["questions"]["items"]
-    assert question["type"] == "object" and question["required"] == ["question", "options"]
+    assert question["type"] == "object"
+    assert question["required"] == ["question", "options"]
     option = question["properties"]["options"]["items"]
     assert option["properties"]["label"] == {
         "description": "The answer option, short (1–5 words).",

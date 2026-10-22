@@ -8,9 +8,14 @@ from pydantic import BaseModel, Field
 
 from gigacrew.permissions import ToolKind
 from gigacrew.safety import MAX_COMMAND, CommandLevel, Verdict, classify
-from gigacrew.security import RiskLevel, classify_shell_command, resolve_in_root
+from gigacrew.security import (
+    RiskLevel,
+    classify_shell_command,
+    resolve_in_root,
+    subprocess_env,
+)
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
-from gigacrew.tools.process import run_process, subprocess_env, truncate_middle
+from gigacrew.tools.process import run_process, truncate_middle
 
 _MAX_OUTPUT = 30_000
 MIN_TIMEOUT = 1
@@ -22,7 +27,8 @@ _SHELL_FAILURES = (126, 127)
 class RunShellParams(BaseModel):
     command: str = Field(description="Command to run with /bin/sh")
     timeout: int = Field(
-        default=120, description=f"Timeout in seconds ({MIN_TIMEOUT}–{MAX_TIMEOUT})"
+        default=120,
+        description=f"Timeout in seconds ({MIN_TIMEOUT}–{MAX_TIMEOUT})",
     )
     cwd: str = Field(
         default="",
@@ -72,7 +78,7 @@ def _risk(verdict: Verdict, command: str, *, classify_commands: bool) -> RiskLev
     return RiskLevel.WRITE
 
 
-class RunShellTool(Tool):
+class RunShellTool(Tool[RunShellParams]):
     name = "run_shell"
     description = (
         "Runs a shell command and returns stdout/stderr and the exit code. Use it to build, "
@@ -95,14 +101,18 @@ class RunShellTool(Tool):
             reason = f"не удалось проверить: {verdict.reason}" if verdict.reason else ""
         kind = ToolKind.EDIT if verdict.edits_only else None
         return Assessment(
-            risk, reason=reason, kind=kind, verdict=verdict, purpose=params.description.strip()
+            risk,
+            reason=reason,
+            kind=kind,
+            verdict=verdict,
+            purpose=params.description.strip(),
         )
 
     def risk(self, params: RunShellParams, ctx: ToolContext) -> RiskLevel:
         return self.assess(params, ctx).risk
 
     def describe(self, params: RunShellParams) -> str:
-        prefix = f"[{params.cwd.strip()}] " if params.cwd.strip() not in ("", ".") else ""
+        prefix = f"[{params.cwd.strip()}] " if params.cwd.strip() not in {"", "."} else ""
         return (prefix + params.command)[:70]
 
     def paths(self, params: RunShellParams) -> tuple[str, ...]:
@@ -128,7 +138,7 @@ class RunShellTool(Tool):
         if res.killed_background:
             notes.append(
                 "фоновые процессы, оставшиеся после команды, остановлены "
-                "(долгоживущие процессы через run_shell не поддерживаются)"
+                "(долгоживущие процессы через run_shell не поддерживаются)",
             )
         if res.timed_out:
             notes.append(f"команда превысила таймаут ({timeout}с) и была остановлена")
@@ -141,7 +151,7 @@ class RunShellTool(Tool):
             # Потомок ушёл из группы команды (setsid) и держит вывод: killpg его не достал.
             notes.append(
                 "фоновый процесс, ушедший из группы команды (setsid), остановить не удалось: "
-                "он продолжает работать, его вывод сюда больше не попадёт"
+                "он продолжает работать, его вывод сюда больше не попадёт",
             )
             summary += " · фоновый процесс остановить не удалось"
         note_text = "".join(f"\n[{n}]" for n in notes)

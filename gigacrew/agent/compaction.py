@@ -52,7 +52,10 @@ class CompactionPlan:
 
 
 def plan_compaction(
-    conversation: Conversation, *, keep_tokens: int, min_tokens: int = 1
+    conversation: Conversation,
+    *,
+    keep_tokens: int,
+    min_tokens: int = 1,
 ) -> CompactionPlan | None:
     """План сжатия или None, если сворачивать нечего.
 
@@ -169,13 +172,17 @@ def _recent_chunks(messages: Sequence[Message], budget_tokens: int) -> list[list
 
 
 def _request_text(
-    previous: str | None, chunk: str, instructions: str, omitted: bool, max_chars: int
+    previous: str | None,
+    chunk: str,
+    instructions: str,
+    omitted: bool,
+    max_chars: int,
 ) -> str:
     parts = []
     if previous:
         parts.append(
             "Summary of the earlier part of the conversation (update it without losing "
-            f"anything important):\n{previous}"
+            f"anything important):\n{previous}",
         )
     if omitted:
         parts.append("(The earliest part of the conversation did not fit and is omitted.)")
@@ -184,7 +191,7 @@ def _request_text(
         parts.append(f"The user's wishes for the summary: {instructions.strip()}")
     parts.append(
         f"Write the summary following the rules. Size — at most {max_chars} characters "
-        f"(~{max(max_chars // CHARS_PER_WORD, 1)} words)."
+        f"(~{max(max_chars // CHARS_PER_WORD, 1)} words).",
     )
     return "\n\n".join(parts)
 
@@ -248,7 +255,11 @@ def summarize(
             Message(
                 role="user",
                 content=_request_text(
-                    summary, "\n\n".join(chunk), instructions, omitted and i == 0, max_chars
+                    summary,
+                    "\n\n".join(chunk),
+                    instructions,
+                    omitted and i == 0,
+                    max_chars,
                 ),
             ),
         ]
@@ -257,7 +268,7 @@ def summarize(
             on_usage(turn.usage)
         if turn.finish_reason != "stop":
             raise CompactionError(
-                f"модель не закончила краткое содержание (finish_reason={turn.finish_reason})"
+                f"модель не закончила краткое содержание (finish_reason={turn.finish_reason})",
             )
         text = turn.message.content.strip()
         if not text:

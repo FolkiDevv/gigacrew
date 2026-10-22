@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,8 +77,11 @@ def load_hooks(
     if user and not store.is_user_trusted(user):
         pending.append(
             _Pending(
-                "пользователя", ("user",), settings.user_groups, lambda: store.trust_user(user)
-            )
+                "пользователя",
+                ("user",),
+                settings.user_groups,
+                lambda: store.trust_user(user),
+            ),
         )
     project = project_fingerprint(settings)
     if project and not store.is_trusted(workspace.root, project):
@@ -88,7 +91,7 @@ def load_hooks(
                 PROJECT_SOURCES,
                 settings.project_groups,
                 lambda: store.trust(workspace.root, project),
-            )
+            ),
         )
     if not pending:
         return HookRunner(settings)
@@ -98,7 +101,7 @@ def load_hooks(
         files = ", ".join(SOURCE_LABELS[source] for source in sources)
         ui.warn(
             f"хуки {owners} ({files}) не подтверждены и пропущены: запустите gigacrew "
-            "интерактивно, чтобы подтвердить их, или передайте --trust-hooks"
+            "интерактивно, чтобы подтвердить их, или передайте --trust-hooks",
         )
         return HookRunner(settings.without(*sources))
     ui.warn(f"новые или изменённые хуки {owners} — gigacrew будет сам запускать эти команды:")
@@ -116,7 +119,10 @@ def load_hooks(
 
 
 def install_request_hook(
-    provider: LLMProvider, runner: HookRunner, ui: Console, config: Config
+    provider: LLMProvider,
+    runner: HookRunner,
+    ui: Console,
+    config: Config,
 ) -> None:
     """Хуки PreRequest — перед каждым запросом к бэкенду GigaCode и перед повтором после
     401 (у других провайдеров их нет). Нет таких хуков — провайдер работает без них.
@@ -153,7 +159,7 @@ def install_request_hook(
 
 
 def describe_groups(groups: tuple[HookGroup, ...]) -> str:
-    """Хуки по событиям: matcher, полная команда, файл.
+    r"""Хуки по событиям: matcher, полная команда, файл.
 
     Пользователь подтверждает ровно то, что выполнится: невидимые символы (управляющие,
     смена направления текста, нулевой ширины) не убираются, а показываются как
@@ -170,11 +176,13 @@ def describe_groups(groups: tuple[HookGroup, ...]) -> str:
             continue
         lines.append(f"  {event.value}")
         for group in found:
-            matcher = f"[{shown(group.matcher)}] " if group.matcher not in ("", "*") else ""
+            matcher = f"[{shown(group.matcher)}] " if group.matcher not in {"", "*"} else ""
             for hook in group.hooks:
                 command = shown(hook.command.strip(" \t\n")).replace("\n", "\n      ")
-                lines.append(f"    {matcher}{command}")
-                lines.append(f"      таймаут {hook.timeout} с · {SOURCE_LABELS[group.source]}")
+                lines.extend((
+                    f"    {matcher}{command}",
+                    f"      таймаут {hook.timeout} с · {SOURCE_LABELS[group.source]}",
+                ))
     return "\n".join(lines)
 
 
@@ -199,7 +207,7 @@ def _session_hook(ui: Console, event: HookEvent, run: Callable[[], None]) -> Non
 
 
 @contextmanager
-def hook_session(agent: Agent, ui: Console, *, source: str, end_reason: str) -> Iterator[None]:
+def hook_session(agent: Agent, ui: Console, *, source: str, end_reason: str) -> Generator[None]:
     """SessionStart (``source``) при входе и SessionEnd (``end_reason``) при выходе."""
     _session_hook(ui, HookEvent.SESSION_START, lambda: agent.start_session(source))
     try:
@@ -209,10 +217,16 @@ def hook_session(agent: Agent, ui: Console, *, source: str, end_reason: str) -> 
 
 
 def restart_session[T](
-    agent: Agent, ui: Console, *, end_reason: str, source: str, switch: Callable[[], T]
+    agent: Agent,
+    ui: Console,
+    *,
+    end_reason: str,
+    source: str,
+    switch: Callable[[], T],
 ) -> T:
     """Смена чата (``/clear``, ``/resume``): SessionEnd старого, ``switch``, SessionStart
-    нового. SessionEnd идёт до ``switch`` — хуки видят id прежнего чата."""
+    нового. SessionEnd идёт до ``switch`` — хуки видят id прежнего чата.
+    """
     _session_hook(ui, HookEvent.SESSION_END, lambda: agent.end_session(end_reason))
     result = switch()
     _session_hook(ui, HookEvent.SESSION_START, lambda: agent.start_session(source))

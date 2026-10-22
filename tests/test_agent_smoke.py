@@ -40,7 +40,7 @@ def test_end_to_end_mini_task(live_config, tmp_path):
             "Создай файл greet.py с функцией greet(name), которая возвращает строку "
             "'Привет, <name>!'. В конце файла добавь print(greet('Мир')). "
             "Затем запусти его командой: python3 greet.py и покажи вывод. "
-            "Используй инструменты write_file и run_shell."
+            "Используй инструменты write_file и run_shell.",
         )
     finally:
         provider.close()
@@ -50,7 +50,11 @@ def test_end_to_end_mini_task(live_config, tmp_path):
     text = target.read_text(encoding="utf-8")
     # файл делает то, что просили: запуск печатает приветствие
     run = subprocess.run(
-        [sys.executable, str(target)], capture_output=True, text=True, timeout=30, cwd=tmp_path
+        [sys.executable, str(target)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=tmp_path,
     )
     assert run.returncode == 0, run.stderr
     assert run.stdout.strip() == "Привет, Мир!", f"вывод: {run.stdout!r}\n{text}"
@@ -72,7 +76,7 @@ def test_agent_reads_and_edits_existing_file(live_config, tmp_path):
     try:
         agent.run_turn(
             "В файле version.txt замени версию 1.0.0 на 2.0.0. "
-            "Сначала прочитай файл, потом используй edit_file."
+            "Сначала прочитай файл, потом используй edit_file.",
         )
     finally:
         provider.close()

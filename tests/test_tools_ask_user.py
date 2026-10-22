@@ -7,7 +7,7 @@ import pytest
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools.ask_user import AskUserTool
 from gigacrew.tools.base import ToolContext, ToolError
-from gigacrew.tools.questions import Answer, QuestionsUnavailable
+from gigacrew.tools.questions import Answer, QuestionsUnavailableError
 
 
 def _q(text="Какую БД?", labels=("PostgreSQL", "SQLite"), **kw):
@@ -36,24 +36,28 @@ def test_answers_are_formatted_for_model(tmp_path):
         [_q(header="БД"), _q("Что включить?", ("Логи", "Метрики", "Трейсы"), multi_select=True)],
         [Answer(("SQLite",)), Answer(("Логи", "Трейсы"), custom="и алерты")],
     )
-    assert result.ok and result.summary == "получены ответы: 2"
+    assert result.ok
+    assert result.summary == "получены ответы: 2"
     assert result.content.splitlines() == [
         "Ответы пользователя:",
         "1. Какую БД? → SQLite",
         "2. Что включить? → Логи, Трейсы, свой ответ: «и алерты»",
     ]
     first, second = asked[0]
-    assert first.header == "БД" and first.options[1].description == "про SQLite"
-    assert second.multi_select is True and len(second.options) == 3
+    assert first.header == "БД"
+    assert first.options[1].description == "про SQLite"
+    assert second.multi_select is True
+    assert len(second.options) == 3
 
 
 def test_declined_is_not_a_failure(tmp_path):
     result, _ = _run(tmp_path, [_q()], None)
-    assert result.ok and "отказался" in result.content
+    assert result.ok
+    assert "отказался" in result.content
 
 
 def test_no_user_to_ask(tmp_path):
-    with pytest.raises(QuestionsUnavailable, match="нет интерактивного пользователя"):
+    with pytest.raises(QuestionsUnavailableError, match="нет интерактивного пользователя"):
         _run(tmp_path, [_q()], ui=False)
 
 

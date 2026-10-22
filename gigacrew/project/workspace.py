@@ -15,11 +15,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 DATA_DIR_NAME = ".gigacode"
+# Данные проекта в каталоге пользователя: ``~/.gigacode/projects/<ключ>/``.
+PROJECTS_DIR = "projects"
 SKILLS_DIR_NAME = "skills"
 HISTORY_FILE_NAME = "history"
 SETTINGS_FILE_NAME = "settings.json"
@@ -60,6 +63,46 @@ def user_settings_file() -> Path:
     return user_data_dir() / SETTINGS_FILE_NAME
 
 
+def project_key(root: Path) -> str:
+    """Ключ проекта: путь корня; рабочее дерево git — путь основного репозитория."""
+    return hashlib.sha256(str(project_key_root(root)).encode("utf-8")).hexdigest()[:16]
+
+
+def project_key_root(root: Path) -> Path:
+    """Путь, от которого считается ключ: у рабочего дерева git — основной репозиторий."""
+    root = Path(os.path.normcase(str(Path(root).resolve())))
+    return _main_worktree(root) or root
+
+
+def _main_worktree(root: Path) -> Path | None:
+    """Основной репозиторий связанного рабочего дерева (``root/.git`` — файл) или None.
+
+    Ссылке верим, только если её подтверждает git: каталог ``<gitdir>`` есть и его файл
+    ``gitdir`` указывает обратно на ``root/.git``. Иначе скачанный проект с поддельным
+    ``.git`` делил бы с чужим проектом его память решений.
+    """
+    dot_git = root / ".git"
+    try:
+        if not dot_git.is_file():
+            return None
+        for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith("gitdir:"):
+                continue
+            target = Path(line[len("gitdir:") :].strip())
+            gitdir = (target if target.is_absolute() else root / target).resolve()
+            # <основной>/.git/worktrees/<имя>
+            if gitdir.parent.name != "worktrees" or gitdir.parent.parent.name != ".git":
+                return None
+            back = Path((gitdir / "gitdir").read_text(encoding="utf-8").strip())
+            back = (back if back.is_absolute() else gitdir / back).resolve()
+            if os.path.normcase(str(back)) != os.path.normcase(str(dot_git.resolve())):
+                return None
+            return gitdir.parent.parent.parent
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 @dataclass(frozen=True)
 class Workspace:
     """Корень проекта и производные пути. Конструктор не трогает файловую систему."""
@@ -82,10 +125,6 @@ class Workspace:
         для рецензента команд и выбрал бы модель. Ключ — тот же, что у разрешений
         (рабочие деревья одного репозитория git делят и чаты).
         """
-        # Ключ проекта вычисляет слой решений; импорт здесь — без цикла импортов
-        # (decisions сам импортирует этот модуль).
-        from gigacrew.agent.decisions import PROJECTS_DIR, project_key
-
         return user_data_dir() / PROJECTS_DIR / project_key(self.root) / "chats"
 
     @property
@@ -136,7 +175,8 @@ class Workspace:
 
     def in_git_repo(self) -> bool:
         """Проект внутри git-репозитория: ``.git`` (каталог или файл рабочего дерева)
-        в корне или выше. Только проверка ФС — git не запускается."""
+        в корне или выше. Только проверка ФС — git не запускается.
+        """
         return any((d / ".git").exists() for d in (self.root, *self.root.parents))
 
     def ensure_data_dir(self) -> Path:

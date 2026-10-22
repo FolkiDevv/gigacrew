@@ -107,7 +107,8 @@ def test_history_layout_with_calls_results_and_reasoning():
     ]
     assert has_reasoning({"messages": sent})
     without = messages_payload(history, reasoning=False)
-    assert "reasoning_content" not in without[2] and not has_reasoning({"messages": without})
+    assert "reasoning_content" not in without[2]
+    assert not has_reasoning({"messages": without})
 
 
 def test_results_follow_their_calls_by_position_and_by_id():
@@ -133,7 +134,8 @@ def test_calls_without_ids_get_stable_ids_shared_with_results():
     first, second = messages_payload(history), messages_payload(history)
     assert first == second
     ids = [c["id"] for c in first[1]["tool_calls"]]
-    assert len(set(ids)) == 2 and all(i.startswith("call_") for i in ids)
+    assert len(set(ids)) == 2
+    assert all(i.startswith("call_") for i in ids)
     assert [m["tool_call_id"] for m in first[2:]] == ids
 
 
@@ -159,13 +161,13 @@ def test_consecutive_user_messages_are_merged():
         Message(role="user", content="<system-reminder>заметка</system-reminder>", meta=True),
     ]
     assert messages_payload(history) == [
-        {"role": "user", "content": "первый\n\n<system-reminder>заметка</system-reminder>"}
+        {"role": "user", "content": "первый\n\n<system-reminder>заметка</system-reminder>"},
     ]
 
 
 def test_empty_assistant_text_without_calls_is_empty_string():
     assert messages_payload([Message(role="assistant", content="")]) == [
-        {"role": "assistant", "content": ""}
+        {"role": "assistant", "content": ""},
     ]
 
 
@@ -179,8 +181,11 @@ def test_chat_payload_options_tools_and_stream():
         stream=True,
         options={"top_p": 0.9, "temperature": 1.0, "model": "чужая"},
     )
-    assert body["model"] == "M" and body["temperature"] == 0.2 and body["top_p"] == 0.9
-    assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+    assert body["model"] == "M"
+    assert body["temperature"] == 0.2
+    assert body["top_p"] == 0.9
+    assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
     assert body["tool_choice"] == "auto"
     assert body["tools"] == [
         {
@@ -190,9 +195,10 @@ def test_chat_payload_options_tools_and_stream():
                 "description": "Читает файл",
                 "parameters": TOOL.parameters,
             },
-        }
+        },
     ]
-    assert "parallel_tool_calls" not in body and "max_tokens" not in body
+    assert "parallel_tool_calls" not in body
+    assert "max_tokens" not in body
     plain = chat_payload(msgs, None, model="M", temperature=0.2, stream=False, tool_choice="none")
     assert plain["stream"] is False
     assert not {"tools", "tool_choice", "stream_options"} & plain.keys()
@@ -202,7 +208,8 @@ def test_chat_payload_options_tools_and_stream():
 
 def test_probe_payload_asks_for_one_token():
     body = probe_payload("текст", "M", stream=True)
-    assert body["max_tokens"] == 1 and body["messages"] == [{"role": "user", "content": "текст"}]
+    assert body["max_tokens"] == 1
+    assert body["messages"] == [{"role": "user", "content": "текст"}]
     assert body["stream_options"] == {"include_usage": True}
     assert "stream_options" not in probe_payload("т", "M", stream=False)
 
@@ -236,8 +243,10 @@ def test_finish_reason_table(finish, calls, done, expected, kept):
     if done:
         chunks.append("[DONE]")
     turn, shown = _consume(_sse(*chunks))
-    assert turn.finish_reason == expected and len(turn.message.function_calls) == kept
-    assert turn.message.content == "Текст" and shown == ["Текст"]
+    assert turn.finish_reason == expected
+    assert len(turn.message.function_calls) == kept
+    assert turn.message.content == "Текст"
+    assert shown == ["Текст"]
 
 
 def test_usage_chunk_ends_the_answer_and_counts_cache():
@@ -264,9 +273,10 @@ def test_calls_streamed_in_pieces_by_index():
             _delta(tool_calls=[_call(0, args='th": "a.txt"}')]),
             _delta("tool_calls"),
             "[DONE]",
-        )
+        ),
     )
-    assert turn.finish_reason == "function_call" and shown == []
+    assert turn.finish_reason == "function_call"
+    assert shown == []
     assert [(c.id, c.name, c.arguments) for c in turn.message.function_calls] == [
         ("c1", "read_file", {"path": "a.txt"}),
         ("c2", "grep", {"q": "x"}),
@@ -282,7 +292,7 @@ def test_calls_without_index_follow_id_changes():
             _delta(tool_calls=[_call(id="c2", name="g", args="{}")]),
             _delta(tool_calls=[_call(args="")]),  # без id — к последнему
             _delta("tool_calls"),
-        )
+        ),
     )
     assert [(c.id, c.name, c.arguments) for c in turn.message.function_calls] == [
         ("c1", "f", {"a": 1}),
@@ -298,7 +308,7 @@ def test_repeated_name_and_repeated_arguments_are_not_glued():
             # сервер повторил аргументы целиком в последнем куске
             _delta(tool_calls=[_call(0, args='{"path": "a", "content": "x\\ny"}')]),
             _delta("tool_calls"),
-        )
+        ),
     )
     (call,) = turn.message.function_calls
     assert call.name == "write_file"  # не «write_filewrite_file»
@@ -307,14 +317,15 @@ def test_repeated_name_and_repeated_arguments_are_not_glued():
 
 def test_new_call_on_a_reused_index_is_not_merged_into_the_old_one():
     """Сервер даёт каждому параллельному вызову index 0: новый id с именем — новый вызов,
-    иначе второй вызов молча пропал бы (его аргументы приклеились бы к первому)."""
+    иначе второй вызов молча пропал бы (его аргументы приклеились бы к первому).
+    """
     turn, _ = _consume(
         _sse(
             _delta(tool_calls=[_call(0, id="call_A", name="read_file", args='{"path": "a.py"}')]),
             _delta(tool_calls=[_call(0, id="call_B", name="run_shell", args='{"command": ')]),
             _delta(tool_calls=[_call(0, args='"pytest -q"}')]),  # продолжение — к последнему
             _delta("tool_calls"),
-        )
+        ),
     )
     assert [(c.id, c.name, c.arguments) for c in turn.message.function_calls] == [
         ("call_A", "read_file", {"path": "a.py"}),
@@ -329,10 +340,10 @@ def test_fresh_id_without_a_name_continues_the_call():
             _delta(tool_calls=[_call(0, id="c1", name="read_file", args='{"path": ')]),
             _delta(tool_calls=[_call(0, id="c2", args='"a.py"}')]),
             _delta("tool_calls"),
-        )
+        ),
     )
     assert [(c.id, c.name, c.arguments) for c in turn.message.function_calls] == [
-        ("c1", "read_file", {"path": "a.py"})
+        ("c1", "read_file", {"path": "a.py"}),
     ]
 
 
@@ -346,8 +357,8 @@ def test_whole_call_in_one_chunk_and_object_arguments():
                     _call(1, name="g", args="[1, 2]"),  # не объект — пустые аргументы
                     _call(2, args="{}"),  # без имени — отбрасывается
                 ],
-            )
-        )
+            ),
+        ),
     )
     calls = turn.message.function_calls
     assert [(c.name, c.arguments) for c in calls] == [("f", {"a": 1}), ("g", {})]
@@ -358,7 +369,8 @@ def test_parse_arguments_is_tolerant():
     assert parse_arguments("") == {}
     assert parse_arguments('{"a": "x\ny"}') == {"a": "x\ny"}
     assert parse_arguments('{"a": 1}{"a": 1}') == {"a": 1}
-    assert parse_arguments("не json") == {} and parse_arguments("42") == {}
+    assert parse_arguments("не json") == {}
+    assert parse_arguments("42") == {}
 
 
 def test_reasoning_is_collected_but_not_shown():
@@ -369,9 +381,10 @@ def test_reasoning_is_collected_but_not_shown():
             _delta(thinking="и всё"),
             _delta(content=[{"type": "text", "text": "Ответ"}]),
             _delta("stop"),
-        )
+        ),
     )
-    assert shown == ["Ответ"] and turn.message.content == "Ответ"
+    assert shown == ["Ответ"]
+    assert turn.message.content == "Ответ"
     assert turn.message.reasoning == "думаю ещё и всё"
 
 
@@ -385,7 +398,8 @@ def test_reasoning_is_collected_but_not_shown():
 )
 def test_leaked_reasoning_tag_is_dropped(pieces, content):
     turn, shown = _consume(_sse(*[_delta(content=p) for p in pieces], _delta("stop")))
-    assert turn.message.content == content and "".join(shown) == content
+    assert turn.message.content == content
+    assert "".join(shown) == content
 
 
 def test_only_first_choice_counts():
@@ -393,21 +407,23 @@ def test_only_first_choice_counts():
         "choices": [
             {"index": 1, "delta": {"content": "чужой"}},
             {"index": 0, "delta": {"content": "свой"}},
-        ]
+        ],
     }
     turn, _ = _consume(_sse(chunk, _delta("stop")))
     assert turn.message.content == "свой"
 
 
 @pytest.mark.parametrize(
-    "content_type", ["application/x-ndjson", "application/stream+json", "", "application/json"]
+    "content_type",
+    ["application/x-ndjson", "application/stream+json", "", "application/json"],
 )
 def test_ndjson_and_mislabelled_streams(content_type):
     lines = [json.dumps(_delta(content="При")), json.dumps(_delta("stop", content="вет"))]
     if content_type == "application/json":
         lines = [f"data: {line}" for line in lines]  # SSE с чужим content-type
     turn, shown = _consume(lines, content_type)
-    assert shown == ["При", "вет"] and turn.finish_reason == "stop"
+    assert shown == ["При", "вет"]
+    assert turn.finish_reason == "stop"
 
 
 def test_whole_json_response_is_parsed_like_a_stream():
@@ -423,18 +439,19 @@ def test_whole_json_response_is_parsed_like_a_stream():
                             "id": "c1",
                             "type": "function",
                             "function": {"name": "f", "arguments": "{}"},
-                        }
+                        },
                     ],
                 },
                 "finish_reason": "tool_calls",
-            }
+            },
         ],
         "usage": {"prompt_tokens": 3, "completion_tokens": 1},
     }
     pretty = json.dumps(whole, indent=2).splitlines()
     for lines, content_type in ((pretty, "application/json"), (pretty, "")):
         turn, _ = _consume(lines, content_type)
-        assert turn.finish_reason == "function_call" and turn.usage.prompt_tokens == 3
+        assert turn.finish_reason == "function_call"
+        assert turn.usage.prompt_tokens == 3
     assert parse_response(whole).message.function_calls[0].id == "c1"
 
 
@@ -471,12 +488,14 @@ def test_bad_whole_responses_raise():
 def test_sse_events_without_blank_lines_between_them():
     lines = [f"data: {json.dumps(_delta(content=t))}" for t in ("При", "вет")] + ["data: [DONE]"]
     turn, shown = _consume(lines)
-    assert shown == ["При", "вет"] and turn.finish_reason == "stop"
+    assert shown == ["При", "вет"]
+    assert turn.finish_reason == "stop"
 
 
 def test_garbage_lines_in_stream_are_skipped():
     turn, shown = _consume([": ping", "", "data: не json", "", *_sse(_delta("stop", content="ok"))])
-    assert shown == ["ok"] and turn.finish_reason == "stop"
+    assert shown == ["ok"]
+    assert turn.finish_reason == "stop"
 
 
 def test_nothing_after_done_is_read():
@@ -487,7 +506,9 @@ def test_nothing_after_done_is_read():
         raise AssertionError("поток читается после [DONE]")
 
     turn, shown = _consume(lines())
-    assert shown == ["ok"] and turn.message.content == "ok" and turn.finish_reason == "stop"
+    assert shown == ["ok"]
+    assert turn.message.content == "ok"
+    assert turn.finish_reason == "stop"
 
 
 def _cut(lines: list[str]):
@@ -500,11 +521,12 @@ def test_drop_after_finish_reason_keeps_the_answer():
     """Ответ закончен (finish_reason), осталось только usage и ``[DONE]``: обрыв — не ошибка."""
     call = _call(0, id="c1", name="read_file", args='{"path": "a.py"}')
     turn, shown = _consume(
-        _cut(_sse(_delta(content="Читаю"), _delta(tool_calls=[call]), _delta("tool_calls")))
+        _cut(_sse(_delta(content="Читаю"), _delta(tool_calls=[call]), _delta("tool_calls"))),
     )
-    assert shown == ["Читаю"] and turn.finish_reason == "function_call"
+    assert shown == ["Читаю"]
+    assert turn.finish_reason == "function_call"
     assert turn.message.function_calls == [
-        FunctionCall(name="read_file", arguments={"path": "a.py"}, id="c1")
+        FunctionCall(name="read_file", arguments={"path": "a.py"}, id="c1"),
     ]
 
 

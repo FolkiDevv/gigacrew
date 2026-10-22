@@ -22,7 +22,7 @@ def _names(text: str, language: str) -> list[tuple[str, str]]:
 
 
 @pytest.mark.parametrize(
-    "path, expected",
+    ("path", "expected"),
     [
         ("a.py", "python"),
         ("src/x.TS", "typescript"),
@@ -71,7 +71,7 @@ def test_python_symbols_with_nesting_and_ranges():
         if True:
             def conditional():
                 pass
-        '''
+        ''',
     )
     symbols = extract_symbols(src, "python")
     got = [(s.kind, s.qualname, s.line, s.end_line, s.depth) for s in symbols]
@@ -98,7 +98,7 @@ def test_python_syntax_error_falls_back_to_tree_sitter():
                     return (
             def tail():
                 pass
-            """
+            """,
         ),
         "python",
     )
@@ -131,7 +131,7 @@ def test_markdown_headings_with_parents_skip_code_fences():
 
 
 @pytest.mark.parametrize(
-    "language, src, expected",
+    ("language", "src", "expected"),
     [
         (
             "typescript",
@@ -316,7 +316,7 @@ def test_python_methods_under_class_level_if_and_try():
             except ImportError:
                 def slow(self):
                     pass
-        """
+        """,
     )
     got = [(s.kind, s.qualname, s.depth) for s in extract_symbols(src, "python")]
     assert got == [
@@ -338,7 +338,7 @@ def test_python_try_blocks_in_source_order():
             def c(): pass
         finally:
             def d(): pass
-        """
+        """,
     )
     assert [s.name for s in extract_symbols(src, "python")] == ["a", "b", "c", "d"]
 
@@ -367,7 +367,7 @@ def test_python_refs_scopes_kinds_and_locals():
 
         def helper(value):
             return Agent().run(value)
-        """
+        """,
     )
     got = [(r.name, r.kind, r.line, r.scope) for r in facts.refs]
     assert got == [
@@ -434,7 +434,7 @@ def test_python_docstring_and_name_column():
 
                 async def  бег(self):
                     """Очень длинная документация """ + "x" * 0
-            '''
+            ''',
         ),
         "python",
     )
@@ -456,7 +456,7 @@ def test_regex_symbols_have_name_column():
 
 
 @pytest.mark.parametrize(
-    "path, expected",
+    ("path", "expected"),
     [
         ("a/b/c.py", ["a", "b", "c"]),
         ("a/b/__init__.py", ["a", "b"]),
@@ -491,14 +491,16 @@ def test_python_scopes_of_comprehensions_imports_and_defaults():
         @decorate(option)
         def other(option):
             return option
-        """
+        """,
     )
     got = {(r.name, r.kind, r.scope) for r in facts.refs}
     assert ("items", "name", "") in got  # первый итерируемый — в объемлющей области
-    assert ("factory", "call", "run") in got and ("MODE", "name", "run") in got
+    assert ("factory", "call", "run") in got
+    assert ("MODE", "name", "run") in got
     assert ("lazy", "call", "run") in got  # локальный импорт — использование
     assert ("helper", "call", "run") in got  # переменная включения не скрывает глобальное
-    assert ("decorate", "call", "other") in got and ("option", "name", "other") in got
+    assert ("decorate", "call", "other") in got
+    assert ("option", "name", "other") in got
 
 
 def test_python_annotations_globals_and_match_rest():
@@ -519,12 +521,12 @@ def test_python_annotations_globals_and_match_rest():
             match event:
                 case {"kind": kind, **settings}:
                     return settings
-        """
+        """,
     )
     got = [(r.name, r.kind, r.line) for r in facts.refs]
     assert ("Model", "name", 1) in got  # аннотации — в объемлющей области
     assert ("helper", "call", 8) in got  # global снимает локальное имя внешней функции
-    assert all(r.name not in ("settings", "kind") for r in facts.refs)  # case {**rest}
+    assert all(r.name not in {"settings", "kind"} for r in facts.refs)  # case {**rest}
 
 
 def test_line_numbers_ignore_form_feed_and_unicode_separators():
@@ -548,7 +550,7 @@ def test_python_nonlocal_stays_local_and_same_line_refs_are_separate():
 
         def both(a, b):
             a.save(); b.save()
-        """
+        """,
     )
     assert all(r.name != "callback" for r in facts.refs)  # nonlocal — локальное внешней
     assert [(r.name, r.line, r.col) for r in facts.refs if r.name == "save"] == [

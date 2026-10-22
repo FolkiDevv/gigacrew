@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Generator
 from contextlib import contextmanager
 
 from pydantic import BaseModel, Field
@@ -31,8 +31,8 @@ from gigacrew.project.index import (
     is_corruption,
 )
 from gigacrew.project.repomap import CHARS_PER_TOKEN, build_repo_map
+from gigacrew.project.secret_paths import is_secret_target
 from gigacrew.project.symbols import Symbol, language_of
-from gigacrew.safety.paths import is_secret_target
 from gigacrew.security import resolve_in_root
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 
@@ -42,7 +42,7 @@ MAX_LISTED_FILES = 15  # файлов в строках «импортирует
 
 
 @contextmanager
-def open_index(ctx: ToolContext) -> Iterator[ProjectIndex]:
+def open_index(ctx: ToolContext) -> Generator[ProjectIndex]:
     index = ProjectIndex(ctx.workspace)
     try:
         with index:
@@ -54,7 +54,7 @@ def open_index(ctx: ToolContext) -> Iterator[ProjectIndex]:
             index.discard()
             raise ToolError(
                 f"Индекс проекта был повреждён ({e}) и удалён — повторите вызов: "
-                "индекс построится заново."
+                "индекс построится заново.",
             ) from e
         raise ToolError(f"Индекс проекта недоступен: {e}") from e
 
@@ -93,7 +93,7 @@ class FindSymbolParams(BaseModel):
         description=(
             "Name or part of the name of a definition (case-insensitive): 'Agent', "
             "'run_turn'; a class method — 'Agent.run_turn'"
-        )
+        ),
     )
     kind: str | None = Field(
         default=None,
@@ -103,12 +103,13 @@ class FindSymbolParams(BaseModel):
         ),
     )
     glob: str | None = Field(
-        default=None, description="Limit to files matching a glob: '*.py' or 'src/**/*.ts'"
+        default=None,
+        description="Limit to files matching a glob: '*.py' or 'src/**/*.ts'",
     )
     max_results: int = Field(default=50, description="Maximum number of results")
 
 
-class FindSymbolTool(Tool):
+class FindSymbolTool(Tool[FindSymbolParams]):
     name = "find_symbol"
     read_only = True
     description = (
@@ -129,7 +130,10 @@ class FindSymbolTool(Tool):
         with open_index(ctx) as index:
             refreshed = index.refresh()
             hits, total = index.find_symbols(
-                params.query, kind=params.kind, path_glob=params.glob, limit=limit
+                params.query,
+                kind=params.kind,
+                path_glob=params.glob,
+                limit=limit,
             )
         if not hits:
             body = (
@@ -164,7 +168,7 @@ def _entry_line(entry: FileEntry, shown_path: str) -> str:
     return f"{shown_path} ({', '.join(details)})"
 
 
-class FileOutlineTool(Tool):
+class FileOutlineTool(Tool[FileOutlineParams]):
     name = "file_outline"
     read_only = True
     description = (
@@ -186,7 +190,7 @@ class FileOutlineTool(Tool):
             if is_excluded(ctx.root, target):
                 raise ToolError(
                     f"Файл исключён из индекса (.gitignore или служебный каталог): "
-                    f"{params.path}. Используйте read_file."
+                    f"{params.path}. Используйте read_file.",
                 )
         with open_index(ctx) as index:
             # импорты Python-файла сопоставляются с другими файлами проекта — нужен весь индекс
@@ -199,7 +203,11 @@ class FileOutlineTool(Tool):
             return self._file(index, rel, params.path, refreshed)
 
     def _file(
-        self, index: ProjectIndex, rel: str, shown: str, refreshed: RefreshStats
+        self,
+        index: ProjectIndex,
+        rel: str,
+        shown: str,
+        refreshed: RefreshStats,
     ) -> ToolResult:
         entry = index.file_entry(rel)
         if entry is None:
@@ -210,7 +218,7 @@ class FileOutlineTool(Tool):
         if entry.status == STATUS_LARGE:
             raise ToolError(
                 f"Файл слишком большой для разбора (>{MAX_INDEX_FILE_BYTES} байт): {shown}. "
-                "Используйте search_content или read_file с диапазоном строк."
+                "Используйте search_content или read_file с диапазоном строк.",
             )
         if entry.status == STATUS_BINARY:
             raise ToolError(f"Бинарный файл: {shown}")
@@ -236,7 +244,7 @@ class FileOutlineTool(Tool):
 
     @staticmethod
     def _imports(index: ProjectIndex, rel: str) -> str:
-        targets = sorted({e.target for e in index.imports_of(rel) if e.target not in (None, rel)})
+        targets = sorted({e.target for e in index.imports_of(rel) if e.target not in {None, rel}})
         users = [path for path, _ in index.imported_by(rel)]
         text = ""
         if targets:
@@ -281,7 +289,7 @@ class FileOutlineTool(Tool):
             lines.append(f"… и ещё {len(direct) - MAX_OUTLINE_FILES} файлов")
         lines.append(
             f"(всего файлов: {len(entries)} — показана сводка по подкаталогам; "
-            "уточните путь, чтобы увидеть файлы)"
+            "уточните путь, чтобы увидеть файлы)",
         )
         return "\n".join(lines)
 
@@ -304,7 +312,7 @@ class RepoMapParams(BaseModel):
     max_tokens: int = Field(default=1500, description="Size of the map (estimated tokens)")
 
 
-class RepoMapTool(Tool):
+class RepoMapTool(Tool[RepoMapParams]):
     name = "repo_map"
     read_only = True
     description = (

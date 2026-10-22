@@ -29,7 +29,7 @@ import select
 import signal
 import sys
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Generator
 from typing import Any
 
 _ESC = 0x1B
@@ -93,7 +93,8 @@ class KeyParser:
 
     def _skip_sequence_byte(self, byte: int) -> bool:
         """Поглощает байт ESC-последовательности. False — последовательность кончилась
-        раньше, и байт нужно обработать как обычный."""
+        раньше, и байт нужно обработать как обычный.
+        """
         state = self._state
         if state == "esc":
             if byte == 0x5B:  # [
@@ -215,7 +216,7 @@ class EscInterrupt:
             self._saved_mode = None
 
     @contextlib.contextmanager
-    def paused(self) -> Iterator[None]:
+    def paused(self) -> Generator[None]:
         """Временно вернуть терминал (для ``input()`` с вопросом пользователю)."""
         if not self.enabled or self._thread is None or self._pause.is_set():
             yield
@@ -306,7 +307,7 @@ class EscInterrupt:
         chars = []
         while msvcrt.kbhit():
             ch = msvcrt.getwch()
-            if ch in ("\x00", "\xe0"):  # стрелки и F-клавиши: префикс + код
+            if ch in {"\x00", "\xe0"}:  # стрелки и F-клавиши: префикс + код
                 if msvcrt.getwch() == "\x0f":  # Shift+Tab — как в POSIX-терминале
                     chars.append("\x1b[Z")
                 continue

@@ -90,18 +90,24 @@ def test_render_window_and_scroll():
     state = PickerState(CHATS, now=NOW)
     text = _text(state)
     assert "Чаты проекта · 12" in text
-    assert "❯ чат номер 0" in text and "чат номер 7" in text and "чат номер 8" not in text
-    assert "↓ ещё 4" in text and "↑ ещё" not in text
+    assert "❯ чат номер 0" in text
+    assert "чат номер 7" in text
+    assert "чат номер 8" not in text
+    assert "↓ ещё 4" in text
+    assert "↑ ещё" not in text
     assert "только что · 1 запрос" in text
     for _ in range(9):
         state.move(1)
     text = _text(state)
-    assert "❯ чат номер 9" in text and "↑ ещё 2" in text and "↓ ещё 2" in text
+    assert "❯ чат номер 9" in text
+    assert "↑ ещё 2" in text
+    assert "↓ ещё 2" in text
 
 
 def test_meta_counts_messages_besides_requests(monkeypatch):
     """Ответы на вопросы модели и шаги с инструментами — не запросы: длинный чат из двух
-    запросов не должен выглядеть коротким."""
+    запросов не должен выглядеть коротким.
+    """
     chat = _chat(1, "долгий чат", messages=108)
     assert "сегодня 14:00 · 2 запроса · 108 сообщений" in _text(PickerState([chat], now=NOW), 100)
     ui, buf = _console(monkeypatch, "")
@@ -112,12 +118,16 @@ def test_meta_counts_messages_besides_requests(monkeypatch):
 def test_render_selected_details_current_mark_and_query():
     chats = [_chat(0, "первый", preview="последний ответ", model="Alpha-2-Max"), _chat(1)]
     text = _text(PickerState(chats, current_id=chats[1].id, now=NOW))
-    assert "последний ответ" in text and "Alpha-2-Max" in text and chats[0].id in text
+    assert "последний ответ" in text
+    assert "Alpha-2-Max" in text
+    assert chats[0].id in text
     assert "чат номер 1 (текущий)" in text
     state = PickerState(chats, now=NOW)
     state.set_query("нет")
     text = _text(state)
-    assert "поиск: нет" in text and "найдено 0" in text and "ничего не найдено" in text
+    assert "поиск: нет" in text
+    assert "найдено 0" in text
+    assert "ничего не найдено" in text
 
 
 def test_render_fits_width():
@@ -160,7 +170,8 @@ def test_plain_picker(monkeypatch):
     ui, buf = _console(monkeypatch, "0", "x", "3")
     assert ui.pick_chat(CHATS[:3], current_id=CHATS[1].id) == CHATS[2]
     out = buf.getvalue()
-    assert "Чаты проекта · 3" in out and "чат номер 1 (текущий)" in out
+    assert "Чаты проекта · 3" in out
+    assert "чат номер 1 (текущий)" in out
     assert "введите номер от 1 до 3" in out
 
 
@@ -207,7 +218,8 @@ def test_chat_resumed_shows_last_exchanges(monkeypatch):
     assert "раньше: 1 запрос · 2 сообщения — сохранены в чате, на экран не выводятся" in out
     assert "нулевой" not in out
     assert out.index("❯ первый вопрос") < out.index("первый ответ") < out.index("❯ второй вопрос")
-    assert "\x1b" not in out and "❯ почини [31mтесты" in out  # sanitize убрал ESC
+    assert "\x1b" not in out
+    assert "❯ почини [31mтесты" in out
     assert "● $ pytest -x" in out  # шаг — как в ленте, без итога: его нет в истории
     assert "Готово: тесты проходят" in out
 
@@ -225,10 +237,13 @@ def test_chat_resumed_folds_tool_calls_and_clips_earlier_answers(monkeypatch):
     ui.chat_resumed(_chat(1, "разбери логи"), messages)
     out = buf.getvalue()
     assert "раньше" not in out  # показаны все обмены
-    assert "… ещё 3 вызова инструментов" in out and out.count("● run_shell") == 5
+    assert "… ещё 3 вызова инструментов" in out
+    assert out.count("● run_shell") == 5
     first, last = out.split("❯ а теперь итог")
-    assert "пропущено" in first and "абзац 19" in first  # ранний ответ сокращён
-    assert "пропущено" not in last and "абзац 10" in last  # последний — целиком
+    assert "пропущено" in first
+    assert "абзац 19" in first
+    assert "пропущено" not in last
+    assert "абзац 10" in last
 
 
 def test_chat_resumed_skips_meta_messages(monkeypatch):
@@ -241,7 +256,8 @@ def test_chat_resumed_skips_meta_messages(monkeypatch):
     ]
     ui.chat_resumed(_chat(0, "спланируй промокоды"), messages)
     out = buf.getvalue()
-    assert "❯ спланируй промокоды" in out and "Промокоды готовы" in out
+    assert "❯ спланируй промокоды" in out
+    assert "Промокоды готовы" in out
     assert "system-reminder" not in out
 
 
@@ -259,7 +275,8 @@ def test_chat_resumed_after_interrupted_turn_shows_no_stale_answer(monkeypatch):
     # Ответ на первый вопрос — в своём обмене, а не ответом на прерванный второй.
     before, after = out.split("❯ второй вопрос")
     assert "ответ на первый" in before
-    assert "ответ на первый" not in after and "ответа нет" in after
+    assert "ответ на первый" not in after
+    assert "ответа нет" in after
 
 
 def test_chat_resumed_folds_consecutive_reads_and_edits(monkeypatch):

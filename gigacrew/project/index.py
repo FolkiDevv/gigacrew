@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from gigacrew.project.files import glob_match, is_excluded, walk_files
+from gigacrew.project.secret_paths import is_secret_entry
 from gigacrew.project.symbols import Symbol, extract, language_of, module_parts
 from gigacrew.project.workspace import Workspace
 
@@ -51,12 +52,13 @@ def is_corruption(error: BaseException) -> bool:
     """Ошибка SQLite «база повреждена»: испорченные страницы данных (сбой диска, запись
     наполовину) или не база вовсе. Заголовок и схему проверяет :meth:`ProjectIndex.open`,
     а порча страниц всплывает только на запросе — такой индекс надо пересоздать
-    (:meth:`ProjectIndex.discard`), иначе каждый запрос к нему будет падать."""
+    (:meth:`ProjectIndex.discard`), иначе каждый запрос к нему будет падать.
+    """
     code = getattr(error, "sqlite_errorcode", None)
     return (
         isinstance(error, sqlite3.DatabaseError)
         and code is not None
-        and code & 0xFF in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB)
+        and code & 0xFF in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}
     )
 
 
@@ -78,11 +80,14 @@ def remove_change_listener(listener: ChangeListener) -> None:
 
 
 def _notify_changes(
-    root: Path, added: tuple[str, ...], updated: tuple[str, ...], removed: tuple[str, ...]
+    root: Path,
+    added: tuple[str, ...],
+    updated: tuple[str, ...],
+    removed: tuple[str, ...],
 ) -> None:
     if not (added or updated or removed):
         return
-    for listener in list(_change_listeners):
+    for listener in _change_listeners:
         try:
             listener(root, added, updated, removed)
         except Exception:  # подписчик не должен ломать обновление индекса
@@ -330,7 +335,8 @@ class ProjectIndex:
                 conn.executescript(_SCHEMA)
                 with conn:
                     conn.execute(
-                        "INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
+                        "INSERT INTO meta VALUES ('schema_version', ?)",
+                        (str(SCHEMA_VERSION),),
                     )
                 return conn
             row = None
@@ -346,7 +352,8 @@ class ProjectIndex:
 
     def discard(self) -> None:
         """Удаляет базу (повреждённую, см. :func:`is_corruption`): следующее открытие
-        создаст пустую, а обновление построит индекс заново."""
+        создаст пустую, а обновление построит индекс заново.
+        """
         self.close()
         self._recreate_file()
         self._modules.clear()
@@ -382,17 +389,16 @@ class ProjectIndex:
         return (base,) if base.exists() else ()
 
     def refresh(
-        self, base: Path | None = None, *, progress: Callable[[int], None] | None = None
+        self,
+        base: Path | None = None,
+        *,
+        progress: Callable[[int], None] | None = None,
     ) -> RefreshStats:
         """Синхронизирует индекс с файлами под ``base`` (по умолчанию — весь проект).
 
         ``progress`` получает число просмотренных файлов. Прерывание (в т.ч. Ctrl+C)
         откатывает только незафиксированную пачку изменений.
         """
-        # Импорт здесь: safety.bash загружает gigacrew.project (treesitter), а с ним и
-        # этот модуль — импорт на уровне модуля замкнул бы цикл.
-        from gigacrew.safety.paths import is_secret_entry
-
         started = time.monotonic()
         db = self._db
         base = self.root if base is None else base
@@ -403,7 +409,8 @@ class ProjectIndex:
         known = {
             path: (size, mtime) if status != STATUS_ERROR else None
             for path, size, mtime, status in db.execute(
-                f"SELECT path, size, mtime_ns, status FROM files WHERE {cond}", args
+                f"SELECT path, size, mtime_ns, status FROM files WHERE {cond}",
+                args,
             )
         }
         scanned = added = updated = pending = 0
@@ -547,7 +554,7 @@ class ProjectIndex:
             (lang, n)
             for lang, n in db.execute(
                 "SELECT language, COUNT(*) AS n FROM files WHERE language IS NOT NULL "
-                "GROUP BY language ORDER BY n DESC, language"
+                "GROUP BY language ORDER BY n DESC, language",
             )
         ]
         updated = self._meta("updated_at")
@@ -621,12 +628,14 @@ class ProjectIndex:
 
     def file_entry(self, rel_path: str) -> FileEntry | None:
         row = self._db.execute(
-            "SELECT path, language, lines, status FROM files WHERE path = ?", (rel_path,)
+            "SELECT path, language, lines, status FROM files WHERE path = ?",
+            (rel_path,),
         ).fetchone()
         if row is None:
             return None
         count = self._db.execute(
-            "SELECT COUNT(*) FROM symbols WHERE path = ?", (rel_path,)
+            "SELECT COUNT(*) FROM symbols WHERE path = ?",
+            (rel_path,),
         ).fetchone()[0]
         return FileEntry(*row, symbols=count)
 
@@ -641,10 +650,16 @@ class ProjectIndex:
         return _symbol(row) if row else None
 
     def ref_at(
-        self, rel_path: str, line: int, names: Iterable[str], *, col: int | None = None
+        self,
+        rel_path: str,
+        line: int,
+        names: Iterable[str],
+        *,
+        col: int | None = None,
     ) -> tuple[str, str] | None:
         """(вид, область) использования одного из ``names`` в строке (и столбце, если
-        задан); из нескольких — вызов первым."""
+        задан); из нескольких — вызов первым.
+        """
         names = list(names)
         if not names:
             return None
@@ -777,12 +792,14 @@ class ProjectIndex:
 
         marks = ",".join("?" * len(names))
         imported = self._db.execute(
-            f"SELECT path, line, alias FROM imports WHERE name IN ({marks})", names
+            f"SELECT path, line, alias FROM imports WHERE name IN ({marks})",
+            names,
         ).fetchall()
         rows: list[tuple[str, int, int, str, str]] = []
         if kinds is None or kinds - {REF_IMPORT}:
             rows += self._db.execute(
-                f"SELECT path, line, col, kind, scope FROM refs WHERE name IN ({marks})", names
+                f"SELECT path, line, col, kind, scope FROM refs WHERE name IN ({marks})",
+                names,
             ).fetchall()
             # `from m import f as g` — в этом файле f используется как g
             for path, alias in {(p, a) for p, _, a in imported if a not in names}:

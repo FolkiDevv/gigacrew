@@ -39,7 +39,8 @@ _NDJSON_TYPES = ("application/x-ndjson", "application/ndjson", "application/stre
 # ------------------------------------------------------------------ #
 def _call_id(call: FunctionCall, message: int, position: int) -> str:
     """Id вызова для запроса: свой у вызова, иначе стабильный по месту и содержимому
-    (чаты, сохранённые без id) — тот же у вызова и его результата."""
+    (чаты, сохранённые без id) — тот же у вызова и его результата.
+    """
     if call.id:
         return call.id
     raw = json.dumps([message, position, call.name, call.arguments], sort_keys=True, default=str)
@@ -68,7 +69,9 @@ def _assistant(msg: Message, ids: list[str], *, reasoning: bool) -> dict[str, An
 
 
 def messages_payload(
-    messages: Sequence[Message], *, reasoning: bool = True
+    messages: Sequence[Message],
+    *,
+    reasoning: bool = True,
 ) -> list[dict[str, Any]]:
     """История для запроса.
 
@@ -144,7 +147,8 @@ def chat_payload(
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Тело запроса chat/completions. ``options`` — параметры генерации модели (из
-    каталога): поля gigacrew (модель, температура, поток) важнее."""
+    каталога): поля gigacrew (модель, температура, поток) важнее.
+    """
     payload: dict[str, Any] = dict(options or {})
     payload.update(
         model=model,
@@ -241,7 +245,9 @@ class _CallParts:
             self.parsed if self.parsed is not None else parse_arguments("".join(self.arguments))
         )
         return FunctionCall(
-            name=self.name, arguments=arguments, id=self.id or f"call_{uuid.uuid4().hex[:24]}"
+            name=self.name,
+            arguments=arguments,
+            id=self.id or f"call_{uuid.uuid4().hex[:24]}",
         )
 
 
@@ -349,14 +355,14 @@ class ChunkBuilder:
         """
         calls = [call for call in (parts.call() for parts in self._calls) if call is not None]
         reason = self._finish_reason
-        if reason in ("length", "max_tokens"):
+        if reason in {"length", "max_tokens"}:
             finish, calls = "length", []
         elif reason is None:
             if done or self.finished:
                 finish = "function_call" if calls else "stop"
             else:
                 finish, calls = "incomplete", []
-        elif reason in ("tool_calls", "function_call"):
+        elif reason in {"tool_calls", "function_call"}:
             finish = "function_call" if calls else "incomplete"
         elif reason == "content_filter":
             finish, calls = reason, []
@@ -369,7 +375,9 @@ class ChunkBuilder:
             reasoning="".join(self._reasoning),
         )
         return AssistantTurn(
-            message=message, finish_reason=finish, usage=Usage.from_raw(self._usage)
+            message=message,
+            finish_reason=finish,
+            usage=Usage.from_raw(self._usage),
         )
 
 
@@ -394,7 +402,8 @@ def _is_object(text: str) -> bool:
 
 def _stream_kind(content_type: str, first: str) -> str:
     """Формат тела: ``sse``, ``ndjson`` или ``json`` (цельный ответ) — по content-type и
-    первой непустой строке."""
+    первой непустой строке.
+    """
     kind = content_type.split(";", 1)[0].strip().lower()
     if kind == "text/event-stream" or first.lstrip().startswith(_SSE_PREFIXES):
         return "sse"
@@ -442,7 +451,10 @@ def _decode(data: str, kind: str) -> list[Any]:
 
 
 def consume_stream(
-    lines: Iterable[str], emit: Callable[[str], None], *, content_type: str = ""
+    lines: Iterable[str],
+    emit: Callable[[str], None],
+    *,
+    content_type: str = "",
 ) -> AssistantTurn:
     """Разбирает тело ответа (поток или целый ответ), отдавая куски текста в ``emit``.
 
@@ -472,7 +484,7 @@ def consume_stream(
                     raise ApiError(f"API вернул ошибку в потоке: {error}")
                 if kind == "json" and not isinstance(chunk.get("choices"), list):
                     raise ApiError(
-                        f"Неожиданный формат ответа API: {str(chunk)[:ERROR_BODY_CHARS]}"
+                        f"Неожиданный формат ответа API: {str(chunk)[:ERROR_BODY_CHARS]}",
                     )
                 piece = builder.add(chunk)
                 if piece:

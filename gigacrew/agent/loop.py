@@ -59,7 +59,7 @@ from gigacrew.agent.guard import (
     ToolOutcome,
     call_key,
 )
-from gigacrew.agent.hooks import HookResult, HookRunner, PromptBlocked
+from gigacrew.agent.hooks import HookResult, HookRunner, PromptBlockedError
 from gigacrew.agent.prompts import (
     SYSTEM_PROMPT,
     build_project_context,
@@ -726,7 +726,10 @@ class Agent:
             return True
 
     def reset(
-        self, conversation: Conversation | None = None, *, chat_id: str | None = None
+        self,
+        conversation: Conversation | None = None,
+        *,
+        chat_id: str | None = None,
     ) -> None:
         """Начать новый диалог или продолжить сохранённый (``conversation``).
 
@@ -755,7 +758,8 @@ class Agent:
 
     def end_session(self, reason: str) -> None:
         """Хуки SessionEnd (``reason``: ``prompt_input_exit``, ``other``, ``clear``,
-        ``resume``) — только побочные действия хуков."""
+        ``resume``) — только побочные действия хуков.
+        """
         self._hook(HookEvent.SESSION_END, reason, reason=reason)
 
     def _hook(self, event: HookEvent, target: str = "", **fields: Any) -> HookResult:
@@ -775,7 +779,11 @@ class Agent:
             **fields,
         }
         return self._hooks.run(
-            event, payload, cwd=self._workspace.root, events=self._events, target=target
+            event,
+            payload,
+            cwd=self._workspace.root,
+            events=self._events,
+            target=target,
         )
 
     def _notify(self, kind: str, message: str) -> None:
@@ -789,10 +797,10 @@ class Agent:
         return self._events.ask_user(questions)
 
     def _prompt_hooks(self, prompt: str) -> str:
-        """Хуки UserPromptSubmit: запрос с их контекстом или :class:`PromptBlocked`."""
+        """Хуки UserPromptSubmit: запрос с их контекстом или :class:`PromptBlockedError`."""
         result = self._hook(HookEvent.USER_PROMPT_SUBMIT, prompt=prompt)
         if result.blocked:
-            raise PromptBlocked(result.reason)
+            raise PromptBlockedError(result.reason)
         if not result.context:
             return prompt
         context = _reminder(f"{HOOK_CONTEXT_HEADER}\n{result.context_text}")
@@ -804,7 +812,7 @@ class Agent:
 
         При любом прерывании (Ctrl+C, ошибка LLM) история приводится в
         согласованное состояние, исключение пробрасывается дальше. Запрос, отклонённый
-        хуком UserPromptSubmit, — :class:`~gigacrew.agent.hooks.PromptBlocked`, история
+        хуком UserPromptSubmit, — :class:`~gigacrew.agent.hooks.PromptBlockedError`, история
         не меняется.
         """
         self._last_turn = None
@@ -881,7 +889,11 @@ class Agent:
         stats.stop_reason = "user_stop"
         self._events.on_notice("остановлен пользователем — подвожу итог", level="warn")
         return self._wrap_up(
-            specs, USER_STOP_REASON, MODEL_STOP_REASONS["user_stop"], stats, user_stop=True
+            specs,
+            USER_STOP_REASON,
+            MODEL_STOP_REASONS["user_stop"],
+            stats,
+            user_stop=True,
         )
 
     def _loop(self, specs: list[ToolSpec], guard: LoopGuard, stats: TurnStats) -> str:
@@ -951,7 +963,8 @@ class Agent:
                     self._forget_reply(turn, stats)
                     if cuts >= MAX_CUT_RETRIES:
                         message = OUTPUT_LIMIT_MESSAGE.format(
-                            count=cuts + 1, reason=turn.finish_reason
+                            count=cuts + 1,
+                            reason=turn.finish_reason,
                         )
                         return self._stopped(specs, StopReason("output_limit", message), stats)
                     cuts += 1
@@ -1053,7 +1066,7 @@ class Agent:
                 self._ctx,
                 plan,
                 on_show=lambda: self._events.on_notice(
-                    "план записан, но не отправлен на одобрение — показываю его"
+                    "план записан, но не отправлен на одобрение — показываю его",
                 ),
             )
         except ToolError:
@@ -1068,7 +1081,8 @@ class Agent:
 
     def _self_check_due(self, reviews: int) -> bool:
         """Нужна ли самопроверка: основной агент в режиме плана, план не менялся и в этом
-        ходе не показывался (``reviews`` — число показов до хода)."""
+        ходе не показывался (``reviews`` — число показов до хода).
+        """
         return (
             self._plan is not None
             and self._parent is None
@@ -1078,7 +1092,11 @@ class Agent:
         )
 
     def _self_check(
-        self, specs: list[ToolSpec], turn: AssistantTurn, stats: TurnStats, note: str = ""
+        self,
+        specs: list[ToolSpec],
+        turn: AssistantTurn,
+        stats: TurnStats,
+        note: str = "",
     ) -> AssistantTurn | None:
         """Ход в режиме плана кончился текстом — без плана и без вопроса: переспросить.
 
@@ -1115,7 +1133,10 @@ class Agent:
         return None
 
     def _run_calls(
-        self, calls: list[FunctionCall], guard: LoopGuard, stats: TurnStats
+        self,
+        calls: list[FunctionCall],
+        guard: LoopGuard,
+        stats: TurnStats,
     ) -> StopReason | None:
         """Выполняет вызовы из ответа модели по очереди.
 
@@ -1236,7 +1257,8 @@ class Agent:
         text = turn.message.content.strip()
         if text:
             self._conversation.add_assistant(
-                Message(role="assistant", content=turn.message.content), turn.usage
+                Message(role="assistant", content=turn.message.content),
+                turn.usage,
             )
         return text
 
@@ -1256,7 +1278,8 @@ class Agent:
 
     def _system_text(self) -> str:
         """Системное сообщение без краткого содержания: промпт, инструкции
-        подкаталогов, правила режима."""
+        подкаталогов, правила режима.
+        """
         parts = [
             self.system_prompt(),
             session_context_prompt(self._session_context),
@@ -1325,10 +1348,10 @@ class Agent:
         history = fit_history(self._conversation.context_messages(), budget)
         self._last_estimate = used + estimate_tokens(history)
         if reminder:
-            if history and history[-1].role in ("user", "function"):
+            if history and history[-1].role in {"user", "function"}:
                 last = history[-1]
                 history[-1] = last.model_copy(
-                    update={"content": _with_note(last.content, reminder)}
+                    update={"content": _with_note(last.content, reminder)},
                 )
             else:
                 system_text = f"{system_text}\n\n{reminder}"
@@ -1392,7 +1415,10 @@ class Agent:
             return None
         trigger = "auto" if auto else "manual"
         self._hook(
-            HookEvent.PRE_COMPACT, trigger, trigger=trigger, custom_instructions=instructions
+            HookEvent.PRE_COMPACT,
+            trigger,
+            trigger=trigger,
+            custom_instructions=instructions,
         )
 
         def count(usage: Usage) -> None:
@@ -1508,7 +1534,8 @@ class Agent:
 
     def _provider_notice(self, text: str) -> None:
         """Сообщение провайдера пользователю: пауза при лимите запросов, отказ шлюза
-        принять рассуждения."""
+        принять рассуждения.
+        """
         self._events.on_notice(text, level="warn")
 
     # ------------------------------------------------------------------ #
@@ -1578,7 +1605,7 @@ class Agent:
             )
             source = _auto_source(risk, self._cfg.auto_approve, kind, self.mode)
             if (
-                decision in (Decision.ASK, Decision.ALLOW)  # -y не снимает запрет плана
+                decision in {Decision.ASK, Decision.ALLOW}  # -y не снимает запрет плана
                 and self.mode is PermissionMode.PLAN
                 and verdict is not None
                 and verdict.level is not None
@@ -1633,7 +1660,7 @@ class Agent:
                         call,
                         "заблокировано: агент только читает",
                         model_text=READ_ONLY_SHELL_NOTE.format(
-                            reason=assessment.reason or verdict.reason
+                            reason=assessment.reason or verdict.reason,
                         ),
                         note=note,
                     )
@@ -1706,7 +1733,14 @@ class Agent:
                 previewed = preview is not None
             elif verdict is not None:
                 journal = self._journal_start(
-                    call, params, verdict, risk, "auto", "", source=source, review=review
+                    call,
+                    params,
+                    verdict,
+                    risk,
+                    "auto",
+                    "",
+                    source=source,
+                    review=review,
                 )
         except ToolError as e:
             return self._fail(call, str(e), note=note)
@@ -1737,7 +1771,10 @@ class Agent:
             finally:
                 self._events.on_tool_end(call)
             self._journal_end(
-                journal, result=result, error=error, duration=time.monotonic() - started
+                journal,
+                result=result,
+                error=error,
+                duration=time.monotonic() - started,
             )
             journaled = True
             if result is None:
@@ -1760,11 +1797,13 @@ class Agent:
                 )
             if result is not None:
                 self._conversation.add_function_result(
-                    name, _tool_text(result.as_function_content(), note)
+                    name,
+                    _tool_text(result.as_function_content(), note),
                 )
             raise
         self._conversation.add_function_result(
-            name, _tool_text(result.as_function_content(), _join_notes(feedback, note))
+            name,
+            _tool_text(result.as_function_content(), _join_notes(feedback, note)),
         )
         if result.ok:
             self._attach_instructions(tool, params)
@@ -1784,7 +1823,8 @@ class Agent:
         if hook.blocked:
             parts.insert(0, hook.reason)
             self._events.on_notice(
-                f"хук PostToolUse ({name}): {_first_line(hook.reason)}", level="warn"
+                f"хук PostToolUse ({name}): {_first_line(hook.reason)}",
+                level="warn",
             )
         if not parts:
             return ""
@@ -1804,7 +1844,7 @@ class Agent:
         if self._subagent_runs >= MAX_SUBAGENTS_PER_TURN:
             raise ToolError(
                 f"лимит суб-агентов в этом ходе исчерпан ({MAX_SUBAGENTS_PER_TURN}) — "
-                "продолжай сам."
+                "продолжай сам.",
             )
         self._subagent_runs += 1
         info = SubagentInfo(spec.name, description)
@@ -1835,7 +1875,8 @@ class Agent:
             # Ответ — тому вызову (task или explore), что его запустил: он первый без ответа.
             pending = self._conversation.pending_calls()
             self._conversation.add_function_result(
-                pending[0].name if pending else "task", interrupted_note(spec, events.trail)
+                pending[0].name if pending else "task",
+                interrupted_note(spec, events.trail),
             )
             raise
         finally:
@@ -1846,7 +1887,8 @@ class Agent:
 
     def _allow_always(self, call: ToolCallInfo, key: str, verdict: Verdict | None = None) -> None:
         """«Да, и не спрашивать»: команды — сохранённые разрешения (части команды, которые
-        спрашивались), прочее — этот вызов до конца сессии."""
+        спрашивались), прочее — этот вызов до конца сессии.
+        """
         if verdict is not None:
             try:
                 added = self._decisions.approve(verdict)
@@ -1864,11 +1906,15 @@ class Agent:
                 return
         self._session_allowed.add(key)
         self._events.on_notice(
-            f"{call.name} с этими аргументами больше не требует подтверждения до конца сессии"
+            f"{call.name} с этими аргументами больше не требует подтверждения до конца сессии",
         )
 
     def _review_command(
-        self, call: ToolCallInfo, params: BaseModel, verdict: Verdict | None, check: CallCheck
+        self,
+        call: ToolCallInfo,
+        params: BaseModel,
+        verdict: Verdict | None,
+        check: CallCheck,
     ) -> tuple[Decision, Review | None, str]:
         """Режим «авто»: спросить модель-рецензента о команде.
 
@@ -1921,7 +1967,8 @@ class Agent:
 
     def _user_requests(self) -> list[str]:
         """Последние запросы пользователя — из диалога основного агента: у суб-агента
-        первое сообщение — поручение модели, а не слова пользователя."""
+        первое сообщение — поручение модели, а не слова пользователя.
+        """
         root = self
         while root._parent is not None:
             root = root._parent
@@ -1978,29 +2025,27 @@ class Agent:
                 "failed": review.failed,
             }
         try:
-            entry_id = self._decisions.record(
-                {
-                    "tool": call.name,
-                    "command": getattr(params, "command", call.summary),
-                    "description": getattr(params, "description", ""),
-                    "cwd": verdict.cwd,
-                    "key": history_key(verdict)[1],
-                    "verdict": {
-                        "level": verdict.level.name if verdict.level is not None else None,
-                        "reason": verdict.reason,
-                        "signatures": list(verdict.signatures),
-                    },
-                    "risk": risk.name,
-                    "mode": self.mode.value,
-                    "agent": self._subagent.name if self._subagent is not None else "main",
-                    "chat": self._session_chat_id,
-                    "model": self._model,
-                    "decision": decision,
-                    "source": source or "auto",
-                    "feedback": feedback,
-                    **extra,
-                }
-            )
+            entry_id = self._decisions.record({
+                "tool": call.name,
+                "command": getattr(params, "command", call.summary),
+                "description": getattr(params, "description", ""),
+                "cwd": verdict.cwd,
+                "key": history_key(verdict)[1],
+                "verdict": {
+                    "level": verdict.level.name if verdict.level is not None else None,
+                    "reason": verdict.reason,
+                    "signatures": list(verdict.signatures),
+                },
+                "risk": risk.name,
+                "mode": self.mode.value,
+                "agent": self._subagent.name if self._subagent is not None else "main",
+                "chat": self._session_chat_id,
+                "model": self._model,
+                "decision": decision,
+                "source": source or "auto",
+                "feedback": feedback,
+                **extra,
+            })
         except Exception:  # журнал — не повод прерывать работу
             return None
         return _Journal(entry_id)
@@ -2064,7 +2109,8 @@ class Agent:
     def call_info(self, call: FunctionCall) -> ToolCallInfo:
         """Вызов из истории (показ продолженного чата) в том виде, в каком его показывает
         интерфейс во время хода: описание, вид, только ли смотрит проект. Неизвестный
-        инструмент — только имя, неверные аргументы — без описания."""
+        инструмент — только имя, неверные аргументы — без описания.
+        """
         tool = self._registry.get(call.name)
         if tool is None:
             return ToolCallInfo(call.name)
@@ -2073,7 +2119,10 @@ class Agent:
         except Exception:
             return ToolCallInfo(call.name, kind=tool.kind, read_only=tool.read_only)
         return ToolCallInfo(
-            call.name, self._describe(tool, params), tool.kind, read_only=tool.read_only
+            call.name,
+            self._describe(tool, params),
+            tool.kind,
+            read_only=tool.read_only,
         )
 
     @staticmethod

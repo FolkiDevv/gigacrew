@@ -44,7 +44,7 @@ _WATCHED_NAMES = frozenset({"pyproject.toml", "ty.toml"})
 _CREATED, _CHANGED, _DELETED = 1, 2, 3
 
 
-class SemanticUnavailable(Exception):
+class SemanticUnavailableError(Exception):
     """ty недоступен (не установлен, не запустился, отключён после сбоев)."""
 
 
@@ -118,11 +118,11 @@ def find_binary() -> str:
     try:
         from ty import find_ty_bin
     except ImportError as e:
-        raise SemanticUnavailable("пакет ty не установлен") from e
+        raise SemanticUnavailableError("пакет ty не установлен") from e
     try:
         return find_ty_bin()
     except FileNotFoundError as e:
-        raise SemanticUnavailable("бинарник ty не найден") from e
+        raise SemanticUnavailableError("бинарник ty не найден") from e
 
 
 class TyServer:
@@ -192,7 +192,10 @@ class TyServer:
 
     # ------------------------------ файлы ------------------------------ #
     def notify_changes(
-        self, added: tuple[str, ...], updated: tuple[str, ...], removed: tuple[str, ...]
+        self,
+        added: tuple[str, ...],
+        updated: tuple[str, ...],
+        removed: tuple[str, ...],
     ) -> None:
         changes = [
             {"uri": (self.root / path).as_uri(), "type": kind}
@@ -219,7 +222,7 @@ class TyServer:
         if parsed.scheme != "file":  # встроенные заглушки ty и т.п.
             return Location(unquote(uri), line, units, in_project=False)
         # url2pathname сам раскодирует %XX; netloc — сервер UNC-пути (Windows)
-        host = parsed.netloc if parsed.netloc not in ("", "localhost") else ""
+        host = parsed.netloc if parsed.netloc not in {"", "localhost"} else ""
         if host and os.name != "nt":
             # С Python 3.14 url2pathname на POSIX отвергает нелокальный хост — собираем сами
             abs_path = Path(f"//{host}{unquote(parsed.path)}")
@@ -253,7 +256,7 @@ class TyServer:
 
     def definition(self, path: str, line: int, col: int) -> list[Location]:
         return self._locations(
-            self._request("textDocument/definition", self._position(path, line, col))
+            self._request("textDocument/definition", self._position(path, line, col)),
         )
 
     def hover(self, path: str, line: int, col: int) -> str:
@@ -327,13 +330,13 @@ _lock = threading.Lock()
 def server_for(workspace: Workspace, env: Mapping[str, str] | None = None) -> TyServer:
     """Работающий сервер для проекта (запускается при первом обращении).
 
-    SemanticUnavailable — ty не установлен, не запустился или отключён после сбоев.
+    SemanticUnavailableError — ty не установлен, не запустился или отключён после сбоев.
     """
     root = workspace.root
     with _lock:
         session = _sessions.setdefault(root, _Session())
         if session.disabled:
-            raise SemanticUnavailable(session.disabled)
+            raise SemanticUnavailableError(session.disabled)
         if session.server is not None:
             if session.server.alive:
                 return session.server
@@ -341,7 +344,7 @@ def server_for(workspace: Workspace, env: Mapping[str, str] | None = None) -> Ty
             session.server = None
             _count_failure(session, "сервер завершился")
             if session.disabled:
-                raise SemanticUnavailable(session.disabled)
+                raise SemanticUnavailableError(session.disabled)
         binary = find_binary()
         log_path = _log_path(workspace)
         server = TyServer(root, binary=binary, env=env, log_path=log_path)
@@ -350,7 +353,7 @@ def server_for(workspace: Workspace, env: Mapping[str, str] | None = None) -> Ty
         except (OSError, LspError) as e:
             server.close()
             _count_failure(session, f"не запустился: {e}")
-            raise SemanticUnavailable(session.disabled or f"ty не запустился: {e}") from e
+            raise SemanticUnavailableError(session.disabled or f"ty не запустился: {e}") from e
         except BaseException:  # Ctrl+C посреди запуска — процесс не должен остаться
             server.close()
             raise
@@ -409,7 +412,10 @@ def _log_path(workspace: Workspace) -> Path | None:
 
 
 def _on_index_changes(
-    root: Path, added: tuple[str, ...], updated: tuple[str, ...], removed: tuple[str, ...]
+    root: Path,
+    added: tuple[str, ...],
+    updated: tuple[str, ...],
+    removed: tuple[str, ...],
 ) -> None:
     session = _sessions.get(root)
     server = session.server if session is not None else None

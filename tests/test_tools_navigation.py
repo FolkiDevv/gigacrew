@@ -13,7 +13,7 @@ import pytest
 from gigacrew.project import semantic
 from gigacrew.project.index import RESOLVED_IMPORT, ProjectIndex, RefHit
 from gigacrew.project.lsp import LspError
-from gigacrew.project.semantic import Location, SemanticUnavailable
+from gigacrew.project.semantic import Location, SemanticUnavailableError
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import ToolContext, ToolError, build_default_registry
 from gigacrew.tools.navigation import (
@@ -103,8 +103,10 @@ def test_registered_in_default_registry():
 def test_find_references_by_index(plain):
     result = _refs(plain, query="Agent.run_turn")
     assert result.content.splitlines() == [
-        "определение: app/agent.py:2-4 method Agent.run_turn — "
-        "def run_turn(self, text: str) -> str:  # Ход агента.",
+        (
+            "определение: app/agent.py:2-4 method Agent.run_turn — "
+            "def run_turn(self, text: str) -> str:  # Ход агента."
+        ),
         "использования (2):",
         "app/cli.py — импортирует модуль с определением:",
         "  5 [вызов] в main — Agent().run_turn(text)",
@@ -193,8 +195,10 @@ def test_find_references_with_ty_marks_confirmed(typed):
         "использования (2):",
         "app/cli.py — точно (ty):",
         "  5 [вызов] в main — Agent().run_turn(text)",
-        "scripts/x.py — совпадение только по имени, ty не подтвердил — "
-        "вероятно, другое определение:",
+        (
+            "scripts/x.py — совпадение только по имени, ty не подтвердил — "
+            "вероятно, другое определение:"
+        ),
         "  2 [вызов] в other — bot.run_turn()",
     ]
     assert "подтверждено ty: 1" in result.summary
@@ -223,13 +227,16 @@ def test_ty_sees_edits_made_after_start(typed):
 def test_goto_definition_with_ty(typed):
     result = _goto(typed, "app/cli.py", 5, "Agent().run_turn")
     assert result.content.splitlines() == [
-        "app/agent.py:2-4 method Agent.run_turn — "
-        "def run_turn(self, text: str) -> str:  # Ход агента.",
+        (
+            "app/agent.py:2-4 method Agent.run_turn — "
+            "def run_turn(self, text: str) -> str:  # Ход агента."
+        ),
         "тип: bound method Agent.run_turn(text: str) -> str",
     ]
     assert result.summary.startswith("определений: 1 (ty)")
     builtin = _goto(typed, "app/cli.py", 7, "len").content.splitlines()
-    assert builtin[0].startswith("typeshed/stdlib/builtins.pyi:") and "(вне проекта)" in builtin[0]
+    assert builtin[0].startswith("typeshed/stdlib/builtins.pyi:")
+    assert "(вне проекта)" in builtin[0]
     assert builtin[1] == "тип: def len(obj: Sized, /) -> int"
 
 
@@ -256,7 +263,7 @@ def test_call_hierarchy_with_ty(typed):
 # --------------------------- сбои и откат на индекс --------------------------- #
 def test_missing_ty_falls_back_to_index(typed, monkeypatch):
     def missing():
-        raise SemanticUnavailable("пакет ty не установлен")
+        raise SemanticUnavailableError("пакет ty не установлен")
 
     monkeypatch.setattr(semantic, "find_binary", missing)
     lines = _refs(typed, query="Agent.run_turn").content.splitlines()
@@ -297,14 +304,14 @@ def test_merge_adds_ty_only_hits_with_kind_and_scope(root):
         added = [h for h in merged if h not in hits]
         assert added == [RefHit("app/cli.py", 7, 4, "name", "main", RESOLVED_TY)]
         assert FindReferencesTool._merge(index, hits, extra, definitions, "call", None) == hits
-        assert FindReferencesTool._merge(index, hits, extra, definitions, None, "scripts/**") == [
-            h for h in hits
-        ]
+        assert FindReferencesTool._merge(
+            index, hits, extra, definitions, None, "scripts/**"
+        ) == list(hits)
         assert all(h.resolution == RESOLVED_IMPORT for h in hits if h.path == "app/cli.py")
 
 
 @pytest.mark.parametrize(
-    "path, expected",
+    ("path", "expected"),
     [
         (
             "/root/.cache/ty/vendored/typeshed/b932/stdlib/os/__init__.pyi",
@@ -322,7 +329,7 @@ def test_external_path(path, expected):
 def test_ty_server_runs_in_own_process_group(typed):
     _refs(typed, query="helper")
     server = semantic.server_for(typed.workspace)
-    pid = server._client._proc.pid  # noqa: SLF001
+    pid = server._client._proc.pid
     assert os.getpgid(pid) != os.getpgid(0)  # Ctrl+C терминала серверу не достаётся
     assert semantic.status(typed.workspace) == "работает"
 
@@ -338,7 +345,12 @@ def test_merge_matches_by_position_not_line(root):
         assert [h.col for h in hits] == [first, second]
         # ty подтвердил только b.run_turn: a.run_turn не помечается
         merged = FindReferencesTool._merge(
-            index, hits, [Location("app/two.py", 5, second)], definitions, None, None
+            index,
+            hits,
+            [Location("app/two.py", 5, second)],
+            definitions,
+            None,
+            None,
         )
         assert [(h.col, h.resolution) for h in merged] == [
             (first, RESOLVED_IMPORT),
@@ -359,7 +371,8 @@ def test_call_hierarchy_with_ty_keeps_other_language_definitions(typed):
     _make(typed.root, "web/helper.js", "function helper() {}\nfunction use() { helper(); }\n")
     lines = _calls(typed, "helper").content.splitlines()
     assert lines[0] == "кто вызывает (глубина 1, ty + индекс):"
-    assert "helper — web/helper.js:1" in lines and "  ← use — web/helper.js (строка 2)" in lines
+    assert "helper — web/helper.js:1" in lines
+    assert "  ← use — web/helper.js (строка 2)" in lines
 
 
 @pytest.mark.parametrize("path", ["../outside.py", "{outside}"])
@@ -393,7 +406,8 @@ def test_find_references_orders_files_by_resolution_not_by_path(tmp_path):
 
 def test_call_hierarchy_depth_is_clamped(tmp_path):
     (tmp_path / "m.py").write_text(
-        "def helper(): pass\ndef main():\n    helper()\n", encoding="utf-8"
+        "def helper(): pass\ndef main():\n    helper()\n",
+        encoding="utf-8",
     )
     ctx = ToolContext(workspace=Workspace(tmp_path), semantic=False)
     out = CallHierarchyTool().run(CallHierarchyParams(query="helper", depth=10), ctx)

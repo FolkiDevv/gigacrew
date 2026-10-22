@@ -44,13 +44,13 @@ Lines = list[list[Segment]]
 
 def block_start_lines(source: str) -> list[int]:
     """Номера строк, с которых начинаются блоки верхнего уровня."""
-    starts = []
-    for token in Markdown(source).parsed:
-        # Открывающие (nesting=1) и самодостаточные (fence, hr: nesting=0) токены
-        # верхнего уровня; у закрывающих нет map.
-        if token.level == 0 and token.map and token.nesting != -1:
-            starts.append(token.map[0])
-    return starts
+    # Открывающие (nesting=1) и самодостаточные (fence, hr: nesting=0) токены
+    # верхнего уровня; у закрывающих нет map.
+    return [
+        token.map[0]
+        for token in Markdown(source).parsed
+        if token.level == 0 and token.map and token.nesting != -1
+    ]
 
 
 def _line_offset(text: str, line: int) -> int:
@@ -93,7 +93,8 @@ _TAIL_SOURCE_LINES = 200
 
 def _fence_opener(block: str) -> str | None:
     """Ограда, если ``block`` (от начала блока верхнего уровня) — блок кода и его первая
-    строка уже пришла целиком; иначе None."""
+    строка уже пришла целиком; иначе None.
+    """
     first, newline, _ = block.partition("\n")
     if not newline:
         return None
@@ -160,7 +161,8 @@ class MarkdownStream:
 
     def _in_open_fence(self, text: str, committed: int) -> bool:
         """Хвост — блок кода, который ещё не закрыт: внутри него блок не кончится, и
-        разбирать текст незачем (длинный блок кода разбирался бы на каждой строке)."""
+        разбирать текст незачем (длинный блок кода разбирался бы на каждой строке).
+        """
         fence = _fence_opener(text[committed:])
         if fence is None:
             return False

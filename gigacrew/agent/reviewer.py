@@ -99,7 +99,7 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
         ]
     lines.append(
         "Levels: EXEC runs project code or tools, WRITE changes files or the local "
-        "environment, UNVERIFIED — the analyzer could not check the command."
+        "environment, UNVERIFIED — the analyzer could not check the command.",
     )
     return "\n".join(lines)
 
@@ -123,7 +123,7 @@ def parse_review(text: str) -> tuple[bool, str]:
         if not isinstance(obj, dict) or "allow" not in obj:
             continue
         allow = obj["allow"]
-        if isinstance(allow, str) and allow.strip().lower() in ("true", "false"):
+        if isinstance(allow, str) and allow.strip().lower() in {"true", "false"}:
             allow = allow.strip().lower() == "true"
         if not isinstance(allow, bool):
             continue

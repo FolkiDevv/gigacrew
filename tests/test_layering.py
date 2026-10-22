@@ -20,7 +20,8 @@ CORE_MODULES = ("__init__.py", "config.py", "errors.py", "permissions.py", "secu
 
 def _imports(path: Path) -> set[str]:
     """Импортируемые модули; ``from X import y`` — и ``X``, и ``X.y`` (y может быть
-    модулем: ``from gigacrew import ui``)."""
+    модулем: ``from gigacrew import ui``).
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     names: set[str] = set()
     for node in ast.walk(tree):
@@ -53,15 +54,16 @@ def test_imports_sees_every_form(tmp_path):
     names = _imports(source)
     assert {"rich.console", "gigacrew.ui", "gigacrew.cli.app", "prompt_toolkit"} <= names
     assert all(_forbidden(n) for n in ("rich", "gigacrew.ui", "prompt_toolkit.shortcuts"))
-    assert not _forbidden("richtext") and not _forbidden("gigacrew.uix")
+    assert not _forbidden("richtext")
+    assert not _forbidden("gigacrew.uix")
 
 
 def test_core_does_not_import_ui():
     offenders = []
     for path in _core_files():
-        for name in _imports(path):
-            if _forbidden(name):
-                offenders.append(f"{path.relative_to(PKG)}: {name}")
+        offenders.extend(
+            f"{path.relative_to(PKG)}: {name}" for name in _imports(path) if _forbidden(name)
+        )
     assert offenders == []
 
 
@@ -73,8 +75,11 @@ def test_core_does_not_load_ui_transitively():
             rel = path.relative_to(PKG.parent).with_suffix("")
             parts = rel.parts[:-1] if rel.name == "__init__" else rel.parts
             modules.append(".".join(parts))
+    # Консоль httpx (httpx._main, rich + click) грузится, только если установлен click: в
+    # окружении разработки его приносят import-linter и deptry, у пакета его нет.
     code = (
         "import importlib, json, sys\n"
+        "sys.modules['httpx._main'] = None\n"
         f"for name in {modules!r}:\n"
         "    importlib.import_module(name)\n"
         f"bad = sorted(m for m in sys.modules if m.split('.')[0] in ('rich', 'prompt_toolkit')"
@@ -83,15 +88,22 @@ def test_core_does_not_load_ui_transitively():
     )
     env = {**os.environ, "PYTHONPATH": str(PKG.parent)}
     out = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
     )
     assert json.loads(out.stdout) == []
 
 
 def test_every_module_imports_first():
-    """Каждый модуль импортируется первым, без уже загруженных модулей gigacrew: цикл
-    импортов (``safety.bash`` → ``project`` → ``project.index`` → ``safety.paths`` →
-    ``safety.bash``) ломает только тот порядок, где цикл начат с его середины."""
+    """Каждый модуль импортируется первым, без уже загруженных модулей gigacrew.
+
+    Цикл импортов (был такой: ``safety.bash`` → ``project`` → ``project.index`` →
+    ``safety.paths`` → ``safety.bash``) ломает только тот порядок, где цикл начат с его
+    середины. Статически слои проверяет import-linter (``.importlinter``).
+    """
     modules = []
     for path in sorted(PKG.rglob("*.py")):
         rel = path.relative_to(PKG.parent).with_suffix("")
@@ -112,7 +124,11 @@ def test_every_module_imports_first():
     )
     env = {**os.environ, "PYTHONPATH": str(PKG.parent)}
     out = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
     )
     assert json.loads(out.stdout) == []
 
@@ -123,7 +139,9 @@ def test_tree_sitter_is_imported_only_by_treesitter_module():
     for path in PKG.rglob("*.py"):
         if path.relative_to(PKG).as_posix() == "project/treesitter.py":
             continue
-        for name in _imports(path):
-            if name.split(".")[0] in ("tree_sitter", "tree_sitter_bash"):
-                offenders.append(f"{path.relative_to(PKG)}: {name}")
+        offenders.extend(
+            f"{path.relative_to(PKG)}: {name}"
+            for name in _imports(path)
+            if name.split(".")[0] in {"tree_sitter", "tree_sitter_bash"}
+        )
     assert offenders == []

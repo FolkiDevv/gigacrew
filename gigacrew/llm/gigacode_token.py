@@ -97,7 +97,8 @@ def parse_token(data: Any) -> Token:
 
 def load_token(path: Path, config_url: str) -> Token:
     """Действующий токен из файла CLI для бэкенда ``config_url``; нет, не читается,
-    истёк или выдан другому бэкенду — :class:`ApiError`."""
+    истёк или выдан другому бэкенду — :class:`ApiError`.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -114,7 +115,7 @@ def load_token(path: Path, config_url: str) -> Token:
         raise ApiError(
             f"токен GigaCode в {path} выдан для {token.config_endpoint}, а GIGACREW_API_URL "
             f"указывает на {config_url} — исправьте GIGACREW_API_URL или пройдите авторизацию "
-            "в GigaCode на нужном бэкенде"
+            "в GigaCode на нужном бэкенде",
         )
     if token.expired():
         raise ApiError(f"токен GigaCode истёк: {login_hint(path)}")

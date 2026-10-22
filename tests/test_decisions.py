@@ -44,7 +44,8 @@ def test_program_rule_matches_wrapped_variants(root, home):
     mem = memory(root, home)
     assert "pytest" in mem.offer(verdict("pytest -q", root))
     [rule] = mem.approve(verdict("pytest -q", root))
-    assert rule.kind == "program" and rule.value == "pytest"
+    assert rule.kind == "program"
+    assert rule.value == "pytest"
     for command in (
         "pytest",
         "pytest -x tests",
@@ -86,13 +87,16 @@ def test_exact_rules_and_stdin_identity(root, home):
 def test_dangerous_is_never_remembered_or_matched(root, home):
     mem = memory(root, home)
     danger = verdict("rm -rf build", root)
-    assert mem.offer(danger) == "" and mem.approve(danger) == []
+    assert mem.offer(danger) == ""
+    assert mem.approve(danger) == []
     mem.rules.append(mem._candidates(verdict("touch x", root))[0])
     assert mem.match(verdict("touch x && rm -rf build", root)) is None
     # целиком, не по частям (перенаправление): защита — у всей команды
     whole = verdict("rm -rf build > log.txt", root)
-    assert whole.level is CommandLevel.DANGER and not whole.composable
-    assert mem.offer(whole) == "" and mem.approve(whole) == []
+    assert whole.level is CommandLevel.DANGER
+    assert not whole.composable
+    assert mem.offer(whole) == ""
+    assert mem.approve(whole) == []
     # устаревшее (прежняя версия правил) или вписанное руками правило не действует
     mem.rules.append(Rule("old", ".", "command", whole.command))
     assert mem.match(whole) is None
@@ -102,7 +106,8 @@ def test_plan_mode_ignores_whole_command_rules(root, home):
     mem = memory(root, home)
     v = verdict("pytest > log.txt", root)  # пишет в файл
     mem.approve(v)
-    assert mem.match(v) is not None and mem.match(v, plan=True) is None
+    assert mem.match(v) is not None
+    assert mem.match(v, plan=True) is None
 
 
 def test_venv_activation_needs_an_approved_program(root, home):
@@ -119,7 +124,7 @@ def test_venv_activation_needs_an_approved_program(root, home):
 def test_always_counts_as_allowed(root, home):
     mem = memory(root, home)
     mem.record(
-        {"command": "make", "cwd": ".", "key": "make", "source": "user", "decision": "always"}
+        {"command": "make", "cwd": ".", "key": "make", "source": "user", "decision": "always"},
     )
     assert mem.history((".", "make")) == (1, 0)
     assert memory(root, home).history((".", "make")) == (1, 0)  # и из журнала
@@ -161,8 +166,11 @@ def test_always_does_not_save_rules_that_never_match(root, home, command):
     _venv(root)
     mem = memory(root, home)
     v = verdict(command, root)
-    assert mem.offer(v) == "" and mem.approve(v) == [] and mem.rules == []
-    assert mem.approvals_path is not None and not mem.approvals_path.exists()
+    assert mem.offer(v) == ""
+    assert mem.approve(v) == []
+    assert mem.rules == []
+    assert mem.approvals_path is not None
+    assert not mem.approvals_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -182,7 +190,8 @@ def test_offered_rule_matches_the_same_command(root, home, command):
     mem = memory(root, home)
     v = verdict(command, root)
     assert mem.offer(v) != ""
-    assert mem.approve(v) and mem.match(v) is not None
+    assert mem.approve(v)
+    assert mem.match(v) is not None
     assert memory(root, home).match(v) is not None  # и после перечитывания с диска
 
 
@@ -215,10 +224,12 @@ def test_rules_persist_and_merge_between_windows(root, home):
     third = memory(root, home)
     assert {r.value for r in third.rules} == {"pytest", "npm test"}
     path = third.approvals_path
-    assert path is not None and stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path is not None
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
     third.forget(1)
     assert len(memory(root, home).rules) == 1
-    assert third.clear() == 1 and memory(root, home).rules == []
+    assert third.clear() == 1
+    assert memory(root, home).rules == []
 
 
 def test_remember_off_keeps_rules_for_session_only(root, home):
@@ -236,7 +247,8 @@ def test_rules_of_another_project_are_ignored(root, home, tmp_path):
     data["root"] = "/elsewhere"
     mem.approvals_path.write_text(json.dumps(data))
     loaded, warning = DecisionMemory.load(root, base=home)
-    assert loaded.rules == [] and warning is not None
+    assert loaded.rules == []
+    assert warning is not None
 
 
 def test_journal_records_choice_context_and_outcome(root, home):
@@ -251,15 +263,16 @@ def test_journal_records_choice_context_and_outcome(root, home):
             "decision": "no",
             "source": "user",
             "feedback": "используй uv run",
-        }
+        },
     )
     mem.outcome(entry, ok=False, interrupted=True)
     mem.record(
-        {"command": "pytest", "cwd": ".", "key": "pytest", "decision": "yes", "source": "user"}
+        {"command": "pytest", "cwd": ".", "key": "pytest", "decision": "yes", "source": "user"},
     )
     lines = [json.loads(x) for x in mem.journal_path.read_text().splitlines()]
     assert lines[0]["command"] == "GITHUB_TOKEN=*** pytest -q"
-    assert lines[0]["feedback"] == "используй uv run" and lines[0]["rules_version"] >= 1
+    assert lines[0]["feedback"] == "используй uv run"
+    assert lines[0]["rules_version"] >= 1
     assert lines[1] == {**lines[1], "id": entry, "event": "outcome", "interrupted": True}
     assert stat.S_IMODE(os.stat(mem.journal_path).st_mode) == 0o600
     assert mem.history((".", "pytest")) == (1, 1)
@@ -279,11 +292,13 @@ def test_session_rejections_and_reviewer_entries(root, home):
     mem.record({**entry, "decision": "auto", "source": "reviewer", "review": {"reason": "ок"}})
     assert not mem.rejected_in_session((".", "make"))
     mem.record({**entry, "decision": "no", "source": "user"})
-    assert mem.rejected_in_session((".", "make")) and not mem.rejected_in_session(("src", "make"))
+    assert mem.rejected_in_session((".", "make"))
+    assert not mem.rejected_in_session(("src", "make"))
     assert [x["source"] for x in mem.recent()] == ["reviewer", "user"]
     # в новой сессии отказ — уже история, а не «отклонено в этой сессии»
     again = memory(root, home)
-    assert not again.rejected_in_session((".", "make")) and again.history((".", "make")) == (0, 1)
+    assert not again.rejected_in_session((".", "make"))
+    assert again.history((".", "make")) == (0, 1)
 
 
 def test_journal_key_is_redacted(root, home):
@@ -297,20 +312,22 @@ def test_journal_key_is_redacted(root, home):
             "key": "x",
             "verdict": {"reason": "API_KEY=secret456 в аргументах"},
             "review": {"reason": "передаёт API_KEY=secret789"},
-        }
+        },
     )
     text = mem.journal_path.read_text()
-    assert "secret456" not in text and "secret789" not in text
+    assert "secret456" not in text
+    assert "secret789" not in text
 
 
 def test_in_memory_only():
     mem = DecisionMemory()
-    assert mem.approvals_path is None and mem.journal_path is None
+    assert mem.approvals_path is None
+    assert mem.journal_path is None
     mem.record({"command": "ls", "decision": "yes", "source": "user", "cwd": ".", "key": "ls"})
 
 
 @pytest.mark.parametrize(
-    "text, expected",
+    ("text", "expected"),
     [
         ("API_KEY=secret123 make deploy", "API_KEY=*** make deploy"),
         ("TOKEN=abc PASSWORD=x ./run", "TOKEN=*** PASSWORD=*** ./run"),
@@ -364,21 +381,25 @@ def test_feedback_and_description_are_redacted(root, home):
             "source": "user",
             "feedback": "используй TOKEN=fb_secret",
             "description": "деплой с API_KEY=desc_secret",
-        }
+        },
     )
     text = mem.journal_path.read_text()
-    assert "fb_secret" not in text and "desc_secret" not in text
-    assert "TOKEN=***" in text and "API_KEY=***" in text
+    assert "fb_secret" not in text
+    assert "desc_secret" not in text
+    assert "TOKEN=***" in text
+    assert "API_KEY=***" in text
 
 
 @pytest.mark.parametrize(
-    "command", ["TOKEN=hunter2 ./build.sh", "./build.sh --password hunter2 > log.txt"]
+    "command",
+    ["TOKEN=hunter2 ./build.sh", "./build.sh --password hunter2 > log.txt"],
 )
 def test_command_with_secret_is_not_saved_as_rule(root, home, command):
     # approvals.json не журнал: секрет из правила не вырезать — правило не сохраняется.
     mem = memory(root, home)
     v = verdict(command, root)
-    assert mem.offer(v) == "" and mem.approve(v) == []
+    assert mem.offer(v) == ""
+    assert mem.approve(v) == []
     assert not mem.approvals_path.exists()
 
 

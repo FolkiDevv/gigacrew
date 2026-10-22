@@ -120,8 +120,16 @@ def _git_tracked(workspace: Workspace, directory: Path) -> set[str] | None:
     """
     try:
         run = subprocess.run(
-            ["git", *_GIT_SAFE_CONFIG, "-C", str(workspace.root), "ls-files", "-z", "--"]
-            + [directory.relative_to(workspace.root).as_posix()],
+            [
+                "git",
+                *_GIT_SAFE_CONFIG,
+                "-C",
+                str(workspace.root),
+                "ls-files",
+                "-z",
+                "--",
+                directory.relative_to(workspace.root).as_posix(),
+            ],
             capture_output=True,
             timeout=_GIT_TIMEOUT,
             check=False,
@@ -140,7 +148,7 @@ def _move(src: Path, dst: Path) -> None:
     Сбой до удаления оригинала — ``OSError``, оригинал на месте, неполной копии нет.
     """
     try:
-        os.replace(src, dst)
+        Path(src).replace(dst)
         return
     except OSError as e:
         if e.errno != errno.EXDEV:
@@ -149,7 +157,7 @@ def _move(src: Path, dst: Path) -> None:
     os.close(fd)
     try:
         shutil.copyfile(src, tmp)  # mkstemp уже дал права 0600
-        os.replace(tmp, dst)
+        Path(tmp).replace(dst)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
@@ -199,15 +207,19 @@ class ChatStore:
             return []
         if not self._workspace.in_git_repo():
             return [
-                f"чаты в {legacy} не перенесены: проект не в git-репозитории, и не проверить, "
-                "не пришли ли они вместе с ним; оттуда они не загружаются. Если это ваши "
-                f"чаты, перенесите файлы в {self.directory} вручную"
+                (
+                    f"чаты в {legacy} не перенесены: проект не в git-репозитории, и не проверить, "
+                    "не пришли ли они вместе с ним; оттуда они не загружаются. Если это ваши "
+                    f"чаты, перенесите файлы в {self.directory} вручную"
+                ),
             ]
         tracked = _git_tracked(self._workspace, legacy)
         if tracked is None:
             return [
-                f"чаты в {legacy} не перенесены: не удалось проверить через git, не пришли ли "
-                "они с репозиторием; оттуда они не загружаются"
+                (
+                    f"чаты в {legacy} не перенесены: не удалось проверить через git, не пришли ли "
+                    "они с репозиторием; оттуда они не загружаются"
+                ),
             ]
         moved, shipped, existing, failed = 0, [], [], []
         for path in files:
@@ -233,22 +245,22 @@ class ChatStore:
         if moved:
             notices.append(
                 f"перенесено чатов: {moved} — из {legacy} в {self.directory} (чаты теперь "
-                "хранятся у пользователя, а не в проекте)"
+                "хранятся у пользователя, а не в проекте)",
             )
         if shipped:
             notices.append(
                 f"чаты {', '.join(shipped)} в {legacy} отслеживает git — они пришли с "
-                "репозиторием и не загружаются"
+                "репозиторием и не загружаются",
             )
         if existing:
             notices.append(
                 f"чаты {', '.join(existing)} уже есть в {self.directory} — копии в {legacy} "
-                "оставлены и не загружаются"
+                "оставлены и не загружаются",
             )
         if failed:
             notices.append(
                 f"не удалось перенести чаты из {legacy}: {'; '.join(failed)} — они остались "
-                "на месте и не загружаются"
+                "на месте и не загружаются",
             )
         return notices
 
@@ -322,7 +334,7 @@ class ChatStore:
             # попал в диалог, пишется экранированным «\udcee» — это корректный JSON.
             with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
                 json.dump(data, f, ensure_ascii=False)
-            os.replace(tmp, path)
+            Path(tmp).replace(path)
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
@@ -457,7 +469,8 @@ class ChatRecorder:
 
     def save(self, conversation: Conversation, *, model: str = "") -> str | None:
         """Сохраняет диалог; возвращает предупреждение, если запись не удалась или
-        диалог пришлось сохранить новым чатом."""
+        диалог пришлось сохранить новым чатом.
+        """
         if not self.enabled or not any(m.is_request for m in conversation.messages):
             return None
         warning = None
@@ -479,7 +492,10 @@ class ChatRecorder:
                 while self.store.exists(self._chat_id):
                     self._chat_id = self.store.new_id()
             info = self.store.save(
-                self._chat_id, conversation, model=model, created_at=self._created_at
+                self._chat_id,
+                conversation,
+                model=model,
+                created_at=self._created_at,
             )
         except (OSError, ValueError) as e:  # ValueError — в том числе UnicodeEncodeError
             self.enabled = False

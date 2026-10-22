@@ -177,12 +177,13 @@ class Conversation:
 
     def add_function_result(self, name: str, content: str, call_id: str | None = None) -> None:
         """Результат вызова инструмента. Результаты идут по порядку вызовов, поэтому
-        без ``call_id`` берётся id первого вызова, на который ещё нет ответа."""
+        без ``call_id`` берётся id первого вызова, на который ещё нет ответа.
+        """
         if call_id is None:
             pending = self.pending_calls()
             call_id = pending[0].id if pending else None
         self._messages.append(
-            Message(role="function", name=name, content=clean_text(content), call_id=call_id)
+            Message(role="function", name=name, content=clean_text(content), call_id=call_id),
         )
 
     # ------------------------------------------------------------------ #

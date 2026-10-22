@@ -38,64 +38,58 @@ except ImportError:  # pragma: no cover — tree-sitter — обязательн
 _MAX_SIGNATURE_LINES = 6
 
 # Виды, внутри которых функция — метод.
-_METHOD_OWNERS = frozenset(
-    {
-        "class",
-        "struct",
-        "interface",
-        "trait",
-        "record",
-        "object",
-        "protocol",
-        "enum",
-        "union",
-        "impl",
-        "extension",
-    }
-)
+_METHOD_OWNERS = frozenset({
+    "class",
+    "struct",
+    "interface",
+    "trait",
+    "record",
+    "object",
+    "protocol",
+    "enum",
+    "union",
+    "impl",
+    "extension",
+})
 _FUNCTION_KINDS = frozenset({"function", "method"})
 
 # Узлы-имена, текст которых — вызываемое имя.
-_NAME_NODES = frozenset(
-    {
-        "identifier",
-        "simple_identifier",
-        "field_identifier",
-        "property_identifier",
-        "type_identifier",
-        "name",
-        "constant",
-        "word",
-        "namespace_identifier",
-        "private_property_identifier",
-        "destructor_name",
-        "operator_name",
-        "string_fragment",  # JS: метод с именем в кавычках — `"save"() {}`
-    }
-)
+_NAME_NODES = frozenset({
+    "identifier",
+    "simple_identifier",
+    "field_identifier",
+    "property_identifier",
+    "type_identifier",
+    "name",
+    "constant",
+    "word",
+    "namespace_identifier",
+    "private_property_identifier",
+    "destructor_name",
+    "operator_name",
+    "string_fragment",  # JS: метод с именем в кавычках — `"save"() {}`
+})
 # Поля, в которых лежит последняя часть составного имени (a.b.c → c).
 _NAME_FIELDS = ("name", "field", "property", "attribute", "suffix", "method")
 
 # Узлы-тела: сигнатура — от начала определения до тела.
-_BODY_NODES = frozenset(
-    {
-        "block",
-        "body_statement",
-        "class_body",
-        "compound_statement",
-        "declaration_list",
-        "enum_body",
-        "enum_class_body",
-        "field_declaration_list",
-        "function_body",
-        "interface_body",
-        "protocol_body",
-        "statement_block",
-        "template_body",
-        "enum_variant_list",
-        "enumerator_list",
-    }
-)
+_BODY_NODES = frozenset({
+    "block",
+    "body_statement",
+    "class_body",
+    "compound_statement",
+    "declaration_list",
+    "enum_body",
+    "enum_class_body",
+    "field_declaration_list",
+    "function_body",
+    "interface_body",
+    "protocol_body",
+    "statement_block",
+    "template_body",
+    "enum_variant_list",
+    "enumerator_list",
+})
 
 
 @dataclass(frozen=True)
@@ -319,11 +313,11 @@ def _leaf_name(node: Node | None) -> Node | None:
                 break
         else:
             named = node.named_children
-            if node.type in ("navigation_expression", "scoped_identifier") and named:
+            if node.type in {"navigation_expression", "scoped_identifier"} and named:
                 node = named[-1]
-            elif node.type in ("command_name", "generic_name", "user_type") and named:
+            elif node.type in {"command_name", "generic_name", "user_type"} and named:
                 node = named[0]
-            elif node.type in ("parenthesized_expression", "string") and named:
+            elif node.type in {"parenthesized_expression", "string"} and named:
                 node = named[0]  # `(load)()`, `"save"() {}`
             elif node.type == "command_name":
                 return node
@@ -339,7 +333,7 @@ def _declarator_name(node: Node | None) -> Node | None:
             return None
         if node.type in _NAME_NODES:
             return node
-        if node.type in ("qualified_identifier", "template_function"):
+        if node.type in {"qualified_identifier", "template_function"}:
             node = node.child_by_field_name("name")
             continue
         node = node.child_by_field_name("declarator")
@@ -359,11 +353,11 @@ _SWIFT_KINDS = frozenset({"class", "struct", "enum", "extension", "actor"})
 def _definition(node: Node, kind: str, language: str) -> tuple[Node | None, str, str] | None:
     """(узел имени, вид, владелец) определения или None — узел не определение."""
     t = node.type
-    if language in ("c", "cpp"):
-        if t in ("struct_specifier", "union_specifier", "enum_specifier", "class_specifier"):
+    if language in {"c", "cpp"}:
+        if t in {"struct_specifier", "union_specifier", "enum_specifier", "class_specifier"}:
             if node.child_by_field_name("body") is None:
                 return None  # упоминание типа (`struct S x;`), а не определение
-        if t in ("function_definition", "type_definition"):
+        if t in {"function_definition", "type_definition"}:
             declarator = node.child_by_field_name("declarator")
             name = _declarator_name(declarator)
             owner = ""
@@ -375,12 +369,12 @@ def _definition(node: Node, kind: str, language: str) -> tuple[Node | None, str,
             return name, kind, owner
     if t == "variable_declarator":  # JS/TS: функция — только `const f = () => …`
         value = node.child_by_field_name("value")
-        if value is None or value.type not in (
+        if value is None or value.type not in {
             "arrow_function",
             "function_expression",
             "function",
             "generator_function",
-        ):
+        }:
             return None
     if language == "go":
         if t == "type_spec":
@@ -397,7 +391,7 @@ def _definition(node: Node, kind: str, language: str) -> tuple[Node | None, str,
     if language == "rust" and t == "impl_item":
         target = node.child_by_field_name("type")
         name = target
-        while name is not None and name.type not in ("type_identifier", "primitive_type"):
+        while name is not None and name.type not in {"type_identifier", "primitive_type"}:
             name = name.child_by_field_name("type") or (
                 name.named_children[0] if name.named_children else None
             )
@@ -523,7 +517,7 @@ def extract(text: str, language: str, path: str = "") -> FileFacts | None:
                             depth=len(scopes),
                             signature=source.signature(node),
                             col=source.col(name_node.start_point),
-                        )
+                        ),
                     )
                 qualname = f"{parent}.{name}" if parent else name
                 scopes.append((node.end_byte, qualname, kind))

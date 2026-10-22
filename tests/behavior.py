@@ -91,7 +91,7 @@ RESEARCH_TOOLS = frozenset(
         "call_hierarchy",
         "file_outline",
         "repo_map",
-    }
+    },
 )
 MAX_ANSWER_CHARS = 2_000
 # Начало системного промпта суб-агента: так запись запроса отличает его от основного.
@@ -596,7 +596,7 @@ def is_safe_command(command: str, *, root: Path) -> bool:
     отказ: eval идёт без присмотра на машине разработчика.
     """
     verdict = classify(command, root=root)
-    if verdict.level not in (CommandLevel.READ, CommandLevel.EXEC) or not verdict.composable:
+    if verdict.level not in {CommandLevel.READ, CommandLevel.EXEC} or not verdict.composable:
         return False
     for part in verdict.parts:
         if _CLASSIFIER_GAPS.search(part.text):
@@ -728,7 +728,7 @@ class RecordingProvider(LLMProvider):
                 "text": bool(turn.message.content.strip()),
                 "tool_choice": kwargs.get("tool_choice", "auto"),
                 "duration_s": round(time.monotonic() - started, 2),
-            }
+            },
         )
 
 
@@ -842,7 +842,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(
             Turn(
                 "Как в проекте устроена обработка ошибок: где какие исключения возникают и "
-                "как они превращаются в HTTP-ответы? Со ссылками path:line."
+                "как они превращаются в HTTP-ответы? Со ссылками path:line.",
             ),
         ),
         expect=("errors.py", "api.py", "storage.py", "payments.py"),
@@ -863,7 +863,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(
             Turn(
                 "Спланируй перевод хранилища заказов с JSON-файла на SQLite: что и где "
-                "придётся изменить."
+                "придётся изменить.",
             ),
         ),
         plan_answers=(None,),
@@ -879,7 +879,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(
             Turn(
                 "Напиши тесты для shop/payments.py (в tests/test_payments.py) и для "
-                "shop/storage.py (в tests/test_storage.py)."
+                "shop/storage.py (в tests/test_storage.py).",
             ),
         ),
         files_expect={"tests/test_payments.py": "def test", "tests/test_storage.py": "def test"},
@@ -927,7 +927,12 @@ def run_scenario(
     recorder = RecordingProvider(provider)
     user = ScriptedUser(scenario.plan_answers, root=root, on_plan=on_plan)
     agent = Agent(
-        recorder, build_default_registry(), config, user, windows=windows, chat_id=chat_id
+        recorder,
+        build_default_registry(),
+        config,
+        user,
+        windows=windows,
+        chat_id=chat_id,
     )
     turns: list[dict[str, Any]] = []
     error: BaseException | None = None
@@ -996,7 +1001,7 @@ def _turn_end(info: dict[str, Any], agent: Agent, user: ScriptedUser) -> None:
             last is not None
             and last.role == "assistant"
             and not last.function_calls
-            and last.content.strip()
+            and last.content.strip(),
         ),
         answer=answer[:MAX_ANSWER_CHARS],
         steps=stats.steps if stats is not None else None,
@@ -1033,7 +1038,8 @@ def _targets(call: FunctionCall, root: Path, target: Path | None) -> bool:
 def well_formed(messages: Sequence[Message]) -> bool:
     """Каждый вызов инструмента получил ровно один результат, сразу после своего хода
     (без сообщений между ними — на такую историю API отвечает 422); результат с id — того
-    вызова, у которого этот id."""
+    вызова, у которого этот id.
+    """
     pending: list[str | None] = []  # id вызовов хода, ещё без результата
     for message in messages:
         if message.role == "function":
@@ -1123,13 +1129,13 @@ def _metrics(
         "task_calls": len(tasks) + explores,
         "explore_calls": explores + sum(1 for call in tasks if _subagent_type(call) == "explore"),
         "general_calls": sum(
-            1 for call in tasks if _subagent_type(call) in ("general", "general-purpose")
+            1 for call in tasks if _subagent_type(call) in {"general", "general-purpose"}
         ),
         "task_batches": sum(
             1
             for m in messages
             if m.role == "assistant"
-            and sum(c.name in ("task", "explore") for c in m.function_calls) >= 2
+            and sum(c.name in {"task", "explore"} for c in m.function_calls) >= 2
         ),
         "subagent_runs": len(subagents),
         "subagent_tool_calls": sum(1 for kind, _ in user.events if kind == "subagent_tool_call"),
@@ -1197,10 +1203,16 @@ def git_revision(root: Path = REPO_ROOT) -> str:
         return ""
     try:
         sha = subprocess.run(
-            [git, "rev-parse", "--short", "HEAD"], cwd=root, capture_output=True, text=True
+            [git, "rev-parse", "--short", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
         ).stdout.strip()
         dirty = subprocess.run(
-            [git, "status", "--porcelain"], cwd=root, capture_output=True, text=True
+            [git, "status", "--porcelain"],
+            cwd=root,
+            capture_output=True,
+            text=True,
         ).stdout.strip()
     except OSError:
         return ""
@@ -1256,7 +1268,8 @@ class EvalSession:
         )
         transcript.parent.mkdir(parents=True, exist_ok=True)
         transcript.write_text(
-            json.dumps(result.transcript, ensure_ascii=False, indent=1), encoding="utf-8"
+            json.dumps(result.transcript, ensure_ascii=False, indent=1),
+            encoding="utf-8",
         )
         record["transcript"] = transcript.relative_to(self.directory).as_posix()
         self.records.append(record)
@@ -1371,7 +1384,7 @@ def summary_table(records: Sequence[Mapping[str, Any]]) -> list[str]:
             "tok,k",
             "cache",
             "time",
-        )
+        ),
     ]
     for key in _ordered(groups):
         runs = groups[key]
@@ -1393,7 +1406,7 @@ def summary_table(records: Sequence[Mapping[str, Any]]) -> list[str]:
                 _mean(runs, _tokens),
                 _cache(runs),
                 _mean(runs, "duration_s", digits=0),
-            )
+            ),
         )
     goals = [f"  {scenario.id} — {scenario.goal}" for scenario in SCENARIOS]
     return [*_table(rows), "", SUMMARY_LEGEND, "Цели сценариев:", *goals]
@@ -1401,9 +1414,7 @@ def summary_table(records: Sequence[Mapping[str, Any]]) -> list[str]:
 
 def _describe(meta: Mapping[str, Any]) -> str:
     parts = [str(meta.get("created", "?"))]
-    for key in ("label", "git"):
-        if meta.get(key):
-            parts.append(str(meta[key]))
+    parts.extend(str(meta[key]) for key in ("label", "git") if meta.get(key))
     parts.append(f"T={meta.get('temperature')}")
     if meta.get("reasoning"):  # в отчётах до этапа 5 ключа нет
         parts.append(f"reasoning={meta['reasoning']}")
@@ -1475,7 +1486,7 @@ def _problem(record: Mapping[str, Any]) -> str:
         parts.append("стоп " + ",".join(record["stop_reasons"]))
     parts.append(
         f"shown={record.get('plan_shown', 0)} exit={record.get('exit_calls', 0)} "
-        f"chk={record.get('self_checks', 0)} task={record.get('task_calls', 0)}"
+        f"chk={record.get('self_checks', 0)} task={record.get('task_calls', 0)}",
     )
     if record.get("answer"):
         parts.append(f"ответ «{_clip(record['answer'], 60)}»")
@@ -1506,7 +1517,7 @@ def digest_report(report: Mapping[str, Any]) -> list[str]:
             "out,k",
             "max,s",
             "stops",
-        )
+        ),
     ]
     for key in _ordered(groups):
         g = groups[key]
@@ -1525,7 +1536,7 @@ def digest_report(report: Mapping[str, Any]) -> list[str]:
                 _peak(g, "max_completion_tokens", scale=1000),
                 _peak(g, "max_request_s"),
                 _stops(g),
-            )
+            ),
         )
     lines = [_describe(report["meta"]), *_table(rows)]
     # Сначала провалы поведения, потом сбои: сбои ещё и сведены в «Частые ошибки» ниже,
@@ -1548,9 +1559,11 @@ def digest_report(report: Mapping[str, Any]) -> list[str]:
         lines += [f"{n}× {text}" for text, n in errors.most_common(DIGEST_ERRORS)]
     lines += [
         "",
-        "rem — план не отправлен моделью; chk — самопроверок; txt — ходов плана, кончившихся "
-        "текстом; cut — повторов после оборванного ответа; out,k — пик вывода за запрос, "
-        "тыс. токенов; max,s — самый долгий запрос.",
+        (
+            "rem — план не отправлен моделью; chk — самопроверок; txt — ходов плана, кончившихся "
+            "текстом; cut — повторов после оборванного ответа; out,k — пик вывода за запрос, "
+            "тыс. токенов; max,s — самый долгий запрос."
+        ),
     ]
     return lines
 
@@ -1566,15 +1579,18 @@ def reasoning_texts(data: Mapping[str, Any]) -> list[str]:
             continue
         content = message.get("content")
         parts = [{"text": content}] if isinstance(content, str) else content or []
-        for part in parts:
-            if isinstance(part, Mapping) and isinstance(part.get("text"), str):
-                texts.append(part["text"])
+        texts.extend(
+            part["text"]
+            for part in parts
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+        )
     return [text for text in texts if text.strip()]
 
 
 def with_reasoning(payload: Mapping[str, Any], text: str) -> dict[str, Any]:
     """Копия запроса с рассуждениями (``role: "reasoning"``) перед последним ответом
-    ассистента — тем же сообщением, каким API отдаёт их в ответе."""
+    ассистента — тем же сообщением, каким API отдаёт их в ответе.
+    """
     copy = json.loads(json.dumps(payload))
     messages = copy["messages"]
     index = max(i for i, message in enumerate(messages) if message["role"] == "assistant")
@@ -1605,7 +1621,7 @@ def describe_probe(model: str, finding: Mapping[str, Any]) -> list[str]:
     if steps:
         lines.append(
             f"  второй шаг, input_tokens: с tools_state_id {_status(steps.get('with_state'))}, "
-            f"без него {_status(steps.get('without_state'))}"
+            f"без него {_status(steps.get('without_state'))}",
         )
         # Порог «заметной» разницы — половина оценки рассуждений, но не меньше 5 токенов.
         threshold = max(5, finding.get("reasoning_chars", 0) // CHARS_PER_TOKEN // 2)
@@ -1623,7 +1639,7 @@ def describe_probe(model: str, finding: Mapping[str, Any]) -> list[str]:
             lines.append(
                 "  рассуждения в запросе (role: reasoning): с tools_state_id "
                 f"{_status(steps['with_state+reasoning'], with_state)}, без него "
-                f"{_status(steps.get('without_state+reasoning'), without)}"
+                f"{_status(steps.get('without_state+reasoning'), without)}",
             )
     elif finding.get("tool_call") is False:
         lines.append("  модель не вызвала функцию — шаги не сравнивались")
@@ -1652,7 +1668,7 @@ def describe_probe(model: str, finding: Mapping[str, Any]) -> list[str]:
         )
         lines.append(
             f"  кеш префикса: повтор запроса {second['input_tokens']} ток., из кеша "
-            f"{second['cached_tokens']}{share}"
+            f"{second['cached_tokens']}{share}",
         )
     return lines
 

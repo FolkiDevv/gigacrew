@@ -184,11 +184,13 @@ def test_toolbar_contents():
                 context_budget=60_000,
                 billed_tokens=45_100,
                 auto_approve=True,
-            )
+            ),
         )
     )
-    assert "Alpha-2-Max" in text and "12.3k/60k (21%)" in text
-    assert "потрачено 45.1k" in text and "авто-подтверждение" in text
+    assert "Alpha-2-Max" in text
+    assert "12.3k/60k (21%)" in text
+    assert "потрачено 45.1k" in text
+    assert "авто-подтверждение" in text
     assert "авто-подтверждение" not in "".join(
         t for _, t in toolbar_fragments(StatusInfo(model="m"))
     )
@@ -240,14 +242,16 @@ def test_completes_skills_after_commands():
 
 def test_completes_mode_argument():
     completer = SlashCommandCompleter(
-        default_commands(), {"/mode": lambda: mode_choices(PermissionMode.PLAN)}
+        default_commands(),
+        {"/mode": lambda: mode_choices(PermissionMode.PLAN)},
     )
     found = [
         (c.text, c.display_meta_text)
         for c in completer.get_completions(Document("/mode "), CompleteEvent())
     ]
     assert [name for name, _ in found] == ["auto", "plan"]
-    assert "текущий" in dict(found)["plan"] and "текущий" not in dict(found)["auto"]
+    assert "текущий" in dict(found)["plan"]
+    assert "текущий" not in dict(found)["auto"]
 
 
 @pytest.mark.parametrize(
@@ -302,16 +306,17 @@ def test_shift_tab_in_completion_menu_moves_back(tmp_path):
 @pytest.mark.parametrize("palette", ["MINT", "MINT_ANSI"])
 def test_completion_menu_text_is_not_black(palette):
     """У меню дополнения в стилях prompt_toolkit по умолчанию чёрный текст: свой фон
-    меню требует и своего цвета текста, иначе команды не видно на тёмном фоне."""
+    меню требует и своего цвета текста, иначе команды не видно на тёмном фоне.
+    """
     from prompt_toolkit.styles import Style, merge_styles
     from prompt_toolkit.styles.defaults import default_ui_style
 
     from gigacrew.ui import theme
 
     style = merge_styles(
-        [default_ui_style(), Style.from_dict(theme.prompt_styles(getattr(theme, palette)))]
+        [default_ui_style(), Style.from_dict(theme.prompt_styles(getattr(theme, palette)))],
     )
     for name in ("completion", "meta.completion", "multi-column-meta"):
         attrs = style.get_attrs_for_style_str(f"class:completion-menu class:completion-menu.{name}")
-        assert attrs.color not in ("", "000000", "ansiblack"), name
+        assert attrs.color not in {"", "000000", "ansiblack"}, name
         assert attrs.bgcolor and attrs.bgcolor != attrs.color, name

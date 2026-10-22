@@ -6,9 +6,19 @@
 
 Формат::
 
-    {"version": 1, "models": {"model-large": {"context_window": 126998,
-        "upper_bound": 128319, "capped": false, "probes": 8,
-        "measured_at": "2026-10-09T12:00:00+03:00", "base_url": "https://..."}}}
+    {
+        "version": 1,
+        "models": {
+            "model-large": {
+                "context_window": 126998,
+                "upper_bound": 128319,
+                "capped": false,
+                "probes": 8,
+                "measured_at": "2026-10-09T12:00:00+03:00",
+                "base_url": "https://...",
+            }
+        },
+    }
 """
 
 from __future__ import annotations
@@ -55,7 +65,10 @@ class ModelWindows:
 
     @classmethod
     def load(
-        cls, path: Path | None = None, *, base_url: str = ""
+        cls,
+        path: Path | None = None,
+        *,
+        base_url: str = "",
     ) -> tuple[ModelWindows, str | None]:
         """Читает файл (по умолчанию :func:`default_path`).
 
@@ -93,7 +106,8 @@ class ModelWindows:
 
     def report(self, windows: Mapping[str, int | None]) -> None:
         """Окна моделей, которые сообщил API: только в памяти, в файл не пишутся.
-        Заменяют прежние; не положительные числа и None пропускаются."""
+        Заменяют прежние; не положительные числа и None пропускаются.
+        """
         self._reported = {
             str(name): window
             for name, window in windows.items()
@@ -102,7 +116,8 @@ class ModelWindows:
 
     def record(self, result: ProbeResult, *, base_url: str = "") -> None:
         """Запоминает замер и сохраняет файл. Ошибки записи — ``OSError``
-        (в памяти замер остаётся)."""
+        (в памяти замер остаётся).
+        """
         entry = {
             "context_window": result.window,
             "upper_bound": result.upper_bound,
@@ -141,7 +156,7 @@ def _write(path: Path, entries: dict[str, dict[str, Any]]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        Path(tmp).replace(path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise

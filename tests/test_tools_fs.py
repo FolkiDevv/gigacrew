@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -36,7 +37,8 @@ def test_write_overwrite_and_diff(ctx):
     params = w.parse({"path": "f.txt", "content": "new\n"})
     preview = w.preview(params, ctx)
     assert preview.kind == "diff"
-    assert "-old" in preview.text and "+new" in preview.text
+    assert "-old" in preview.text
+    assert "+new" in preview.text
     res = w.run(params, ctx)
     assert "перезаписан" in res.summary
 
@@ -52,8 +54,10 @@ def test_read_line_range(ctx):
     w.run(w.parse({"path": "n.txt", "content": "l1\nl2\nl3\nl4"}), ctx)
     r = ReadFileTool()
     out = r.run(r.parse({"path": "n.txt", "start_line": 2, "end_line": 3}), ctx)
-    assert "l2" in out.content and "l3" in out.content
-    assert "l1" not in out.content and "l4" not in out.content
+    assert "l2" in out.content
+    assert "l3" in out.content
+    assert "l1" not in out.content
+    assert "l4" not in out.content
 
 
 def test_edit_single_occurrence(ctx):
@@ -115,7 +119,7 @@ def test_edit_tolerant_trailing_whitespace(ctx):
                 "path": "t.py",
                 "old_string": "def f():\n    return 1",
                 "new_string": "def f():\n    return 2",
-            }
+            },
         ),
         ctx,
     )
@@ -151,7 +155,7 @@ def test_edit_with_double_escaped_old_string(ctx):
                 "path": "m.py",
                 "old_string": "def b():\\n    return 2",
                 "new_string": "def b():\\n    return 22",
-            }
+            },
         ),
         ctx,
     )
@@ -180,7 +184,7 @@ def test_edit_old_string_with_line_number_prefixes(ctx):
             {
                 "path": "k.py",
                 "content": "def add(a, b):\n    return a + b\n\ndef divide(a, b):\n    return a / b\n",
-            }
+            },
         ),
         ctx,
     )
@@ -191,7 +195,7 @@ def test_edit_old_string_with_line_number_prefixes(ctx):
                 "path": "k.py",
                 "old_string": "4\tdef divide(a, b):\n5\t    return a / b",
                 "new_string": "4\tdef divide(a, b):\n5\t    return a / b\n6\t\n7\tdef power(b, e):\n8\t    return b ** e",
-            }
+            },
         ),
         ctx,
     )
@@ -209,7 +213,8 @@ def test_edit_not_found_shows_context(ctx):
         e.run(e.parse({"path": "c.py", "old_string": "zzz", "new_string": "q"}), ctx)
     # сообщение об ошибке содержит пронумерованный контекст файла
     msg = str(ei.value)
-    assert "alpha" in msg and "1\t" in msg
+    assert "alpha" in msg
+    assert "1\t" in msg
 
 
 def test_edit_not_found(ctx):
@@ -236,7 +241,8 @@ def test_find_files(ctx):
         w.run(w.parse({"path": p, "content": "x"}), ctx)
     f = FindFilesTool()
     out = f.run(f.parse({"pattern": "*.py"}), ctx)
-    assert "a.py" in out.content and "sub/d.py" in out.content
+    assert "a.py" in out.content
+    assert "sub/d.py" in out.content
     assert "c.txt" not in out.content
 
 
@@ -348,14 +354,17 @@ def test_plan_file_is_writable_without_risk(ctx):
     write = w.parse({"path": ".gigacode/plans/chat1.md", "content": "# План\n1. a\n"})
     assert w.risk(write, pctx) is RiskLevel.SAFE
     res = w.run(write, pctx)
-    assert res.ok and res.summary == "создан план" and pctx.plan.dirty
+    assert res.ok
+    assert res.summary == "создан план"
+    assert pctx.plan.dirty
     # папка данных получила .gitignore — план не попадёт в репозиторий
     assert (ctx.root / ".gigacode" / ".gitignore").exists()
 
     pctx.plan.dirty = False
     edit = e.parse({"path": ".gigacode/plans/chat1.md", "old_string": "1. a", "new_string": "1. b"})
     assert e.risk(edit, pctx) is RiskLevel.SAFE
-    assert e.run(edit, pctx).summary == "изменён план" and pctx.plan.dirty
+    assert e.run(edit, pctx).summary == "изменён план"
+    assert pctx.plan.dirty
     assert pctx.plan.path.read_text(encoding="utf-8") == "# План\n1. b\n"
 
     # чужой план, чаты и обычный контекст без плана — по-прежнему закрыты
@@ -374,8 +383,6 @@ def test_plan_file_is_writable_without_risk(ctx):
 @pytest.mark.parametrize("target", [".git/config", ".gigacode/chats/x.json"])
 def test_symlinked_plan_file_is_not_a_plan(ctx, target):
     """Ссылка на месте файла плана не уводит запись без вопроса в .git/ или к чатам."""
-    import os
-
     from gigacrew.security import RiskLevel
 
     victim = ctx.root / target
@@ -383,7 +390,7 @@ def test_symlinked_plan_file_is_not_a_plan(ctx, target):
     victim.write_text("orig", encoding="utf-8")
     pctx = _plan_ctx(ctx)
     pctx.plan.path.parent.mkdir(parents=True)
-    os.symlink(victim, pctx.plan.path)
+    pathlib.Path(pctx.plan.path).symlink_to(victim)
     w = WriteFileTool()
     params = w.parse({"path": ".gigacode/plans/chat1.md", "content": "x"})
     assert w.risk(params, pctx) is RiskLevel.WRITE
@@ -391,16 +398,16 @@ def test_symlinked_plan_file_is_not_a_plan(ctx, target):
         w.preview(params, pctx)
     with pytest.raises(ToolError):
         w.run(w.parse({"path": target, "content": "x"}), pctx)
-    assert victim.read_text(encoding="utf-8") == "orig" and not pctx.plan.dirty
+    assert victim.read_text(encoding="utf-8") == "orig"
+    assert not pctx.plan.dirty
 
 
 def test_plan_dir_symlinked_into_git_is_rejected(ctx):
-    import os
 
     git = ctx.root / ".git"
     git.mkdir()
     (ctx.root / ".gigacode").mkdir()
-    os.symlink(git, ctx.workspace.plans_dir)
+    pathlib.Path(ctx.workspace.plans_dir).symlink_to(git)
     pctx = _plan_ctx(ctx)
     w = WriteFileTool()
     with pytest.raises(ToolError, match="Внутренности git"):
@@ -410,7 +417,8 @@ def test_plan_dir_symlinked_into_git_is_rejected(ctx):
 
 def test_plan_under_symlinked_data_dir_is_not_a_plan(ctx):
     """.gigacode — ссылка на каталог проекта: файл плана под ней — не план, запись туда —
-    правка проекта (без «безопасно» и без вопроса — нельзя)."""
+    правка проекта (без «безопасно» и без вопроса — нельзя).
+    """
     import os
 
     from gigacrew.security import RiskLevel
@@ -425,14 +433,16 @@ def test_plan_under_symlinked_data_dir_is_not_a_plan(ctx):
     assert w.risk(params, pctx) is RiskLevel.WRITE
     with pytest.raises(ToolError, match="Служебная папка"):
         w.run(params, pctx)
-    assert not (ctx.root / "src" / "plans").exists() and not pctx.plan.dirty
+    assert not (ctx.root / "src" / "plans").exists()
+    assert not pctx.plan.dirty
 
 
 def test_plan_file_edit_does_not_mark_other_writes(ctx):
     pctx = _plan_ctx(ctx)
     w = WriteFileTool()
     res = w.run(w.parse({"path": "a.txt", "content": "x"}), pctx)
-    assert res.summary == "создан a.txt" and not pctx.plan.dirty
+    assert res.summary == "создан a.txt"
+    assert not pctx.plan.dirty
 
 
 def test_data_dir_write_rejected_before_confirmation(tmp_path):
@@ -446,7 +456,7 @@ def test_data_dir_write_rejected_before_confirmation(tmp_path):
         [
             tool_turn("write_file", {"path": ".gigacode/chats/a.json", "content": "{}"}),
             text_turn("ок"),
-        ]
+        ],
     )
     events = RecordingEvents()
     cfg = Config(access_key="x", project_root=tmp_path, stream=False)
@@ -490,7 +500,8 @@ def test_list_dir_shows_hidden(ctx):
     (ctx.root / ".gitignore").write_text("x", encoding="utf-8")
     lister = ListDirTool()
     out = lister.run(lister.parse({}), ctx).content
-    assert ".github/" in out and ".gitignore" in out
+    assert ".github/" in out
+    assert ".gitignore" in out
 
 
 @pytest.mark.parametrize("path", [".gigacode/index/index.sqlite3", ".gigacode", "./.gigacode/x"])
@@ -542,7 +553,8 @@ def _git_layout(root):
 )
 def test_git_internals_are_not_writable(ctx, path):
     """Правка .git/config превратила бы `git status` (без подтверждения) в запуск
-    произвольной команды (core.fsmonitor, diff.external) — отказ ещё в превью."""
+    произвольной команды (core.fsmonitor, diff.external) — отказ ещё в превью.
+    """
     _git_layout(ctx.root)
     w, e = WriteFileTool(), EditFileTool()
     write = w.parse({"path": path, "content": "[core]\n\tfsmonitor = touch pwned\n"})
@@ -597,7 +609,7 @@ def test_git_config_write_rejected_in_accept_edits_mode(tmp_path):
                 {"path": ".git/config", "content": "[core]\n\tfsmonitor = touch pwned\n"},
             ),
             text_turn("ок"),
-        ]
+        ],
     )
     events = RecordingEvents()
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, mode=PermissionMode.AUTO)
@@ -640,7 +652,8 @@ def test_write_over_crlf_file_keeps_its_line_endings(ctx):
     w = WriteFileTool()
     params = w.parse({"path": "w.bat", "content": "@echo off\necho 2\n"})
     preview = w.preview(params, ctx)
-    assert "\r" not in preview.text and "-echo 1\n+echo 2\n" in preview.text
+    assert "\r" not in preview.text
+    assert "-echo 1\n+echo 2\n" in preview.text
     w.run(params, ctx)
     assert (ctx.root / "w.bat").read_bytes() == b"@echo off\r\necho 2\r\n"
 
@@ -677,13 +690,15 @@ def test_make_diff_marks_missing_final_newline():
 
 
 def test_make_diff_splits_only_on_newlines():
-    """\\x0c, \\x85, \\u2028 — не переводы строк: строки диффа не склеиваются."""
+    r"""\\x0c, \\x85, \\u2028 — не переводы строк: строки диффа не склеиваются."""
     from gigacrew.tools.fs import make_diff
 
     diff = make_diff("a\x0cb\nc d\nend\n", "a\x0cb\nC d\nend\n", "x")
     lines = [line for line in diff.split("\n")[2:] if line]
-    assert lines and all(line[:1] in " +-@\\" for line in lines)
-    assert "-c d" in diff and "+C d" in diff
+    assert lines
+    assert all(line[:1] in " +-@\\" for line in lines)
+    assert "-c d" in diff
+    assert "+C d" in diff
 
 
 def test_interrupted_write_leaves_file_intact(ctx, monkeypatch):
@@ -719,7 +734,7 @@ def test_edit_rejects_empty_old_string(ctx, replace_all):
     (ctx.root / "e.txt").write_text("abc\n", encoding="utf-8")
     e = EditFileTool()
     params = e.parse(
-        {"path": "e.txt", "old_string": "", "new_string": "X", "replace_all": replace_all}
+        {"path": "e.txt", "old_string": "", "new_string": "X", "replace_all": replace_all},
     )
     for call in (e.preview, e.run):
         with pytest.raises(ToolError, match="old_string пуст"):
@@ -763,7 +778,7 @@ def test_edit_tolerant_refuses_inconsistent_indentation(ctx):
     e = EditFileTool()
     # один и тот же отступ шаблона соответствует разным отступам файла — не угадываем
     params = e.parse(
-        {"path": "i.py", "old_string": "b = 1\nif b:\nc = 2", "new_string": "b = 1\nif b:\nc = 3"}
+        {"path": "i.py", "old_string": "b = 1\nif b:\nc = 2", "new_string": "b = 1\nif b:\nc = 3"},
     )
     with pytest.raises(ToolError, match="не найден"):
         e.run(params, ctx)
@@ -840,8 +855,10 @@ def test_read_cp1251_file(ctx):
     (ctx.root / "old.txt").write_bytes("Привет\r\nмир\r\n".encode("cp1251"))
     r = ReadFileTool()
     res = r.run(r.parse({"path": "old.txt"}), ctx)
-    assert "1\tПривет" in res.content and "2\tмир" in res.content
-    assert "показан как cp1251" in res.content and "cp1251" in res.summary
+    assert "1\tПривет" in res.content
+    assert "2\tмир" in res.content
+    assert "показан как cp1251" in res.content
+    assert "cp1251" in res.summary
 
 
 def test_hard_linked_file_is_edited_in_place(ctx):
@@ -868,7 +885,8 @@ def test_file_with_xattrs_is_edited_in_place(ctx):
         pytest.skip("ФС без user xattr")
     inode = path.stat().st_ino
     _edit(ctx, "acl.txt", "x = 1", "x = 2")
-    assert path.stat().st_ino == inode and os.getxattr(path, "user.gigacode") == b"1"
+    assert path.stat().st_ino == inode
+    assert os.getxattr(path, "user.gigacode") == b"1"
 
 
 def _fake_git_dir(directory):
@@ -880,7 +898,8 @@ def _fake_git_dir(directory):
 
 def test_nested_repository_git_dir_is_not_writable(ctx):
     """Вложенный репозиторий, чей .git — симлинк или gitdir:-файл на каталог в проекте:
-    ни путь через .git, ни прямой путь к его каталогу git не пишутся."""
+    ни путь через .git, ни прямой путь к его каталогу git не пишутся.
+    """
     import os
 
     if os.name == "nt":
@@ -919,7 +938,8 @@ def test_nested_repository_git_dir_is_not_writable(ctx):
 def test_git_dir_cannot_be_built_file_by_file(ctx, order):
     """Каталог git нельзя собрать по файлу: запись, которая завершила бы раскладку
     (HEAD, objects/, refs/), отклоняется в любом порядке — иначе config, записанный
-    первым, стал бы настройкой репозитория, который git найдёт в этом каталоге."""
+    первым, стал бы настройкой репозитория, который git найдёт в этом каталоге.
+    """
     w = WriteFileTool()
     *first, last = order
     for name in first:
@@ -941,7 +961,8 @@ def _decide(tool, params, ctx, mode="auto", **kw):
 @pytest.mark.parametrize("path", [".env", "sub/.env", ".ENV", "link.txt"])
 def test_env_write_always_asks(ctx, path):
     """.env — настройки самого gigacrew (ключ, адреса API, TLS): правка — только с
-    подтверждения, в любом режиме и даже с -y или разрешением хука."""
+    подтверждения, в любом режиме и даже с -y или разрешением хука.
+    """
     import os
 
     from gigacrew.permissions import Decision
@@ -1003,12 +1024,14 @@ def test_env_edit_in_auto_mode_is_confirmed(tmp_path):
     events = RecordingEvents(confirm_answer=False)
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, auto_approve=True)
     Agent(provider, build_default_registry(), cfg, events).run_turn("поправь адрес")
-    assert len(events.confirms) == 1 and events.confirms[0][2]  # как опасная операция
+    assert len(events.confirms) == 1
+    assert events.confirms[0][2]
     assert env.read_text(encoding="utf-8") == "GIGACREW_AUTH_URL=https://auth.test/oauth\n"
 
 
 @pytest.mark.parametrize(
-    "path", [".env", ".Env.Local", "deploy.pem", ".npmrc", "credentials.json", ".ssh/id_rsa"]
+    "path",
+    [".env", ".Env.Local", "deploy.pem", ".npmrc", "credentials.json", ".ssh/id_rsa"],
 )
 def test_read_file_refuses_secret_files(ctx, path):
     target = ctx.root / path
@@ -1017,7 +1040,8 @@ def test_read_file_refuses_secret_files(ctx, path):
     r = ReadFileTool()
     with pytest.raises(ToolError, match="секрет") as err:
         r.run(r.parse({"path": path}), ctx)
-    assert "s3cr3t" not in str(err.value) and "run_shell" in str(err.value)
+    assert "s3cr3t" not in str(err.value)
+    assert "run_shell" in str(err.value)
 
 
 def test_read_file_refuses_symlink_to_secret_and_reads_template(ctx):
@@ -1053,7 +1077,8 @@ def test_search_skips_and_refuses_secret_files(ctx):
 
 def test_edit_not_found_in_secret_file_shows_no_content(ctx):
     """Неудачная правка показывает модели файл — но не файл с секретами (ошибка превью
-    уходит модели до вопроса о подтверждении)."""
+    уходит модели до вопроса о подтверждении).
+    """
     (ctx.root / ".env").write_text("TOKEN=s3cr3t\n", encoding="utf-8")
     with pytest.raises(ToolError, match="не найден") as err:
         _edit(ctx, ".env", "MISSING=1", "MISSING=2")

@@ -261,7 +261,7 @@ def test_program_path_is_normalized_before_trusting_system_dir(root):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         ("env -i ls", READ),
         ("env -u HOME ls", READ),
@@ -294,7 +294,7 @@ def test_env_options_and_assignments(root, command, expected):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         # значение флага в группе коротких (`-uo FILE`) — как в getopt
         ("sort -uo .git/x a.txt", DANGER),
@@ -376,7 +376,7 @@ def test_option_values_are_parsed_like_getopt(root, command, expected):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         # значения флагов, которые читают файлы, проверяются как пути
         ("date -f ~/.ssh/id_rsa", DANGER),
@@ -450,7 +450,7 @@ def test_git_reads_and_changes(repo):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         # настройки, запускающие программы, — на один запуск и постоянно
         ("git -c core.pager='sh -c id' log", DANGER),
@@ -594,7 +594,7 @@ def test_git_in_nested_repository_asks(repo):
 
 # --------------------------- выполнение кода -------------------------- #
 @pytest.mark.parametrize(
-    "command, signature",
+    ("command", "signature"),
     [
         ("pytest", "pytest"),
         ("pytest -q -x tests/test_a.py", "pytest"),
@@ -668,7 +668,7 @@ def test_make_dry_run_still_runs_makefile_code(root):
 
 
 @pytest.mark.parametrize(
-    "command, expected, signatures",
+    ("command", "expected", "signatures"),
     [
         ("make -j 4 test", EXEC, ("make test",)),
         ("make -j8 test", EXEC, ("make test",)),
@@ -697,7 +697,7 @@ def test_npm_script_must_exist(root):
 
 # ----------------------- запись, сеть, опасное ------------------------ #
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         ("mkdir -p build", WRITE),
         ("cp a.txt c.txt", WRITE),
@@ -738,11 +738,15 @@ def test_edits_only(root):
 # ------------------------------ разбор ------------------------------- #
 def test_cd_prefix_becomes_cwd(root):
     verdict = classify("cd src && ls -la", root=root)
-    assert verdict.cwd == "src" and verdict.command == "ls -la"
+    assert verdict.cwd == "src"
+    assert verdict.command == "ls -la"
     verdict = classify("ls", root=root, cwd="src")
-    assert verdict.cwd == "src" and verdict.level is READ
+    assert verdict.cwd == "src"
+    assert verdict.level is READ
     mixed = classify("cd src && cd /tmp && ls", root=root)
-    assert mixed.cwd == "src" and mixed.command == "cd /tmp && ls" and mixed.level is None
+    assert mixed.cwd == "src"
+    assert mixed.command == "cd /tmp && ls"
+    assert mixed.level is None
     assert classify("cd src; ls", root=root).level is None  # после «;» cd мог не сработать
     assert classify("cd ../.. && ls", root=root).cwd == "."
 
@@ -779,11 +783,12 @@ def test_every_command_node_is_classified(root, command):
         nodes += n.type == "command"
         stack.extend(n.children)
     script = shell.parse(command, root=root)
-    assert script is not None and len(script.commands) + script.consumed == nodes
+    assert script is not None
+    assert len(script.commands) + script.consumed == nodes
 
 
 @pytest.mark.parametrize(
-    "command, value",
+    ("command", "value"),
     [
         ('echo "a\nb"', "a\nb"),
         ('echo "\n  x = 1\n"', "\n  x = 1\n"),
@@ -802,12 +807,12 @@ def test_quoted_word_keeps_newlines(root, command, value):
 
 def test_long_commands_and_other_platforms_ask(root, monkeypatch):
     assert level("echo " + "x" * 20_000, root) is None
-    monkeypatch.setattr("gigacrew.safety._is_posix", lambda: False)
+    monkeypatch.setattr("gigacrew.safety.classifier._is_posix", lambda: False)
     assert level("ls", root) is None
 
 
 def test_child_environment_drops_shell_hooks_and_adds_git_safety(monkeypatch):
-    from gigacrew.tools.process import subprocess_env
+    from gigacrew.security import subprocess_env
 
     env = subprocess_env(
         {
@@ -817,10 +822,13 @@ def test_child_environment_drops_shell_hooks_and_adds_git_safety(monkeypatch):
             "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "user.name",
             "GIT_CONFIG_VALUE_0": "me",
-        }
+        },
     )
-    assert "CDPATH" not in env and "BASH_ENV" not in env and "ENV" not in env
-    assert env["GIT_CONFIG_COUNT"] == "3" and env["GIT_CONFIG_KEY_0"] == "user.name"
+    assert "CDPATH" not in env
+    assert "BASH_ENV" not in env
+    assert "ENV" not in env
+    assert env["GIT_CONFIG_COUNT"] == "3"
+    assert env["GIT_CONFIG_KEY_0"] == "user.name"
     assert env["GIT_CONFIG_KEY_1"] == "safe.bareRepository"
     assert env["GIT_CONFIG_VALUE_2"] == "false"
     # окружение самого процесса не меняется
@@ -867,8 +875,10 @@ def venv_site(root):
         "import _virtualenv",
         "import _distutils_hack",
         "import __editable___pkg_1_0_finder; __editable___pkg_1_0_finder.install()",
-        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') "
-        "== 'local'; enabled and __import__('_distutils_hack').add_shim(); ",
+        (
+            "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') "
+            "== 'local'; enabled and __import__('_distutils_hack').add_shim(); "
+        ),
     ],
 )
 def test_standard_pth_lines_are_trusted(root, venv_site, line):
@@ -940,7 +950,7 @@ def test_stdlib_shadowing_in_run_directory_is_exec(root):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         ("python3 -m json.tool package.json /tmp/o.json", DANGER),
         ("python3 -m json.tool package.json .git/config", DANGER),
@@ -991,7 +1001,7 @@ def test_flags_before_subcommand_drop_signature(root, command):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         ("uv --directory=/tmp/other run pytest", None),
         ("uv run --python /tmp/x/python python -c 'print(1)'", None),
@@ -1056,13 +1066,15 @@ def test_tool_levels(root, command, expected):
 def test_npm_format_script_edits_files(root):
     (root / "package.json").write_text('{"scripts": {"format": "prettier -w .", "lint": "x"}}')
     verdict = classify("npm run format", root=root)
-    assert verdict.level is WRITE and verdict.edits_only and verdict.signatures == ()
+    assert verdict.level is WRITE
+    assert verdict.edits_only
+    assert verdict.signatures == ()
     assert classify("npm run lint", root=root).signatures == ("npm run lint",)
 
 
 # ------------- точные уровни правил (обе стороны каждого) ------------- #
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         # sed: правка на месте и в группе флагов, запуск команд
         ("sed -Ei 's/a/b/' a.txt", WRITE),
@@ -1156,7 +1168,8 @@ def test_rule_levels(root, command, expected):
 
 def test_fd_search_paths_are_relative_to_base_directory(root):
     """Относительные пути поиска fd отсчитывает от -C/--base-directory, а не от каталога
-    команды: из src/a `fd y ../x -C ../..` ищет в <проект>/../x — за пределами проекта."""
+    команды: из src/a `fd y ../x -C ../..` ищет в <проект>/../x — за пределами проекта.
+    """
     (root / "src" / "a").mkdir()
     sub = {"cwd": "src/a"}
     assert level("fd y ../x -x cat", root, **sub) is READ  # src/x — внутри
@@ -1200,6 +1213,8 @@ def test_source_project_venv_activate_is_prelude(root):
     (root / "scripts").mkdir()
     (root / "scripts" / "activate").write_text("echo hi\n")
     real = classify("source .venv/bin/activate && pytest", root=root)
-    assert real.parts[0].prelude and real.parts[0].signature == "venv-activate"
+    assert real.parts[0].prelude
+    assert real.parts[0].signature == "venv-activate"
     fake = classify("source scripts/activate && pytest", root=root)
-    assert not fake.parts[0].prelude and fake.parts[0].signature is None
+    assert not fake.parts[0].prelude
+    assert fake.parts[0].signature is None

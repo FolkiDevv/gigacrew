@@ -1,5 +1,6 @@
 """Офлайн-тесты инфраструктуры eval (``tests/behavior.py``): учебный проект, сценарный
-пользователь, метрики прогона, отчёт и разбор проб — на ScriptedProvider, без сети."""
+пользователь, метрики прогона, отчёт и разбор проб — на ScriptedProvider, без сети.
+"""
 
 from __future__ import annotations
 
@@ -84,7 +85,8 @@ def test_fixture_project_is_consistent(shop):
 def test_scenarios_are_well_defined():
     assert len({scenario.id for scenario in SCENARIOS}) == len(SCENARIOS)
     for scenario in SCENARIOS:
-        assert scenario.turns and scenario.goal
+        assert scenario.turns
+        assert scenario.goal
         assert all(
             rel in FIXTURE_FILES or rel.startswith("tests/") for rel in scenario.files_expect
         )
@@ -156,7 +158,8 @@ def test_other_commands_are_rejected(command, shop):
 def test_only_what_the_classifier_reads_is_auto_approved(shop):
     """Разрешение — от классификатора, а не от своего списка: команда, которую он считает
     только чтением, проходит, даже если это незнакомая harness'у программа; «не знаю» —
-    нет."""
+    нет.
+    """
     assert is_safe_command("wc -l shop/cart.py", root=shop)
     assert is_safe_command("git log --oneline -5", root=shop)
     assert not is_safe_command("make", root=shop)  # исполняет — не pytest
@@ -171,7 +174,8 @@ def test_scripted_user_answers_plan_and_model_questions(tmp_path):
     assert user.ask_user([plan]) is None  # ответы кончились — как Esc
     question = Question("Какая БД?", (QuestionOption("SQLite"), QuestionOption("Postgres")))
     assert user.ask_user([question]) == [Answer(("SQLite",))]
-    assert user.plans == ["# План"] * 3 and user.model_questions == 1
+    assert user.plans == ["# План"] * 3
+    assert user.model_questions == 1
 
 
 def test_scripted_user_confirms_edits_and_safe_commands_only(shop):
@@ -200,11 +204,15 @@ def test_plan_submitted_by_model(shop):
         shop,
     )
     record = result.record
-    assert result.error is None and record["ok"]
+    assert result.error is None
+    assert record["ok"]
     assert record["exit_calls"] == record["plan_shown"] == record["plan_writes"] == 1
-    assert record["plan_turns_ended_in_text"] == 0 and record["plan_reminders"] == 0
-    assert record["plan_written"] and record["changed_files"] == []
-    assert record["final_mode"] == "plan" and record["requests"] == 3
+    assert record["plan_turns_ended_in_text"] == 0
+    assert record["plan_reminders"] == 0
+    assert record["plan_written"]
+    assert record["changed_files"] == []
+    assert record["final_mode"] == "plan"
+    assert record["requests"] == 3
     assert invariant_errors(SCENARIO_BY_ID["plan_exit"], record) == []
     assert result.transcript["plans"][0].startswith("# План")
 
@@ -220,9 +228,13 @@ def test_plan_left_in_text_is_shown_by_harness(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["exit_calls"] == 0 and record["plan_shown"] == 1
-    assert record["plan_reminders"] == 1 and record["self_checks"] == 0
-    assert record["plan_turns_ended_in_text"] == 0 and record["requests"] == 2
+    assert record["ok"]
+    assert record["exit_calls"] == 0
+    assert record["plan_shown"] == 1
+    assert record["plan_reminders"] == 1
+    assert record["self_checks"] == 0
+    assert record["plan_turns_ended_in_text"] == 0
+    assert record["requests"] == 2
 
 
 def test_promise_without_plan_gets_self_check(shop):
@@ -237,9 +249,11 @@ def test_promise_without_plan_gets_self_check(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["exit_calls"] == record["plan_shown"] == 1
+    assert record["ok"]
+    assert record["exit_calls"] == record["plan_shown"] == 1
     assert record["self_checks"] == record["self_checks_resumed"] == 1
-    assert record["requests"] == 4 and record["plan_reminders"] == 0
+    assert record["requests"] == 4
+    assert record["plan_reminders"] == 0
 
 
 def test_plan_revised_after_remarks(shop):
@@ -262,8 +276,10 @@ def test_plan_revised_after_remarks(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["plan_revised"]
-    assert record["plan_shown"] == record["exit_calls"] == 2 and record["plan_edits"] == 1
+    assert record["ok"]
+    assert record["plan_revised"]
+    assert record["plan_shown"] == record["exit_calls"] == 2
+    assert record["plan_edits"] == 1
 
 
 def test_approved_plan_is_implemented(shop):
@@ -278,9 +294,12 @@ def test_approved_plan_is_implemented(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["final_mode"] == "auto"
-    assert record["changed_files"] == ["shop/cart.py"] and record["changed_before_plan"] == []
-    assert record["files_ok"] and record["tests_pass"]
+    assert record["ok"]
+    assert record["final_mode"] == "auto"
+    assert record["changed_files"] == ["shop/cart.py"]
+    assert record["changed_before_plan"] == []
+    assert record["files_ok"]
+    assert record["tests_pass"]
     assert invariant_errors(SCENARIO_BY_ID["plan_implement"], record) == []
 
 
@@ -297,9 +316,11 @@ def test_manual_exit_from_plan_mode(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["answer"] == "Готово."
+    assert record["ok"]
+    assert record["answer"] == "Готово."
     assert [turn["mode_before"] for turn in record["turns"]] == ["plan", "auto"]
-    assert record["turns"][0]["plan_shown"] == 1 and record["turns"][1]["exit_calls"] == 0
+    assert record["turns"][0]["plan_shown"] == 1
+    assert record["turns"][1]["exit_calls"] == 0
     assert [turn["plan_shown"] for turn in record["turns"]] == [1, 0]  # по ходу, не нарастающим
 
 
@@ -313,11 +334,15 @@ def test_question_in_plan_mode(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["answer_hits"] == 1.0
-    assert record["plan_shown"] == 0 and not record["plan_written"]
-    assert record["research_calls"] == 1 and record["plan_turns_ended_in_text"] == 1
+    assert record["ok"]
+    assert record["answer_hits"] == 1.0
+    assert record["plan_shown"] == 0
+    assert not record["plan_written"]
+    assert record["research_calls"] == 1
+    assert record["plan_turns_ended_in_text"] == 1
     # ответ на вопрос пережил самопроверку: +1 запрос, служебного обмена в истории нет
-    assert record["self_checks"] == 1 and record["self_checks_resumed"] == 0
+    assert record["self_checks"] == 1
+    assert record["self_checks_resumed"] == 0
     assert record["requests"] == 3
 
 
@@ -340,10 +365,13 @@ def test_broad_question_delegated_to_explore(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["answer_hits"] == 1.0
+    assert record["ok"]
+    assert record["answer_hits"] == 1.0
     assert record["task_calls"] == record["explore_calls"] == record["subagent_runs"] == 1
-    assert record["requests"] == 4 and record["requests_subagent"] == 2
-    assert record["research_calls"] == 0 and record["subagent_tool_calls"] == 1
+    assert record["requests"] == 4
+    assert record["requests_subagent"] == 2
+    assert record["research_calls"] == 0
+    assert record["subagent_tool_calls"] == 1
 
 
 def test_broad_question_explored_with_explore_tool(shop):
@@ -357,8 +385,10 @@ def test_broad_question_explored_with_explore_tool(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["task_calls"] == record["explore_calls"] == 1
-    assert record["general_calls"] == 0 and record["subagent_runs"] == 1
+    assert record["ok"]
+    assert record["task_calls"] == record["explore_calls"] == 1
+    assert record["general_calls"] == 0
+    assert record["subagent_runs"] == 1
 
 
 PAYMENTS_TESTS = """\
@@ -406,8 +436,10 @@ def test_subtasks_done_by_main_agent_count(shop, storage, ok):
         shop,
     )
     record = result.record
-    assert record["task_calls"] == 0 and record["files_ok"]
-    assert record["tests_pass"] is ok and record["ok"] is ok
+    assert record["task_calls"] == 0
+    assert record["files_ok"]
+    assert record["tests_pass"] is ok
+    assert record["ok"] is ok
 
 
 def test_pinpoint_question_answered_directly(shop):
@@ -417,13 +449,16 @@ def test_pinpoint_question_answered_directly(shop):
         shop,
     )
     record = result.record
-    assert record["ok"] and record["task_calls"] == 0 and record["research_calls"] == 1
+    assert record["ok"]
+    assert record["task_calls"] == 0
+    assert record["research_calls"] == 1
 
 
 def test_api_error_is_recorded_not_lost(shop):
     result = _run("delegate_pinpoint", [LLMError("шлюз недоступен")], shop)
     assert isinstance(result.error, LLMError)
-    assert result.record["error"] == "LLMError: шлюз недоступен" and not result.record["ok"]
+    assert result.record["error"] == "LLMError: шлюз недоступен"
+    assert not result.record["ok"]
     assert result.record["well_formed"]
 
 
@@ -472,7 +507,8 @@ def test_well_formed_batch_pairs_results_with_their_calls():
 
 def test_crashed_run_is_not_ok_even_if_its_check_passes(shop):
     """Сбой (ошибка API) — не успех, даже если метрика сценария к этому моменту выполнена:
-    иначе упавшие прогоны завышали бы долю успеха в отчёте."""
+    иначе упавшие прогоны завышали бы долю успеха в отчёте.
+    """
     result = _run(
         "delegate_broad",
         [tool_turn("explore", {"question": "q"}), text_turn("отчёт"), LLMError("шлюз упал")],
@@ -481,7 +517,8 @@ def test_crashed_run_is_not_ok_even_if_its_check_passes(shop):
     record = result.record
     assert record["explore_calls"] == 1  # check сценария выполнен
     assert SCENARIO_BY_ID["delegate_broad"].check(record)
-    assert isinstance(result.error, LLMError) and record["ok"] is False
+    assert isinstance(result.error, LLMError)
+    assert record["ok"] is False
 
 
 def test_unchanged_plan_shown_again_is_not_revised(shop):
@@ -497,8 +534,10 @@ def test_unchanged_plan_shown_again_is_not_revised(shop):
         shop,
     )
     record = result.record
-    assert record["plan_shown"] == 2 and record["plan_edits"] == 0
-    assert record["plan_revised"] is False and record["ok"] is False
+    assert record["plan_shown"] == 2
+    assert record["plan_edits"] == 0
+    assert record["plan_revised"] is False
+    assert record["ok"] is False
 
 
 def test_write_attempt_in_plan_mode_is_blocked_and_counted(shop):
@@ -514,14 +553,16 @@ def test_write_attempt_in_plan_mode_is_blocked_and_counted(shop):
         shop,
     )
     record = result.record
-    assert record["blocked_calls"] == 1 and record["changed_files"] == []
+    assert record["blocked_calls"] == 1
+    assert record["changed_files"] == []
     assert invariant_errors(SCENARIO_BY_ID["plan_exit"], record) == []
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["complete", "stream"])
 def test_agent_passes_the_configured_temperature(tmp_path, stream):
     """GIGACREW_TEMPERATURE доходит до каждого запроса агента: отчёт eval печатает T=…,
-    и она должна быть той, с которой модель на самом деле отвечала."""
+    и она должна быть той, с которой модель на самом деле отвечала.
+    """
     provider = ScriptedProvider([tool_turn("list_dir", {"path": "."}), text_turn("ok")])
     config = Config(access_key="x", project_root=tmp_path, temperature=0.7, stream=stream)
     Agent(provider, build_default_registry(), config, RecordingEvents()).run_turn("что тут?")
@@ -570,7 +611,8 @@ def test_report_is_written_after_each_run_and_compared(shop, tmp_path):
     assert all(name in compared[3] for name in ("err", "rem", "chk", "txt", "res"))
     assert main(["show", str(session.path)]) == 0
     assert main(["digest", str(session.path)]) == 0
-    assert report["meta"]["reasoning"] == "turn" and "reasoning=turn" in compared[0]
+    assert report["meta"]["reasoning"] == "turn"
+    assert "reasoning=turn" in compared[0]
     off_meta = {**newer["meta"], "reasoning": "off"}
     assert "reasoning=off" in compare_reports(report, {**newer, "meta": off_meta})[1]
     old_meta = {k: v for k, v in report["meta"].items() if k != "reasoning"}  # до этапа 5
@@ -615,12 +657,14 @@ def test_digest_fits_a_chat_message():
     lines = digest_report(report)
     assert len(lines) <= 100
     text = "\n".join(lines)
-    assert "Неуспешные прогоны: 41 из 82" in text and "… и ещё 11" in text
+    assert "Неуспешные прогоны: 41 из 82" in text
+    assert "… и ещё 11" in text
     assert "40× LLMError: The read operation timed out" in text
     assert "стоп tool_failures" in text
     assert "Пауз из-за лимита запросов (429): 3 в 1 прогонах" in text
     row = next(line for line in lines if line.startswith("model-1") and "plan_exit" in line)
-    assert "6.5" in row and "205.0" in row
+    assert "6.5" in row
+    assert "205.0" in row
 
 
 def test_eval_models_from_environment():
@@ -636,7 +680,7 @@ def test_probe_helpers():
             {"role": "reasoning", "content": [{"text": "думаю"}]},
             {"role": "reasoning", "content": "ещё"},
             {"role": "assistant", "content": [{"text": "ок"}]},
-        ]
+        ],
     }
     assert reasoning_texts(data) == ["думаю", "ещё"]
     payload = {
@@ -644,7 +688,7 @@ def test_probe_helpers():
             {"role": "user", "content": [{"text": "?"}]},
             {"role": "assistant", "content": [{"text": ""}]},
             {"role": "tool", "content": []},
-        ]
+        ],
     }
     patched = with_reasoning(payload, "думаю")
     assert [m["role"] for m in patched["messages"]] == ["user", "reasoning", "assistant", "tool"]
@@ -666,9 +710,12 @@ def test_probe_helpers():
         ],
     }
     text = "\n".join(describe_probe("m", finding))
-    assert "да, 300 симв." in text and "ошибка 422" in text and "480 ток. (+80)" in text
+    assert "да, 300 симв." in text
+    assert "ошибка 422" in text
+    assert "480 ток. (+80)" in text
     assert "разница +100 ток.: похоже, шлюз сам подставляет" in text
-    assert "из кеша 900 (90%)" in text and "top_p=0.95 → принято" in text
+    assert "из кеша 900 (90%)" in text
+    assert "top_p=0.95 → принято" in text
     assert "текстовый поток: finish_reason=stop — окончание приходит" in text
     same = {**finding["step2"], "without_state": {"status": 200, "input_tokens": 498}}
     text = "\n".join(describe_probe("m", {**finding, "step2": same}))

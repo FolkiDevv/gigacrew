@@ -15,26 +15,24 @@ from pathlib import Path
 from gigacrew.project.gitignore import IgnoreStack, compile_glob, root_stack, stack_for
 from gigacrew.project.workspace import DATA_DIR_NAME
 
-IGNORE_DIRS: frozenset[str] = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        "__pycache__",
-        "node_modules",
-        ".venv",
-        "venv",
-        ".tox",
-        ".eggs",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        "dist",
-        "build",
-        ".idea",
-        DATA_DIR_NAME,
-    }
-)
+IGNORE_DIRS: frozenset[str] = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".tox",
+    ".eggs",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+    ".idea",
+    DATA_DIR_NAME,
+})
 
 
 TREE_TRUNCATED = "... (tree truncated)"
@@ -66,7 +64,8 @@ def is_secret_path(path: Path) -> bool:
 
 def git_dirs(root: Path) -> list[Path]:
     """Каталоги git проекта: ``<root>/.git`` (раскрытый) или цель ``gitdir:`` из
-    ``.git``-файла (рабочие деревья, сабмодули, раскладка с ``.bare``)."""
+    ``.git``-файла (рабочие деревья, сабмодули, раскладка с ``.bare``).
+    """
     dot_git = root / GIT_DIR_NAME
     try:
         if dot_git.is_dir():
@@ -272,7 +271,8 @@ def build_file_tree(root: Path, max_entries: int = 200) -> str:
     def listing(directory: Path, rel_dir: str, stack: IgnoreStack) -> list[tuple[str, bool]]:
         try:
             entries = sorted(
-                directory.iterdir(), key=lambda e: (not is_real_dir(e), e.name.lower())
+                directory.iterdir(),
+                key=lambda e: (not is_real_dir(e), e.name.lower()),
             )
         except OSError:
             return []

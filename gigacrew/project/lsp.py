@@ -34,7 +34,7 @@ class LspError(Exception):
     """Сбой обмена с сервером: ответ-ошибка, сервер завершился, нарушен протокол."""
 
 
-class LspTimeout(LspError):
+class LspTimeoutError(LspError):
     """Сервер не ответил вовремя."""
 
 
@@ -79,7 +79,7 @@ class LspClient:
             kwargs["start_new_session"] = True
         else:
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        stderr = open(self._stderr_path, "ab") if self._stderr_path else subprocess.DEVNULL  # noqa: SIM115
+        stderr = Path(self._stderr_path).open("ab") if self._stderr_path else subprocess.DEVNULL  # noqa: SIM115
         try:
             self._proc = subprocess.Popen(
                 self._argv,
@@ -99,7 +99,7 @@ class LspClient:
         self._writer.start()
 
     def request(self, method: str, params: Any = None, *, timeout: float) -> Any:
-        """Запрос и ожидание ответа. LspError — ошибка сервера, LspTimeout — нет ответа."""
+        """Запрос и ожидание ответа. LspError — ошибка сервера, LspTimeoutError — нет ответа."""
         with self._pending_lock:
             self._next_id += 1
             msg_id = self._next_id
@@ -111,7 +111,7 @@ class LspClient:
                 reply = slot.get(timeout=timeout)
             except queue.Empty:
                 self._cancel(msg_id)
-                raise LspTimeout(f"{method}: сервер не ответил за {timeout:g} с") from None
+                raise LspTimeoutError(f"{method}: сервер не ответил за {timeout:g} с") from None
             except BaseException:  # Ctrl+C посреди ожидания: ответ больше не нужен
                 self._cancel(msg_id)
                 raise
@@ -180,7 +180,8 @@ class LspClient:
 
     def _write_loop(self) -> None:
         proc = self._proc
-        assert proc is not None and proc.stdin is not None
+        assert proc is not None
+        assert proc.stdin is not None
         while True:
             chunk = self._outbox.get()
             if chunk is None:
@@ -217,7 +218,8 @@ class LspClient:
 
     def _read_loop(self) -> None:
         proc = self._proc
-        assert proc is not None and proc.stdout is not None
+        assert proc is not None
+        assert proc.stdout is not None
         try:
             while True:
                 message = self._read_message(proc.stdout)

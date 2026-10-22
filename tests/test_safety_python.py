@@ -34,12 +34,18 @@ def root(tmp_path: Path) -> Path:
         "import platform; print(platform.python_version())",
         "import json\nwith open('package.json') as f:\n    print(json.load(f)['version'])",
         "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb')))",
-        "from pathlib import Path\nfor p in sorted(Path('pkg').rglob('*.py')):\n"
-        "    print(p, len(p.read_text().splitlines()))",
-        "import ast, pathlib\nt = ast.parse(pathlib.Path('pkg/mod.py').read_text())\n"
-        "print([n.name for n in t.body])",
-        "import os\nfor root, dirs, files in os.walk('pkg'):\n    for f in files:\n"
-        "        print(len(open(os.path.join(root, f)).read()))",
+        (
+            "from pathlib import Path\nfor p in sorted(Path('pkg').rglob('*.py')):\n"
+            "    print(p, len(p.read_text().splitlines()))"
+        ),
+        (
+            "import ast, pathlib\nt = ast.parse(pathlib.Path('pkg/mod.py').read_text())\n"
+            "print([n.name for n in t.body])"
+        ),
+        (
+            "import os\nfor root, dirs, files in os.walk('pkg'):\n    for f in files:\n"
+            "        print(len(open(os.path.join(root, f)).read()))"
+        ),
         "import importlib.metadata as m; print(m.version('pytest'))",
         "import os; print(os.getcwd(), os.listdir('.'))",
         "import re\nprint(re.findall(r'def (\\w+)', open('pkg/mod.py').read()))",
@@ -55,7 +61,7 @@ def test_read_only_code(root, code):
 
 
 @pytest.mark.parametrize(
-    "code, expected",
+    ("code", "expected"),
     [
         ("import os; os.system('id')", DANGER),
         ("from os import system as s; s('id')", DANGER),
@@ -110,7 +116,7 @@ def test_risky_code(root, code, expected):
 
 
 @pytest.mark.parametrize(
-    "code, expected",
+    ("code", "expected"),
     [
         # os, импортированный «безопасным» модулем, — тот же os
         ("import glob; glob.os.system('id')", DANGER),
@@ -148,7 +154,7 @@ def test_modules_reached_through_other_modules(root, code, expected):
 
 
 @pytest.mark.parametrize(
-    "code, expected",
+    ("code", "expected"),
     [
         # псевдоним функции модуля проверяется как она сама
         ("import os; rm = os.remove; rm('/etc/hosts')", DANGER),
@@ -158,8 +164,10 @@ def test_modules_reached_through_other_modules(root, code, expected):
         ("from pathlib import Path as P; P('/etc/hosts').write_text('x')", DANGER),
         # у имени есть и другие значения — не псевдоним
         (
-            "import os\np = os.path\nfrom pathlib import Path\nfor p in Path('.').rglob('*'):\n"
-            "    p.unlink()",
+            (
+                "import os\np = os.path\nfrom pathlib import Path\nfor p in Path('.').rglob('*'):\n"
+                "    p.unlink()"
+            ),
             None,
         ),
         ("import os\nf = os.path.join\nf = os.remove\nf('/etc/hosts')", None),
@@ -196,7 +204,7 @@ def test_callables_as_values(root, code, expected):
 
 
 @pytest.mark.parametrize(
-    "code, expected",
+    ("code", "expected"),
     [
         # куда переносится или копируется файл — тоже запись
         ("from pathlib import Path; Path('a.txt').rename('/tmp/x')", DANGER),
@@ -230,7 +238,7 @@ def test_move_and_copy_destination(root, code, expected):
 
 
 @pytest.mark.parametrize(
-    "code, expected",
+    ("code", "expected"),
     [
         # пути в функциях os/shutil — и позиционные, и именованные
         ("import os; os.rename('a.txt', dst='/tmp/x')", DANGER),
@@ -253,7 +261,7 @@ def test_os_writers_keyword_arguments(root, code, expected):
 
 
 @pytest.mark.parametrize(
-    "code, expected",
+    ("code", "expected"),
     [
         # .gigacode/ — чаты, планы и скиллы агента: как и в shell, запись туда — DANGER
         ("open('.gigacode/skills/x.md', 'w').write('x')", DANGER),
@@ -272,7 +280,7 @@ def test_writes_into_gigacode_data(root, code, expected):
 
 
 @pytest.mark.parametrize(
-    "code, expected",
+    ("code", "expected"),
     [
         # sys.path под другим именем — всё тот же sys.path
         ("from sys import path; path.insert(0, '/tmp'); import json", DANGER),
@@ -295,15 +303,45 @@ def test_sys_path_changes(root, code, expected):
 
 # Каждую строку ловит одно правило: в test_risky_code уровень часто даёт другое, раньше
 # (rmtree, os.system, __builtins__), и само правило там не проверяется.
-_DANGER_METHOD_NAMES = (
-    "system popen spawnl spawnle spawnlp spawnv spawnve spawnvp execl execle execlp execlpe "
-    "execv execve execvp execvpe fork forkpty kill killpg urlopen putenv unsetenv chroot "
-    "setuid setgid symlink link rmtree extractall startfile run_module run_path"
-).split()
+_DANGER_METHOD_NAMES = [
+    "system",
+    "popen",
+    "spawnl",
+    "spawnle",
+    "spawnlp",
+    "spawnv",
+    "spawnve",
+    "spawnvp",
+    "execl",
+    "execle",
+    "execlp",
+    "execlpe",
+    "execv",
+    "execve",
+    "execvp",
+    "execvpe",
+    "fork",
+    "forkpty",
+    "kill",
+    "killpg",
+    "urlopen",
+    "putenv",
+    "unsetenv",
+    "chroot",
+    "setuid",
+    "setgid",
+    "symlink",
+    "link",
+    "rmtree",
+    "extractall",
+    "startfile",
+    "run_module",
+    "run_path",
+]
 
 
 @pytest.mark.parametrize(
-    "code, expected",
+    ("code", "expected"),
     [
         # режимы открытия: w, a, x, + — запись; позиционно и mode=; неизвестный — «не знаю»
         ("open('a.txt', 'r+').write('x')", WRITE),
@@ -374,8 +412,10 @@ _DANGER_METHOD_NAMES = (
             None,
         ),
         (
-            "import os\nfor root, dirs, files in os.walk('pkg'):\n"
-            "    print(open(os.path.join(root, '..', 'x')).read())",
+            (
+                "import os\nfor root, dirs, files in os.walk('pkg'):\n"
+                "    print(open(os.path.join(root, '..', 'x')).read())"
+            ),
             None,
         ),
         (
@@ -455,7 +495,7 @@ def test_stdlib_shadowing_by_packages_script_dir_and_pythonpath(root):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         ("python3 -c 'print(1)'", READ),
         ("python3 -Bc 'print(1)'", READ),
@@ -493,7 +533,8 @@ def test_python_script_is_analyzed(root):
     assert classify("python3 bad.py", root=root).level is DANGER
     assert classify("python3 uses_pkg.py", root=root).level is EXEC  # pkg/ рядом — код проекта
     signature = classify("python3 uses_pkg.py", root=root).parts[0].signature
-    assert signature is not None and signature.startswith("python uses_pkg.py#")
+    assert signature is not None
+    assert signature.startswith("python uses_pkg.py#")
 
 
 def test_project_venv_with_executable_pth_is_exec(root):

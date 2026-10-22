@@ -35,8 +35,10 @@ def test_stream_and_output_are_sanitized():
         previewed=False,
     )
     out = buf.getvalue()
-    assert "\x1b" not in out and "\x07" not in out
-    assert "there" in out and "cleared" in out
+    assert "\x1b" not in out
+    assert "\x07" not in out
+    assert "there" in out
+    assert "cleared" in out
 
 
 def test_edit_shows_file_and_line_counts_not_diff():
@@ -47,7 +49,8 @@ def test_edit_shows_file_and_line_counts_not_diff():
     result = ToolResult(content="", summary="изменён a.py", display=Display(diff, "diff", "a.py"))
     ui.on_tool_result(ToolCallInfo("edit_file", "a.py", ToolKind.EDIT), result, previewed=False)
     out = buf.getvalue()
-    assert "● Изменил a.py  +2 −1" in out and "UNIQUE" not in out
+    assert "● Изменил a.py  +2 −1" in out
+    assert "UNIQUE" not in out
 
 
 def test_turn_stats_line():
@@ -60,11 +63,14 @@ def test_turn_stats_line():
             completion_tokens=20,
             context_tokens=12_345,
             duration_s=3.21,
-        )
+        ),
     )
     out = buf.getvalue()
-    assert "2 шага" in out and "1 инструмент " in out and "3.2 с" in out
-    assert "контекст ~12.3k" in out and "потрачено 220" in out
+    assert "2 шага" in out
+    assert "1 инструмент " in out
+    assert "3.2 с" in out
+    assert "контекст ~12.3k" in out
+    assert "потрачено 220" in out
 
 
 # ------------------------------ живой режим ------------------------------ #
@@ -87,8 +93,11 @@ def test_streamed_markdown_is_formatted():
         ui.on_stream_delta(chunk)
     ui.on_stream_end()
     out = _plain(buf)
-    assert "Заголовок" in out and "жирный текст" in out and "конец" in out
-    assert "**" not in out and "# " not in out
+    assert "Заголовок" in out
+    assert "жирный текст" in out
+    assert "конец" in out
+    assert "**" not in out
+    assert "# " not in out
     assert "\x1b[1m" in buf.getvalue()  # жирный — настоящим стилем терминала
     assert ui._live is None
 
@@ -111,7 +120,8 @@ def test_live_area_stopped_after_interrupt(tmp_path):
     with pytest.raises(KeyboardInterrupt):
         agent.run_turn("привет")
     assert ui._live is None
-    assert "Начало ответа" in _plain(buf) and "ещё" in _plain(buf)
+    assert "Начало ответа" in _plain(buf)
+    assert "ещё" in _plain(buf)
 
 
 def test_tool_spinner_lifecycle():
@@ -129,7 +139,8 @@ def test_single_live_area():
     ui.on_stream_start()
     first = ui._live
     ui.on_tool_start(ToolCallInfo("x"))
-    assert ui._live is not first and not first.active
+    assert ui._live is not first
+    assert not first.active
     ui.stop_live()
 
 
@@ -163,13 +174,15 @@ def test_compaction_progress_and_result():
     ui.on_compact_end(CompactResult(before_tokens=24_000, after_tokens=6_500, messages=31))
     out = buf.getvalue()
     assert "контекст почти заполнен — сжимаю историю…" in out
-    assert "контекст сжат: ~24k → ~6.5k ток." in out and "31 сообщение" in out
+    assert "контекст сжат: ~24k → ~6.5k ток." in out
+    assert "31 сообщение" in out
 
     ui, buf = _live_console()
     ui.on_compact_start(auto=False)
     assert ui._live is not None
     ui.on_compact_end(None)  # не удалось — только убрать индикатор
-    assert ui._live is None and "сжат" not in _plain(buf)
+    assert ui._live is None
+    assert "сжат" not in _plain(buf)
 
 
 def test_no_live_area_without_terminal():
@@ -188,7 +201,9 @@ def test_command_shows_last_line_or_tail_of_failure():
     text = "\n".join(f"line{i}" for i in range(100))
     call = ToolCallInfo("run_shell", "seq 100", ToolKind.COMMAND)
     ui.on_tool_result(
-        call, ToolResult(content=text, summary="ok", display=Display(text)), previewed=False
+        call,
+        ToolResult(content=text, summary="ok", display=Display(text)),
+        previewed=False,
     )
     assert buf.getvalue() == "● $ seq 100  ✔ line99\n"
     failed = text + "\n" + "=" * 30 + " short test summary " + "=" * 30
@@ -199,7 +214,9 @@ def test_command_shows_last_line_or_tail_of_failure():
     )
     out = buf.getvalue()
     assert "● $ seq 100  ✘ код 1" in out
-    assert "│ line97\n" in out and "│ line99\n" in out and "line96" not in out
+    assert "│ line97\n" in out
+    assert "│ line99\n" in out
+    assert "line96" not in out
     assert "short test summary" not in out  # строка-разделитель в хвост не идёт
 
 
@@ -213,13 +230,16 @@ def test_confirm_question_includes_summary(monkeypatch):
     edit = ToolCallInfo("edit_file", "a.py", ToolKind.EDIT)
     assert ui.confirm(edit, None, dangerous=False).approval is Approval.YES
     out = buf.getvalue()
-    assert "▌ edit_file a.py\n" in out and "▌ ? Применить правку? [y/N/a]" in out
+    assert "▌ edit_file a.py\n" in out
+    assert "▌ ? Применить правку? [y/N/a]" in out
     assert "до конца сессии" in out
     danger = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND, reason="удаление без возврата")
     assert ui.confirm(danger, None, dangerous=True).approval is Approval.NO
     out = buf.getvalue()
-    assert "▌ $ rm -rf x\n" in out and "▌ почему опасно  удаление без возврата" in out
-    assert "▌ ⚠ Выполнить опасную команду? [y/N] " in out and "запомнить нельзя" in out
+    assert "▌ $ rm -rf x\n" in out
+    assert "▌ почему опасно  удаление без возврата" in out
+    assert "▌ ⚠ Выполнить опасную команду? [y/N] " in out
+    assert "запомнить нельзя" in out
     command = ToolCallInfo(
         "run_shell",
         "pytest -q",
@@ -230,8 +250,10 @@ def test_confirm_question_includes_summary(monkeypatch):
     )
     assert ui.confirm(command, None, dangerous=False).approval is Approval.ALWAYS
     out = buf.getvalue()
-    assert "▌ $ pytest -q\n" in out and "▌ ? Выполнить команду? [y/N/a]" in out
-    assert "▌ почему спрашиваю  выполняет код проекта" in out and "раньше: разрешали 2" in out
+    assert "▌ $ pytest -q\n" in out
+    assert "▌ ? Выполнить команду? [y/N/a]" in out
+    assert "▌ почему спрашиваю  выполняет код проекта" in out
+    assert "раньше: разрешали 2" in out
     assert "a — всегда разрешать «pytest»" in out
     assert (
         ui.confirm(danger, None, dangerous=True).approval is Approval.NO
@@ -281,7 +303,8 @@ def test_confirm_free_text_is_feedback_and_no_answer_is_marked(monkeypatch):
     monkeypatch.setattr(ui._c, "input", lambda prompt: next(answers))
     command = ToolCallInfo("run_shell", "pytest", ToolKind.COMMAND)
     result = ui.confirm(command, None, dangerous=False)
-    assert result.approval is Approval.NO and result.feedback == "Используй uv run pytest"
+    assert result.approval is Approval.NO
+    assert result.feedback == "Используй uv run pytest"
     assert ui.confirm(command, None, dangerous=False).approval is Approval.ALWAYS  # «ф» = «a»
     assert ui.confirm(command, None, dangerous=False).feedback == ""
 
@@ -290,7 +313,8 @@ def test_confirm_free_text_is_feedback_and_no_answer_is_marked(monkeypatch):
 
     monkeypatch.setattr(ui._c, "input", eof)
     result = ui.confirm(command, None, dangerous=False)
-    assert result.approval is Approval.NO and not result.answered
+    assert result.approval is Approval.NO
+    assert not result.answered
 
 
 def test_format_helpers():
@@ -313,7 +337,8 @@ def test_format_helpers():
     long_lines = "\n".join(f"{i:03d} " + "x" * 290 for i in range(40)) + "\nИТОГ: 3 failed"
     clipped = clip_lines(long_lines)
     assert len(clipped) <= 4000
-    assert clipped.startswith("000") and clipped.endswith("ИТОГ: 3 failed")
+    assert clipped.startswith("000")
+    assert clipped.endswith("ИТОГ: 3 failed")
 
 
 def test_animation_thread_stops():
@@ -323,7 +348,8 @@ def test_animation_thread_stops():
     area = ui._live
     ui.on_stream_delta("текст\n\nещё\n")
     ui.on_stream_end()
-    assert area._thread is not None and not area._thread.is_alive()
+    assert area._thread is not None
+    assert not area._thread.is_alive()
     assert "текст" in _plain(buf)
 
 
@@ -336,7 +362,9 @@ _DB = Question(
     header="БД",
 )
 _PARTS = Question(
-    "Что добавить?", (QuestionOption("Логи"), QuestionOption("Метрики")), multi_select=True
+    "Что добавить?",
+    (QuestionOption("Логи"), QuestionOption("Метрики")),
+    multi_select=True,
 )
 
 
@@ -374,7 +402,8 @@ def test_plain_questions(monkeypatch, replies, expected):
     answers = ui.ask_user([_DB, _PARTS])
     assert answers[0] == expected[0]
     out = buf.getvalue()
-    assert "▌ ? Какую БД?   БД · 1 из 2" in out and "с сервером" in out
+    assert "▌ ? Какую БД?   БД · 1 из 2" in out
+    assert "с сервером" in out
     assert "3. Свой ответ" in out
     assert "● Какую БД?  " in out  # итог в ленте
 
@@ -391,10 +420,10 @@ def test_questions_declined(monkeypatch):
 
 
 def test_questions_need_keyboard(monkeypatch):
-    from gigacrew.tools.questions import QuestionsUnavailable
+    from gigacrew.tools.questions import QuestionsUnavailableError
 
     ui, _ = _console()
-    with pytest.raises(QuestionsUnavailable):
+    with pytest.raises(QuestionsUnavailableError):
         ui.ask_user([_DB])
 
 
@@ -418,8 +447,11 @@ def test_banner_shows_rocket_title_and_meta():
     ui, buf = _console()
     ui.banner(version="9.9.9", model="Alpha-Max", root="/work/proj", hints=[("/help", "справка")])
     out = _plain(buf)
-    assert "▄▄▄██▀▀▀▀█" in out and "┃╺┓" in out  # ракета и крупное название
-    assert "v9.9.9" in out and "Alpha-Max" in out and "/work/proj" in out
+    assert "▄▄▄██▀▀▀▀█" in out
+    assert "┃╺┓" in out
+    assert "v9.9.9" in out
+    assert "Alpha-Max" in out
+    assert "/work/proj" in out
     assert "/help справка" in out
 
 
@@ -428,7 +460,8 @@ def test_banner_without_rocket_in_narrow_terminal():
     ui = Console(no_color=True, file=buf, width=60)
     ui.banner(version="1", model="m", root="/r")
     out = buf.getvalue()
-    assert "┃╺┓" in out and "▀" not in out
+    assert "┃╺┓" in out
+    assert "▀" not in out
 
 
 def test_banner_shows_mode():
@@ -444,11 +477,17 @@ def test_question_body_is_shown_before_options(monkeypatch):
 
     ui, buf = _asking_console(monkeypatch, "1")
     question = replace(
-        _DB, header="План", body="## Шаги\n1. **Поправить** `a.py`", source="plans/x.md"
+        _DB,
+        header="План",
+        body="## Шаги\n1. **Поправить** `a.py`",
+        source="plans/x.md",
     )
     assert ui.ask_user([question]) == [Answer(("PostgreSQL",))]
     out = buf.getvalue()
-    assert "План" in out and "Шаги" in out and "Поправить" in out and "**" not in out
+    assert "План" in out
+    assert "Шаги" in out
+    assert "Поправить" in out
+    assert "**" not in out
     assert "plans/x.md" in out  # файл — в подписи рамки
     assert out.index("Поправить") < out.index("? Какую БД?")
 
@@ -485,7 +524,7 @@ def test_subagent_steps_nested_and_text_hidden(tmp_path):
             tool_turn("read_file", {"path": "nope.py"}),
             text_turn("СЕКРЕТНЫЙ ОТЧЁТ суб-агента"),
             text_turn("Итог основного"),
-        ]
+        ],
     )
     ui, buf = _live_console(width=100)
     cfg = Config(access_key="x", project_root=tmp_path, stream=True, auto_approve=True)
@@ -560,8 +599,10 @@ def test_confirm_shows_long_command_entirely_and_offers_pager(monkeypatch):
     assert result.approval is Approval.YES
     out = buf.getvalue()
     assert all(f"line {i:03d}" in out for i in range(200))  # ничего не обрезано
-    assert "202 │ EOF" in out and "202 строки" in out  # номера строк и размер
-    assert "v — открыть целиком" in out and "[y/N/a/v]" in out
+    assert "202 │ EOF" in out
+    assert "202 строки" in out
+    assert "v — открыть целиком" in out
+    assert "[y/N/a/v]" in out
     assert "▌ $ python3 - <<'EOF' …\n" in out  # первая строка команды — над рамкой
     assert "▌ зачем  печать строк  со слов модели" in out
     assert pages == [f"$ {command}"]  # просмотрщик открыт, потом вопрос задан снова
@@ -574,10 +615,14 @@ def test_confirm_makes_invisible_characters_visible():
     ui._c.input = lambda prompt: "n"
     command = "ls ‮txt.exe\x1b[2K"
     ui.confirm(
-        ToolCallInfo("run_shell", "ls", ToolKind.COMMAND), Display(f"$ {command}"), dangerous=True
+        ToolCallInfo("run_shell", "ls", ToolKind.COMMAND),
+        Display(f"$ {command}"),
+        dangerous=True,
     )
     out = buf.getvalue()
-    assert "⟨U+202E⟩" in out and "⟨U+001B⟩" in out and "‮" not in out
+    assert "⟨U+202E⟩" in out
+    assert "⟨U+001B⟩" in out
+    assert "‮" not in out
     assert "v — открыть" not in out  # короткая команда помещается на экран
 
 
@@ -641,13 +686,14 @@ def test_edits_collapse_per_file():
 
 
 def test_group_is_shown_in_live_area_while_running():
-    ui, buf = _live_console(width=100)
+    ui, _buf = _live_console(width=100)
     ui.on_stream_start()
     _step(ui, _read("a.py"), ToolResult(content="", summary="прочитан"))
     ui.on_tool_call(_read("b.py"))
     rows = [row.plain for row in ui._live_steps()]
     assert rows[0].startswith("● Изучаю код  2 вызова")
-    assert rows[1].startswith("  ✔ read_file  a.py") and rows[2].startswith("  ◌ read_file  b.py")
+    assert rows[1].startswith("  ✔ read_file  a.py")
+    assert rows[2].startswith("  ◌ read_file  b.py")
     ui.stop_live()
 
 
@@ -661,7 +707,9 @@ def test_asked_call_leaves_group_and_gets_own_line(monkeypatch):
 
     ui.confirm(replace(asked, reason="хук требует подтверждения"), _diff(2, 0), dangerous=False)
     ui.on_tool_result(
-        asked, ToolResult(content="", summary="изменён", display=_diff(2, 0)), previewed=True
+        asked,
+        ToolResult(content="", summary="изменён", display=_diff(2, 0)),
+        previewed=True,
     )
     out = buf.getvalue()
     # группа до вопроса — итогом, спрошенная правка — своей строкой после ответа
@@ -765,8 +813,11 @@ def test_control_characters_never_reach_terminal(sink):
     ui, buf = _console()
     sink(ui)
     out = buf.getvalue()
-    assert "x[2K[1A]0;owned" in out and "евил" in out  # текст виден, без управляющих
-    assert "\x1b" not in out and "\x07" not in out and "\x9b" not in out
+    assert "x[2K[1A]0;owned" in out
+    assert "евил" in out
+    assert "\x1b" not in out
+    assert "\x07" not in out
+    assert "\x9b" not in out
 
 
 def test_control_characters_stripped_in_live_terminal_but_own_codes_kept():
@@ -775,7 +826,8 @@ def test_control_characters_stripped_in_live_terminal_but_own_codes_kept():
     ui.on_tool_start(ToolCallInfo(f"read{_ESC}", "a.py", read_only=True))
     ui.stop_live()
     out = buf.getvalue()
-    assert "\x1b]0;owned" not in out and "\x07" not in out
+    assert "\x1b]0;owned" not in out
+    assert "\x07" not in out
     assert "\x1b[" in out  # свои последовательности Rich (цвет, курсор) — на месте
 
 
@@ -783,7 +835,7 @@ def test_control_characters_stripped_in_live_terminal_but_own_codes_kept():
 @pytest.mark.parametrize(
     "char",
     [
-        "​",  # нулевой ширины
+        "\u200b",  # нулевой ширины
         "‍",  # соединитель нулевой ширины
         "‏",  # RLM
         "؜",  # ARABIC LETTER MARK — тоже управляет направлением текста
@@ -803,7 +855,8 @@ def test_confirm_marks_every_invisible_character_in_command(char):
     call = ToolCallInfo("run_shell", "rm", ToolKind.COMMAND)
     ui.confirm(call, Display(f"$ rm{char} -rf x"), dangerous=True)
     out = buf.getvalue()
-    assert f"$ rm⟨U+{ord(char):04X}⟩ -rf x" in out and char not in out
+    assert f"$ rm⟨U+{ord(char):04X}⟩ -rf x" in out
+    assert char not in out
 
 
 def test_confirm_marks_invisible_characters_in_diff():
@@ -819,7 +872,8 @@ def test_confirm_marks_invisible_characters_in_diff():
     )
     out = buf.getvalue()
     assert "+# ⟨U+202E⟩; rm -rf ~ ⟨U+202C⟩⟨U+0001⟩" in out  # и управляющие — не молча
-    assert "‮" not in out and "-ok = 1" in out
+    assert "‮" not in out
+    assert "-ok = 1" in out
 
 
 @pytest.mark.parametrize("dangerous", [True, False])
@@ -873,4 +927,6 @@ def test_confirm_russian_layout_no_is_a_plain_refusal(reply):
     ui, _ = _console()
     ui._c.input = lambda prompt: reply
     result = ui.confirm(ToolCallInfo("run_shell", "ls", ToolKind.COMMAND), None, dangerous=False)
-    assert result.approval is Approval.NO and result.feedback == "" and result.answered
+    assert result.approval is Approval.NO
+    assert result.feedback == ""
+    assert result.answered

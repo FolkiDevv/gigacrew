@@ -37,7 +37,8 @@ def _hooks(event: str, command: str, matcher: str | None = None, **extra) -> dic
 
 def test_no_files_no_hooks(tmp_path):
     settings, warnings = load_settings(Workspace(tmp_path))
-    assert settings.groups == () and warnings == []
+    assert settings.groups == ()
+    assert warnings == []
 
 
 def test_sources_merge_in_order(tmp_path):
@@ -106,10 +107,10 @@ def test_timeout_default_and_clamp(tmp_path):
                             {"type": "command", "command": "g", "timeout": 10**400},
                             {"type": "command", "command": "h", "timeout": 0},
                             {"type": "command", "command": "i", "timeout": -5},
-                        ]
-                    }
-                ]
-            }
+                        ],
+                    },
+                ],
+            },
         },
     )
     settings, warnings = load_settings(ws)
@@ -123,7 +124,8 @@ def test_timeout_default_and_clamp(tmp_path):
     assert len(warnings) == 7
     for j, warning in enumerate(warnings, start=2):
         assert f"hooks[{j}]" in warning
-    assert f"взято {MIN_HOOK_TIMEOUT}" in warnings[-1] and "timeout -5" in warnings[-1]
+    assert f"взято {MIN_HOOK_TIMEOUT}" in warnings[-1]
+    assert "timeout -5" in warnings[-1]
 
 
 @pytest.mark.parametrize(
@@ -150,7 +152,8 @@ def test_bad_entries_warn_and_skip(tmp_path, content, fragment):
     # Хорошая запись в другом файле не теряется из-за ошибки в этом.
     _write(ws.local_settings_file, _hooks("Stop", "echo ok"))
     settings, warnings = load_settings(ws)
-    assert len(warnings) == 1 and fragment in warnings[0]
+    assert len(warnings) == 1
+    assert fragment in warnings[0]
     assert str(ws.settings_file) in warnings[0]
     assert [h.command for h in settings.commands(HookEvent.STOP)] == ["echo ok"]
 
@@ -163,7 +166,9 @@ def test_command_that_cannot_run_is_skipped(tmp_path, command):
     _write(ws.local_settings_file, _hooks("Stop", "echo ok"))
     settings, warnings = load_settings(ws)
     assert [h.command for h in settings.commands(HookEvent.STOP)] == ["echo ok"]
-    assert len(warnings) == 1 and "hooks[0]" in warnings[0] and "command" in warnings[0]
+    assert len(warnings) == 1
+    assert "hooks[0]" in warnings[0]
+    assert "command" in warnings[0]
 
 
 def test_deeply_nested_settings_file_is_skipped(tmp_path):
@@ -171,7 +176,8 @@ def test_deeply_nested_settings_file_is_skipped(tmp_path):
     _write(ws.settings_file, "[" * 200_000 + "]" * 200_000)
     settings, warnings = load_settings(ws)
     assert settings == HookSettings()
-    assert len(warnings) == 1 and "не удалось прочитать" in warnings[0]
+    assert len(warnings) == 1
+    assert "не удалось прочитать" in warnings[0]
 
 
 def test_disable_all_hooks(tmp_path):
@@ -179,7 +185,8 @@ def test_disable_all_hooks(tmp_path):
     _write(ws.settings_file, _hooks("Stop", "echo"))
     _write(user_settings_file(), {"disableAllHooks": True})
     settings, _ = load_settings(ws)
-    assert settings.disabled and not settings.has(HookEvent.STOP)
+    assert settings.disabled
+    assert not settings.has(HookEvent.STOP)
 
 
 @pytest.mark.parametrize("file", ["settings", "local"])
@@ -191,9 +198,12 @@ def test_project_disable_all_hooks_turns_off_only_project_hooks(tmp_path, file):
     _write(project, {"disableAllHooks": True, **_hooks("Stop", "echo project")})
     _write(ws.settings_file if file == "local" else ws.local_settings_file, _hooks("Stop", "x"))
     settings, warnings = load_settings(ws)
-    assert warnings == [] and not settings.disabled and settings.project_disabled
+    assert warnings == []
+    assert not settings.disabled
+    assert settings.project_disabled
     assert [h.command for h in settings.commands(HookEvent.PRE_TOOL_USE, "run_shell")] == ["guard"]
-    assert not settings.has(HookEvent.STOP) and settings.project_groups == ()
+    assert not settings.has(HookEvent.STOP)
+    assert settings.project_groups == ()
 
 
 @pytest.mark.parametrize("value", ["true", 1, "yes"])
@@ -201,8 +211,10 @@ def test_disable_all_hooks_must_be_boolean(tmp_path, value):
     ws = Workspace(tmp_path)
     _write(user_settings_file(), {"disableAllHooks": value, **_hooks("Stop", "echo")})
     settings, warnings = load_settings(ws)
-    assert not settings.disabled and settings.has(HookEvent.STOP)
-    assert len(warnings) == 1 and "disableAllHooks" in warnings[0]
+    assert not settings.disabled
+    assert settings.has(HookEvent.STOP)
+    assert len(warnings) == 1
+    assert "disableAllHooks" in warnings[0]
 
 
 def test_without_project_keeps_user_hooks(tmp_path):
@@ -211,7 +223,7 @@ def test_without_project_keeps_user_hooks(tmp_path):
     _write(ws.settings_file, _hooks("Stop", "echo project"))
     settings, _ = load_settings(ws)
     assert [h.command for h in settings.without("project", "local").commands(HookEvent.STOP)] == [
-        "echo user"
+        "echo user",
     ]
 
 
@@ -247,7 +259,7 @@ def test_fingerprint_covers_matcher_event_timeout_and_file(tmp_path, file, chang
     if file == "local":
         ws.settings_file.unlink()
     _write(ws.settings_file if file == "settings" else ws.local_settings_file, changed)
-    assert project_fingerprint(load_settings(ws)[0]) not in ("", before)
+    assert project_fingerprint(load_settings(ws)[0]) not in {"", before}
 
 
 def test_fingerprint_ignores_user_hooks(tmp_path):
@@ -274,7 +286,8 @@ def test_trust_store_user_and_projects_coexist(tmp_path):
     store = TrustStore(tmp_path / "trusted_hooks.json")
     store.trust(tmp_path, "proj")
     store.trust_user("usr")
-    assert store.is_user_trusted("usr") and not store.is_user_trusted("other")
+    assert store.is_user_trusted("usr")
+    assert not store.is_user_trusted("other")
     assert store.is_trusted(tmp_path, "proj")  # trust_user не затёр проекты
     store.trust(tmp_path, "proj2")
     assert store.is_user_trusted("usr")  # и наоборот

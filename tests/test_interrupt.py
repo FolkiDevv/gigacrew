@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import sys
 import time
 
@@ -26,14 +27,16 @@ def test_lone_escape_interrupts():
 def test_escape_sequences_are_not_escape(keys):
     parser, hits = _parser()
     parser.feed(keys)
-    assert hits == [] and parser.take_text() == ""
+    assert hits == []
+    assert parser.take_text() == ""
 
 
 def test_sequence_split_across_reads():
     parser, hits = _parser(pending=True)  # после ESC сразу пришли ещё байты
     parser.feed(b"\x1b")
     parser.feed(b"[Bok")
-    assert hits == [] and parser.take_text() == "ok"
+    assert hits == []
+    assert parser.take_text() == "ok"
 
 
 def test_double_escape_still_interrupts():
@@ -89,10 +92,11 @@ def test_escape_interrupts_main_thread_and_restores_terminal(pty_pair):
 @pty_only
 def test_interrupted_exit_still_stops_reader_and_restores_terminal(pty_pair):
     """SIGINT от Esc в самом конце хода прерывает ожидание блокировки в __exit__:
-    поток чтения всё равно останавливается, терминал восстанавливается."""
+    поток чтения всё равно останавливается, терминал восстанавливается.
+    """
     import termios
 
-    master, slave = pty_pair
+    _master, slave = pty_pair
     before = termios.tcgetattr(slave)
     esc = EscInterrupt(fd=slave, enabled=True, interrupt=lambda: None)
 
@@ -108,7 +112,8 @@ def test_interrupted_exit_still_stops_reader_and_restores_terminal(pty_pair):
     esc._lock = Interrupted()
     with pytest.raises(KeyboardInterrupt):
         esc.__exit__(None, None, None)
-    assert esc._thread is None and not thread.is_alive()
+    assert esc._thread is None
+    assert not thread.is_alive()
     assert termios.tcgetattr(slave) == before
 
 
@@ -136,7 +141,7 @@ def test_typeahead_and_pause(pty_pair):
 
 
 def test_disabled_without_terminal(tmp_path):
-    with open(tmp_path / "f", "w") as f:
+    with pathlib.Path(tmp_path / "f").open("w") as f:
         esc = EscInterrupt(fd=f.fileno())
         assert esc.enabled is False
         with esc, esc.paused():
@@ -158,7 +163,8 @@ def test_disabled_without_terminal(tmp_path):
 def test_text_after_sequences_is_kept(keys, text):
     parser, hits = _parser()
     parser.feed(keys)
-    assert hits == [] and parser.take_text() == text
+    assert hits == []
+    assert parser.take_text() == text
 
 
 @pty_only
@@ -183,7 +189,8 @@ def _backtab_parser(pending: bool = False):
 def test_shift_tab_cycles_mode():
     parser, escapes, backtabs = _backtab_parser()
     parser.feed(b"ab\x1b[Zcd\x1b[Z")
-    assert backtabs == [1, 1] and escapes == []
+    assert backtabs == [1, 1]
+    assert escapes == []
     assert parser.take_text() == "abcd"
 
 
@@ -199,7 +206,8 @@ def test_shift_tab_split_across_reads():
     parser.feed(b"\x1b")
     parser.feed(b"[")
     parser.feed(b"Z")
-    assert backtabs == [1] and escapes == []
+    assert backtabs == [1]
+    assert escapes == []
 
 
 @pty_only
@@ -210,7 +218,8 @@ def test_shift_tab_reaches_callback_without_interrupting(pty_pair):
     with esc:
         os.write(master, b"\x1b[Z")
         time.sleep(0.3)
-    assert hits == [1] and esc.take_typeahead() == ""
+    assert hits == [1]
+    assert esc.take_typeahead() == ""
 
 
 def test_on_escape_keeps_interrupt_armed_while_subagent_takes_it():

@@ -140,7 +140,11 @@ class SubagentEvents(AgentEvents):
         self._parent.on_subagent_tool_call(self._info, call)
 
     def confirm(
-        self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
+        self,
+        call: ToolCallInfo,
+        preview: Display | None,
+        *,
+        dangerous: bool,
     ) -> bool | Approval | ConfirmResult:
         return self._parent.confirm(call, preview, dangerous=dangerous)
 
@@ -181,7 +185,8 @@ class SubagentEvents(AgentEvents):
     def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:
         # Остановка суб-агента — не остановка хода: основной агент продолжает.
         self._parent.on_notice(
-            f"{self._info.name}: {text}", level="warn" if level == "error" else level
+            f"{self._info.name}: {text}",
+            level="warn" if level == "error" else level,
         )
 
     def on_turn_end(self, stats: TurnStats) -> None:
@@ -212,7 +217,10 @@ def _summary(spec: SubagentSpec, stats: TurnStats | None, tail: str = "") -> str
 
 
 def subagent_report(
-    spec: SubagentSpec, text: str, stats: TurnStats | None, trail: SubagentTrail
+    spec: SubagentSpec,
+    text: str,
+    stats: TurnStats | None,
+    trail: SubagentTrail,
 ) -> ToolResult:
     """Результат ``task`` для основного агента: отчёт суб-агента и факты о сделанном."""
     stop = stats.stop_reason if stats is not None else None

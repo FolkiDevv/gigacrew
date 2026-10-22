@@ -29,12 +29,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from importlib import metadata
 from pathlib import Path
 
-from gigacrew import __version__
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
 from gigacrew.agent.decisions import DecisionMemory
-from gigacrew.agent.hooks import PromptBlocked
+from gigacrew.agent.hooks import PromptBlockedError
 from gigacrew.agent.loop import Agent
 from gigacrew.agent.reviewer import check_reviewer
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
@@ -131,7 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Отключить потоковый вывод (ответ печатается целиком в конце)",
     )
     p.add_argument(
-        "--list-models", action="store_true", help="Показать доступные чат-модели и выйти"
+        "--list-models",
+        action="store_true",
+        help="Показать доступные чат-модели и выйти",
     )
     p.add_argument(
         "--test-context",
@@ -139,7 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Замерить окно контекста модели (пробные запросы), сохранить "
         "в ~/.gigacode/models.json и выйти",
     )
-    p.add_argument("--version", action="version", version=f"gigacrew {__version__}")
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"gigacrew {metadata.version('gigacrew')}",
+    )
     return p
 
 
@@ -182,14 +188,15 @@ def run_oneshot(
     resumed: bool = False,
 ) -> int:
     """Один ход; хуки SessionStart/SessionEnd — вокруг него (SessionEnd — после
-    сохранения чата). ``resumed`` — чат продолжен (``-c``/``-r``)."""
+    сохранения чата). ``resumed`` — чат продолжен (``-c``/``-r``).
+    """
     esc = esc_interrupt_for(ui, agent=agent)
     source = "resume" if resumed else "startup"
     with hook_session(agent, ui, source=source, end_reason="other"):
         try:
             with esc:
                 agent.run_turn(prompt)
-        except PromptBlocked as e:
+        except PromptBlockedError as e:
             ui.stop_live()
             ui.warn(f"запрос отклонён хуком UserPromptSubmit: {e.reason}")
             return EXIT_STOPPED
@@ -212,7 +219,12 @@ def run_oneshot(
 
 
 def run_test_context(
-    provider: LLMProvider, windows: ModelWindows, model: str, ui: Console, *, base_url: str
+    provider: LLMProvider,
+    windows: ModelWindows,
+    model: str,
+    ui: Console,
+    *,
+    base_url: str,
 ) -> int:
     """``--test-context``: принудительный замер окна ``model`` с выводом каждой пробы."""
     if not provider.supports_measure:
@@ -347,11 +359,13 @@ def main(argv: list[str] | None = None) -> int:
                 return EXIT_ERROR
         if not config.model:
             ui.error(
-                "не задана модель: укажите GIGACREW_MODEL или --model (список — --list-models)"
+                "не задана модель: укажите GIGACREW_MODEL или --model (список — --list-models)",
             )
             return EXIT_ERROR
         decisions, warning = DecisionMemory.load(
-            config.project_root, remember=config.remember_approvals, log=config.save_chats
+            config.project_root,
+            remember=config.remember_approvals,
+            log=config.save_chats,
         )
         if warning:
             ui.warn(warning)
@@ -396,7 +410,12 @@ def main(argv: list[str] | None = None) -> int:
             return run_oneshot(agent, ui, prompt, chats, resumed=saved is not None)
         resumed = saved.info if saved is not None else None
         return run_repl(
-            agent, ui, commands, chats=chats, resumed=resumed, trust_hooks=args.trust_hooks
+            agent,
+            ui,
+            commands,
+            chats=chats,
+            resumed=resumed,
+            trust_hooks=args.trust_hooks,
         )
     finally:
         provider.close()

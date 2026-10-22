@@ -1,5 +1,6 @@
 """Офлайн-тесты провайдера бэкенда GigaCode на подменном транспорте (httpx.MockTransport):
-каталог моделей, токен из файла официального CLI, запросы чата."""
+каталог моделей, токен из файла официального CLI, запросы чата.
+"""
 
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ CATALOGUE = {
                 "ai_api": {"max_tokens": 32000, "temperature": 0.3, "top_p": 0.9, "stream": True},
             },
             {"id": "fast", "ai_api": {"stream": False}},
-        ]
+        ],
     },
     "chat": {"url": CHAT, "models": []},
 }
@@ -180,10 +181,13 @@ def test_catalogue_from_the_contract_example():
     catalogue = parse_catalogue(CATALOGUE, CONFIG)
     assert [m.id for m in catalogue.models] == ["coder", "fast"]
     coder, fast = catalogue.models
-    assert coder.context_window == 131_072 and fast.context_window == DEFAULT_CONTEXT_WINDOW
+    assert coder.context_window == 131_072
+    assert fast.context_window == DEFAULT_CONTEXT_WINDOW
     assert dict(coder.sampling) == {"top_p": 0.9}  # temperature и max_tokens — свои
-    assert coder.streams and not fast.streams
-    assert catalogue.default_model == "coder" and catalogue.chat_url == CHAT
+    assert coder.streams
+    assert not fast.streams
+    assert catalogue.default_model == "coder"
+    assert catalogue.chat_url == CHAT
 
 
 def test_catalogue_sources_in_order():
@@ -217,11 +221,13 @@ def test_model_id_from_the_model_key():
         },
     }
     catalogue = parse_catalogue(
-        {"agent": {"models": [item]}, "default_model": "Qwen3.6-35B"}, CONFIG
+        {"agent": {"models": [item]}, "default_model": "Qwen3.6-35B"},
+        CONFIG,
     )
     (model,) = catalogue.models
     assert model.id == catalogue.default_model == "Qwen3.6-35B"
-    assert model.context_window == DEFAULT_CONTEXT_WINDOW and model.streams
+    assert model.context_window == DEFAULT_CONTEXT_WINDOW
+    assert model.streams
     assert dict(model.sampling) == {"frequency_penalty": 0, "presence_penalty": 0}
     assert parse_catalogue({"models": [{"id": "a", "model": "b"}]}, CONFIG).models[0].id == "a"
 
@@ -253,7 +259,8 @@ def test_bad_catalogues(data, message):
 def test_catalogue_default_model_and_chat_url():
     models = [{"id": "a"}, {"id": "b"}]
     pick = parse_catalogue(
-        {"models": models, "chat": {"default_model": "b"}, "default_model": "a"}, CONFIG
+        {"models": models, "chat": {"default_model": "b"}, "default_model": "a"},
+        CONFIG,
     )
     assert pick.default_model == "b"
     assert parse_catalogue({"models": models, "default_model": "b"}, CONFIG).default_model == "b"
@@ -354,9 +361,11 @@ def test_token_of_another_backend_is_not_sent(tmp_path):
 def test_constructor_does_no_io(tmp_path):
     backend = Backend()
     provider = _provider(backend, tmp_path, token=None)
-    assert backend.requests == [] and not (tmp_path / "cli-home").exists()
+    assert backend.requests == []
+    assert not (tmp_path / "cli-home").exists()
     assert provider.token_file == tmp_path / "cli-home" / "gigacode_token.json"
-    assert provider.list_models() == [] and provider.known_models() is None
+    assert provider.list_models() == []
+    assert provider.known_models() is None
     assert provider.model == ""
     provider.close()
 
@@ -478,7 +487,7 @@ def test_chat_errors_and_retries(tmp_path, _no_sleep):
             httpx.Response(529, json={"error": "overloaded"}),
             _text("после перегрузки"),
             httpx.Response(403, text="нет доступа к модели"),
-        ]
+        ],
     )
     provider = _provider(backend, tmp_path)
     provider.connect()
@@ -500,9 +509,13 @@ def test_chat_request_headers_and_body(tmp_path):
     assert chat[0].headers["User-Agent"] == AGENT
     assert chat[0].headers["X-Session-Id"] == chat[1].headers["X-Session-Id"]
     body = backend.chat_bodies[0]
-    assert body["model"] == "coder" and body["temperature"] == 0.4 and body["top_p"] == 0.9
-    assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
-    assert body["tool_choice"] == "auto" and body["tools"][0]["function"]["name"] == "read_file"
+    assert body["model"] == "coder"
+    assert body["temperature"] == 0.4
+    assert body["top_p"] == 0.9
+    assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
+    assert body["tool_choice"] == "auto"
+    assert body["tools"][0]["function"]["name"] == "read_file"
     assert "max_tokens" not in body
     assert body["messages"] == [{"role": "user", "content": "привет"}]
     assert deltas == ["ok"]
@@ -516,7 +529,8 @@ def test_complete_goes_through_the_stream(tmp_path):
     provider = _provider(backend, tmp_path, model="coder")
     provider.connect()
     turn = provider.complete(_msgs(), [TOOL])
-    assert turn.message.content == "ok" and turn.usage.prompt_tokens == 10
+    assert turn.message.content == "ok"
+    assert turn.usage.prompt_tokens == 10
     assert backend.chat_bodies[0]["stream"] is True
 
 
@@ -530,13 +544,16 @@ class _BrokenStream(httpx.SyncByteStream):
 
 def _broken() -> httpx.Response:
     return httpx.Response(
-        200, headers={"content-type": "text/event-stream"}, stream=_BrokenStream()
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=_BrokenStream(),
     )
 
 
 def test_complete_is_retried_after_a_drop_mid_answer(tmp_path):
     """complete() (рецензент, сжатие) ничего не показывает: обрыв после первого куска —
-    обычный транзиентный сбой, повтор не дублирует вывод."""
+    обычный транзиентный сбой, повтор не дублирует вывод.
+    """
     backend = Backend(chat=[_broken(), _text("сводка целиком")])
     provider = _provider(backend, tmp_path)
     provider.connect()
@@ -551,7 +568,8 @@ def test_stream_shown_text_is_not_retried_after_a_drop(tmp_path):
     deltas: list[str] = []
     with pytest.raises(ApiError, match="Сетевой сбой во время потоковой передачи"):
         provider.stream(_msgs(), on_delta=deltas.append)
-    assert deltas == ["Сводка, часть 1"] and backend.count(CHAT) == 1
+    assert deltas == ["Сводка, часть 1"]
+    assert backend.count(CHAT) == 1
 
 
 class _CutAfterEnd(httpx.SyncByteStream):
@@ -565,15 +583,17 @@ class _CutAfterEnd(httpx.SyncByteStream):
 
 def test_unclean_close_after_the_end_keeps_the_answer(tmp_path):
     """Обрыв после окончания ответа — ответ целиком: иначе показанный текст стал бы
-    ошибкой, а не показанный ответ ушёл бы повтором и был бы оплачен дважды."""
+    ошибкой, а не показанный ответ ушёл бы повтором и был бы оплачен дважды.
+    """
     cut = httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=_CutAfterEnd())
     backend = Backend(chat=[cut])
     provider = _provider(backend, tmp_path)
     provider.connect()
     turn = provider.stream(_msgs(), [TOOL])
-    assert turn.finish_reason == "function_call" and turn.usage.prompt_tokens == 12
+    assert turn.finish_reason == "function_call"
+    assert turn.usage.prompt_tokens == 12
     assert turn.message.function_calls == [
-        FunctionCall(name="run_shell", arguments={"command": "pytest"}, id="c1")
+        FunctionCall(name="run_shell", arguments={"command": "pytest"}, id="c1"),
     ]
     assert backend.count(CHAT) == 1
 
@@ -591,7 +611,8 @@ def test_model_without_stream_gets_a_whole_answer(tmp_path):
     provider.connect()
     deltas: list[str] = []
     turn = provider.stream(_msgs(), model="fast", on_delta=deltas.append)
-    assert turn.message.content == "целиком" and deltas == ["целиком"]
+    assert turn.message.content == "целиком"
+    assert deltas == ["целиком"]
     assert backend.chat_bodies[0]["stream"] is False
     assert "stream_options" not in backend.chat_bodies[0]
 
@@ -619,9 +640,12 @@ def test_measure_prompt_reads_usage_from_the_stream(tmp_path):
     backend = Backend(chat=[_text(".", prompt_tokens=1234)])
     provider = _provider(backend, tmp_path)
     provider.connect()
-    assert provider.supports_measure and provider.measure_prompt("текст") == 1234
+    assert provider.supports_measure
+    assert provider.measure_prompt("текст") == 1234
     body = backend.chat_bodies[0]
-    assert body["max_tokens"] == 1 and body["model"] == "coder" and body["stream"] is True
+    assert body["max_tokens"] == 1
+    assert body["model"] == "coder"
+    assert body["stream"] is True
 
 
 def test_probe_of_a_model_without_stream_is_not_streamed(tmp_path):
@@ -638,7 +662,8 @@ def test_probe_of_a_model_without_stream_is_not_streamed(tmp_path):
     provider.connect()
     assert provider.measure_prompt("x", model="fast") == 77
     body = backend.chat_bodies[0]
-    assert body["stream"] is False and "stream_options" not in body
+    assert body["stream"] is False
+    assert "stream_options" not in body
 
 
 def test_request_without_connect_loads_the_catalogue(tmp_path):
@@ -665,7 +690,8 @@ def test_agent_turn_with_a_tool_call(tmp_path):
     assert answer == "там hello"
     second = backend.chat_bodies[1]["messages"]
     assert second[-2]["tool_calls"][0]["id"] == "c1"
-    assert second[-1]["role"] == "tool" and second[-1]["tool_call_id"] == "c1"
+    assert second[-1]["role"] == "tool"
+    assert second[-1]["tool_call_id"] == "c1"
     assert "hello" in second[-1]["content"]
     provider.close()
 
@@ -738,7 +764,8 @@ def test_hook_on_config_401(tmp_path):
 
 def test_config_401_with_a_new_token_still_asks_to_log_in(tmp_path):
     """Хук положил новый токен, но и его конфигурация не приняла — просьба войти заново,
-    а не «Не удалось получить конфигурацию (401)»."""
+    а не «Не удалось получить конфигурацию (401)».
+    """
     backend = Backend(valid=())
     provider = _provider(backend, tmp_path)
     provider.request_hook = RecordingHook(tmp_path, tokens=["tok-1", "tok-2"])

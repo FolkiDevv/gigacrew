@@ -17,7 +17,8 @@ def _env_file(path, text):
 
 def test_read_dotenv_parses_quotes_comments_export(tmp_path):
     (tmp_path / ".env").write_text(
-        "# comment\nA=1\nexport B=\"two\"\nC='three'\nbroken line\n", encoding="utf-8"
+        "# comment\nA=1\nexport B=\"two\"\nC='three'\nbroken line\n",
+        encoding="utf-8",
     )
     assert read_dotenv(tmp_path / ".env") == {"A": "1", "B": "two", "C": "three"}
     assert read_dotenv(tmp_path / "missing.env") == {}
@@ -179,9 +180,11 @@ def test_provider_choice(tmp_path):
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     cfg = load({"GIGACREW_ACCESS_KEY": "k"})
-    assert cfg.provider == "api" and cfg.auth_mode == "oauth"
+    assert cfg.provider == "api"
+    assert cfg.auth_mode == "oauth"
     cfg = load({"GIGACREW_PROVIDER": " GigaCode ", "GIGACREW_ACCESS_KEY": "k"})
-    assert cfg.provider == "gigacode" and cfg.auth_mode == "cli_token"  # ключ не нужен
+    assert cfg.provider == "gigacode"
+    assert cfg.auth_mode == "cli_token"
     assert cfg.verify_ssl  # проверка TLS — по умолчанию, как у официального CLI
     with pytest.raises(ConfigError, match="GIGACREW_PROVIDER"):
         load({"GIGACREW_PROVIDER": "openai"})
@@ -220,7 +223,9 @@ def test_gigacode_user_agent_has_no_default(tmp_path):
     cfg.require_credentials()  # ключ и сертификат не нужны
     # API v2 без него обходится
     Config(
-        access_key="k", auth_url="https://a.test", base_url="https://api.test/v1"
+        access_key="k",
+        auth_url="https://a.test",
+        base_url="https://api.test/v1",
     ).require_credentials()
 
 
@@ -276,9 +281,11 @@ def test_compaction_settings(tmp_path):
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     cfg = load({})
-    assert cfg.auto_compact is True and cfg.compact_threshold == 0.8
+    assert cfg.auto_compact is True
+    assert cfg.compact_threshold == 0.8
     cfg = load({"GIGACREW_AUTO_COMPACT": "0", "GIGACREW_COMPACT_THRESHOLD": "65"})
-    assert cfg.auto_compact is False and cfg.compact_threshold == 0.65
+    assert cfg.auto_compact is False
+    assert cfg.compact_threshold == 0.65
 
 
 def test_subagent_limits(tmp_path):
@@ -296,7 +303,7 @@ def test_subagent_limits(tmp_path):
             "GIGACREW_SUBAGENT_MAX_STEPS": "10",
             "GIGACREW_SUBAGENT_CONTEXT": "60",
             "GIGACREW_SUBAGENT_TIMEOUT": "120",
-        }
+        },
     )
     assert (cfg.subagent_max_steps, cfg.subagent_context_share, cfg.subagent_timeout) == (
         10,
@@ -336,9 +343,11 @@ def test_rate_limit_wait(tmp_path):
 
 def test_yes_all_implies_auto_approve(tmp_path):
     cfg = Config.load(project_root=tmp_path, yes_all=True, environ={}, cwd=tmp_path)
-    assert cfg.auto_approve and cfg.yes_all
+    assert cfg.auto_approve
+    assert cfg.yes_all
     cfg = Config.load(project_root=tmp_path, auto_approve=True, environ={}, cwd=tmp_path)
-    assert cfg.auto_approve and not cfg.yes_all
+    assert cfg.auto_approve
+    assert not cfg.yes_all
 
 
 def test_ca_bundle_enables_verification(tmp_path):
@@ -348,12 +357,16 @@ def test_ca_bundle_enables_verification(tmp_path):
 
     env = {"GIGACREW_ACCESS_KEY": "k", "GIGACREW_CA_BUNDLE": certifi.where()}
     cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
-    assert cfg.verify_ssl and cfg.ca_bundle == certifi.where()
+    assert cfg.verify_ssl
+    assert cfg.ca_bundle == certifi.where()
     context = cfg.build_ssl_verify()
-    assert isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED
     # явный GIGACREW_VERIFY_SSL=0 важнее
     cfg = Config.load(
-        project_root=tmp_path, environ={**env, "GIGACREW_VERIFY_SSL": "0"}, cwd=tmp_path
+        project_root=tmp_path,
+        environ={**env, "GIGACREW_VERIFY_SSL": "0"},
+        cwd=tmp_path,
     )
     assert cfg.build_ssl_verify() is False
     with pytest.raises(ConfigError, match="GIGACREW_CA_BUNDLE"):
@@ -415,7 +428,8 @@ def _self_signed(tmp_path, cn="test"):
 @pytest.fixture
 def _certifi_roots(monkeypatch):
     """Стандартные корни — из certifi, как у httpx: не из SSL_CERT_FILE/SSL_CERT_DIR машины
-    (корни из каталога грузятся лениво, и get_ca_certs() их не показал бы)."""
+    (корни из каталога грузятся лениво, и get_ca_certs() их не показал бы).
+    """
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 
@@ -437,10 +451,14 @@ def test_gigacode_verifies_tls_by_default(tmp_path, _certifi_roots):
     cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
     assert cfg.verify_ssl  # токен официального CLI без проверки сервера не уходит
     context = cfg.build_ssl_verify()
-    assert isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED
-    assert context.check_hostname and context.get_ca_certs()  # стандартные корни на месте
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname
+    assert context.get_ca_certs()
     cfg = Config.load(
-        project_root=tmp_path, environ={**env, "GIGACREW_VERIFY_SSL": "0"}, cwd=tmp_path
+        project_root=tmp_path,
+        environ={**env, "GIGACREW_VERIFY_SSL": "0"},
+        cwd=tmp_path,
     )
     assert cfg.build_ssl_verify() is False  # явное значение важнее
 
@@ -458,19 +476,25 @@ def test_gigacode_trusts_official_cli_certificates(tmp_path, _isolated_home, _ce
 
     own, _ = _self_signed(tmp_path / "c", "own")  # GIGACREW_CA_BUNDLE — в дополнение
     cfg = Config.load(
-        project_root=tmp_path, environ={**env, "GIGACREW_CA_BUNDLE": str(own)}, cwd=tmp_path
+        project_root=tmp_path,
+        environ={**env, "GIGACREW_CA_BUNDLE": str(own)},
+        cwd=tmp_path,
     )
     names = _common_names(cfg.build_ssl_verify())
-    assert {"bundled", "extra", "own"} <= names and len(names) > 3
+    assert {"bundled", "extra", "own"} <= names
+    assert len(names) > 3
 
     other = tmp_path / "other-home"
     (other / "certs").mkdir(parents=True)
     _self_signed(tmp_path / "d", "other")[0].rename(other / "certs" / "root.pem")
     cfg = Config.load(
-        project_root=tmp_path, environ={**env, "GIGACODE_HOME": str(other)}, cwd=tmp_path
+        project_root=tmp_path,
+        environ={**env, "GIGACODE_HOME": str(other)},
+        cwd=tmp_path,
     )
     names = _common_names(cfg.build_ssl_verify())
-    assert "other" in names and "bundled" not in names
+    assert "other" in names
+    assert "bundled" not in names
 
 
 def test_gigacode_broken_certificate_is_an_error(tmp_path, _isolated_home):
@@ -478,7 +502,9 @@ def test_gigacode_broken_certificate_is_an_error(tmp_path, _isolated_home):
     certs.mkdir(parents=True)
     (certs / "broken.pem").write_text("-----BEGIN CERTIFICATE-----\nмусор\n")
     cfg = Config.load(
-        project_root=tmp_path, environ={"GIGACREW_PROVIDER": "gigacode"}, cwd=tmp_path
+        project_root=tmp_path,
+        environ={"GIGACREW_PROVIDER": "gigacode"},
+        cwd=tmp_path,
     )
     with pytest.raises(RuntimeError, match="broken.pem"):
         cfg.build_ssl_verify()
@@ -494,33 +520,42 @@ def test_mtls_verification_loads_trust_anchors(tmp_path, monkeypatch):
     monkeypatch.setenv("SSL_CERT_FILE", str(cert))
     base = {"GIGACREW_CERT": str(cert), "GIGACREW_KEY": str(key)}
     cfg = Config.load(
-        project_root=tmp_path, environ={**base, "GIGACREW_VERIFY_SSL": "1"}, cwd=tmp_path
+        project_root=tmp_path,
+        environ={**base, "GIGACREW_VERIFY_SSL": "1"},
+        cwd=tmp_path,
     )
     context = cfg.build_ssl_verify()
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.cert_store_stats()["x509_ca"] > 0 or context.get_ca_certs() != []
     cfg = Config.load(
-        project_root=tmp_path, environ={**base, "GIGACREW_CA_BUNDLE": str(cert)}, cwd=tmp_path
+        project_root=tmp_path,
+        environ={**base, "GIGACREW_CA_BUNDLE": str(cert)},
+        cwd=tmp_path,
     )
     context = cfg.build_ssl_verify()
-    assert context.verify_mode == ssl.CERT_REQUIRED and len(context.get_ca_certs()) == 1
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert len(context.get_ca_certs()) == 1
 
 
 # ------------------------- проверка TLS у API v2 ------------------------- #
 def test_api_verifies_tls_by_default(tmp_path, _certifi_roots):
     """Ключ OAuth и Bearer-токен не уходят на непроверенный сервер: проверка TLS у API v2
-    включена и без GIGACREW_CA_BUNDLE — стандартными корнями."""
+    включена и без GIGACREW_CA_BUNDLE — стандартными корнями.
+    """
     import ssl
 
     assert Config().verify_ssl  # и у конфигурации, собранной вручную
     cfg = Config.load(project_root=tmp_path, environ={"GIGACREW_ACCESS_KEY": "k"}, cwd=tmp_path)
     assert cfg.verify_ssl
     context = cfg.build_ssl_verify()
-    assert isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED
-    assert context.check_hostname and context.get_ca_certs()  # стандартные корни на месте
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname
+    assert context.get_ca_certs()
     env = {"GIGACREW_ACCESS_KEY": "k", "GIGACREW_VERIFY_SSL": "0"}  # явный отказ — работает
     cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
-    assert not cfg.verify_ssl and cfg.build_ssl_verify() is False
+    assert not cfg.verify_ssl
+    assert cfg.build_ssl_verify() is False
 
 
 def test_mtls_verifies_server_by_default(tmp_path, _certifi_roots):
@@ -529,7 +564,8 @@ def test_mtls_verifies_server_by_default(tmp_path, _certifi_roots):
     cert, key = _self_signed(tmp_path)
     env = {"GIGACREW_CERT": str(cert), "GIGACREW_KEY": str(key)}
     context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
-    assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname
     assert context.get_ca_certs()
     env["GIGACREW_VERIFY_SSL"] = "0"
     context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
@@ -550,7 +586,8 @@ _SECURITY = (
 
 def test_project_dotenv_cannot_set_security_settings(tmp_path):
     """Закоммиченный .env репозитория не перенаправит ключ на чужой адрес, не выключит
-    проверку TLS и не подложит свои корни или токен; ключ доступа и прочие настройки — можно."""
+    проверку TLS и не подложит свои корни или токен; ключ доступа и прочие настройки — можно.
+    """
     import certifi
 
     root, cwd = tmp_path / "repo", tmp_path / "repo" / "sub"
@@ -562,7 +599,8 @@ def test_project_dotenv_cannot_set_security_settings(tmp_path):
     _env_file(cwd, "GIGACREW_AUTH_URL=https://other.test/oauth\nGIGACREW_TEMPERATURE=1\n")
     cfg = Config.load(project_root=root, environ={}, cwd=cwd)
     assert (cfg.base_url, cfg.auth_url, cfg.ca_bundle, cfg.gigacode_home) == ("", None, None, None)
-    assert cfg.verify_ssl and (cfg.cert, cfg.key) == (None, None)
+    assert cfg.verify_ssl
+    assert (cfg.cert, cfg.key) == (None, None)
     assert (cfg.access_key, cfg.model, cfg.timeout, cfg.mode.value) == ("k", "M", 7, "plan")
     assert cfg.temperature == 1.0
     keys = {key for key, _ in cfg.ignored_env}
@@ -577,12 +615,14 @@ def test_project_dotenv_cannot_set_security_settings(tmp_path):
     }
     assert ("GIGACREW_AUTH_URL", str(cwd.resolve() / ".env")) in cfg.ignored_env
     text = cfg.ignored_env_warning
-    assert "GIGACREW_AUTH_URL" in text and "~/.gigacode/.env" in text
+    assert "GIGACREW_AUTH_URL" in text
+    assert "~/.gigacode/.env" in text
 
 
 def test_user_dotenv_and_environment_are_trusted(tmp_path, _isolated_home):
     """Настройки безопасности задаются окружением или ~/.gigacode/.env; файл пользователя
-    важнее .env проекта, окружение — важнее всего."""
+    важнее .env проекта, окружение — важнее всего.
+    """
     root = tmp_path / "repo"
     _env_file(root, "GIGACREW_AUTH_URL=https://collector.test/oauth\nGIGACREW_MODEL=repo-M\n")
     _env_file(
@@ -591,7 +631,8 @@ def test_user_dotenv_and_environment_are_trusted(tmp_path, _isolated_home):
         "GIGACREW_MODEL=user-M\nGIGACREW_API_URL=https://api.mine/v1\n",
     )
     cfg = Config.load(project_root=root, environ={}, cwd=root)
-    assert cfg.auth_url == "https://auth.mine/oauth" and not cfg.verify_ssl
+    assert cfg.auth_url == "https://auth.mine/oauth"
+    assert not cfg.verify_ssl
     assert cfg.base_url == "https://api.mine/v1"
     assert cfg.model == "user-M"  # файл пользователя важнее .env проекта и для обычных настроек
     assert [key for key, _ in cfg.ignored_env] == ["GIGACREW_AUTH_URL"]
@@ -602,7 +643,8 @@ def test_user_dotenv_and_environment_are_trusted(tmp_path, _isolated_home):
     # то же значение, что задано доверенно, — не повод для предупреждения
     _env_file(root, "GIGACREW_AUTH_URL=https://auth.mine/oauth\n")
     cfg = Config.load(project_root=root, environ={}, cwd=root)
-    assert cfg.ignored_env == () and cfg.ignored_env_warning is None
+    assert cfg.ignored_env == ()
+    assert cfg.ignored_env_warning is None
 
 
 def test_trusted_dotenv_reads_security_settings(tmp_path):
@@ -612,7 +654,8 @@ def test_trusted_dotenv_reads_security_settings(tmp_path):
     assert env["GIGACREW_AUTH_URL"] == "https://auth.dev/oauth"
     assert "GIGACREW_AUTH_URL" not in load_environment(tmp_path, environ={}, cwd=tmp_path)
     cfg = Config.load(project_root=tmp_path, environ={}, cwd=tmp_path, trusted_dotenv=True)
-    assert cfg.auth_url == "https://auth.dev/oauth" and not cfg.verify_ssl
+    assert cfg.auth_url == "https://auth.dev/oauth"
+    assert not cfg.verify_ssl
     assert cfg.ignored_env == ()
 
 
@@ -623,4 +666,5 @@ def test_main_warns_about_ignored_project_settings(tmp_path, oneshot, capsys):
     oneshot(ScriptedProvider([text_turn("ok")]))
     assert main(["-C", str(tmp_path), "-p", "x", "--no-color", "--no-stream"]) == 0
     out = " ".join(capsys.readouterr().out.split())
-    assert "GIGACREW_AUTH_URL, GIGACREW_KEY" in out and "~/.gigacode/.env" in out
+    assert "GIGACREW_AUTH_URL, GIGACREW_KEY" in out
+    assert "~/.gigacode/.env" in out

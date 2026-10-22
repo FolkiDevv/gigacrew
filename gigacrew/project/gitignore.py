@@ -1,4 +1,4 @@
-"""Правила ``.gitignore``: разбор, стек правил по каталогам, glob → regex.
+r"""Правила ``.gitignore``: разбор, стек правил по каталогам, glob → regex.
 
 Поддерживается то, что встречается в реальных проектах: комментарии, ``!`` —
 отрицание, хвостовой ``/`` — только каталоги, ``/`` в начале или середине — шаблон
@@ -24,7 +24,7 @@ _MAX_RULES_BYTES = 1_000_000  # больше — явно не файл прав
 
 @functools.lru_cache(maxsize=1024)
 def compile_glob(pattern: str) -> re.Pattern[str]:
-    """glob → regex: ``**`` — любое число каталогов, ``*``/``?`` — в пределах сегмента.
+    r"""Glob → regex: ``**`` — любое число каталогов, ``*``/``?`` — в пределах сегмента.
 
     Как в ``.gitignore``, ``**`` пересекает ``/`` только целым сегментом пути
     (``**/x``, ``a/**``, ``a/**/b``); в остальных местах (``foo**bar``) это ``*``.
@@ -95,7 +95,7 @@ class IgnoreRule:
 
 
 def _strip_trailing_spaces(line: str) -> str:
-    """Хвостовые пробелы отбрасываются, если не экранированы (``foo\\ ``)."""
+    r"""Хвостовые пробелы отбрасываются, если не экранированы (``foo\\ ``)."""
     end = len(line)
     while end > 0 and line[end - 1] == " ":
         backslashes = 0
@@ -115,9 +115,7 @@ def parse_rule(line: str) -> IgnoreRule | None:
     if not line or line.startswith("#"):
         return None
     negate = line.startswith("!")
-    if negate:
-        line = line[1:]
-    elif line.startswith("\\!") or line.startswith("\\#"):
+    if negate or line.startswith(("\\!", "\\#")):
         line = line[1:]
     dir_only = line.endswith("/") and not line.endswith("\\/")
     line = line.rstrip("/")

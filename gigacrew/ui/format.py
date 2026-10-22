@@ -54,7 +54,12 @@ def skipped_line(count: int) -> str:
 
 
 def clip_lines(
-    text: str, *, head: int = 6, tail: int = 10, max_line: int = 300, max_chars: int = 4000
+    text: str,
+    *,
+    head: int = 6,
+    tail: int = 10,
+    max_line: int = 300,
+    max_chars: int = 4000,
 ) -> str:
     """Сокращает длинный вывод: начало + конец (итог pytest/компилятора обычно в конце).
 

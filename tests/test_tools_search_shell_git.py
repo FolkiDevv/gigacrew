@@ -36,7 +36,8 @@ def test_search_glob_filter(ctx):
     _write(ctx, "a.txt", "needle")
     s = SearchContentTool()
     out = s.run(s.parse({"pattern": "needle", "glob": "*.py"}), ctx)
-    assert "a.py" in out.content and "a.txt" not in out.content
+    assert "a.py" in out.content
+    assert "a.txt" not in out.content
 
 
 def test_search_skips_ignored_binary_large_and_secrets(ctx):
@@ -58,7 +59,8 @@ def test_search_glob_with_path(ctx):
     _write(ctx, "lib/b.py", "needle")
     s = SearchContentTool()
     out = s.run(s.parse({"pattern": "needle", "glob": "src/**/*.py"}), ctx).content
-    assert "src/x/a.py" in out and "lib/b.py" not in out
+    assert "src/x/a.py" in out
+    assert "lib/b.py" not in out
 
 
 def test_search_max_results_is_clamped(ctx):
@@ -127,7 +129,9 @@ def test_shell_runs_in_cwd_and_rejects_outside(ctx):
     with pytest.raises(ToolError):
         sh.run(sh.parse({"command": "pwd", "cwd": "../.."}), ctx)
     verdict = sh.assess(sh.parse({"command": "cd sub && ls"}), ctx).verdict
-    assert verdict is not None and verdict.cwd == "sub" and verdict.command == "ls"
+    assert verdict is not None
+    assert verdict.cwd == "sub"
+    assert verdict.command == "ls"
 
 
 # -------------------------------- git --------------------------------- #
@@ -183,7 +187,7 @@ def stashed_repo(git_repo):
 
 @pytest.mark.parametrize("dashdash", [False, True])
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("stash", ["list"]),
         ("stash", ["show"]),
@@ -207,7 +211,7 @@ def test_git_forbidden_options_rejected_after_double_dash(stashed_repo, sub, arg
 
 
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("add", ["--pathspec-from-file=/etc/hostname"]),
         ("add", ["--pathspec-from=x"]),  # сокращение опции
@@ -226,7 +230,7 @@ def test_git_forbidden_options_for_every_subcommand(stashed_repo, sub, args):
 
 
 @pytest.mark.parametrize(
-    "sub, args, reason",
+    ("sub", "args", "reason"),
     [
         ("branch", ["-D", "feature"], "git branch -D: удаление ветки без проверки слияния"),
         ("branch", ["--delete", "--force", "feature"], "git branch -D"),
@@ -273,7 +277,7 @@ def test_git_destructive_operations_are_dangerous(stashed_repo, sub, args, reaso
 
 
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("branch", ["-d", "feature"]),
         ("branch", ["-m", "new"]),
@@ -314,12 +318,13 @@ def test_git_restore_with_yes_flag_still_asks(stashed_repo):
     root = stashed_repo.root
     _write(stashed_repo, "f.txt", "three\n")
     provider = ScriptedProvider(
-        [tool_turn("git", {"subcommand": "restore", "args": ["."]}), text_turn("ок")]
+        [tool_turn("git", {"subcommand": "restore", "args": ["."]}), text_turn("ок")],
     )
     events = RecordingEvents(confirm_answer=False)
     cfg = Config(access_key="x", project_root=root, stream=False, auto_approve=True)
     Agent(provider, build_default_registry(), cfg, events).run_turn("откати правки")
-    assert len(events.confirms) == 1 and events.confirms[0][2] is True  # dangerous
+    assert len(events.confirms) == 1
+    assert events.confirms[0][2] is True
     assert (root / "f.txt").read_text(encoding="utf-8") == "three\n"
 
 
@@ -331,7 +336,7 @@ def outside_secret(tmp_path_factory):
 
 
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("diff", ["{abs}", "f.txt"]),  # путь вне дерева — git сам включает --no-index
         ("diff", ["--", "{abs}", "/dev/null"]),
@@ -368,7 +373,7 @@ def test_git_paths_outside_project_are_refused_outside_a_repository(ctx, outside
 
 
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("diff", ["f.txt"]),
         ("diff", ["HEAD", "--", "f.txt"]),
@@ -384,7 +389,7 @@ def test_git_reads_inside_project_stay_safe(stashed_repo, sub, args):
     assert g.run(params, stashed_repo).ok is True
 
 
-@pytest.mark.parametrize("sub, args", [("status", []), ("diff", []), ("log", [])])
+@pytest.mark.parametrize(("sub", "args"), [("status", []), ("diff", []), ("log", [])])
 def test_git_reads_outside_a_repository_are_not_safe(ctx, sub, args):
     g = GitTool()
     assessment = g.assess(g.parse({"subcommand": sub, "args": args}), ctx)
@@ -460,10 +465,11 @@ def test_git_status_does_not_run_fsmonitor_hook(git_repo):
 
 
 @pytest.mark.parametrize(
-    "sub, args", [("diff", []), ("log", ["-p"]), ("show", []), ("status", []), ("stash", ["list"])]
+    ("sub", "args"),
+    [("diff", []), ("log", ["-p"]), ("show", []), ("status", []), ("stash", ["list"])],
 )
 def test_git_reads_with_textconv_in_repo_config_are_not_safe(stashed_repo, sub, args):
-    """textconv из .git/config запускается на чтении: оно уже не SAFE (и в репозитории)."""
+    """Textconv из .git/config запускается на чтении: оно уже не SAFE (и в репозитории)."""
     g = GitTool()
     params = g.parse({"subcommand": sub, "args": args})
     assert g.risk(params, stashed_repo) is RiskLevel.SAFE
@@ -480,7 +486,7 @@ def test_git_reads_are_not_safe_when_repo_config_is_unknown(stashed_repo, monkey
 
 
 @pytest.mark.parametrize(
-    "args, risk",
+    ("args", "risk"),
     [
         (["--set-upstream-to=origin/main"], RiskLevel.WRITE),
         (["--unset-upstream"], RiskLevel.WRITE),
@@ -519,12 +525,13 @@ def test_git_commit_in_auto_mode_is_confirmed(stashed_repo):
     _git(stashed_repo, "add", "f.txt")
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True).stdout
     provider = ScriptedProvider(
-        [tool_turn("git", {"subcommand": "commit", "args": ["-m", "x"]}), text_turn("ок")]
+        [tool_turn("git", {"subcommand": "commit", "args": ["-m", "x"]}), text_turn("ок")],
     )
     events = RecordingEvents(confirm_answer=False)
     cfg = Config(access_key="x", project_root=root, stream=False, auto_approve=False)
     Agent(provider, build_default_registry(), cfg, events).run_turn("закоммить")
-    assert len(events.confirms) == 1 and events.confirms[0][2] is False
+    assert len(events.confirms) == 1
+    assert events.confirms[0][2] is False
     after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True).stdout
     assert after == head
 
@@ -544,7 +551,8 @@ def test_git_diff_does_not_run_external_diff(git_repo):
     g = GitTool()
     res = g.run(g.parse({"subcommand": "diff"}), git_repo)
     assert not marker.exists()
-    assert "-one" in res.content and "+two" in res.content
+    assert "-one" in res.content
+    assert "+two" in res.content
 
 
 def _project_with_submodule(base, *, filter_program=None):
@@ -610,7 +618,9 @@ def test_git_ignores_implicit_bare_repository(ctx):
     hook, marker = _marker_script(ctx.root, "planted")
     subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=bare, check=True)
     res = subprocess.run(
-        ["git", "-c", "safe.bareRepository=explicit", "status"], cwd=bare, capture_output=True
+        ["git", "-c", "safe.bareRepository=explicit", "status"],
+        cwd=bare,
+        capture_output=True,
     )
     if res.returncode == 0:
         pytest.skip("эта версия git не знает safe.bareRepository")
@@ -619,7 +629,9 @@ def test_git_ignores_implicit_bare_repository(ctx):
 
     g = GitTool()
     out = g.run(g.parse({"subcommand": "log"}), ToolContext(workspace=Workspace(bare)))
-    assert not out.ok and "safe.bareRepository" in out.content and not marker.exists()
+    assert not out.ok
+    assert "safe.bareRepository" in out.content
+    assert not marker.exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="FIFO")
@@ -662,9 +674,11 @@ def test_search_limit_note_only_when_more_matches(ctx):
     _write(ctx, "a.txt", "hit\n" * 3)
     s = SearchContentTool()
     exact = s.run(s.parse({"pattern": "hit", "max_results": 3}), ctx).content
-    assert "показаны первые" not in exact and exact.count("a.txt:") == 3
+    assert "показаны первые" not in exact
+    assert exact.count("a.txt:") == 3
     more = s.run(s.parse({"pattern": "hit", "max_results": 2}), ctx).content
-    assert more.count("a.txt:") == 2 and "показаны первые 2 совпадений" in more
+    assert more.count("a.txt:") == 2
+    assert "показаны первые 2 совпадений" in more
 
 
 def test_search_line_numbers_match_read_file(ctx):

@@ -356,7 +356,11 @@ has to be changed and where.
 
 
 def mode_prompt(
-    mode: PermissionMode, *, subagent: bool = False, read_only: bool = False, plan_path: str = ""
+    mode: PermissionMode,
+    *,
+    subagent: bool = False,
+    read_only: bool = False,
+    plan_path: str = "",
 ) -> str:
     """Правила текущего режима для системного промпта ("" — особых правил нет).
 
@@ -387,8 +391,7 @@ def build_project_context(workspace: Workspace) -> str:
     """
     root = workspace.root
     parts = [f"Project root: {root}"]
-    for doc in load_instructions(root):
-        parts.append(_instruction_block("Project instructions", doc))
+    parts.extend(_instruction_block("Project instructions", doc) for doc in load_instructions(root))
     skills = skills_prompt(discover_skills(workspace))
     if skills:
         parts.append(f"\n{skills}")
@@ -398,14 +401,14 @@ def build_project_context(workspace: Workspace) -> str:
         if tree.endswith(TREE_TRUNCATED):
             parts.append(
                 "(A large project, the tree is incomplete: a directory overview — "
-                "file_outline, files — find_files, definitions — find_symbol.)"
+                "file_outline, files — find_files, definitions — find_symbol.)",
             )
             repo_map = _repo_map(workspace)
             if repo_map:
                 parts.append(
                     "\nProject map — key definitions ranked by references (a map for "
                     "the task — repo_map, a whole file — file_outline):\n"
-                    f"{repo_map}"
+                    f"{repo_map}",
                 )
     return clean_text("\n".join(parts))
 
@@ -432,8 +435,10 @@ def skills_prompt(skills: Sequence[Skill]) -> str:
     if not skills:
         return ""
     lines = [
-        "Skills — ready-made instructions for typical tasks. When the task matches a "
-        "skill's description, load it with the skill tool before starting and follow it:"
+        (
+            "Skills — ready-made instructions for typical tasks. When the task matches a "
+            "skill's description, load it with the skill tool before starting and follow it:"
+        ),
     ]
     for skill in skills[:MAX_SKILLS_LISTED]:
         description = skill.description or "(no description)"
@@ -459,8 +464,10 @@ def skill_invocation_prompt(skill: Skill, body: str, command_line: str, args: st
         args = ""
     parts = [
         command_line,
-        f"The user invoked the skill {skill.name} — follow its instructions "
-        f"(files of the skill are in {skill.directory}):",
+        (
+            f"The user invoked the skill {skill.name} — follow its instructions "
+            f"(files of the skill are in {skill.directory}):"
+        ),
         f'<skill name="{skill.name}">\n{body}\n</skill>',
     ]
     if args:
@@ -488,8 +495,10 @@ def nested_instructions_prompt(files: Sequence[InstructionFile]) -> str:
         return ""
     parts = [
         NESTED_HEADER,
-        "They apply to files of their directory and its subdirectories and win over the "
-        "root instructions.",
+        (
+            "They apply to files of their directory and its subdirectories and win over the "
+            "root instructions."
+        ),
     ]
     budget = MAX_NESTED_CHARS
     skipped = []
@@ -503,7 +512,7 @@ def nested_instructions_prompt(files: Sequence[InstructionFile]) -> str:
     if skipped:
         parts.append(
             "\nToo large for the context (read them with read_file before working with "
-            f"files of these directories): {', '.join(skipped)}"
+            f"files of these directories): {', '.join(skipped)}",
         )
     return clean_text("\n".join(parts))
 

@@ -1,4 +1,4 @@
-"""Строка ввода REPL на prompt_toolkit.
+r"""Строка ввода REPL на prompt_toolkit.
 
 * автодополнение слеш-команд из :class:`~gigacrew.cli.commands.CommandRegistry`
   и скиллов (имя + краткое описание), меню появляется при вводе ``/``; аргументы
@@ -113,7 +113,8 @@ class SlashCommandCompleter(Completer):
     """Дополняет первое слово, если это начало слеш-команды или скилла (не путь
     ``/home/...``), и аргумент команды, для которой есть источник вариантов в
     ``arg_choices`` (ключ — имя команды): сначала совпадения по началу, затем по
-    подстроке. Скилл с именем встроенной команды не предлагается — её не перекрыть."""
+    подстроке. Скилл с именем встроенной команды не предлагается — её не перекрыть.
+    """
 
     def __init__(
         self,
@@ -126,7 +127,9 @@ class SlashCommandCompleter(Completer):
         self._skills = skills
 
     def get_completions(
-        self, document: Document, complete_event: CompleteEvent
+        self,
+        document: Document,
+        complete_event: CompleteEvent,
     ) -> Iterable[Completion]:
         text = document.text_before_cursor
         if _COMMAND_PREFIX_RE.fullmatch(text):
@@ -279,7 +282,8 @@ def create_prompt_session(
 
 def _read_plain(default: str = "") -> str:
     """``input()`` не умеет заполнять строку: набранное заранее печатается после
-    приглашения и приклеивается к введённому."""
+    приглашения и приклеивается к введённому.
+    """
     return default + input(PLAIN_PROMPT + default)
 
 

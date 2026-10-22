@@ -15,7 +15,9 @@ from gigacrew.llm.types import FunctionCall, Message, ToolSpec
 def _provider() -> ApiProvider:
     # Не делает сетевых запросов до вызова complete(); ключ нужен лишь для конструктора.
     cfg = Config(
-        access_key="dummy", auth_url="https://auth.test/oauth", base_url="https://api.test/v1"
+        access_key="dummy",
+        auth_url="https://auth.test/oauth",
+        base_url="https://api.test/v1",
     )
     return ApiProvider(cfg)
 
@@ -75,12 +77,13 @@ def test_payload_v2_layout_with_tools():
                         "name": "read_file",
                         "description": "Читает файл",
                         "parameters": TOOL.parameters,
-                    }
-                ]
-            }
-        }
+                    },
+                ],
+            },
+        },
     ]
-    assert "stream" not in payload and "functions" not in payload
+    assert "stream" not in payload
+    assert "functions" not in payload
     p.close()
 
 
@@ -88,7 +91,11 @@ def test_payload_tool_choice_none_forbids_calls():
     """Итог после остановки: схемы остаются (история с вызовами), вызывать нельзя."""
     p = _provider()
     payload = p._payload(
-        [Message(role="user", content="q")], [TOOL], model="m", temperature=0, tool_choice="none"
+        [Message(role="user", content="q")],
+        [TOOL],
+        model="m",
+        temperature=0,
+        tool_choice="none",
     )
     assert payload["tool_config"] == {"mode": "none"}
     assert payload["tools"]
@@ -122,7 +129,8 @@ def test_reasoning_goes_before_its_answer():
 
 def test_several_calls_and_results_serialized_as_one_tool_message():
     """Все результаты вызовов одного ответа — одно сообщение role=tool с тем же
-    состоянием и id вызовов (иначе 422 «Function calls count does not match…»)."""
+    состоянием и id вызовов (иначе 422 «Function calls count does not match…»).
+    """
     sent = ApiProvider._messages_payload(_two_calls())
     assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool"]
     assert sent[2] == {
@@ -135,7 +143,7 @@ def test_several_calls_and_results_serialized_as_one_tool_message():
                     "name": "read_file",
                     "arguments": {"path": "README.md"},
                     "id": "c2",
-                }
+                },
             },
         ],
         "tools_state_id": "S",
@@ -148,7 +156,7 @@ def test_several_calls_and_results_serialized_as_one_tool_message():
                     "id": "c1",
                     "name": "file_outline",
                     "result": {"result": "src: файлов 100"},
-                }
+                },
             },
             {"function_result": {"id": "c2", "name": "read_file", "result": {"text": "# demo"}}},
         ],
@@ -189,7 +197,7 @@ def test_history_without_ids_and_state():
             Message(role="user", content="x"),
             Message(role="assistant", function_calls=[FunctionCall(name="read_file")]),
             Message(role="function", name="read_file", content="1\tx"),
-        ]
+        ],
     )
     assert sent[1] == {
         "role": "assistant",
@@ -227,7 +235,8 @@ def test_object_result_passed_as_is():
 )
 def test_result_with_non_finite_numbers_is_text(content):
     """json.loads принимает NaN/Infinity, а тело запроса — строгий JSON (httpx отверг бы его
-    ValueError, и сообщение сломало бы каждый следующий запрос чата): такой результат — текст."""
+    ValueError, и сообщение сломало бы каждый следующий запрос чата): такой результат — текст.
+    """
     result = ApiProvider._result_object(content)
     assert result == {"result": content}
     json.dumps(result, allow_nan=False)  # тело запроса собирается
@@ -244,8 +253,8 @@ def test_arguments_with_non_finite_numbers_are_dropped():
                     {"function_call": {"id": "c2", "name": "g", "arguments": {"y": float("inf")}}},
                     {"function_call": {"id": "c3", "name": "h", "arguments": {"z": 1.5}}},
                 ],
-            }
-        ]
+            },
+        ],
     }
     calls = ApiProvider._parse_response(data).message.function_calls
     assert [(c.name, c.arguments) for c in calls] == [("f", {}), ("g", {}), ("h", {"z": 1.5})]
@@ -268,14 +277,14 @@ def test_parse_response_with_reasoning_text_and_parallel_calls():
                             "id": "ba12",
                             "name": "get_weather",
                             "arguments": {"city": "Москва"},
-                        }
+                        },
                     },
                     {
                         "function_call": {
                             "id": "4552",
                             "name": "get_weather",
                             "arguments": {"city": "Казань"},
-                        }
+                        },
                     },
                 ],
             },
@@ -322,8 +331,8 @@ def test_parse_response_arguments_as_string():
             {
                 "role": "assistant",
                 "content": [{"function_call": {"name": "f", "arguments": '{"k": "v"}'}}],
-            }
-        ]
+            },
+        ],
     }
     turn = ApiProvider._parse_response(data)
     assert turn.message.function_calls[0].arguments == {"k": "v"}
@@ -376,7 +385,8 @@ def test_consume_sse_parallel_calls():
     assert turn.message.function_calls[1].arguments == {"city": "Казань"}
     assert turn.message.state_id == "01a12ea7"
     assert turn.finish_reason == "function_call"
-    assert turn.usage.prompt_tokens == 445 and turn.usage.completion_tokens == 110
+    assert turn.usage.prompt_tokens == 445
+    assert turn.usage.completion_tokens == 110
 
 
 def test_consume_sse_text_stream():
@@ -509,7 +519,8 @@ def test_consume_sse_status_below_400_is_not_an_error():
 
 def test_sse_event_without_blank_separator_is_not_merged():
     """Строка ``event:`` без пустой строки перед ней начинает новое событие: склеенный
-    JSON не разобрался бы и молча пропал бы — вместе с текстом, вызовами или окончанием."""
+    JSON не разобрался бы и молча пропал бы — вместе с текстом, вызовами или окончанием.
+    """
     assert list(iter_sse_events(["event: a", "data: 1", "event: b", "data: 2", ""])) == [
         ("a", "1"),
         ("b", "2"),
@@ -517,7 +528,8 @@ def test_sse_event_without_blank_separator_is_not_merged():
     stream = _delta("ok").rstrip("\n") + "\n" + _DONE
     deltas: list[str] = []
     turn = ApiProvider._consume_sse(_FakeSSE(stream), deltas.append)
-    assert deltas == ["ok"] and turn.finish_reason == "stop"
+    assert deltas == ["ok"]
+    assert turn.finish_reason == "stop"
 
 
 def test_parallel_calls_without_ids_are_all_kept():
@@ -529,8 +541,8 @@ def test_parallel_calls_without_ids_are_all_kept():
                     {"function_call": {"name": "f", "arguments": {"a": 1}}},
                     {"function_call": {"name": "g", "arguments": {"b": 2}}},
                 ],
-            }
-        ]
+            },
+        ],
     }
     assert ApiProvider._parse_response(data).message.function_calls == [
         FunctionCall(name="f", arguments={"a": 1}),
@@ -546,8 +558,8 @@ def test_state_id_under_either_spelling(key):
                 "role": "assistant",
                 key: "S",
                 "content": [{"function_call": {"id": "c1", "name": "f", "arguments": {}}}],
-            }
-        ]
+            },
+        ],
     }
     assert ApiProvider._parse_response(data).message.state_id == "S"
 
@@ -562,7 +574,7 @@ def test_malformed_parts_are_skipped():
                 "role": "assistant",
                 "content": ["x", {"function_call": {"name": "f", "arguments": "{bad"}}],
             },
-        ]
+        ],
     }
     turn = ApiProvider._parse_response(data)
     assert turn.message.function_calls == [FunctionCall(name="f", arguments={})]

@@ -180,7 +180,8 @@ def rank_definitions(
     marks = ",".join("?" * len(_SKIP_KINDS))
     found: dict[str, set[str]] = defaultdict(set)
     for path, name in db.execute(
-        f"SELECT DISTINCT path, name FROM symbols WHERE kind NOT IN ({marks})", _SKIP_KINDS
+        f"SELECT DISTINCT path, name FROM symbols WHERE kind NOT IN ({marks})",
+        _SKIP_KINDS,
     ):
         found[name].add(path)
     if not found:
@@ -189,7 +190,7 @@ def rank_definitions(
     references: dict[str, dict[str, int]] = defaultdict(dict)
     for path, name, count in db.execute(
         "SELECT r.path, r.name, COUNT(*) FROM refs r "
-        "WHERE r.name IN (SELECT name FROM symbols) GROUP BY r.path, r.name"
+        "WHERE r.name IN (SELECT name FROM symbols) GROUP BY r.path, r.name",
     ):
         if name in defines:
             references[name][path] = count
@@ -223,7 +224,7 @@ def rank_definitions(
             for u, w in users.items()
         )
         for definer in defines[name]:
-            ranked[(definer, name)] = share
+            ranked[definer, name] = share
     used = sorted(
         (RankedDefinition(path, name, rank) for (path, name), rank in ranked.items()),
         key=lambda d: (-d.rank, d.path, d.name),
@@ -245,7 +246,9 @@ def rank_definitions(
 # Отрисовка
 # --------------------------------------------------------------------------- #
 def _render(
-    index: ProjectIndex, chosen: list[RankedDefinition], outlines: dict[str, list[Symbol]]
+    index: ProjectIndex,
+    chosen: list[RankedDefinition],
+    outlines: dict[str, list[Symbol]],
 ) -> tuple[str, int, int]:
     """Файлы в порядке важности, в каждом — выбранные определения по строкам.
 

@@ -25,7 +25,7 @@ from pydantic import BaseModel, PrivateAttr
 from gigacrew.permissions import PermissionMode
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.fs import WriteFileParams, WriteFileTool
-from gigacrew.tools.questions import Question, QuestionOption, QuestionsUnavailable
+from gigacrew.tools.questions import Question, QuestionOption, QuestionsUnavailableError
 
 APPROVE = "Да, выполнять"
 _APPROVALS = {APPROVE: PermissionMode.AUTO}
@@ -34,7 +34,8 @@ PLAN_QUESTION = Question(
     header="План",
     options=(
         QuestionOption(
-            APPROVE, f"Режим «{PermissionMode.AUTO.label}»: {PermissionMode.AUTO.description}"
+            APPROVE,
+            f"Режим «{PermissionMode.AUTO.label}»: {PermissionMode.AUTO.description}",
         ),
     ),
     custom_label="Замечания…",
@@ -85,7 +86,7 @@ class PlanReview:
     @property
     def continues(self) -> bool:
         """Работа в ходе продолжается: план выполняется или дорабатывается."""
-        return self.outcome in ("approved", "revise")
+        return self.outcome in {"approved", "revise"}
 
 
 # Без параметров: план читается из файла плана (docstring ушёл бы в схему). План из
@@ -112,7 +113,7 @@ def _read_plan(ctx: ToolContext, plan: PlanFile) -> str:
     if not text:
         raise ToolError(
             f"План не записан: сначала запиши его в {path} инструментом write_file, "
-            "затем снова вызови exit_plan_mode (без аргументов)."
+            "затем снова вызови exit_plan_mode (без аргументов).",
         )
     return text
 
@@ -144,7 +145,10 @@ def _take_plan_argument(ctx: ToolContext, plan: PlanFile, text: str) -> None:
 
 
 def review_plan(
-    ctx: ToolContext, plan_file: PlanFile, *, on_show: Callable[[], None] | None = None
+    ctx: ToolContext,
+    plan_file: PlanFile,
+    *,
+    on_show: Callable[[], None] | None = None,
 ) -> PlanReview:
     """Показать план из файла пользователю и узнать решение.
 
@@ -160,7 +164,9 @@ def review_plan(
     plan = _read_plan(ctx, plan_file)
     plan_file.reviews += 1
     no_approver = PlanReview(
-        "no_approver", NO_APPROVER_NOTE.format(path=path), "одобрить план некому"
+        "no_approver",
+        NO_APPROVER_NOTE.format(path=path),
+        "одобрить план некому",
     )
     if ctx.ask_user is None:
         plan_file.dirty = False
@@ -169,7 +175,7 @@ def review_plan(
         on_show()
     try:
         answers = ctx.ask_user([replace(PLAN_QUESTION, body=plan, source=path)])
-    except QuestionsUnavailable:
+    except QuestionsUnavailableError:
         plan_file.dirty = False
         return no_approver
     plan_file.dirty = False  # пользователь видел эту версию плана
@@ -181,7 +187,9 @@ def review_plan(
     if mode is None:
         feedback = answer.custom.strip()
         return PlanReview(
-            "revise", REVISE_NOTE.format(feedback=feedback, path=path), "план на доработку"
+            "revise",
+            REVISE_NOTE.format(feedback=feedback, path=path),
+            "план на доработку",
         )
     set_mode(mode)
     return PlanReview(
@@ -191,7 +199,7 @@ def review_plan(
     )
 
 
-class ExitPlanModeTool(Tool):
+class ExitPlanModeTool(Tool[ExitPlanModeParams]):
     name = "exit_plan_mode"
     description = (
         "Plan mode only: hands the plan to the user for approval. First write the plan "

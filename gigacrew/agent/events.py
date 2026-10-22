@@ -20,7 +20,7 @@ from typing import Literal
 
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, ToolResult
-from gigacrew.tools.questions import Answer, Question, QuestionsUnavailable
+from gigacrew.tools.questions import Answer, Question, QuestionsUnavailableError
 
 NoticeLevel = Literal["info", "warn", "error"]
 
@@ -163,7 +163,11 @@ class AgentEvents:
         """Модель вызвала инструмент."""
 
     def confirm(
-        self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
+        self,
+        call: ToolCallInfo,
+        preview: Display | None,
+        *,
+        dangerous: bool,
     ) -> bool | Approval | ConfirmResult:
         """Спросить пользователя, выполнять ли изменяющую/опасную операцию.
 
@@ -180,7 +184,8 @@ class AgentEvents:
 
     def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
         """Проверка закончилась (вызывается всегда). None — прервана; при отказе или
-        сбое дальше придёт ``confirm`` с ``call.review``."""
+        сбое дальше придёт ``confirm`` с ``call.review``.
+        """
 
     def on_tool_start(self, call: ToolCallInfo) -> None:
         """Инструмент запущен (после подтверждения, если оно требовалось)."""
@@ -200,7 +205,7 @@ class AgentEvents:
         Интерфейс без поддержки вопросов сообщает, что спросить некого, — модель
         получит ошибку и решит сама, а не примет выдуманный ответ.
         """
-        raise QuestionsUnavailable()
+        raise QuestionsUnavailableError
 
     # --- сжатие контекста ---
     def on_compact_start(self, *, auto: bool) -> None:
@@ -218,7 +223,11 @@ class AgentEvents:
         """Суб-агент запущен."""
 
     def on_subagent_activity(
-        self, info: SubagentInfo, activity: str, *, wrapping_up: bool = False
+        self,
+        info: SubagentInfo,
+        activity: str,
+        *,
+        wrapping_up: bool = False,
     ) -> None:
         """Чем занят суб-агент: «думаю», имя инструмента, «сжимаю контекст».
 
@@ -230,7 +239,12 @@ class AgentEvents:
         """Суб-агент вызвал инструмент."""
 
     def on_subagent_tool_result(
-        self, info: SubagentInfo, call: ToolCallInfo, result: ToolResult, *, previewed: bool
+        self,
+        info: SubagentInfo,
+        call: ToolCallInfo,
+        result: ToolResult,
+        *,
+        previewed: bool,
     ) -> None:
         """Результат инструмента суб-агента."""
 

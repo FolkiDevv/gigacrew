@@ -13,7 +13,8 @@ from gigacrew.llm.model_windows import ModelWindows, default_path
 
 
 @pytest.mark.parametrize(
-    "window", [4_096, 8_192, 32_000, 32_768, 50_000, 128_000, 131_072, 200_000]
+    "window",
+    [4_096, 8_192, 32_000, 32_768, 50_000, 128_000, 131_072, 200_000],
 )
 @pytest.mark.parametrize("hint", [False, True])
 def test_result_is_confirmed_and_close(window, hint):
@@ -22,7 +23,8 @@ def test_result_is_confirmed_and_close(window, hint):
     result = probe_context_window(provider, "M", on_step=steps.append)
     assert result.window <= window  # консервативно: только подтверждённый размер
     assert result.window >= window * 0.98 - 512
-    assert not result.capped and result.upper_bound is not None
+    assert not result.capped
+    assert result.upper_bound is not None
     assert result.window < result.upper_bound
     assert result.probes == len(steps) <= MAX_PROBES
     assert {model for model, _ in provider.measured} == {"M"}
@@ -41,31 +43,39 @@ def test_standard_window_costs_one_large_probe(window):
 def test_limit_from_error_text_shortcuts_search():
     steps = []
     result = probe_context_window(WindowProvider(50_000, hint=True), "M", on_step=steps.append)
-    assert result.probes <= 4 and sum(1 for s in steps if s.ok) == 2
+    assert result.probes <= 4
+    assert sum(1 for s in steps if s.ok) == 2
     assert 49_000 <= result.window <= 50_000
 
 
 def test_window_above_cap_is_capped():
     result = probe_context_window(WindowProvider(1_000_000), "M")
-    assert result.capped and result.upper_bound is None
+    assert result.capped
+    assert result.upper_bound is None
     assert result.probes == 2
     assert MAX_CONTEXT_WINDOW * 0.98 <= result.window <= MAX_CONTEXT_WINDOW
 
 
 def test_capped_rechecks_undershoot_after_calibration():
     """Калибровка на маленьком запросе промахивается (большие служебные токены):
-    прошедший «потолок» с заметным недобором перепроверяется с новым соотношением."""
+    прошедший «потолок» с заметным недобором перепроверяется с новым соотношением.
+    """
     steps = []
     result = probe_context_window(
-        WindowProvider(1_000_000, overhead=300), "M", on_step=steps.append
+        WindowProvider(1_000_000, overhead=300),
+        "M",
+        on_step=steps.append,
     )
-    assert steps[1].ok and steps[1].prompt_tokens < MAX_CONTEXT_WINDOW * 0.9
-    assert result.capped and result.window >= MAX_CONTEXT_WINDOW * 0.98
+    assert steps[1].ok
+    assert steps[1].prompt_tokens < MAX_CONTEXT_WINDOW * 0.9
+    assert result.capped
+    assert result.window >= MAX_CONTEXT_WINDOW * 0.98
 
 
 def test_capped_recheck_rejected_continues_search():
     result = probe_context_window(WindowProvider(250_000, overhead=300), "M")
-    assert not result.capped and 245_000 <= result.window <= 250_000
+    assert not result.capped
+    assert 245_000 <= result.window <= 250_000
 
 
 def test_rejections_without_status_count_as_too_large():
@@ -84,7 +94,8 @@ def test_calibration_failure_aborts():
 def test_server_that_truncates_silently_stops_the_probe(window):
     """Сервер молча обрезает запрос до окна и считает обрезанное: prompt_tokens не растёт
     вслед за текстом. Доверься замер ему — соотношение символов и токенов росло бы
-    с каждой пробой, и пробы раздувались бы в геометрической прогрессии."""
+    с каждой пробой, и пробы раздувались бы в геометрической прогрессии.
+    """
     provider = WindowProvider(window, truncate=True, max_chars=MAX_CONTEXT_WINDOW * 4)
     with pytest.raises(LLMError, match="обрезает") as e:
         probe_context_window(provider, "M")
@@ -96,7 +107,9 @@ def test_server_that_truncates_silently_stops_the_probe(window):
 def test_store_round_trip_and_merge(tmp_path):
     path = tmp_path / ".gigacode" / "models.json"
     windows, warning = ModelWindows.load(path)
-    assert warning is None and windows.get("A") is None and not path.exists()
+    assert warning is None
+    assert windows.get("A") is None
+    assert not path.exists()
 
     windows.record(probe_context_window(WindowProvider(32_768), "A"), base_url="https://x")
     # другое окно gigacrew успело записать свою модель — она не теряется
@@ -109,7 +122,8 @@ def test_store_round_trip_and_merge(tmp_path):
     assert 16_000 <= reloaded.get("A") <= 16_384
     assert 8_000 <= reloaded.get("B") <= 8_192
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["version"] == 1 and data["models"]["A"]["capped"] is False
+    assert data["version"] == 1
+    assert data["models"]["A"]["capped"] is False
     assert data["models"]["A"]["base_url"] == ""
     assert [p.name for p in path.parent.iterdir()] == ["models.json"]  # без .tmp
 
@@ -118,7 +132,9 @@ def test_store_broken_file_warns_and_is_overwritten(tmp_path):
     path = tmp_path / "models.json"
     path.write_text("{битый", encoding="utf-8")
     windows, warning = ModelWindows.load(path)
-    assert warning and "models.json" in warning and windows.get("A") is None
+    assert warning
+    assert "models.json" in warning
+    assert windows.get("A") is None
     windows.record(probe_context_window(WindowProvider(8_192), "A"))
     assert ModelWindows.load(path)[0].get("A") is not None
 
@@ -127,7 +143,8 @@ def test_store_of_an_unknown_format_version_is_not_trusted(tmp_path):
     path = tmp_path / "models.json"
     path.write_text(json.dumps({"version": 2, "models": {"A": {"context_window": 1000}}}))
     windows, warning = ModelWindows.load(path)
-    assert warning and windows.get("A") is None
+    assert warning
+    assert windows.get("A") is None
 
 
 def test_store_in_memory_and_default_path(_isolated_home):
@@ -164,7 +181,9 @@ def test_windows_reported_by_api(tmp_path):
     assert windows.get("Here") == 100_000  # замер этого эндпоинта
     assert windows.get("There") == 131_072  # замер другого — не берётся, есть окно API
     assert windows.get("Old") == 32_768  # окно API важнее замера без эндпоинта
-    assert windows.get("New") == 65_536 and windows.get("Bad") is None
+    assert windows.get("New") == 65_536
+    assert windows.get("Bad") is None
     assert not path.exists()  # только в памяти
     windows.report({})
-    assert windows.get("New") is None and windows.get("Old") == 8_000
+    assert windows.get("New") is None
+    assert windows.get("Old") == 8_000

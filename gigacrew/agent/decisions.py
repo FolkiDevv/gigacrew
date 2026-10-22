@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import os
 import re
@@ -36,13 +35,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from gigacrew.project.workspace import user_data_dir
+from gigacrew.project.workspace import (
+    PROJECTS_DIR,
+    project_key,
+    project_key_root,
+    user_data_dir,
+)
 from gigacrew.safety.levels import RULES_VERSION, CommandLevel, Verdict
 
 __all__ = ["DecisionMemory", "Rule", "history_key", "project_key", "redact"]
 
 FORMAT_VERSION = 1
-PROJECTS_DIR = "projects"
 APPROVALS_FILE = "approvals.json"
 JOURNAL_FILE = "decisions.jsonl"
 MAX_JOURNAL_BYTES = 5 * 1024 * 1024
@@ -81,46 +84,6 @@ def _now() -> str:
     return datetime.now().astimezone().replace(microsecond=0).isoformat()
 
 
-def project_key(root: Path) -> str:
-    """Ключ проекта: путь корня; рабочее дерево git — путь основного репозитория."""
-    return hashlib.sha256(str(_key_root(root)).encode("utf-8")).hexdigest()[:16]
-
-
-def _key_root(root: Path) -> Path:
-    """Путь, от которого считается ключ: у рабочего дерева git — основной репозиторий."""
-    root = Path(os.path.normcase(str(Path(root).resolve())))
-    return _main_worktree(root) or root
-
-
-def _main_worktree(root: Path) -> Path | None:
-    """Основной репозиторий связанного рабочего дерева (``root/.git`` — файл) или None.
-
-    Ссылке верим, только если её подтверждает git: каталог ``<gitdir>`` есть и его файл
-    ``gitdir`` указывает обратно на ``root/.git``. Иначе скачанный проект с поддельным
-    ``.git`` делил бы с чужим проектом его память решений.
-    """
-    dot_git = root / ".git"
-    try:
-        if not dot_git.is_file():
-            return None
-        for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.startswith("gitdir:"):
-                continue
-            target = Path(line[len("gitdir:") :].strip())
-            gitdir = (target if target.is_absolute() else root / target).resolve()
-            # <основной>/.git/worktrees/<имя>
-            if gitdir.parent.name != "worktrees" or gitdir.parent.parent.name != ".git":
-                return None
-            back = Path((gitdir / "gitdir").read_text(encoding="utf-8").strip())
-            back = (back if back.is_absolute() else gitdir / back).resolve()
-            if os.path.normcase(str(back)) != os.path.normcase(str(dot_git.resolve())):
-                return None
-            return gitdir.parent.parent.parent
-    except (OSError, ValueError):
-        return None
-    return None
-
-
 # --------------------------------------------------------------------------- #
 # Вырезание секретов из журнала
 # --------------------------------------------------------------------------- #
@@ -130,9 +93,12 @@ _SECRET_ASSIGN = re.compile(
     re.IGNORECASE,
 )
 _URL_CREDS = re.compile(r"(\b[a-z][a-z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@", re.IGNORECASE)
-_AUTH_HEADER = re.compile(r"(authorization:\s*(?:bearer|basic|token)?\s*)[^\s'\"]+", re.I)
+_AUTH_HEADER = re.compile(r"(authorization:\s*(?:bearer|basic|token)?\s*)[^\s'\"]+", re.IGNORECASE)
 # --password, --access-token, --client-secret, --api-key…
-_FLAG_SECRET = re.compile(r"(--[\w-]*(?:password|passwd|token|secret|api-?key)[=\s]+)(\S+)", re.I)
+_FLAG_SECRET = re.compile(
+    r"(--[\w-]*(?:password|passwd|token|secret|api-?key)[=\s]+)(\S+)",
+    re.IGNORECASE,
+)
 _SECRET_NAME = r"[\w-]*(?:key|token|secret|password|passwd)"
 # Значение в кавычках целиком или слово.
 _VALUE = r"('[^']*'|\"[^\"]*\"|[^\s'\"]+)"
@@ -142,22 +108,23 @@ _SSHPASS = re.compile(r"(\bsshpass\b[^|;&\n]*?\s-p\s*)" + _VALUE)
 # curl -u user:pass, --user=user:pass
 _USER_PASS = re.compile(r"(\s(?:-u\s*|--user(?:=|\s+))['\"]?)([^\s:'\"]+):([^\s'\"]+)")
 # httpie: token:=…
-_HTTPIE_JSON = re.compile(rf"(\b{_SECRET_NAME}[\w-]*:=)(\S+)", re.I)
+_HTTPIE_JSON = re.compile(rf"(\b{_SECRET_NAME}[\w-]*:=)(\S+)", re.IGNORECASE)
 # заголовки и YAML: X-Api-Key: …, api_token: …
-_HEADER = re.compile(rf"(\b{_SECRET_NAME}:[ \t]*)([^\s'\"=][^\s'\"]*)", re.I)
+_HEADER = re.compile(rf"(\b{_SECRET_NAME}:[ \t]*)([^\s'\"=][^\s'\"]*)", re.IGNORECASE)
 # JSON: "api_key": "…"
-_JSON_FIELD = re.compile(rf"(\"{_SECRET_NAME}\"\s*:\s*\")[^\"]*(\")", re.I)
+_JSON_FIELD = re.compile(rf"(\"{_SECRET_NAME}\"\s*:\s*\")[^\"]*(\")", re.IGNORECASE)
 # Узнаваемые токены сервисов (GitHub, GitLab, Slack, OpenAI, AWS)
 _KNOWN_TOKEN = re.compile(
     r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|glpat-[\w-]{20,}"
-    r"|xox[abprs]-[\w-]{10,}|sk-[\w-]{20,}|AKIA[0-9A-Z]{16})\b"
+    r"|xox[abprs]-[\w-]{10,}|sk-[\w-]{20,}|AKIA[0-9A-Z]{16})\b",
 )
 
 
 def redact(text: str) -> str:
     """Убрать из команды похожее на секреты: ``TOKEN=…``, пароли в URL и флагах
     (``--password``, ``mysql -p…``, ``curl -u user:pass``), заголовки авторизации и
-    ключей, поля JSON с ключами, узнаваемые токены сервисов."""
+    ключей, поля JSON с ключами, узнаваемые токены сервисов.
+    """
     text = _SECRET_ASSIGN.sub(lambda m: f"{m.group(1)}=***", text)
     text = _URL_CREDS.sub(lambda m: f"{m.group(1)}{m.group(2)}:***@", text)
     text = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}***", text)
@@ -216,7 +183,7 @@ class DecisionMemory:
             (base if base is not None else user_data_dir()) / PROJECTS_DIR / project_key(root)
         )
         # Корень в файле — путь ключа: рабочие деревья одного репозитория делят разрешения.
-        memory = cls(directory, str(_key_root(root)), remember=remember, log=log)
+        memory = cls(directory, str(project_key_root(root)), remember=remember, log=log)
         warning = None
         try:
             memory.rules = memory._read_rules()
@@ -388,7 +355,7 @@ class DecisionMemory:
         stored = data.get("root")
         # Корень рабочего дерева, а не основного репозитория (так писали прежние версии) —
         # тот же проект.
-        if stored not in (None, "", self.root) and not (
+        if stored not in {None, "", self.root} and not (
             isinstance(stored, str) and project_key(Path(stored)) == project_key(Path(self.root))
         ):
             raise ValueError(f"файл другого проекта ({stored})")
@@ -400,12 +367,16 @@ class DecisionMemory:
                 rule = Rule(**{k: item[k] for k in Rule.__dataclass_fields__ if k in item})
             except TypeError:
                 continue
-            if rule.kind in ("program", "exact", "command"):
+            if rule.kind in {"program", "exact", "command"}:
                 rules.append(rule)
         return rules
 
     def _save(
-        self, *, added: list[Rule] = (), touched: list[Rule] = (), removed: set[str] = frozenset()
+        self,
+        *,
+        added: list[Rule] = (),
+        touched: list[Rule] = (),
+        removed: set[str] = frozenset(),
     ) -> None:
         """Перечитать файл, применить изменения и записать атомарно."""
         path = self.approvals_path
@@ -442,7 +413,7 @@ class DecisionMemory:
         if entry.get("source") == "user" and "key" in entry:
             key = (str(entry.get("cwd", ".")), str(entry["key"]))
             h = self._history.setdefault(key, _History())
-            if decision in ("yes", "always"):
+            if decision in {"yes", "always"}:
                 h.allowed += 1
             elif decision == "no":
                 h.rejected += 1
@@ -489,7 +460,7 @@ class DecisionMemory:
             path.parent.mkdir(parents=True, exist_ok=True)
             with contextlib.suppress(OSError):
                 if path.stat().st_size > MAX_JOURNAL_BYTES:
-                    os.replace(path, path.with_suffix(".1.jsonl"))
+                    Path(path).replace(path.with_suffix(".1.jsonl"))
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a", encoding="utf-8") as f:
                 f.write(json.dumps(line, ensure_ascii=False) + "\n")
@@ -502,7 +473,7 @@ class DecisionMemory:
                 continue
             key = (str(line.get("cwd", ".")), str(line.get("key", "")))
             h = self._history.setdefault(key, _History())
-            if line.get("decision") in ("yes", "always"):
+            if line.get("decision") in {"yes", "always"}:
                 h.allowed += 1
             elif line.get("decision") == "no":
                 h.rejected += 1
@@ -512,7 +483,7 @@ class DecisionMemory:
         if path is None:
             return
         try:
-            with open(path, encoding="utf-8") as f:
+            with Path(path).open(encoding="utf-8") as f:
                 for raw in f:
                     with contextlib.suppress(ValueError):
                         item = json.loads(raw)
@@ -526,7 +497,7 @@ class DecisionMemory:
         items = [
             x
             for x in self._journal_lines()
-            if x.get("event") == "decision" and x.get("source") in ("user", "reviewer")
+            if x.get("event") == "decision" and x.get("source") in {"user", "reviewer"}
         ]
         return items[-limit:]
 
@@ -543,8 +514,8 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        Path(tmp).chmod(0o600)
+        Path(tmp).replace(path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise

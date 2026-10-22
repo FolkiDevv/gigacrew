@@ -70,7 +70,8 @@ def next_mode(mode: PermissionMode) -> PermissionMode:
 
 def parse_mode(text: str) -> PermissionMode:
     """Режим по имени (``auto``/``plan``, без учёта регистра; ``manual``/``edits`` —
-    прежние имена ``auto``)."""
+    прежние имена ``auto``).
+    """
     value = text.strip().lower()
     for mode in PermissionMode:
         if value == mode.value:
@@ -123,24 +124,32 @@ def decide(
     спрашиваются. Запрет режима (BLOCK) хук не снимает.
     """
     decision = _decide(
-        mode, risk, kind, auto_approve=auto_approve, yes_all=yes_all, read_only=read_only
+        mode,
+        risk,
+        kind,
+        auto_approve=auto_approve,
+        yes_all=yes_all,
+        read_only=read_only,
     )
     return apply_hook(decision, risk, hook)
 
 
 def apply_hook(
-    decision: Decision, risk: RiskLevel, hook: Literal["allow", "ask"] | None
+    decision: Decision,
+    risk: RiskLevel,
+    hook: Literal["allow", "ask"] | None,
 ) -> Decision:
     """Решение с учётом хука PreToolUse (см. :func:`decide`). Отдельно — для агента: он
     сначала уточняет решение по вердикту классификатора (изменяющая команда в режиме
     плана — запрет; за команду, которую классификатор не проверил, ``-y`` не ручается),
     и только потом применяет хук, чтобы ``allow`` не снял запрет. За непроверенную
-    команду не ручается и ``allow``."""
-    if hook == "ask" and decision in (Decision.ALLOW, Decision.REVIEW):
+    команду не ручается и ``allow``.
+    """
+    if hook == "ask" and decision in {Decision.ALLOW, Decision.REVIEW}:
         return Decision.ASK
     if (
         hook == "allow"
-        and decision in (Decision.ASK, Decision.REVIEW)
+        and decision in {Decision.ASK, Decision.REVIEW}
         and risk < RiskLevel.DANGEROUS
     ):
         return Decision.ALLOW

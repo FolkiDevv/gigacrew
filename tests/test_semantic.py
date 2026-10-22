@@ -35,10 +35,10 @@ def test_status_lifecycle(tmp_path, monkeypatch):
     assert semantic.status(ws).startswith("не запущен")
 
     def missing():
-        raise semantic.SemanticUnavailable("пакет ty не установлен")
+        raise semantic.SemanticUnavailableError("пакет ty не установлен")
 
     monkeypatch.setattr(semantic, "find_binary", missing)
-    with pytest.raises(semantic.SemanticUnavailable):
+    with pytest.raises(semantic.SemanticUnavailableError):
         semantic.server_for(ws)
     semantic.shutdown_all()
 
@@ -59,7 +59,8 @@ def test_interrupted_start_does_not_leave_server(tmp_path, monkeypatch):
 
     monkeypatch.setattr(semantic, "find_binary", lambda: "ty")
     monkeypatch.setattr(TyServer, "start", interrupted)
-    monkeypatch.setattr(TyServer, "close", lambda self: closed.append(self))
+    # Лямбда, а не closed.append: атрибут класса получает self при вызове метода.
+    monkeypatch.setattr(TyServer, "close", lambda self: closed.append(self))  # noqa: PLW0108
     with pytest.raises(KeyboardInterrupt):
         semantic.server_for(Workspace(tmp_path))
     assert len(closed) == 1
@@ -75,6 +76,9 @@ def test_lines_split_like_lsp(tmp_path):
 def test_location_keeps_unc_host(tmp_path):
     server = TyServer(tmp_path, binary="ty")
     loc = server._location(
-        "file://server/share/a.py", {"line": 0, "character": 0}, semantic._Lines()
+        "file://server/share/a.py",
+        {"line": 0, "character": 0},
+        semantic._Lines(),
     )
-    assert loc.path.replace("\\", "/").endswith("server/share/a.py") and not loc.in_project
+    assert loc.path.replace("\\", "/").endswith("server/share/a.py")
+    assert not loc.in_project

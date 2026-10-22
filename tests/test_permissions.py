@@ -99,7 +99,8 @@ def test_labels():
 @pytest.mark.parametrize("kind", list(ToolKind))
 @pytest.mark.parametrize("risk", [RiskLevel.WRITE, RiskLevel.DANGEROUS])
 @pytest.mark.parametrize(
-    "flags", [{}, {"auto_approve": True}, {"auto_approve": True, "yes_all": True}]
+    "flags",
+    [{}, {"auto_approve": True}, {"auto_approve": True, "yes_all": True}],
 )
 def test_read_only_blocks_any_change(mode, kind, risk, flags):
     flags = {"auto_approve": False, **flags}

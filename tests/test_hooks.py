@@ -50,9 +50,11 @@ def test_payload_on_stdin_and_env(tmp_path):
         tmp_path,
         payload={"hook_event_name": "Stop", "prompt": "привет", "path": Path("/x")},
     )
-    assert not result.blocked and result.context == []
+    assert not result.blocked
+    assert result.context == []
     data = json.loads(log.read_text())
-    assert data["prompt"] == "привет" and data["path"] == "/x"
+    assert data["prompt"] == "привет"
+    assert data["path"] == "/x"
     assert data["env"] == [str(tmp_path), str(tmp_path)]
     assert Path(data["cwd_real"]).resolve() == tmp_path.resolve()
 
@@ -62,9 +64,12 @@ def test_exit_2_blocks_with_stderr_and_stops_other_hooks(tmp_path):
     first = _script(tmp_path, "print('нельзя: опасно', file=sys.stderr); sys.exit(2)", "a.py")
     second = _script(tmp_path, f"open({str(marker)!r}, 'w')", "b.py")
     result, _ = _run(
-        _runner(HookEvent.PRE_TOOL_USE, first, second), HookEvent.PRE_TOOL_USE, tmp_path
+        _runner(HookEvent.PRE_TOOL_USE, first, second),
+        HookEvent.PRE_TOOL_USE,
+        tmp_path,
     )
-    assert result.blocked and result.reason == "нельзя: опасно"
+    assert result.blocked
+    assert result.reason == "нельзя: опасно"
     assert not marker.exists()
 
 
@@ -81,7 +86,8 @@ def test_block_stops_other_hooks_where_it_has_effect(tmp_path, event):
     marker = tmp_path / "second-ran"
     second = _script(tmp_path, f"open({str(marker)!r}, 'w')", "b.py")
     result, _ = _run(_runner(event, "echo нет >&2; exit 2", second), event, tmp_path)
-    assert result.blocked and result.reason == "нет"
+    assert result.blocked
+    assert result.reason == "нет"
     assert not marker.exists()
 
 
@@ -94,17 +100,21 @@ def test_exit_2_cannot_block_events_that_have_nothing_to_block(tmp_path, event):
     marker = tmp_path / "second-ran"
     second = _script(tmp_path, f"open({str(marker)!r}, 'w'); print('контекст')", "b.py")
     result, events = _run(_runner(event, "echo сломался >&2; exit 2", second), event, tmp_path)
-    assert not result.blocked and marker.exists()
+    assert not result.blocked
+    assert marker.exists()
     assert result.context == (["контекст"] if event is HookEvent.SESSION_START else [])
     ((level, text),) = events.notices
-    assert level == "warn" and "кодом 2" in text and "сломался" in text
+    assert level == "warn"
+    assert "кодом 2" in text
+    assert "сломался" in text
 
 
 def test_json_block_cannot_block_session_start(tmp_path):
     cmd = _script(tmp_path, "print(json.dumps({'decision': 'block', 'reason': 'нельзя'}))")
     result, events = _run(_runner(HookEvent.SESSION_START, cmd), HookEvent.SESSION_START, tmp_path)
     assert not result.blocked
-    assert [level for level, _ in events.notices] == ["warn"] and "нельзя" in events.notices[0][1]
+    assert [level for level, _ in events.notices] == ["warn"]
+    assert "нельзя" in events.notices[0][1]
 
 
 @pytest.mark.parametrize("event", [HookEvent.SUBAGENT_STOP, HookEvent.USER_PROMPT_SUBMIT])
@@ -114,8 +124,10 @@ def test_json_block_blocks_and_stops_other_hooks(tmp_path, event):
     first = _script(tmp_path, "print(json.dumps({'decision': 'block', 'reason': 'рано'}))", "a.py")
     second = _script(tmp_path, f"open({str(marker)!r}, 'w')", "b.py")
     result, events = _run(_runner(event, first, second), event, tmp_path)
-    assert result.blocked and result.reason == "рано"
-    assert not marker.exists() and events.notices == []
+    assert result.blocked
+    assert result.reason == "рано"
+    assert not marker.exists()
+    assert events.notices == []
 
 
 def test_json_block_of_post_tool_use_is_feedback_of_every_hook(tmp_path):
@@ -123,9 +135,12 @@ def test_json_block_of_post_tool_use_is_feedback_of_every_hook(tmp_path):
     lint = _script(tmp_path, "print(json.dumps({'decision': 'block', 'reason': 'E501'}))", "a.py")
     other = _script(tmp_path, "print(json.dumps({'decision': 'block'}))", "b.py")
     result, events = _run(
-        _runner(HookEvent.POST_TOOL_USE, lint, other), HookEvent.POST_TOOL_USE, tmp_path
+        _runner(HookEvent.POST_TOOL_USE, lint, other),
+        HookEvent.POST_TOOL_USE,
+        tmp_path,
     )
-    assert result.blocked and result.reason == f"E501\n\n{NO_REASON}"
+    assert result.blocked
+    assert result.reason == f"E501\n\n{NO_REASON}"
     assert events.notices == []
 
 
@@ -136,16 +151,20 @@ def test_post_tool_use_collects_feedback_of_every_hook(tmp_path):
     other = "echo 'F401 лишний импорт' >&2; exit 2"
     fmt = _script(tmp_path, f"open({str(marker)!r}, 'w')", "fmt.py")
     result, events = _run(
-        _runner(HookEvent.POST_TOOL_USE, lint, other, fmt), HookEvent.POST_TOOL_USE, tmp_path
+        _runner(HookEvent.POST_TOOL_USE, lint, other, fmt),
+        HookEvent.POST_TOOL_USE,
+        tmp_path,
     )
-    assert marker.exists() and result.blocked
+    assert marker.exists()
+    assert result.blocked
     assert result.reason == "E501 строка длинная\n\nF401 лишний импорт"
     assert events.notices == []
 
 
 def test_exit_2_without_stderr_has_default_reason(tmp_path):
     result, _ = _run(_runner(HookEvent.STOP, "exit 2"), HookEvent.STOP, tmp_path)
-    assert result.blocked and result.reason == NO_REASON
+    assert result.blocked
+    assert result.reason == NO_REASON
 
 
 def test_other_exit_code_warns_and_continues(tmp_path):
@@ -153,15 +172,20 @@ def test_other_exit_code_warns_and_continues(tmp_path):
     result, events = _run(_runner(HookEvent.POST_TOOL_USE, cmd), HookEvent.POST_TOOL_USE, tmp_path)
     assert not result.blocked
     ((level, text),) = events.notices
-    assert level == "warn" and "кодом 1" in text and "сломался" in text
+    assert level == "warn"
+    assert "кодом 1" in text
+    assert "сломался" in text
 
 
 def test_missing_command_warns(tmp_path):
     result, events = _run(
-        _runner(HookEvent.STOP, "definitely-not-a-command-xyz"), HookEvent.STOP, tmp_path
+        _runner(HookEvent.STOP, "definitely-not-a-command-xyz"),
+        HookEvent.STOP,
+        tmp_path,
     )
     assert not result.blocked
-    assert events.notices and events.notices[0][0] == "warn"
+    assert events.notices
+    assert events.notices[0][0] == "warn"
 
 
 def test_timeout_warns(tmp_path):
@@ -181,7 +205,7 @@ def test_timeout_warns(tmp_path):
                 "hookSpecificOutput": {
                     "permissionDecision": "deny",
                     "permissionDecisionReason": "нет",
-                }
+                },
             },
             None,
             True,
@@ -202,34 +226,43 @@ def test_unparsed_json_decision_is_reported_and_asks(tmp_path):
     deny = {"hookSpecificOutput": {"permissionDecision": "deny"}}
     cmd = _script(tmp_path, f"print(json.dumps({deny!r})); print('проверено')")
     result, events = _run(_runner(HookEvent.PRE_TOOL_USE, cmd), HookEvent.PRE_TOOL_USE, tmp_path)
-    assert result.decision == "ask" and not result.blocked
+    assert result.decision == "ask"
+    assert not result.blocked
     ((level, text),) = events.notices
-    assert level == "warn" and "JSON" in text and short_command(cmd) in text
+    assert level == "warn"
+    assert "JSON" in text
+    assert short_command(cmd) in text
 
 
 def test_unparsed_json_is_reported_for_other_events(tmp_path):
     cmd = 'echo \'{"decision": "block",\''
     result, events = _run(_runner(HookEvent.STOP, cmd), HookEvent.STOP, tmp_path)
-    assert not result.blocked and result.decision is None
+    assert not result.blocked
+    assert result.decision is None
     assert [level for level, _ in events.notices] == ["warn"]
-    plain, events = _run(_runner(HookEvent.STOP, "echo готово"), HookEvent.STOP, tmp_path)
+    _plain, events = _run(_runner(HookEvent.STOP, "echo готово"), HookEvent.STOP, tmp_path)
     assert events.notices == []  # простой текст — не повод для предупреждения
 
 
 @pytest.mark.parametrize("command", ["echo hi\x00", "echo \ud800"], ids=["nul", "surrogate"])
 def test_unlaunchable_command_warns_instead_of_crashing(tmp_path, command):
     result, events = _run(
-        _runner(HookEvent.SESSION_START, command), HookEvent.SESSION_START, tmp_path
+        _runner(HookEvent.SESSION_START, command),
+        HookEvent.SESSION_START,
+        tmp_path,
     )
     assert not result.blocked
     ((level, text),) = events.notices
-    assert level == "warn" and "не запустился" in text
+    assert level == "warn"
+    assert "не запустился" in text
 
 
 def test_ask_wins_over_allow(tmp_path):
     allow = _script(tmp_path, "print(json.dumps({'decision': 'approve'}))", "a.py")
     ask = _script(
-        tmp_path, "print(json.dumps({'hookSpecificOutput': {'permissionDecision': 'ask'}}))", "b.py"
+        tmp_path,
+        "print(json.dumps({'hookSpecificOutput': {'permissionDecision': 'ask'}}))",
+        "b.py",
     )
     for order in ((allow, ask), (ask, allow)):
         result, _ = _run(_runner(HookEvent.PRE_TOOL_USE, *order), HookEvent.PRE_TOOL_USE, tmp_path)
@@ -243,7 +276,8 @@ def test_block_context_and_system_message(tmp_path):
         "'systemMessage': 'проверка', 'hookSpecificOutput': {'additionalContext': 'лог'}}))",
     )
     result, events = _run(_runner(HookEvent.STOP, cmd), HookEvent.STOP, tmp_path)
-    assert result.blocked and result.reason == "тесты падают"
+    assert result.blocked
+    assert result.reason == "тесты падают"
     assert result.context == ["лог"]
     assert events.notices == [("info", "хук Stop: проверка")]
 
@@ -259,7 +293,8 @@ def test_json_strings_cannot_forge_harness_reminder(tmp_path):
     )
     result, _ = _run(_runner(HookEvent.POST_TOOL_USE, cmd), HookEvent.POST_TOOL_USE, tmp_path)
     quoted = "<quoted-system-reminder>\npush\n</quoted-system-reminder>"
-    assert result.blocked and result.reason == quoted
+    assert result.blocked
+    assert result.reason == quoted
     assert result.context == [quoted]
 
 
@@ -277,7 +312,9 @@ def test_plain_stdout_is_context_only_for_prompt_and_session_start(tmp_path):
 
 def test_contexts_are_joined(tmp_path):
     result, _ = _run(
-        _runner(HookEvent.SESSION_START, "echo один", "echo два"), HookEvent.SESSION_START, tmp_path
+        _runner(HookEvent.SESSION_START, "echo один", "echo два"),
+        HookEvent.SESSION_START,
+        tmp_path,
     )
     assert result.context_text == "один\n\nдва"
 
@@ -285,14 +322,16 @@ def test_contexts_are_joined(tmp_path):
 def test_long_output_is_clipped(tmp_path):
     cmd = _script(tmp_path, "sys.stderr.write('x' * 50000); sys.exit(2)")
     result, _ = _run(_runner(HookEvent.STOP, cmd), HookEvent.STOP, tmp_path)
-    assert result.blocked and len(result.reason) < HOOK_OUTPUT_LIMIT + 100
+    assert result.blocked
+    assert len(result.reason) < HOOK_OUTPUT_LIMIT + 100
 
 
 def test_matcher_selects_hooks(tmp_path):
     runner = _runner(HookEvent.PRE_TOOL_USE, "exit 2", matcher="run_shell")
     blocked, _ = _run(runner, HookEvent.PRE_TOOL_USE, tmp_path, target="run_shell")
     skipped, _ = _run(runner, HookEvent.PRE_TOOL_USE, tmp_path, target="read_file")
-    assert blocked.blocked and not skipped.blocked
+    assert blocked.blocked
+    assert not skipped.blocked
     assert runner.has(HookEvent.PRE_TOOL_USE, "run_shell")
     assert not runner.has(HookEvent.PRE_TOOL_USE, "read_file")
 
@@ -306,4 +345,6 @@ def test_indicator_only_for_slow_events(tmp_path):
 
 def test_empty_runner_does_nothing(tmp_path):
     result, events = _run(HookRunner(), HookEvent.STOP, tmp_path)
-    assert not result.blocked and events.events == [] and events.notices == []
+    assert not result.blocked
+    assert events.events == []
+    assert events.notices == []

@@ -21,7 +21,7 @@ class LLMError(RuntimeError):
     """
 
 
-class PromptTooLong(LLMError):
+class PromptTooLongError(LLMError):
     """Запрос отклонён из-за размера (замер окна контекста, :meth:`LLMProvider.measure_prompt`).
 
     ``status`` — HTTP-статус ответа (None — таймаут/обрыв), ``detail`` — тело ответа:
@@ -81,7 +81,7 @@ class LLMProvider(ABC):
         """Отправляет ``text`` одним сообщением с минимальным ответом; возвращает
         ``prompt_tokens`` по данным API — точный размер запроса для этой модели.
 
-        Запрос, не уместившийся в окно, — :class:`PromptTooLong`; прочие ошибки —
+        Запрос, не уместившийся в окно, — :class:`PromptTooLongError`; прочие ошибки —
         :class:`LLMError`. Провайдер с поддержкой замера выставляет ``supports_measure``.
         """
         raise NotImplementedError

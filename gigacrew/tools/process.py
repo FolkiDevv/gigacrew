@@ -30,8 +30,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-# Переменные с этими префиксами не передаются дочерним процессам.
-SECRET_ENV_PREFIXES = ("GIGACREW_",)
+from gigacrew.security import subprocess_env
 
 # Сколько ждать закрытия вывода после выхода команды, прежде чем считать,
 # что его держат фоновые потомки.
@@ -40,38 +39,6 @@ _PIPE_GRACE_SECONDS = 1.0
 _GROUP_SETTLE_SECONDS = 0.2
 # Сколько символов каждого потока держим в памяти (начало и конец).
 _CAPTURE_LIMIT = 200_000
-
-
-# Переменные, меняющие поведение оболочки команды: CDPATH уводит `cd src` из проекта,
-# ENV и BASH_ENV — файлы, которые sh/bash исполнят перед командой.
-SHELL_ENV_DROP = ("CDPATH", "ENV", "BASH_ENV")
-# Настройки git для всех команд агента: неявный bare-репозиторий (файлы HEAD, config,
-# objects/ в каталоге проекта) не распознаётся, fsmonitor-хук не запускается.
-GIT_SAFE_CONFIG = (("safe.bareRepository", "explicit"), ("core.fsmonitor", "false"))
-
-
-def subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Окружение для дочернего процесса: без секретов и без интерактива."""
-    source = os.environ if environ is None else environ
-    env = {
-        k: v
-        for k, v in source.items()
-        if not k.upper().startswith(SECRET_ENV_PREFIXES) and k not in SHELL_ENV_DROP
-    }
-    env["GIT_TERMINAL_PROMPT"] = "0"  # не спрашивать логин/пароль
-    env["GIT_EDITOR"] = "true"  # не открывать редактор (commit без -m)
-    env["GIT_PAGER"] = "cat"
-    env["PAGER"] = "cat"
-    try:
-        count = int(env.get("GIT_CONFIG_COUNT", "0"))
-    except ValueError:
-        count = 0
-    for key, value in GIT_SAFE_CONFIG:
-        env[f"GIT_CONFIG_KEY_{count}"] = key
-        env[f"GIT_CONFIG_VALUE_{count}"] = value
-        count += 1
-    env["GIT_CONFIG_COUNT"] = str(count)
-    return env
 
 
 # Тег заметок harness'а: системный промпт велит модели выполнять такие блоки и считать
@@ -201,12 +168,12 @@ def _live_members(pgid: int) -> bool | None:
         return None
     for pid in pids:
         try:
-            with open(f"/proc/{pid}/stat", "rb") as f:
+            with Path(f"/proc/{pid}/stat").open("rb") as f:
                 fields = f.read().rsplit(b")", 1)[1].split()
         except (OSError, IndexError):
             continue  # процесс уже завершился
         # после имени: состояние, родитель, группа
-        if len(fields) > 2 and int(fields[2]) == pgid and fields[0] not in (b"Z", b"X"):
+        if len(fields) > 2 and int(fields[2]) == pgid and fields[0] not in {b"Z", b"X"}:
             return True
     return False
 

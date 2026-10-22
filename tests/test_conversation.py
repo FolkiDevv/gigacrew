@@ -135,7 +135,8 @@ def test_truncate_drops_the_tail_but_never_summarized_messages():
     size = len(conv)
     conv.add_user("служебное", meta=True)
     conv.truncate(size)
-    assert len(conv) == size and conv.messages[-1].role == "function"
+    assert len(conv) == size
+    assert conv.messages[-1].role == "function"
     with pytest.raises(ValueError):
         conv.truncate(size + 1)
     conv.set_summary(Summary("сводка", 5))
@@ -173,7 +174,8 @@ def test_repair_closes_pending_call():
     conv.add_assistant(_call(path="a"))
     assert [c.name for c in conv.pending_calls()] == ["read_file"]
     assert conv.repair() is True
-    assert conv.messages[-1].role == "function" and conv.messages[-1].name == "read_file"
+    assert conv.messages[-1].role == "function"
+    assert conv.messages[-1].name == "read_file"
     assert conv.pending_calls() == []
     assert conv.repair() is False
 
@@ -269,7 +271,8 @@ def test_fit_history_pins_task_and_keeps_pairs():
     for i, m in enumerate(fitted):
         if m.role == "function":
             prev = fitted[i - 1]
-            assert prev.role == "assistant" and prev.function_calls
+            assert prev.role == "assistant"
+            assert prev.function_calls
     # что именно отброшено: сначала прошлый ход, затем ранние шаги текущего — не свежие
     assert fitted == [history[2], *history[5:]]
 
@@ -295,7 +298,8 @@ def test_token_estimate_counts_call_arguments_and_reasoning():
     assert estimate_message_tokens(write) >= 1000
     thinking = Message(role="assistant", content="ok", reasoning="r" * 3000)
     assert estimate_message_tokens(thinking) >= 1000
-    assert estimate_text_tokens("ab") == 1 and estimate_text_tokens("abcd") == 2  # вверх
+    assert estimate_text_tokens("ab") == 1
+    assert estimate_text_tokens("abcd") == 2
 
 
 def test_budget_for_small_window_has_a_floor():
@@ -315,7 +319,9 @@ def test_fit_history_keeps_pinned_even_over_budget():
 def test_fit_history_pins_the_request_not_a_meta_message():
     history = _history()
     meta = Message(
-        role="user", content="<system-reminder>план одобрен</system-reminder>", meta=True
+        role="user",
+        content="<system-reminder>план одобрен</system-reminder>",
+        meta=True,
     )
     history.insert(5, meta)  # после первого вызова текущего хода
     fitted = fit_history(history, 10)
@@ -333,7 +339,8 @@ def test_guard_step_limit():
     assert guard.before_step() is None
     assert guard.before_step() is None
     stop = guard.before_step()
-    assert stop is not None and stop.kind == "max_steps"
+    assert stop is not None
+    assert stop.kind == "max_steps"
 
 
 OK = ToolOutcome(ok=True)
@@ -352,7 +359,8 @@ def test_guard_failures_reset_on_success():
     assert guard.after_tool(call, FAIL) is None
     assert guard.failure_warning() is not None  # следующий запрос — с предупреждением
     stop = guard.after_tool(call, FAIL)
-    assert stop is not None and stop.kind == "tool_failures"
+    assert stop is not None
+    assert stop.kind == "tool_failures"
 
 
 def test_guard_warns_one_failure_before_stop():
@@ -363,12 +371,15 @@ def test_guard_warns_one_failure_before_stop():
         assert guard.failure_warning() is None
     guard.after_tool(call, FAIL)
     warning = guard.failure_warning()
-    assert warning is not None and "the last 3 tool calls failed" in warning.model
+    assert warning is not None
+    assert "the last 3 tool calls failed" in warning.model
     assert "ещё одна неудача остановит ход" in warning.notice
     # заметка — в каждый запрос, пока серия у предела (ответ мог быть отброшен), строка
     # пользователю — один раз на серию
     again = guard.failure_warning()
-    assert again is not None and again.model == warning.model and again.notice == ""
+    assert again is not None
+    assert again.model == warning.model
+    assert again.notice == ""
     guard.after_tool(call, ToolOutcome(ok=False, soft=True))  # мягкая неудача серию не меняет
     assert guard.failure_warning() is not None
     guard.after_tool(call, OK)  # серия прервалась — новая предупреждается снова
@@ -376,7 +387,8 @@ def test_guard_warns_one_failure_before_stop():
         guard.after_tool(call, FAIL)
     assert guard.failure_warning().notice
     stop = guard.after_tool(call, FAIL)
-    assert stop is not None and stop.kind == "tool_failures"
+    assert stop is not None
+    assert stop.kind == "tool_failures"
     assert LoopGuard(max_steps=1, max_failures=1).failure_warning() is None
 
 
@@ -389,19 +401,24 @@ def test_guard_stops_on_failures_only_after_the_warning_was_sent():
     for _ in range(4):  # один ответ: четыре неудачи подряд
         assert guard.after_tool(call, FAIL) is None
     warning = guard.failure_warning()  # следующий запрос
-    assert warning is not None and "the last 5 tool calls failed" in warning.model
+    assert warning is not None
+    assert "the last 5 tool calls failed" in warning.model
     stop = guard.after_tool(call, FAIL)
-    assert stop is not None and stop.kind == "tool_failures"
+    assert stop is not None
+    assert stop.kind == "tool_failures"
     # с пределом 1 предупреждать некогда — стоп сразу
     assert LoopGuard(max_steps=1, max_failures=1).after_tool(call, FAIL) is not None
 
 
 @pytest.mark.parametrize(
-    "outcome", [REJECTED, ToolOutcome(ok=False, soft=True)], ids=["rejected", "soft"]
+    "outcome",
+    [REJECTED, ToolOutcome(ok=False, soft=True)],
+    ids=["rejected", "soft"],
 )
 def test_guard_over_the_limit_stops_only_on_a_failure(outcome):
     """Серия за пределом (её перешла пачка) и предупреждение ушло: отказ пользователя или
-    мягкая неудача — не неудача, ход не останавливают."""
+    мягкая неудача — не неудача, ход не останавливают.
+    """
     guard = LoopGuard(max_steps=100, max_failures=2)
     call = FunctionCall(name="x")
     for _ in range(3):
@@ -431,7 +448,8 @@ def test_call_key_ignores_description():
     assert call_key(d) != call_key(a)
     guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
     checks = [_run(guard, call) for call in (a, b, a, b)]
-    assert checks[2].warning is not None and checks[3].stop is not None
+    assert checks[2].warning is not None
+    assert checks[3].stop is not None
 
 
 def test_target_key_normalizes_paths():
@@ -439,7 +457,8 @@ def test_target_key_normalizes_paths():
         return target_key(FunctionCall(name="read_file", arguments={"path": path}))
 
     assert key("a.py") == key("./a.py") == key(" a.py ")
-    assert key("src/") == key("src") and key("src\\a.py") == key("src/a.py")
+    assert key("src/") == key("src")
+    assert key("src\\a.py") == key("src/a.py")
     assert key("a.py") != key("b.py")
     assert key("a b.txt") != key("a  b.txt")  # разные файлы
 
@@ -460,8 +479,10 @@ def test_guard_repeats_warn_then_stop(outcome):
     assert [c.repeats for c in checks] == [1, 2, 3, 4]
     assert [c.warning is not None for c in checks] == [False, False, True, False]
     assert [c.stop is not None for c in checks[:3]] == [False, False, False]
-    assert checks[3].stop is not None and checks[3].stop.kind == "tool_repeats"
-    assert checks[2].notice is not None and "3-й раз повторяет вызов" in checks[2].notice
+    assert checks[3].stop is not None
+    assert checks[3].stop.kind == "tool_repeats"
+    assert checks[2].notice is not None
+    assert "3-й раз повторяет вызов" in checks[2].notice
 
 
 def test_guard_similar_notice_names_the_similar_count():
@@ -476,7 +497,8 @@ def test_guard_similar_notice_names_the_similar_count():
         "Модель 5-й раз подряд вызывает read_file с той же целью — предупреждена; "
         "ход остановится на 7-м таком вызове."
     )
-    assert checks[6].stop is not None and checks[6].stop.kind == "similar_calls"
+    assert checks[6].stop is not None
+    assert checks[6].stop.kind == "similar_calls"
 
 
 def test_guard_change_by_other_call_resets_repeats():
@@ -498,7 +520,8 @@ def test_guard_detects_alternating_calls():
     a = FunctionCall(name="read_file", arguments={"path": "a"})
     b = FunctionCall(name="list_dir", arguments={})
     checks = [_run(guard, call) for call in (a, b, a, b, a, b, a)]
-    assert checks[-1].stop is not None and checks[-1].stop.kind == "tool_repeats"
+    assert checks[-1].stop is not None
+    assert checks[-1].stop.kind == "tool_repeats"
 
 
 def test_guard_rejection_is_neutral_and_remembered():
@@ -512,7 +535,8 @@ def test_guard_rejection_is_neutral_and_remembered():
     assert guard.before_tool(other).rejected_before is False
     assert guard.failure_warning() is not None  # серия у предела — запрос с предупреждением
     stop = guard.after_tool(other, FAIL)  # ...и не сбрасывает её
-    assert stop is not None and stop.kind == "tool_failures"
+    assert stop is not None
+    assert stop.kind == "tool_failures"
 
 
 def test_lone_surrogates_are_replaced_on_the_way_into_history():
@@ -531,7 +555,7 @@ def test_lone_surrogates_are_replaced_on_the_way_into_history():
             content="смотрю \ud800",
             reasoning="думаю \udfff",
             function_calls=[FunctionCall(name="read_file", arguments={"path": [name]})],
-        )
+        ),
     )
     conv.add_function_result("list_dir", f"{name}\nb.txt")
     for m in conv.messages:

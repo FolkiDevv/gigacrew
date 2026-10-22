@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from itertools import starmap
 from typing import Any
 
 from pydantic import BaseModel
 
 from gigacrew.agent.events import AgentEvents, ToolCallInfo, TurnStats
-from gigacrew.llm.base import LLMProvider, ModelInfo, PromptTooLong
+from gigacrew.llm.base import LLMProvider, ModelInfo, PromptTooLongError
 from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, Usage
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, Tool, ToolContext, ToolResult
@@ -79,7 +80,7 @@ def _next(queue: list, default: str) -> AssistantTurn:
 class WindowProvider(ScriptedProvider):
     """Провайдер с окном ``window`` токенов для замера (токен ≈ ``chars_per_token`` символа).
 
-    Отказ — :class:`PromptTooLong` со статусом ``status``; ``hint`` — текст отказа
+    Отказ — :class:`PromptTooLongError` со статусом ``status``; ``hint`` — текст отказа
     называет лимит (как сервер модели). Каждая проба пишется в ``measured`` (модель, токены).
     """
 
@@ -128,7 +129,7 @@ class WindowProvider(ScriptedProvider):
                 if self.hint
                 else "Request too large"
             )
-            raise PromptTooLong(self.status, detail)
+            raise PromptTooLongError(self.status, detail)
         return tokens
 
 
@@ -145,7 +146,7 @@ class CatalogueProvider(WindowProvider):
         connect_errors: Iterable[BaseException] = (),
     ):
         super().__init__(16_384, turns)
-        self.catalogue = [ModelInfo(name, window) for name, window in models]
+        self.catalogue = list(starmap(ModelInfo, models))
         self.connect_errors = list(connect_errors)
         self.connects = 0
 
@@ -303,9 +304,10 @@ class FakeParams(BaseModel):
     path: str = "x"
 
 
-class FakeTool(Tool):
+class FakeTool(Tool[FakeParams]):
     """Настраиваемый WRITE-инструмент для тестов агентного цикла (``kind`` — вид для
-    режимов разрешений)."""
+    режимов разрешений).
+    """
 
     name = "fake_write"
     description = "тестовый инструмент"

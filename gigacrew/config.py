@@ -70,9 +70,10 @@ _INLINE_COMMENT_RE = re.compile(r"\s#")
 
 def _dotenv_value(raw: str) -> str:
     """Значение из .env: в кавычках — до парной закрывающей (остальное — комментарий),
-    без кавычек — до « #» (``MODEL=model-large # быстрая``)."""
+    без кавычек — до « #» (``MODEL=model-large # быстрая``).
+    """
     value = raw.strip()
-    if value[:1] in ("'", '"'):
+    if value[:1] in {"'", '"'}:
         end = value.find(value[0], 1)
         return value[1:end] if end != -1 else value
     return _INLINE_COMMENT_RE.split(value, maxsplit=1)[0].rstrip()
@@ -169,9 +170,9 @@ def _env_bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     if val is None or not val.strip():
         return default
     norm = val.strip().lower()
-    if norm in ("1", "true", "yes", "on"):
+    if norm in {"1", "true", "yes", "on"}:
         return True
-    if norm in ("0", "false", "no", "off"):
+    if norm in {"0", "false", "no", "off"}:
         return False
     # Опечатка не должна молча выключать настройку — например, проверку TLS у GigaCode.
     raise ConfigError(f"{name}: ожидается 1/0, true/false, yes/no или on/off, получено {val!r}")
@@ -252,7 +253,7 @@ def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, 
         raise ConfigError(f"{name}: ожидается число, получено {raw!r}") from e
     if not lo <= value <= hi:
         raise ConfigError(
-            f"{name}: значение должно быть в диапазоне [{lo}; {hi}], получено {value}"
+            f"{name}: значение должно быть в диапазоне [{lo}; {hi}], получено {value}",
         )
     return value
 
@@ -379,7 +380,10 @@ class Config:
         """
         root = Path(project_root or cwd or Path.cwd()).resolve()
         collected = collect_environment(
-            root, environ=environ, cwd=cwd, trusted_dotenv=trusted_dotenv
+            root,
+            environ=environ,
+            cwd=cwd,
+            trusted_dotenv=trusted_dotenv,
         )
         env = collected.values
 
@@ -419,7 +423,11 @@ class Config:
             context_budget_tokens=_env_optional_int(env, "GIGACREW_CONTEXT_TOKENS", minimum=4_000),
             auto_compact=_env_bool(env, "GIGACREW_AUTO_COMPACT", True),
             compact_threshold=_env_int(
-                env, "GIGACREW_COMPACT_THRESHOLD", 80, minimum=10, maximum=95
+                env,
+                "GIGACREW_COMPACT_THRESHOLD",
+                80,
+                minimum=10,
+                maximum=95,
             )
             / 100,
             save_chats=save_chats and _env_bool(env, "GIGACREW_SAVE_CHATS", True),
@@ -430,7 +438,11 @@ class Config:
             reviewer_model=(env.get("GIGACREW_REVIEWER_MODEL") or "").strip() or None,
             subagent_max_steps=_env_int(env, "GIGACREW_SUBAGENT_MAX_STEPS", 25),
             subagent_context_share=_env_int(
-                env, "GIGACREW_SUBAGENT_CONTEXT", 80, minimum=10, maximum=95
+                env,
+                "GIGACREW_SUBAGENT_CONTEXT",
+                80,
+                minimum=10,
+                maximum=95,
             )
             / 100,
             subagent_timeout=_env_int(env, "GIGACREW_SUBAGENT_TIMEOUT", 600, minimum=10),
@@ -510,13 +522,14 @@ class Config:
     def _server_ssl_context(self) -> ssl.SSLContext:
         """Проверка сервера API v2: корни из ``ca_bundle``, если он задан, иначе
         стандартные — как у httpx (certifi или SSL_CERT_FILE/SSL_CERT_DIR) и системное
-        хранилище (туда ставят корпоративные корни)."""
+        хранилище (туда ставят корпоративные корни).
+        """
         if self.ca_bundle:
             try:
                 return ssl.create_default_context(cafile=self.ca_bundle)
             except (OSError, ssl.SSLError) as e:
                 raise RuntimeError(
-                    f"не удалось загрузить GIGACREW_CA_BUNDLE {self.ca_bundle}: {e}"
+                    f"не удалось загрузить GIGACREW_CA_BUNDLE {self.ca_bundle}: {e}",
                 ) from e
         context = httpx.create_ssl_context()
         context.load_default_certs()
@@ -533,7 +546,7 @@ class Config:
         files = sorted(
             path
             for path in (certs.iterdir() if certs.is_dir() else ())
-            if path.suffix.lower() in (".pem", ".crt") and path.is_file()
+            if path.suffix.lower() in {".pem", ".crt"} and path.is_file()
         )
         if self.ca_bundle:
             files.append(Path(self.ca_bundle))
@@ -550,28 +563,28 @@ class Config:
             if not self.base_url:
                 raise RuntimeError(
                     "Не задан адрес бэкенда GigaCode. Укажите GIGACREW_API_URL в переменных "
-                    "окружения или ~/.gigacode/.env (не в .env проекта). См. .env.example."
+                    "окружения или ~/.gigacode/.env (не в .env проекта). См. .env.example.",
                 )
             if not self.user_agent:
                 raise RuntimeError(
                     "Не задан User-Agent для запросов к GigaCode. Укажите GIGACREW_USER_AGENT "
-                    "в .env или переменных окружения. См. .env.example."
+                    "в .env или переменных окружения. См. .env.example.",
                 )
             return
         if self.auth_mode == "none":
             raise RuntimeError(
                 "Не заданы реквизиты API. Укажите либо GIGACREW_ACCESS_KEY (OAuth) в .env или "
                 "переменных окружения, либо пару GIGACREW_CERT и GIGACREW_KEY (mTLS) в "
-                "переменных окружения или ~/.gigacode/.env. См. .env.example."
+                "переменных окружения или ~/.gigacode/.env. См. .env.example.",
             )
         if not self.base_url:
             raise RuntimeError(
                 "Не задан адрес API. Укажите GIGACREW_API_URL в переменных окружения или "
-                "~/.gigacode/.env (не в .env проекта). См. .env.example."
+                "~/.gigacode/.env (не в .env проекта). См. .env.example.",
             )
         if self.auth_mode == "oauth" and not self.auth_url:
             raise RuntimeError(
                 "Не задан адрес выдачи токена. Для схемы OAuth укажите GIGACREW_AUTH_URL "
                 "в переменных окружения или ~/.gigacode/.env (не в .env проекта). "
-                "См. .env.example."
+                "См. .env.example.",
             )

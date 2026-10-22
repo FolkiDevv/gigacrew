@@ -110,7 +110,7 @@ def _parse_model(raw: Any) -> CatalogueModel:
     ):
         raise ApiError(f"в каталоге GigaCode модель без корректного id или model: {str(raw)[:200]}")
     window = _window(_mapping(raw.get("plugin_side")).get("context_window_size")) or _window(
-        raw.get("context_window_size")
+        raw.get("context_window_size"),
     )
     options = _mapping(raw.get("ai_api"))
     sampling = {
@@ -129,13 +129,13 @@ def _chat_endpoint(value: Any, config_url: str) -> str:
         return config_url.removesuffix("/config") + "/chat/completions"
     url = urljoin(config_url, value.strip())  # относительный — от адреса конфигурации
     parts = urlsplit(url)
-    if parts.scheme not in ("https", "http") or not parts.hostname:
+    if parts.scheme not in {"https", "http"} or not parts.hostname:
         raise ApiError(f"некорректный адрес чата в конфигурации GigaCode: {value[:200]}")
     if parts.scheme == "http" and urlsplit(config_url).scheme == "https":
         # Конфигурация по https, а чат — нет: токен ушёл бы открытым текстом.
         raise ApiError(
             "адрес чата в конфигурации GigaCode — http при https-адресе конфигурации, "
-            f"токен ушёл бы открытым текстом: {value[:200]}"
+            f"токен ушёл бы открытым текстом: {value[:200]}",
         )
     return url
 
@@ -198,11 +198,13 @@ class GigaCodeProvider(HttpProvider):
     ):
         if config.provider != "gigacode":
             raise RuntimeError(
-                f"GIGACREW_PROVIDER={config.provider}: этот провайдер — для бэкенда GigaCode"
+                f"GIGACREW_PROVIDER={config.provider}: этот провайдер — для бэкенда GigaCode",
             )
         config.require_credentials()  # адрес и User-Agent заданы
         super().__init__(
-            config, transport=transport, headers={"User-Agent": config.user_agent or ""}
+            config,
+            transport=transport,
+            headers={"User-Agent": config.user_agent or ""},
         )
         self._config_url = config_endpoint(config.base_url)
         self._token_file = token_file if token_file is not None else token_path(config.gigacode_dir)
@@ -262,7 +264,8 @@ class GigaCodeProvider(HttpProvider):
 
     def _reload_rejected(self, rejected: Token) -> Token:
         """Бэкенд ответил 401 на ``rejected``: файл мог обновиться — перечитать. Там тот
-        же токен — :class:`ApiError` с просьбой пройти авторизацию заново."""
+        же токен — :class:`ApiError` с просьбой пройти авторизацию заново.
+        """
         self._token = None
         token = load_token(self._token_file, self._config_url)
         if token.access_token == rejected.access_token:
@@ -295,7 +298,7 @@ class GigaCodeProvider(HttpProvider):
         if not resp.is_success:
             raise ApiError(
                 f"Не удалось получить конфигурацию GigaCode ({resp.status_code}): "
-                f"{error_body(resp)}"
+                f"{error_body(resp)}",
             )
         self._catalogue = parse_catalogue(self._json(resp), self._config_url)
 
@@ -314,7 +317,8 @@ class GigaCodeProvider(HttpProvider):
 
     def _auth_headers(self, *, force: bool = False) -> dict[str, str]:
         """``Authorization`` с действующим токеном. ``force`` (чат ответил 401) —
-        перечитать файл: там тот же токен — ошибка с просьбой пройти авторизацию."""
+        перечитать файл: там тот же токен — ошибка с просьбой пройти авторизацию.
+        """
         if force:
             # Отвергнут токен, ушедший в прошлом запросе, а не текущий: хук перед повтором
             # мог уже положить в файл новый.
@@ -377,7 +381,9 @@ class GigaCodeProvider(HttpProvider):
     def _probe_usage(self, resp: httpx.Response) -> Usage:
         content_type = resp.headers.get("content-type", "")
         turn = openai_chat.consume_stream(
-            resp.text.splitlines(), lambda _s: None, content_type=content_type
+            resp.text.splitlines(),
+            lambda _s: None,
+            content_type=content_type,
         )
         return turn.usage
 
@@ -419,7 +425,8 @@ class GigaCodeProvider(HttpProvider):
         on_notice: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Через поток: бэкенд рассчитан на него, а ответ без потока разбирается тем же
-        кодом."""
+        кодом.
+        """
         return self.stream(
             messages,
             tools,

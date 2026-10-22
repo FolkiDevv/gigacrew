@@ -8,8 +8,16 @@
 
 Формат секции — как у Claude Code::
 
-    {"hooks": {"PostToolUse": [{"matcher": "write_file|edit_file",
-        "hooks": [{"type": "command", "command": "make fmt", "timeout": 30}]}]}}
+    {
+        "hooks": {
+            "PostToolUse": [
+                {
+                    "matcher": "write_file|edit_file",
+                    "hooks": [{"type": "command", "command": "make fmt", "timeout": 30}],
+                }
+            ]
+        }
+    }
 
 Ошибки в файлах не мешают запуску: запись с ошибкой пропускается, вызывающий получает
 текст предупреждения. Хуки — запуск команд без вопросов, поэтому они работают только после
@@ -82,7 +90,7 @@ class HookGroup:
         Пустой matcher и ``*`` — всё; иначе регулярное выражение целиком
         (``write_file|edit_file``, ``.*_file``).
         """
-        if self.event in UNMATCHED_EVENTS or self.matcher in ("", "*"):
+        if self.event in UNMATCHED_EVENTS or self.matcher in {"", "*"}:
             return True
         return re.fullmatch(self.matcher, target) is not None
 
@@ -166,7 +174,7 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
             project_disabled = True
         elif off is True:
             disabled = True
-        elif off not in (None, False):  # "true" или 1 молча не выключили бы ничего
+        elif off not in {None, False}:  # "true" или 1 молча не выключили бы ничего
             warnings.append(f"{path}: disableAllHooks — ожидается true или false, пропущено")
         hooks = data.get("hooks")
         if hooks is None:
@@ -196,7 +204,11 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
 
 
 def _parse_group(
-    event: HookEvent, entry: Any, source: SettingsSource, where: str, warnings: list[str]
+    event: HookEvent,
+    entry: Any,
+    source: SettingsSource,
+    where: str,
+    warnings: list[str],
 ) -> HookGroup | None:
     if not isinstance(entry, dict):
         warnings.append(f"{where}: ожидается объект с полями matcher и hooks — пропущено")
@@ -207,7 +219,7 @@ def _parse_group(
     if not isinstance(matcher, str):
         warnings.append(f"{where}: matcher — не строка, запись пропущена")
         return None
-    if matcher not in ("", "*"):
+    if matcher not in {"", "*"}:
         try:
             re.compile(matcher)
         except re.error as e:
@@ -257,7 +269,7 @@ def _parse_command(raw: Any, where: str, warnings: list[str]) -> HookCommand | N
     if not MIN_HOOK_TIMEOUT <= timeout <= MAX_HOOK_TIMEOUT:
         warnings.append(
             f"{where}: timeout {timeout} вне {MIN_HOOK_TIMEOUT}…{MAX_HOOK_TIMEOUT} с, "
-            f"взято {clamped}"
+            f"взято {clamped}",
         )
     return HookCommand(command, clamped)
 
@@ -336,12 +348,14 @@ class TrustStore:
             data["user"] = user
         data["projects"] = dict(sorted(projects.items()))
         fd, tmp = tempfile.mkstemp(
-            prefix=f".{self.path.stem}.", suffix=".tmp", dir=self.path.parent
+            prefix=f".{self.path.stem}.",
+            suffix=".tmp",
+            dir=self.path.parent,
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.path)
+            Path(tmp).replace(self.path)
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise

@@ -41,7 +41,8 @@ from gigacrew.ui.console import Console
 
 def save_chat(chats: ChatRecorder, agent: Agent, ui: Console) -> None:
     """Сохранить чат. Если файл чата изменила другая сессия, диалог сохраняется новым
-    чатом — тогда и план этой сессии переезжает к нему (:meth:`Agent.continue_as`)."""
+    чатом — тогда и план этой сессии переезжает к нему (:meth:`Agent.continue_as`).
+    """
     warning = chats.save(agent.conversation, model=agent.model)
     if chats.chat_id != agent.chat_id:
         agent.continue_as(chats.chat_id)
@@ -247,7 +248,7 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
     memory = ctx.agent.decisions
     words = arg.split()
     action = words[0].lower() if words else ""
-    if action in ("forget", "rm", "удалить"):
+    if action in {"forget", "rm", "удалить"}:
         # isdecimal, а не isdigit: «²» — цифра, но int() её не разберёт
         if len(words) != 2 or not words[1].isdecimal():
             ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
@@ -261,7 +262,7 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
         else:
             ctx.ui.info(f"разрешение удалено: {redact(rule.describe())}")
         return True
-    if action in ("clear", "очистить"):
+    if action in {"clear", "очистить"}:
         try:
             n = memory.clear()
         except OSError as e:
@@ -269,7 +270,7 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
         else:
             ctx.ui.info(f"удалено разрешений: {n}")
         return True
-    if action in ("log", "журнал"):
+    if action in {"log", "журнал"}:
         items = memory.recent()
         if not items:
             ctx.ui.info("журнал решений пуст" + ("" if memory.log else " (не ведётся: --no-save)"))
@@ -277,12 +278,13 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
         lines = []
         for item in items:
             mark = {"yes": "да", "always": "всегда", "no": "нет", "no_answer": "без ответа"}.get(
-                str(item.get("decision")), str(item.get("decision"))
+                str(item.get("decision")),
+                str(item.get("decision")),
             )
             review = item.get("review") if isinstance(item.get("review"), dict) else {}
             if item.get("source") == "reviewer":
                 mark = "разрешил рецензент"
-            where = "" if item.get("cwd") in (None, ".") else f" [{item.get('cwd')}]"
+            where = "" if item.get("cwd") in {None, "."} else f" [{item.get('cwd')}]"
             text = f"  • {mark}{where}: {item.get('command', '')}"
             if item.get("feedback"):
                 text += f" — «{item['feedback']}»"
@@ -351,7 +353,11 @@ RESUME_LIMIT = 100  # сколько последних чатов показы�
 
 
 def resume_chat(
-    agent: Agent, chats: ChatRecorder, saved: SavedChat, *, keep_model: bool = False
+    agent: Agent,
+    chats: ChatRecorder,
+    saved: SavedChat,
+    *,
+    keep_model: bool = False,
 ) -> str | None:
     """Продолжить сохранённый чат: дальнейшие ходы дописываются в него же.
 
@@ -408,13 +414,16 @@ def _resume(ctx: CommandContext, arg: str) -> bool:
     if ctx.agent.model != previous:
         ctx.ui.info(f"модель чата: {ctx.agent.model}")
         ensure_context_window(
-            ctx.agent, ctx.ui, interrupt=ctx.interrupt, declined=ctx.declined_windows
+            ctx.agent,
+            ctx.ui,
+            interrupt=ctx.interrupt,
+            declined=ctx.declined_windows,
         )
     return True
 
 
 def _index(ctx: CommandContext, arg: str) -> bool:
-    if arg not in ("", "rebuild"):
+    if arg not in {"", "rebuild"}:
         ctx.ui.error("использование: /index [rebuild]")
         return True
     workspace = ctx.agent.workspace
@@ -427,13 +436,16 @@ def _index(ctx: CommandContext, arg: str) -> bool:
 
 
 def _hooks(ctx: CommandContext, arg: str) -> bool:
-    if arg not in ("", "reload"):
+    if arg not in {"", "reload"}:
         ctx.ui.error("использование: /hooks [reload]")
         return True
     if arg == "reload":
         agent = ctx.agent
         agent.hooks = load_hooks(
-            agent.workspace, ctx.ui, interactive=ctx.ui.interactive(), trust=ctx.trust_hooks
+            agent.workspace,
+            ctx.ui,
+            interactive=ctx.ui.interactive(),
+            trust=ctx.trust_hooks,
         )
         install_request_hook(agent.provider, agent.hooks, ctx.ui, agent.config)
         ctx.ui.info("настройки хуков перечитаны")
@@ -457,7 +469,7 @@ def default_commands() -> CommandRegistry:
             "разрешённые без вопросов команды и журнал решений",
             _permissions,
             usage=PERMISSIONS_USAGE,
-        )
+        ),
     )
     registry.register(SlashCommand("/clear", "новый чат", _clear))
     registry.register(
@@ -466,7 +478,7 @@ def default_commands() -> CommandRegistry:
             "сжать историю в краткое содержание",
             _compact,
             usage="/compact [пожелания]",
-        )
+        ),
     )
     registry.register(
         SlashCommand(
@@ -475,10 +487,10 @@ def default_commands() -> CommandRegistry:
             _resume,
             usage="/resume [id]",
             aliases=("/chats",),
-        )
+        ),
     )
     registry.register(
-        SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]")
+        SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]"),
     )
     registry.register(SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"))
     registry.register(SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")))

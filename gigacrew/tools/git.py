@@ -30,25 +30,23 @@ _ALLOWED = _READ_ONLY | {
 
 # Подкоманды, которых нет в инструменте, а в исследовании они обычно читают (у reflog есть и
 # изменяющие формы): для них — подсказка про run_shell, там их проверяет классификатор.
-_READ_ELSEWHERE = frozenset(
-    {
-        "blame",
-        "grep",
-        "ls-files",
-        "ls-tree",
-        "rev-parse",
-        "rev-list",
-        "shortlog",
-        "describe",
-        "reflog",
-        "merge-base",
-        "cat-file",
-        "show-ref",
-        "name-rev",
-        "for-each-ref",
-        "whatchanged",
-    }
-)
+_READ_ELSEWHERE = frozenset({
+    "blame",
+    "grep",
+    "ls-files",
+    "ls-tree",
+    "rev-parse",
+    "rev-list",
+    "shortlog",
+    "describe",
+    "reflog",
+    "merge-base",
+    "cat-file",
+    "show-ref",
+    "name-rev",
+    "for-each-ref",
+    "whatchanged",
+})
 
 # Опции, позволяющие писать/читать файлы вне проекта или запускать внешние
 # программы. Запрещены для всех подкоманд (включая сокращения: git принимает
@@ -98,7 +96,8 @@ def _is_forbidden(arg: str) -> bool:
 
 def _options(args: list[str], valued: frozenset[str] = frozenset()) -> tuple[set[str], list[str]]:
     """(опции, позиционные до ``--``): ``--name`` без значения, буквы ``-abc`` по отдельности.
-    Слово после опции из ``valued`` — её значение, а не позиционный аргумент."""
+    Слово после опции из ``valued`` — её значение, а не позиционный аргумент.
+    """
     flags: set[str] = set()
     positional: list[str] = []
     skip = False
@@ -131,7 +130,8 @@ def _has(flags: set[str], *names: str) -> bool:
 
 def _discards_work(sub: str, args: list[str], root: Path) -> str:
     """Почему вызов теряет работу (правки, ветки, отложенное) — как у классификатора
-    run_shell; "" — не теряет. Такие вызовы спрашиваются и с ``-y``."""
+    run_shell; "" — не теряет. Такие вызовы спрашиваются и с ``-y``.
+    """
     flags, positional = _options(args, frozenset({"-b", "-B", "--orphan"}))
     lost = "незакоммиченные правки будут потеряны"
     if sub == "branch" and (
@@ -171,7 +171,7 @@ def _reading(sub: str, args: list[str]) -> bool:
     return (
         sub in _READ_ONLY
         or (sub == "branch" and _branch_is_listing(args))
-        or (sub == "stash" and bool(args) and args[0] in ("list", "show"))
+        or (sub == "stash" and bool(args) and args[0] in {"list", "show"})
     )
 
 
@@ -207,7 +207,8 @@ def _commit_files(args: list[str]) -> list[str]:
 
 def _outside_path(sub: str, args: list[str], root: Path) -> str | None:
     """Аргумент, который ведёт за пределы проекта: путь у читающих подкоманд (с ним git
-    сам переходит в --no-index или читает чужой репозиторий) или файл `commit -F/-t`."""
+    сам переходит в --no-index или читает чужой репозиторий) или файл `commit -F/-t`.
+    """
     if _reading(sub, args) and sub != "branch":
         candidates = [a for a in args if not a.startswith("-")]  # ревизии и пути
     elif sub == "commit":
@@ -240,7 +241,7 @@ class GitParams(BaseModel):
         description=(
             "git subcommand: status, diff, log, show, branch, add, commit, checkout, "
             "switch, restore, stash"
-        )
+        ),
     )
     args: list[str] = Field(
         default_factory=list,
@@ -248,7 +249,7 @@ class GitParams(BaseModel):
     )
 
 
-class GitTool(Tool):
+class GitTool(Tool[GitParams]):
     name = "git"
     description = (
         "Runs git operations in the project repository. Supported: status, diff, log, "
@@ -300,7 +301,7 @@ class GitTool(Tool):
             )
             raise ToolError(
                 f"Подкоманда git '{sub}' не поддерживается этим инструментом. Доступно: "
-                f"{sorted(_ALLOWED)}.{hint}"
+                f"{sorted(_ALLOWED)}.{hint}",
             )
         # Опции проверяются и после `--`: `stash list` отбрасывает `--` и передаёт следующие
         # слова в `git log` как опции. Путь, названный как запрещённая опция, не пройдёт.
@@ -310,7 +311,7 @@ class GitTool(Tool):
         outside = _outside_path(sub, params.args, ctx.root)
         if outside is not None:
             raise ToolError(
-                f"Путь '{outside}' — вне проекта: инструмент git работает только с файлами проекта."
+                f"Путь '{outside}' — вне проекта: инструмент git работает только с файлами проекта.",
             )
 
     @staticmethod

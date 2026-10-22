@@ -41,15 +41,15 @@ class Answer:
 
 
 # Задать вопросы пользователю. Ответ на каждый вопрос по порядку; None — пользователь
-# отказался отвечать. Нет интерактивного пользователя — QuestionsUnavailable.
+# отказался отвечать. Нет интерактивного пользователя — QuestionsUnavailableError.
 AskUser = Callable[[Sequence[Question]], "list[Answer] | None"]
 
 
-class QuestionsUnavailable(ToolError):
+class QuestionsUnavailableError(ToolError):
     """Спросить некого: одноразовый режим без терминала, ввод не с клавиатуры."""
 
     def __init__(self, reason: str = "нет интерактивного пользователя"):
         super().__init__(
             f"Нельзя задать вопрос: {reason}. Прими разумное решение сам и перечисли "
-            "сделанные допущения в ответе."
+            "сделанные допущения в ответе.",
         )
