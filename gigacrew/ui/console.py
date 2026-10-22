@@ -414,6 +414,17 @@ class Console(AgentEvents):
         self._sub_activity = ""
         self._sub_wrapping = False
         self._sub_steps: list[_Step] = []
+        self._keyboard_only = False  # отвечать на вопросы — только с терминала (-p)
+
+    def keyboard_only(self) -> None:
+        """Вопросы (подтверждения, выбор чата) — только с клавиатуры: ввод не с
+        терминала — ответа нет. Для ``-p``: stdin там не канал ввода (запрос — аргумент),
+        и строка «y» или «a» из перенаправленных в него данных не должна ничего
+        подтверждать. В REPL ввод не с терминала — это и запросы, и ответы."""
+        self._keyboard_only = True
+
+    def _no_keyboard(self) -> bool:
+        return self._keyboard_only and not _stdin_is_terminal()
 
     def set_interrupt_keys(
         self,
@@ -1317,11 +1328,23 @@ class Console(AgentEvents):
         feedback: bool = False,
         view: bool = False,
     ) -> str | None:
-        """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода)."""
+        """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода, ввод не
+        с терминала там, где отвечать можно только с клавиатуры)."""
         self._flush_group()
         self.stop_live()
         p = self._p
         bar = self._bar(dangerous=dangerous)
+        if self._no_keyboard():
+            self._out(
+                Text.assemble(
+                    bar,
+                    (f"{question} ", f"bold {p.fg}"),
+                    ("— ответить можно только с клавиатуры, а ввод не с терминала: ", p.muted),
+                    ("нет", f"bold {p.fg}"),
+                )
+            )
+            self._blank = False
+            return None
         notes = []
         if always is not None:
             notes.append(f"a — {always}")
@@ -1488,6 +1511,9 @@ class Console(AgentEvents):
         self._flush_group()
         self.stop_live()
         if not chats:
+            return None
+        if self._no_keyboard():
+            self.warn("выбрать чат можно только с клавиатуры (или по id: -r ID) — начат новый")
             return None
         if self._live_ok and _stdin_is_terminal():
             try:

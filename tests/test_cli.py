@@ -1162,3 +1162,38 @@ def test_repl_warns_about_tls_for_the_backend_token(tmp_path, capsys):
     agent._cfg = replace(agent.config, provider="gigacode", access_key=None)
     run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
     assert "ключ или токен можно перехватить" in _flat(capsys)
+
+
+@pytest.mark.parametrize("piped", ["a\nещё данные\n", "y\n", "да\n"])
+def test_oneshot_does_not_take_approvals_from_piped_stdin(
+    tmp_path, oneshot, capsys, monkeypatch, piped
+):
+    import io
+
+    from gigacrew.agent.decisions import DecisionMemory
+
+    # stdin в -p — не канал ввода (запрос — аргумент): строка «a» или «y» из pipe не
+    # подтверждает команду и не сохраняет разрешение.
+    monkeypatch.setattr("sys.stdin", io.StringIO(piped))
+    monkeypatch.setenv("GIGACREW_REVIEWER_MODEL", "nope")
+    command = "python3 -c \"open('made', 'w')\""  # выполняет код — спрашивается
+    oneshot(ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")]))
+    assert _main(tmp_path, "-p", "сделай") == 0
+    assert not (tmp_path / "made").exists()
+    assert "ответить можно только с клавиатуры" in _flat(capsys)
+    memory, _ = DecisionMemory.load(tmp_path)
+    assert memory.rules == []
+    assert [e["decision"] for e in memory.recent()] == ["no_answer"]
+
+
+def test_oneshot_resume_picker_needs_keyboard(tmp_path, oneshot, capsys, monkeypatch):
+    import io
+
+    oneshot(ScriptedProvider([text_turn("a")]))
+    assert _main(tmp_path, "-p", "первый") == 0
+    monkeypatch.setattr("sys.stdin", io.StringIO("1\n"))
+    provider = ScriptedProvider([text_turn("b")])
+    oneshot(provider)
+    assert _main(tmp_path, "-r", "-p", "новый") == 0
+    assert _history(provider) == [("user", "новый")]  # чат не выбран из pipe
+    assert "выбрать чат можно только с клавиатуры" in _flat(capsys)

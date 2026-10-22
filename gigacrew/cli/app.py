@@ -239,6 +239,8 @@ def _chat_to_resume(args: argparse.Namespace, store: ChatStore, ui: Console) -> 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     ui = Console(no_color=args.no_color)
+    if args.prompt is not None:
+        ui.keyboard_only()  # -p: ответы на вопросы — не из перенаправленного stdin
     root = Path(args.dir)
     if not root.is_dir():
         ui.error(f"каталог проекта не найден: {root}")
