@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import sys
+from datetime import UTC, datetime
 
 import pytest
 
@@ -74,6 +75,16 @@ def test_load_errors(store):
     (store.directory / "bad.json").write_text("{не json", encoding="utf-8")
     with pytest.raises(ChatStoreError):
         store.load("bad")
+
+
+@pytest.mark.parametrize("bad", ["../secret", "a/../../secret", "a/b", "a.json", "a\nb", ""])
+def test_ids_that_could_leave_the_chats_dir_are_rejected(store, bad):
+    # Первый символ id — буква или цифра, и весь id — без «/» и «.»: ни load, ни save, ни
+    # exists не выходят за .gigacode/chats.
+    (store.directory / "a").mkdir(parents=True)
+    for action in (store.load, store.exists, lambda i: store.save(i, _conv())):
+        with pytest.raises(ChatStoreError, match="некорректный"):
+            action(bad)
 
 
 @pytest.mark.parametrize("conversation", [[], "x", None, {"version": 1, "messages": 5}])
@@ -172,6 +183,26 @@ def test_find_by_id_and_prefix(store):
         store.find("  ")
 
 
+def test_find_prefers_exact_id_over_longer_ids_with_that_prefix(store):
+    store.save("a1", _conv("первый"))
+    store.save("a10", _conv("второй"))
+    assert store.find("a1").title == "первый"
+    with pytest.raises(ChatStoreError, match="несколько"):
+        store.find("a")
+
+
+def test_failed_write_leaves_no_temporary_file(store, monkeypatch):
+    import gigacrew.agent.chat_store as chat_store
+
+    def full(*a, **kw):
+        raise OSError("диск заполнен")
+
+    monkeypatch.setattr(chat_store.json, "dump", full)
+    with pytest.raises(OSError, match="заполнен"):
+        store.save("a1", _conv())
+    assert list(store.directory.iterdir()) == []
+
+
 def test_new_ids_are_unique_and_sortable(store):
     ids = {store.new_id() for _ in range(50)}
     assert len(ids) == 50
@@ -209,6 +240,23 @@ def test_recorder_skips_empty_and_keeps_created_at(store):
     rec.save(conv)
     again = store.load(rec.chat_id).info
     assert again.created_at == first.created_at and again.requests == 2
+    assert [c.id for c in store.recent()] == [rec.chat_id]  # тот же файл, не новый
+    # Продолженный чат хранит время создания, а не время продолжения (метки — в
+    # секундах: в одной секунде проверка выше прошла бы и без этого).
+    when = datetime(2020, 1, 1, tzinfo=UTC)
+    assert store.save("old1", conv, created_at=when).created_at == when
+    rec.switch_to(store.load("old1").info)
+    conv.add_user("и ещё")
+    rec.save(conv)
+    info = store.load("old1").info
+    assert info.created_at == when and info.updated_at > when and info.requests == 3
+
+
+def test_recorder_does_not_save_harness_only_conversation(store):
+    conv = Conversation()
+    conv.add_user("<system-reminder>\nплан одобрен\n</system-reminder>", meta=True)
+    assert ChatRecorder(store).save(conv) is None
+    assert store.recent() == []
 
 
 def test_recorder_new_and_switch(store):

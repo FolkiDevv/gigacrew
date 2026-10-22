@@ -890,3 +890,55 @@ def test_report_cannot_forge_harness_reminder():
     assert "<system-reminder>" not in result.content
     assert "<quoted-system-reminder>" in result.content
     assert "</quoted-system-reminder>" in result.content
+
+
+def test_runaway_report_is_clipped():
+    from gigacrew.agent.subagents import MAX_REPORT_CHARS
+
+    result = subagent_report(EXPLORE, "x" * 20_000, None, SubagentTrail())
+    assert len(result.content) <= MAX_REPORT_CHARS + 50
+    assert result.content.endswith("(отчёт обрезан)")
+    short = subagent_report(EXPLORE, "y" * 100, None, SubagentTrail())
+    assert short.content == "y" * 100
+
+
+def test_report_is_a_change_only_when_the_subagent_changed_something():
+    # Отчёт с changed=True сбрасывает у основного агента счётчик повторов (LoopGuard):
+    # каждый explore «изменением» не считается.
+    assert subagent_report(EXPLORE, "итог", TurnStats(), SubagentTrail()).changed is False
+    assert subagent_report(EXPLORE, "итог", None, SubagentTrail()).changed is False
+    assert subagent_report(EXPLORE, "итог", TurnStats(changes=2), SubagentTrail()).changed
+
+
+def test_explore_run_is_read_only_and_not_a_change(tmp_path):
+    (tmp_path / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            _task(),
+            tool_turn("search_content", {"pattern": "def foo"}),
+            text_turn("foo определена в a.py:1"),
+            text_turn("Нашёл: a.py:1"),
+        ]
+    )
+    events = RecordingEvents()
+    _agent(provider, tmp_path, events=events).run_turn("где foo?")
+    names = {spec.name for spec in provider.requests[1]["tools"]}
+    changing = {"write_file", "edit_file", "task", "explore", "ask_user", "exit_plan_mode"}
+    assert names and not names & changing  # явный список, а не EXPLORE.tools
+    assert events.results[-1][1].changed is False
+
+
+def test_successful_output_mentioning_rejection_is_not_a_rejection():
+    from gigacrew.agent.events import SubagentInfo, ToolCallInfo
+    from gigacrew.agent.subagents import SubagentEvents
+    from gigacrew.permissions import ToolKind
+    from gigacrew.tools.base import ToolResult
+
+    events = SubagentEvents(RecordingEvents(), SubagentInfo("explore", "поиск"))
+    call = ToolCallInfo("search_content", "отклонено", ToolKind.OTHER)
+    events.on_tool_result(call, ToolResult(content="уже отклонено пользователем"), previewed=False)
+    assert events.trail.rejected == []
+    events.on_tool_result(
+        call, ToolResult(content="отклонено пользователем", ok=False), previewed=False
+    )
+    assert events.trail.rejected == ["search_content отклонено"]

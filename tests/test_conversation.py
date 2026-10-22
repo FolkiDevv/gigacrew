@@ -270,6 +270,39 @@ def test_fit_history_pins_task_and_keeps_pairs():
         if m.role == "function":
             prev = fitted[i - 1]
             assert prev.role == "assistant" and prev.function_calls
+    # что именно отброшено: сначала прошлый ход, затем ранние шаги текущего — не свежие
+    assert fitted == [history[2], *history[5:]]
+
+
+def test_fit_history_drops_call_and_result_only_together():
+    # Бюджет чуть меньше всей истории: отбросить одно сообщение (вызов) хватило бы, но
+    # его результат без вызова API не примет — уходит пара целиком.
+    history = [
+        Message(role="user", content="ЗАДАЧА"),
+        _call(path="1"),
+        _result(content="x" * 3000),
+        _call(path="2"),
+        _result(content="ok"),
+    ]
+    assert fit_history(history, estimate_tokens(history) - 5) == [history[0], *history[3:]]
+
+
+def test_token_estimate_counts_call_arguments_and_reasoning():
+    from gigacrew.agent.context_window import estimate_message_tokens, estimate_text_tokens
+
+    # Большой write_file — главный расход контекста: аргументы вызова считаются.
+    write = _call("write_file", path="a.py", content="y" * 3000)
+    assert estimate_message_tokens(write) >= 1000
+    thinking = Message(role="assistant", content="ok", reasoning="r" * 3000)
+    assert estimate_message_tokens(thinking) >= 1000
+    assert estimate_text_tokens("ab") == 1 and estimate_text_tokens("abcd") == 2  # вверх
+
+
+def test_budget_for_small_window_has_a_floor():
+    from gigacrew.agent.context_window import MIN_BUDGET_TOKENS, budget_for_window
+
+    assert budget_for_window(8_192) == budget_for_window(0) == MIN_BUDGET_TOKENS
+    assert budget_for_window(128_000) > MIN_BUDGET_TOKENS
 
 
 def test_fit_history_keeps_pinned_even_over_budget():
