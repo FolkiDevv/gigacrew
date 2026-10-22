@@ -346,6 +346,9 @@ _PATH_WRITERS = frozenset(
 )
 # Из них — только у путей: у объекта неизвестного типа такой вызов — возможно, запись.
 _PATH_ONLY_WRITERS = _PATH_WRITERS - {"rename", "replace", "copy", "move"}
+# Переносят или копируют: запись и туда, куда (первый аргумент).
+_PATH_MOVERS = frozenset({"rename", "replace", "copy", "copy_into", "move", "move_into"})
+_TARGET_KWARGS = ("target", "target_dir")
 _MODE_TEXT = re.compile(r"[rwxabt+U]+")
 # Методы путей, читающие содержимое.
 _PATH_READERS = frozenset({"read_text", "read_bytes"})
@@ -1075,10 +1078,16 @@ def _check_call(node: ast.Call, ctx: _Ctx) -> None:
         elif attr in _PATH_WRITERS and _looks_like_path(func.value, ctx):
             target = _path_of(func.value, ctx)
             _check_write(target, ctx, f".{attr}()", recursive=False)
+            if attr in _PATH_MOVERS:
+                _check_destination(node, ctx, f".{attr}()")
+            if attr.startswith("copy"):
+                _check_read(target, ctx, f".{attr}()")  # копия секрета — его чтение
         elif attr in _PATH_READERS:
             _check_read(_path_of(func.value, ctx), ctx, f".{attr}()")
-        elif attr in _PATH_ONLY_WRITERS:
+        elif attr in _PATH_ONLY_WRITERS or (attr in _PATH_MOVERS and _one_target(node)):
             ctx.flag(None, f".{attr}(): объект неизвестен — возможно, запись в файл")
+            if attr in _PATH_MOVERS:
+                _check_destination(node, ctx, f".{attr}()")
         elif attr == "open" and _looks_like_path(func.value, ctx):
             _check_open(node, _path_of(func.value, ctx), 0, ctx, ".open()")
         elif attr == "open" and _opens_for_write(node):
@@ -1101,6 +1110,35 @@ def _check_call(node: ast.Call, ctx: _Ctx) -> None:
                 ctx.flag(None, "str.format: шаблон не литерал")
         return
     ctx.flag(None, "вызов результата выражения")
+
+
+def _one_target(node: ast.Call) -> bool:
+    """Вызов как ``p.rename(target)``: один позиционный аргумент или ``target=``
+    (у ``str.replace`` их два, у ``dict.copy`` — ни одного)."""
+    if len(node.args) == 1:
+        return True
+    return not node.args and any(kw.arg in _TARGET_KWARGS for kw in node.keywords)
+
+
+def _check_destination(node: ast.Call, ctx: _Ctx, what: str) -> None:
+    """Куда переносит или копирует ``p.rename/replace/copy/move(_into)``."""
+    dest = _call_arg(node, 0, *_TARGET_KWARGS)
+    _check_write(_path_of(dest, ctx) if dest is not None else _UNKNOWN_PATH, ctx, what)
+
+
+def _call_arg(node: ast.Call, index: int, *names: str) -> ast.AST | None:
+    """Аргумент вызова — позиционный или именованный. ``*args`` и ``**kwargs`` могут
+    подставить любой: тогда значение известно только при выполнении."""
+    if any(isinstance(a, ast.Starred) for a in node.args[: index + 1]) or any(
+        kw.arg is None for kw in node.keywords
+    ):
+        return _RUNTIME_ARG
+    if len(node.args) > index:
+        return node.args[index]
+    for kw in node.keywords:
+        if kw.arg in names:
+            return kw.value
+    return None
 
 
 def _opens_for_write(node: ast.Call) -> bool:

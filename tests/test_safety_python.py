@@ -192,6 +192,40 @@ def test_callables_as_values(root, code, expected):
     assert result.level is expected, result.reason
 
 
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        # куда переносится или копируется файл — тоже запись
+        ("from pathlib import Path; Path('a.txt').rename('/tmp/x')", DANGER),
+        ("from pathlib import Path; Path('a.txt').rename('b.txt')", WRITE),
+        ("from pathlib import Path; Path('a.txt').replace(target='/tmp/x')", DANGER),
+        ("from pathlib import Path; Path('a.txt').replace(Path.home() / 'x')", DANGER),
+        ("from pathlib import Path; Path('a.txt').copy_into('/tmp')", DANGER),
+        ("from pathlib import Path; Path('a.txt').move('pkg/b.txt')", WRITE),
+        ("from pathlib import Path; Path('a.txt').rename(n)", None),
+        ("from pathlib import Path; Path('pkg/mod.py').copy('b.py')", WRITE),
+        ("from pathlib import Path; Path('.env').copy('b.txt')", None),  # чтение секрета
+        # у объекта неизвестного типа: один аргумент — как у пути (у str.replace их два)
+        ("from pathlib import Path\nfor p in [Path('a.txt')]:\n    p.rename('/tmp/x')", DANGER),
+        ("from pathlib import Path\nfor p in [Path('a.txt')]:\n    p.rename('b.txt')", None),
+        ("from pathlib import Path; ps = [Path('a.txt')]; ps[0].replace('/tmp/x')", DANGER),
+        ("from pathlib import Path; ps = [Path('a.txt')]; ps[0].replace(target='b.txt')", None),
+        (
+            "from pathlib import Path\ndef f():\n    return Path('a.txt')\nf().replace('b.txt')",
+            None,
+        ),
+        ("from pathlib import Path; p = Path('a') if 1 else Path('b'); p.rename('c')", None),
+        ("def f():\n    return 1\nf().copy('/tmp/x', follow_symlinks=False)", DANGER),
+        ("x = 'abc'; print(x.replace('a', 'b'), x.replace('a', 'b', 1))", READ),
+        ("import datetime; print(datetime.date.today().replace(year=2000))", READ),
+        ("d = {}; e = d.copy(); print(e)", READ),
+    ],
+)
+def test_move_and_copy_destination(root, code, expected):
+    result = analyze(code, root=root)
+    assert result.level is expected, result.reason
+
+
 def test_secret_files_ask(root):
     (root / ".env").write_text("TOKEN=1\n")
     assert analyze("print(open('.env').read())", root=root).level is None
