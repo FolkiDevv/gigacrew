@@ -153,7 +153,8 @@ def _classify(
     # разрешениями другого каталога: память решений ищет их по Verdict.cwd.
     same_dir = all(cmd.cwd == script.cwd for cmd in script.commands)
     composable = not writes and not problems and bool(parts) and same_dir
-    return Verdict(level, reason, script.cwd, script.rest, tuple(parts), composable)
+    redirects_edit = all(w.edits for w in writes if w.level is CommandLevel.WRITE)
+    return Verdict(level, reason, script.cwd, script.rest, tuple(parts), composable, redirects_edit)
 
 
 def _text_of(cmd, depth: int = 0) -> str:

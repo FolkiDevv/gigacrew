@@ -168,3 +168,23 @@ def test_cd_inside_subshell_is_not_matched_by_rule_for_other_directory(two_makef
     assert memory.match(top) is None
     # тот же каталог — по-прежнему по частям
     assert classify(f"(cd . && {command})", root=root).composable is True
+
+
+# ------------------------- только правки ---------------------------- #
+def test_edits_only_requires_every_part_and_every_redirect_to_be_an_edit(root):
+    """edits_only даёт ToolKind.EDIT — в режиме «авто» без вопроса при любом риске."""
+    (root / ".env").write_text("T=1\n")
+    assert classify("ls > files.txt", root=root).edits_only
+    assert classify("sed -i s/a/b/ a.txt && ls", root=root).edits_only
+    # перезапись файла с секретами — не правка, как и `cp a.txt .env`
+    assert not classify("cp a.txt .env", root=root).edits_only
+    assert not classify("cat a.txt > .env", root=root).edits_only
+    assert not classify("ls >> .env", root=root).edits_only
+    # правка вместе с не-правкой (T1-S1)
+    assert not classify("ruff format . && rm a.txt", root=root).edits_only
+    assert not classify("sed -i s/a/b/ a.txt && pip install x", root=root).edits_only
+    # только уровень WRITE (T1-S2): опасное и «не знаю» — не правки
+    danger = classify("sed -i 's/a/b/' a.txt > ../x", root=root)
+    assert danger.level is DANGER and not danger.edits_only
+    unknown = classify("sed -i 's/a/b/' a.txt > $OUT", root=root)
+    assert unknown.level is None and not unknown.edits_only
