@@ -1226,6 +1226,16 @@ def _check_module_function(full: str, node: ast.Call, ctx: _Ctx) -> None:
     if module.startswith("pathlib") and attr in ("home",):
         ctx.flag(None, f"{full}() — путь вне проекта")
         return
+    if (
+        module.startswith("pathlib")
+        and module.rpartition(".")[2] in _PATH_CTORS
+        and attr in _PATH_WRITERS | _PATH_READERS | _PATH_LISTERS | {"open"}
+    ):
+        # метод, вызванный у класса: Path.write_text(p, 'x') — то же, что p.write_text('x')
+        obj = node.args[0] if node.args else _RUNTIME_ARG
+        method = ast.Attribute(value=obj, attr=attr, ctx=ast.Load())
+        _check_call(ast.Call(func=method, args=node.args[1:], keywords=node.keywords), ctx)
+        return
     if module in ("json", "tomllib", "csv", "pickle") and attr in ("dump",):
         return  # файл открыт open() — проверен там
     allowed = _MODULE_ATTRS.get(module)
@@ -1233,8 +1243,92 @@ def _check_module_function(full: str, node: ast.Call, ctx: _Ctx) -> None:
         ctx.flag(None, f"{full}() не проверен классификатором")
 
 
+def _collect_aliases(ctx: _Ctx) -> None:
+    """``rm = os.remove``, ``P = Path``: имя — псевдоним модуля или его атрибута, вызовы
+    через него проверяются как вызовы оригинала. Только если других значений у имени нет
+    (иначе ``p.unlink()`` для ``p`` из обхода стал бы «функцией модуля»)."""
+    changed = True
+    while changed:  # псевдоним псевдонима
+        changed = False
+        for name, values in ctx.bindings.items():
+            if name in ctx.modules or name in ctx.iterations or name in ctx.defs:
+                continue
+            resolved = {_resolve_module(v, ctx) for v in values}
+            if len(resolved) == 1 and (target := resolved.pop()) is not None:
+                ctx.modules[name] = target
+                changed = True
+
+
+def _is_alias(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> bool:
+    if (
+        not isinstance(parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+        or parent.value is not node
+    ):
+        return False
+    targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+    resolved = _resolve_module(node, ctx)
+    return all(isinstance(t, ast.Name) and ctx.modules.get(t.id) == resolved for t in targets)
+
+
+# Модули с функциями записи и процессов: переданный куда-то модуль — не проследить.
+_ESCAPING_MODULES = frozenset({*_MODULE_ATTRS, "pathlib"})
+# Атрибуты, которые проверяются в месте вызова: как значения — проверяем вызов с
+# аргументами, известными только при выполнении.
+_REF_ATTRS = _PATH_WRITERS | _PATH_READERS | _PATH_LISTERS | _DANGER_METHODS | {"open", "format"}
+_RUNTIME_ARG = ast.Name(id="<при выполнении>")
+
+
+def _harmless_use(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> bool:
+    """Значение только читают: ``print(os)``, ``for p in sys.path``, ``'\\n'.join(...)``."""
+    if isinstance(parent, ast.Call):
+        func = parent.func
+        if isinstance(func, ast.Name):
+            return (
+                func.id in _SAFE_BUILTINS
+                and func.id not in ctx.modules
+                and not _defined(func.id, ctx)
+            )
+        return isinstance(func, ast.Attribute) and isinstance(func.value, ast.Constant)
+    if isinstance(parent, (ast.For, ast.AsyncFor, ast.comprehension)):
+        return parent.iter is node
+    return isinstance(parent, (ast.Compare, ast.FormattedValue, ast.Expr))
+
+
+def _check_reference(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> None:
+    """Функция или модуль как значение (``map(os.remove, …)``, ``o = open``, ``f(os)``):
+    проверки в месте вызова их не увидят."""
+    if isinstance(parent, ast.Call) and parent.func is node:
+        return  # вызов — проверяется в _check_call
+    if isinstance(parent, ast.Attribute):
+        return  # основание атрибута: os.path, Path('x').write_text
+    resolved = _resolve_module(node, ctx)
+    if resolved is not None and _is_alias(node, parent, ctx):
+        return  # псевдоним — проверяются его вызовы
+    if resolved in _ESCAPING_MODULES:
+        if not _harmless_use(node, parent, ctx):
+            ctx.flag(None, f"модуль {resolved} передан как значение — что с ним сделают, не видно")
+        return
+    if resolved is None:
+        if isinstance(node, ast.Name):
+            if node.id != "open" or _defined(node.id, ctx):
+                return
+        elif not isinstance(node, ast.Attribute) or node.attr not in _REF_ATTRS:
+            return
+    start = len(ctx.levels)
+    _check_call(ast.Call(func=node, args=[_RUNTIME_ARG], keywords=[]), ctx)
+    found = ctx.levels[start:]
+    del ctx.levels[start:]
+    if found:
+        what = resolved or (node.id if isinstance(node, ast.Name) else f".{node.attr}")
+        level = worst(*(lv for lv, _ in found))
+        ctx.flag(level, f"{what} передана как значение: аргументы известны только при выполнении")
+
+
 def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
+    parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     for node in ast.walk(tree):
+        if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
+            _check_reference(node, parents.get(id(node)), ctx)
         if isinstance(node, ast.Attribute):
             attr = node.attr
             if attr.startswith("__") and attr.endswith("__") and attr not in _SAFE_DUNDERS:
@@ -1330,6 +1424,7 @@ def analyze(
     ctx = _Ctx(root=root, cwd=run_dir, script=script)
     _collect_bindings(tree, ctx)
     _check_imports(tree, ctx)
+    _collect_aliases(ctx)
     _check_attributes(tree, ctx)
     first = script.parent if script is not None else run_dir
     for directory in (first, *path_dirs):

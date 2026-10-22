@@ -144,6 +144,54 @@ def test_modules_reached_through_other_modules(root, code, expected):
     assert result.level is expected, result.reason
 
 
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        # псевдоним функции модуля проверяется как она сама
+        ("import os; rm = os.remove; rm('/etc/hosts')", DANGER),
+        ("import os; rm = os.remove; rm('a.txt')", WRITE),
+        ("import glob; o = glob.os; o.system('id')", DANGER),
+        ("import os; f = os.path.join; print(f('a', 'b'))", READ),
+        ("from pathlib import Path as P; P('/etc/hosts').write_text('x')", DANGER),
+        # у имени есть и другие значения — не псевдоним
+        (
+            "import os\np = os.path\nfrom pathlib import Path\nfor p in Path('.').rglob('*'):\n"
+            "    p.unlink()",
+            None,
+        ),
+        ("import os\nf = os.path.join\nf = os.remove\nf('/etc/hosts')", None),
+        # функция записи как значение: аргументы известны только при выполнении
+        ("o = open; o('/etc/x', 'w')", None),
+        ("list(map(open, ['/tmp/x'], ['w']))", None),
+        ("import os; list(map(os.remove, ['/etc/hosts']))", None),
+        ("import os; sorted(['a'], key=os.remove)", None),
+        ("from os import remove; list(map(remove, ['a.txt']))", None),
+        ("import shutil; fs = [shutil.move]", None),
+        ("from pathlib import Path; list(map(Path.unlink, [Path('a.txt')]))", None),
+        ("from pathlib import Path; w = Path('/etc/hosts').write_text; w('x')", DANGER),
+        ("def f(p):\n    return p\nf(open)", None),
+        # метод пути, вызванный у класса: путь — первый аргумент
+        ("from pathlib import Path; Path.write_text(Path('/home/u/.bashrc'), 'x')", DANGER),
+        ("from pathlib import Path; Path.write_text(Path('a.txt'), 'x')", WRITE),
+        ("from pathlib import Path; print(Path.read_text(Path('pyproject.toml')))", READ),
+        ("from pathlib import Path; Path.open(Path('a.txt'), 'w')", WRITE),
+        # модуль с функциями записи как значение: что с ним сделают — не проследить
+        ("import os\ndef f(m):\n    m.remove('/etc/hosts')\nf(os)", None),
+        ("import shutil; tools = {'sh': shutil}", None),
+        ("import os; print(os, type(os))", READ),
+        # функции без побочных эффектов как значения — можно
+        ("import os; print(sorted(os.listdir('.'), key=os.path.getsize))", READ),
+        ("import os; print(list(map(os.path.basename, ['a/b'])))", READ),
+        ("from pathlib import Path; print(list(map(Path, ['a'])))", READ),
+        ("print(sorted(['B', 'a'], key=str.lower))", READ),
+        ("import json; print(json.dumps({}, default=str))", READ),
+    ],
+)
+def test_callables_as_values(root, code, expected):
+    result = analyze(code, root=root)
+    assert result.level is expected, result.reason
+
+
 def test_secret_files_ask(root):
     (root / ".env").write_text("TOKEN=1\n")
     assert analyze("print(open('.env').read())", root=root).level is None
