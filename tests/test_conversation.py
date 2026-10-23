@@ -14,7 +14,7 @@ from gigacrew.agent.context_window import (
     estimate_tokens,
     fit_history,
 )
-from gigacrew.agent.conversation import Conversation, Summary, clean_text
+from gigacrew.agent.conversation import FORMAT_VERSION, Conversation, Summary, clean_text
 from gigacrew.agent.guard import CallCheck, LoopGuard, ToolOutcome, call_key, target_key
 from gigacrew.llm.types import FunctionCall, Message, Usage
 
@@ -65,7 +65,7 @@ def test_summary_round_trip_and_old_files_without_it() -> None:
     conv = _mid_turn()
     conv.set_summary(Summary("сводка", 5))
     dumped = json.loads(json.dumps(conv.to_dict(), ensure_ascii=False))
-    assert dumped["version"] == Conversation.FORMAT_VERSION  # summary — необязательный ключ
+    assert dumped["version"] == FORMAT_VERSION  # summary — необязательный ключ
     restored = Conversation.from_dict(dumped)
     assert restored.summary == Summary("сводка", 5)
     assert restored.messages == conv.messages
@@ -243,7 +243,7 @@ def test_loads_format_v1_chat_with_single_function_call() -> None:
     assert conv.pending_calls() == []
 
     saved = conv.to_dict()
-    assert saved["version"] == Conversation.FORMAT_VERSION
+    assert saved["version"] == FORMAT_VERSION
     assert "function_call" not in saved["messages"][1]
     assert Conversation.from_dict(saved).messages == conv.messages
 

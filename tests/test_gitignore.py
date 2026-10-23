@@ -26,7 +26,7 @@ def _rels(root: Path, base: Path | None = None) -> list[str]:
 
 
 def _ignored(rules: str, path: str, *, is_dir: bool = False) -> bool:
-    return IgnoreStack().push("", parse_rules(rules)).is_ignored(path, is_dir)
+    return IgnoreStack().push("", parse_rules(rules)).is_ignored(path, is_dir=is_dir)
 
 
 # ------------------------------ правила ------------------------------ #

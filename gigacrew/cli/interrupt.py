@@ -78,11 +78,11 @@ class KeyParser:
         # "alt" — хвост многобайтного символа после ESC (Alt+буква).
         self._state = ""
 
-    def feed(self, data: bytes) -> None:
+    def feed(self, chunk: bytes) -> None:
         """Разобрать очередную пачку прочитанных байтов."""
         position = 0
-        while position < len(data):
-            position = self._feed_at(data, position)
+        while position < len(chunk):
+            position = self._feed_at(chunk, position)
 
     def take_text(self) -> str:
         """Набранный текст (без завершающих переводов строк); буфер очищается."""

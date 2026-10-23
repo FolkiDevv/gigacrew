@@ -204,6 +204,9 @@ def _clean_schema(model: type[BaseModel]) -> dict[str, Any]:
     """JSON-schema параметров в формате function calling API."""
     schema = model.model_json_schema()
     schema.pop("title", None)
+    # Docstring модели параметров — для разработчика, а не для модели: у инструмента
+    # своё описание (Tool.description).
+    schema.pop("description", None)
     defs = schema.pop("$defs", None) or {}
     props = schema.get("properties", {})
     schema["properties"] = {

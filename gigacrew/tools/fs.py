@@ -148,7 +148,7 @@ def decode_text(raw: str) -> TextFile:
     return TextFile(text, eol, bom, mixed)
 
 
-def write_atomic(path: Path, data: bytes) -> None:
+def write_atomic(path: Path, payload: bytes) -> None:
     """Записывает файл целиком или не трогает его вовсе.
 
     Существующий файл заменяется через временный файл в том же каталоге
@@ -160,16 +160,16 @@ def write_atomic(path: Path, data: bytes) -> None:
     нельзя (каталог без права записи), файл перезаписывается на месте, как раньше.
     """
     if not path.exists() or not _replace_keeps_metadata(path):
-        path.write_bytes(data)
+        path.write_bytes(payload)
         return
     try:
         fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     except PermissionError:
-        path.write_bytes(data)
+        path.write_bytes(payload)
         return
     tmp_path = Path(tmp_name)
     try:
-        _replace_through_temp(path, data, fd, tmp_path)
+        _replace_through_temp(path, payload, fd, tmp_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -620,6 +620,8 @@ def _tolerant_find(text: str, pattern: str) -> _Match | None:
 # read_file
 # --------------------------------------------------------------------------- #
 class ReadFileParams(BaseModel):
+    """Параметры read_file: файл и (необязательно) диапазон строк."""
+
     path: str = Field(description="File path relative to the project root")
     start_line: int | None = Field(default=None, description="First line (1-based), inclusive")
     end_line: int | None = Field(default=None, description="Last line (1-based), inclusive")
@@ -768,6 +770,8 @@ def _select_lines(
 # write_file
 # --------------------------------------------------------------------------- #
 class WriteFileParams(BaseModel):
+    """Параметры write_file: файл и его новое содержимое целиком."""
+
     path: str = Field(description="File path relative to the project root")
     content: str = Field(description="The complete new content of the file")
 
@@ -848,6 +852,8 @@ class WriteFileTool(Tool[WriteFileParams]):
 # edit_file
 # --------------------------------------------------------------------------- #
 class EditFileParams(BaseModel):
+    """Параметры edit_file: файл, заменяемый фрагмент и замена."""
+
     path: str = Field(description="File path relative to the project root")
     old_string: str = Field(description="The exact fragment to replace (must be present)")
     new_string: str = Field(description="The replacement text")
@@ -1034,6 +1040,8 @@ MAX_LIST_ENTRIES = 500
 
 
 class ListDirParams(BaseModel):
+    """Параметры list_dir: каталог проекта."""
+
     path: str = Field(default=".", description="Directory path (the project root by default)")
 
 
@@ -1079,6 +1087,8 @@ _DEFAULT_FIND_RESULTS = 200
 
 
 class FindFilesParams(BaseModel):
+    """Параметры find_files: шаблон glob и предел числа результатов."""
+
     pattern: str = Field(
         description="Glob pattern: '*.py' — by name in any directory, 'src/**/*.ts' — by path "
         "from the root",

@@ -133,7 +133,7 @@ def test_render_selected_details_current_mark_and_query() -> None:
     assert chats[0].id in text
     assert "чат номер 1 (текущий)" in text
     state = PickerState(chats, now=NOW)
-    state.set_query("нет")
+    state.search("нет")
     text = _text(state)
     assert "поиск: нет" in text
     assert "найдено 0" in text
@@ -176,7 +176,7 @@ def _console(
             raise reply
         return reply
 
-    monkeypatch.setattr(ui._c, "input", fake_input)
+    monkeypatch.setattr(ui._console, "input", fake_input)
     return ui, buf
 
 

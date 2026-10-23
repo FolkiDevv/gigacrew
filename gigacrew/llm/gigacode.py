@@ -150,7 +150,7 @@ def _chat_endpoint(raw_url: Any, config_url: str) -> str:
     return url
 
 
-def parse_catalogue(data: Mapping[str, Any], config_url: str) -> Catalogue:
+def parse_catalogue(backend_config: Mapping[str, Any], config_url: str) -> Catalogue:
     """Каталог моделей из конфигурации бэкенда; некорректный — :class:`ApiError`.
 
     Модели — из ``chat.models``, иначе ``agent.models``, иначе ``models``; id модели —
@@ -160,12 +160,12 @@ def parse_catalogue(data: Mapping[str, Any], config_url: str) -> Catalogue:
     Адрес чата — ``chat.url`` или ``chatEndpoint``, иначе ``…/chat/completions`` рядом с
     конфигурацией. Незнакомые поля не мешают.
     """
-    chat = _mapping(data.get("chat"))
-    agent = _mapping(data.get("agent"))
+    chat = _mapping(backend_config.get("chat"))
+    agent = _mapping(backend_config.get("agent"))
     raw = next(
         (
             models
-            for models in (chat.get("models"), agent.get("models"), data.get("models"))
+            for models in (chat.get("models"), agent.get("models"), backend_config.get("models"))
             if isinstance(models, list) and models
         ),
         None,
@@ -182,12 +182,12 @@ def parse_catalogue(data: Mapping[str, Any], config_url: str) -> Catalogue:
     default = next(
         (
             candidate
-            for candidate in (chat.get("default_model"), data.get("default_model"))
+            for candidate in (chat.get("default_model"), backend_config.get("default_model"))
             if isinstance(candidate, str) and candidate in ids
         ),
         models[0].id,
     )
-    url = _chat_endpoint(chat.get("url") or data.get("chatEndpoint"), config_url)
+    url = _chat_endpoint(chat.get("url") or backend_config.get("chatEndpoint"), config_url)
     return Catalogue(models=tuple(models), default_model=default, chat_url=url)
 
 

@@ -147,7 +147,7 @@ class Backend:
         return sum(str(request.url) == url for request in self.requests)
 
 
-def _token_file(
+def token_file(
     token: str = "tok-1",
     expires_ms: float | None = None,
     endpoint: str = CONFIG,
@@ -163,7 +163,7 @@ def _token_file(
     return {"version": 1, "token": entry}
 
 
-def _write_token(
+def write_token(
     tmp_path: Path,
     token: str = "tok-1",
     expires_at: float | None = None,
@@ -174,7 +174,7 @@ def _write_token(
     home.mkdir(exist_ok=True)
     expires_ms = None if expires_at is None else expires_at * 1000
     path = home / "gigacode_token.json"
-    path.write_text(json.dumps(_token_file(token, expires_ms, **kw)), encoding="utf-8")
+    path.write_text(json.dumps(token_file(token, expires_ms, **kw)), encoding="utf-8")
     return path
 
 
@@ -198,7 +198,7 @@ def _provider(
     **kw: Any,
 ) -> GigaCodeProvider:
     if token is not None:
-        _write_token(tmp_path, token)
+        write_token(tmp_path, token)
     return GigaCodeProvider(_config(tmp_path, **kw), transport=httpx.MockTransport(backend.handler))
 
 
@@ -348,7 +348,7 @@ def test_catalogue_sampling_keeps_only_finite_numbers() -> None:
 
 # ------------------------------ токен ------------------------------ #
 def test_parse_token_of_the_cli_format() -> None:
-    stored = _token_file(expires_ms=1_900_000_000_000)
+    stored = token_file(expires_ms=1_900_000_000_000)
     entry = stored["token"]
     entry["resourceUrl"] = "https://res.test"
     assert parse_token(stored) == Token("tok-1", 1_900_000_000, CONFIG)
@@ -384,10 +384,10 @@ def test_load_token_errors_ask_to_log_in_to_gigacode(tmp_path: Path) -> None:
     path.write_text("{битый", encoding="utf-8")
     with pytest.raises(ApiError, match="авторизацию в GigaCode"):
         load_token(path, CONFIG)
-    path.write_text(json.dumps(_token_file("t", (time.time() + 30) * 1000)))
+    path.write_text(json.dumps(token_file("t", (time.time() + 30) * 1000)))
     with pytest.raises(ApiError, match=r"истёк.*авторизацию в GigaCode"):  # запас — минута
         load_token(path, CONFIG)
-    path.write_text(json.dumps(_token_file("t", (time.time() + 3600) * 1000)))
+    path.write_text(json.dumps(token_file("t", (time.time() + 3600) * 1000)))
     assert load_token(path, CONFIG).access_token == "t"
     assert load_token(path, f"{CONFIG}/").access_token == "t"
 
@@ -402,7 +402,7 @@ def test_unreadable_token_file_is_an_api_error(tmp_path: Path) -> None:
 
 def test_token_of_another_backend_is_not_sent(tmp_path: Path) -> None:
     backend = Backend()
-    _write_token(tmp_path, endpoint="https://other.test/api/v2/config")
+    write_token(tmp_path, endpoint="https://other.test/api/v2/config")
     provider = GigaCodeProvider(_config(tmp_path), transport=httpx.MockTransport(backend.handler))
     with pytest.raises(ApiError, match=r"выдан для https://other.test.*GIGACREW_API_URL"):
         provider.connect()
@@ -462,7 +462,7 @@ def test_connect_without_a_token_asks_to_log_in(tmp_path: Path) -> None:
     with pytest.raises(ApiError, match="авторизацию в GigaCode"):
         provider.connect()
     assert not backend.requests
-    _write_token(tmp_path, "tok-1")  # пользователь вошёл в GigaCode
+    write_token(tmp_path, "tok-1")  # пользователь вошёл в GigaCode
     provider.connect()
     assert provider.model == "coder"
 
@@ -471,11 +471,11 @@ def test_expired_token_asks_to_log_in_and_a_new_one_is_picked_up(tmp_path: Path)
     backend = Backend()
     provider = _provider(backend, tmp_path)
     provider.connect()
-    _write_token(tmp_path, "tok-1", expires_at=time.time() - 10)
+    write_token(tmp_path, "tok-1", expires_at=time.time() - 10)
     with pytest.raises(ApiError, match=r"истёк.*авторизацию в GigaCode"):
         provider.connect()
     backend.valid.add("tok-2")
-    _write_token(tmp_path, "tok-2", expires_at=time.time() + 3600)
+    write_token(tmp_path, "tok-2", expires_at=time.time() + 3600)
     provider.connect()
     assert provider.stream(_msgs()).message.content == "ok"
     assert backend.requests[-1].headers["Authorization"] == "Bearer tok-2"
@@ -486,10 +486,10 @@ def test_token_expiring_during_a_session_is_reread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = Backend(valid=("tok-1", "tok-2"))
-    _write_token(tmp_path, "tok-1", expires_at=time.time() + 3600)
+    write_token(tmp_path, "tok-1", expires_at=time.time() + 3600)
     provider = GigaCodeProvider(_config(tmp_path), transport=httpx.MockTransport(backend.handler))
     provider.connect()
-    _write_token(tmp_path, "tok-2", expires_at=time.time() + 7200)
+    write_token(tmp_path, "tok-2", expires_at=time.time() + 7200)
     later = time.time() + 3600
     monkeypatch.setattr(time, "time", lambda: later)
     assert provider.stream(_msgs()).message.content == "ok"
@@ -508,7 +508,7 @@ def test_config_errors(tmp_path: Path) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, text="forbidden")
 
-    _write_token(tmp_path)
+    write_token(tmp_path)
     provider = GigaCodeProvider(_config(tmp_path), transport=httpx.MockTransport(handler))
     with pytest.raises(ApiError, match=r"конфигурацию GigaCode \(403\)"):
         provider.connect()
@@ -520,11 +520,11 @@ def test_chat_http401_rereads_the_token_file(tmp_path: Path) -> None:
     provider.connect()
     assert provider.stream(_msgs()).message.content == "ok"
     backend.valid = {"tok-2"}  # бэкенд отозвал tok-1, пользователь вошёл заново
-    _write_token(tmp_path, "tok-2")
+    write_token(tmp_path, "tok-2")
     assert provider.stream(_msgs()).message.content == "ok"
     assert backend.requests[-1].headers["Authorization"] == "Bearer tok-2"
     backend.valid = {"tok-3"}
-    _write_token(tmp_path, "tok-3")
+    write_token(tmp_path, "tok-3")
     assert provider.complete(_msgs()).message.content == "ok"  # и без потока — так же
 
 
@@ -776,7 +776,7 @@ class RecordingHook:
     def __call__(self, kind: str, reason: str) -> str | None:
         self.calls.append((kind, reason))
         if self.tokens:
-            _write_token(self.tmp_path, self.tokens.pop(0))
+            write_token(self.tmp_path, self.tokens.pop(0))
         return self.block
 
 
@@ -867,7 +867,7 @@ def test_connect_with_hook_leaves_expired_token_to_the_request(tmp_path: Path) -
     backend = Backend(valid=("tok-1", "tok-2"))
     provider = _provider(backend, tmp_path)
     provider.connect()
-    _write_token(tmp_path, "tok-1", expires_at=int(time.time()) - 3600)  # истёк
+    write_token(tmp_path, "tok-1", expires_at=int(time.time()) - 3600)  # истёк
     provider.request_hook = RecordingHook(tmp_path, tokens=["tok-2"])
     provider.connect()  # перед ходом в REPL: без хука упало бы «токен истёк»
     assert provider.stream(_msgs()).message.content == "ok"

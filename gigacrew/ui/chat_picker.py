@@ -63,7 +63,7 @@ class PickerState:
         """Чат под курсором; None — ничего не найдено."""
         return self._visible[self.cursor] if self._visible else None
 
-    def set_query(self, query: str) -> None:
+    def search(self, query: str) -> None:
         """Меняет поисковый запрос: список отбирается заново, курсор — в начало."""
         self.query = query
         self._refilter()
@@ -260,14 +260,14 @@ class _PickerKeys:
         text = event.data.replace("\r", " ").replace("\n", " ")
         typed = "".join(ch for ch in text if ch.isprintable())
         if typed:
-            self._state.set_query(self._state.query + typed)
+            self._state.search(self._state.query + typed)
 
     def _erase(self, event: KeyPressEvent) -> None:
         if self._state.query:
-            self._state.set_query(self._state.query[:-1])
+            self._state.search(self._state.query[:-1])
 
     def _clear(self, event: KeyPressEvent) -> None:
-        self._state.set_query("")
+        self._state.search("")
 
     def _enter(self, event: KeyPressEvent) -> None:
         if self._state.selected is not None:

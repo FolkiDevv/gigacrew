@@ -50,7 +50,7 @@ def _has_live_area(ui: Console) -> bool:
 def _echoing_input(ui: Console, answers: Iterator[str]) -> Callable[[str], str]:
     # Ввод, как в терминале: приглашение остаётся в выводе, ответ — следующий заготовленный.
     def echo_input(prompt: str) -> str:
-        ui._c.print(prompt)
+        ui._console.print(prompt)
         return next(answers)
 
     return echo_input
@@ -260,7 +260,7 @@ def test_command_shows_last_line_or_tail_of_failure() -> None:
 def test_confirm_question_includes_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
     answers = iter(["д", "", "a", "a"])
-    monkeypatch.setattr(ui._c, "input", _echoing_input(ui, answers))
+    monkeypatch.setattr(ui._console, "input", _echoing_input(ui, answers))
     edit = ToolCallInfo("edit_file", "a.py", ToolKind.EDIT)
     assert ui.confirm(edit, None, dangerous=False).approval is Approval.YES
     out = buf.getvalue()
@@ -312,7 +312,7 @@ def test_reviewer_lines(monkeypatch: pytest.MonkeyPatch) -> None:
         "● $ ./deploy-check  ✔ код 0\n  рецензент (R) разрешил: проверка проекта\n"
     )
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "y")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "y")
     asked = ToolCallInfo(
         "run_shell",
         "./deploy-check",
@@ -330,7 +330,7 @@ def test_confirm_free_text_is_feedback_and_no_answer_is_marked(
 ) -> None:
     ui, _ = _console()
     answers = iter(["Используй uv run pytest", "ф", "нет"])
-    monkeypatch.setattr(ui._c, "input", lambda prompt: next(answers))
+    monkeypatch.setattr(ui._console, "input", lambda prompt: next(answers))
     command = ToolCallInfo("run_shell", "pytest", ToolKind.COMMAND)
     outcome = ui.confirm(command, None, dangerous=False)
     assert outcome.approval is Approval.NO
@@ -341,7 +341,7 @@ def test_confirm_free_text_is_feedback_and_no_answer_is_marked(
     def eof(prompt: str) -> NoReturn:
         raise EOFError
 
-    monkeypatch.setattr(ui._c, "input", eof)
+    monkeypatch.setattr(ui._console, "input", eof)
     outcome = ui.confirm(command, None, dangerous=False)
     assert outcome.approval is Approval.NO
     assert not outcome.answered
@@ -413,7 +413,7 @@ def _asking_console(
             raise reply
         return reply
 
-    monkeypatch.setattr(ui._c, "input", fake_input)
+    monkeypatch.setattr(ui._console, "input", fake_input)
     return ui, buf
 
 
@@ -600,14 +600,14 @@ def test_confirm_shows_long_command_entirely_and_offers_pager(
 ) -> None:
     buf = io.StringIO()
     ui = Console(no_color=True, file=buf, width=80)
-    monkeypatch.setattr(type(ui._c), "size", property(lambda _: ConsoleDimensions(80, 24)))
+    monkeypatch.setattr(type(ui._console), "size", property(lambda _: ConsoleDimensions(80, 24)))
     numbers = [format(index, "03d") for index in range(200)]
     body = "\n".join(f"print('line {number}')" for number in numbers)
     command = f"python3 - <<'EOF'\n{body}\nEOF"
     pages: list[str] = []
     monkeypatch.setattr(ui, "_page", lambda preview: pages.append(preview.text))
     answers = iter(["v", "y"])
-    monkeypatch.setattr(ui._c, "input", _echoing_input(ui, answers))
+    monkeypatch.setattr(ui._console, "input", _echoing_input(ui, answers))
     call = ToolCallInfo("run_shell", command[:70], ToolKind.COMMAND, purpose="печать строк")
     outcome = ui.confirm(call, Display(f"$ {command}", title="команда"), dangerous=False)
     assert outcome.approval is Approval.YES
@@ -624,7 +624,7 @@ def test_confirm_shows_long_command_entirely_and_offers_pager(
 
 def test_confirm_makes_invisible_characters_visible(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "n")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     command = "ls \u202etxt.exe\x1b[2K"
     ui.confirm(
         ToolCallInfo("run_shell", "ls", ToolKind.COMMAND),
@@ -709,7 +709,7 @@ def test_group_is_shown_in_live_area_while_running() -> None:
 
 def test_asked_call_leaves_group_and_gets_own_line(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "y")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "y")
     _step(ui, _edit("a.py"), ToolResult(content="", summary="изменён", display=_diff(1, 0)))
     asked = _edit("b.py")
     ui.on_tool_call(asked)
@@ -729,10 +729,10 @@ def test_sixteen_color_terminal_gets_ansi_palette(monkeypatch: pytest.MonkeyPatc
     monkeypatch.delenv("COLORTERM", raising=False)
     monkeypatch.setenv("TERM", "xterm")
     ui, _ = _live_console()
-    assert ui._p is MINT_ANSI
+    assert ui._palette is MINT_ANSI
     monkeypatch.setenv("COLORTERM", "truecolor")
     ui, _ = _live_console()
-    assert ui._p is MINT
+    assert ui._palette is MINT
 
 
 def test_prompt_toolkit_color_depth_follows_rich(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -759,25 +759,25 @@ def _sink_tool_name(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _sink_diff_title(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "n")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     preview = Display("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n", "diff", f"a{_ESC}.py")
     ui.confirm(ToolCallInfo("edit_file", "a.py", ToolKind.EDIT), preview, dangerous=False)
 
 
 def _sink_exact_title(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "n")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     preview = Display("$ make\nmake test", title=f"команда · {_ESC}")
     ui.confirm(ToolCallInfo("run_shell", "make", ToolKind.COMMAND), preview, dangerous=False)
 
 
 def _sink_purpose(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "n")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     call = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND, purpose=_ESC)
     ui.confirm(call, None, dangerous=True)
 
 
 def _sink_plain_question(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "1")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "1")
     question = Question(f"Q{_ESC}?", (QuestionOption(f"A{_ESC}", f"d{_ESC}"), QuestionOption("B")))
     ui._ask_plain(question, 1, 1)
 
@@ -851,7 +851,7 @@ def test_confirm_marks_every_invisible_character_in_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "n")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     call = ToolCallInfo("run_shell", "rm", ToolKind.COMMAND)
     ui.confirm(call, Display(f"$ rm{char} -rf x"), dangerous=True)
     out = buf.getvalue()
@@ -862,7 +862,7 @@ def test_confirm_marks_every_invisible_character_in_command(
 
 def test_confirm_marks_invisible_characters_in_diff(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "n")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-ok = 1\n+# \u202e; rm -rf ~ \u202c\x01\n"
     ui.confirm(
         ToolCallInfo("edit_file", "x.py", ToolKind.EDIT),
@@ -888,14 +888,14 @@ def test_confirm_shows_directory_command_runs_in(
     ctx = ToolContext(workspace=Workspace(tmp_path))
     tool = RunShellTool()
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "n")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     call = ToolCallInfo("run_shell", command, ToolKind.COMMAND)
     params = RunShellParams(command=command, cwd="vendor/lib/")
     ui.confirm(call, tool.preview(params, ctx), dangerous=dangerous)
     assert "▌ каталог  vendor/lib\n" in buf.getvalue()
     # в корне проекта — без строки о каталоге
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "n")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     ui.confirm(call, tool.preview(RunShellParams(command=command), ctx), dangerous=dangerous)
     assert "каталог" not in buf.getvalue()
 
@@ -920,7 +920,7 @@ def test_ask_defaults_to_no(
     expected: bool,
 ) -> None:
     ui, _ = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: reply)
+    monkeypatch.setattr(ui._console, "input", lambda prompt: reply)
     assert ui.ask("Разрешить хуки?", dangerous=True) is expected
 
 
@@ -930,7 +930,7 @@ def test_confirm_russian_layout_no_is_a_plain_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ui, _ = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: reply)
+    monkeypatch.setattr(ui._console, "input", lambda prompt: reply)
     outcome = ui.confirm(ToolCallInfo("run_shell", "ls", ToolKind.COMMAND), None, dangerous=False)
     assert outcome.approval is Approval.NO
     assert not outcome.feedback

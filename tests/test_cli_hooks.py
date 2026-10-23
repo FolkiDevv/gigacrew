@@ -12,7 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fakes import ScriptedProvider, text_turn
-from test_gigacode import BASE, CHAT, CONFIG, Backend, _token_file, _write_token
+from test_gigacode import BASE, CHAT, CONFIG, Backend, token_file, write_token
 
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore
 from gigacrew.agent.loop import Agent
@@ -201,7 +201,7 @@ def _request_hooks(
     requests_log = str(tmp_path / "requests.log")
     refresh = ""
     if token:
-        token_json = _token_file(token)
+        token_json = token_file(token)
         refresh = f"open(d['token_file'], 'w').write(json.dumps({token_json!r}))\n"
     stop = ""
     if block:
@@ -226,7 +226,7 @@ def gigacode(tmp_path: Path, oneshot: _OneShot, monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("GIGACREW_USER_AGENT", "test-agent/1.0")
     monkeypatch.setenv("GIGACREW_MODEL", "coder")
     monkeypatch.setenv("GIGACODE_HOME", str(tmp_path / "cli-home"))
-    _write_token(tmp_path, "tok-1")
+    write_token(tmp_path, "tok-1")
     backend = Backend(valid=("tok-1", "tok-2"))
     monkeypatch.setattr(
         app,

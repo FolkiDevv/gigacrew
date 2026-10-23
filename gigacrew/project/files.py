@@ -175,7 +175,7 @@ def is_excluded(root: Path, path: Path) -> bool:
     for index, part in enumerate(parts):
         sub = f"{sub}/{part}" if index else part  # первые index + 1 компонентов пути
         is_dir = index < last or is_last_dir
-        if stack.is_ignored(sub, is_dir):
+        if stack.is_ignored(sub, is_dir=is_dir):
             return True
         if index < last:
             stack = stack.enter(root, sub)

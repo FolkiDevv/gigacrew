@@ -196,6 +196,8 @@ convention = "google"
     "S107",
     "S108",   # пути /tmp/… — данные для классификатора путей
 ]
+# Классификатор команд: политики по семействам программ (см. setup.cfg).
+"gigacrew/safety/programs.py" = ["C901"]
 
 [tool.mypy]
 # https://mypy.readthedocs.io/en/latest/config_file.html — как в wemake-django-template.

@@ -1452,8 +1452,8 @@ class EvalSession:
             yes_all=False,
         )
 
-    def add(self, result: ScenarioResult, *, run: int) -> dict[str, Any]:
-        record = {**result.record, "run": run}
+    def add(self, scenario_result: ScenarioResult, *, run: int) -> dict[str, Any]:
+        record = {**scenario_result.record, "run": run}
         transcript = (
             self.directory
             / self.name
@@ -1461,7 +1461,7 @@ class EvalSession:
         )
         transcript.parent.mkdir(parents=True, exist_ok=True)
         transcript.write_text(
-            json.dumps(result.transcript, ensure_ascii=False, indent=1),
+            json.dumps(scenario_result.transcript, ensure_ascii=False, indent=1),
             encoding="utf-8",
         )
         record["transcript"] = transcript.relative_to(self.directory).as_posix()
@@ -1826,10 +1826,10 @@ def _frequent_error_lines(runs: _Runs) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Пробы шлюза (test_api_probe_live.py)
 # --------------------------------------------------------------------------- #
-def reasoning_texts(data: Mapping[str, Any]) -> list[str]:
+def reasoning_texts(response: Mapping[str, Any]) -> list[str]:
     """Рассуждения модели из ответа API v2 (сообщения ``role: "reasoning"``)."""
     texts: list[str] = []
-    for message in data.get("messages") or []:
+    for message in response.get("messages") or []:
         if not isinstance(message, Mapping) or message.get("role") != "reasoning":
             continue
         content = message.get("content")

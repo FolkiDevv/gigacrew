@@ -243,11 +243,11 @@ class TyServer:
         lines = _Lines()
         return [self._call_item(raw, lines) for raw in reply or []]
 
-    def incoming_calls(self, item: CallItem) -> list[CallItem]:
-        """Кто вызывает ``item``: места вызовов — в файле вызывающего."""
+    def incoming_calls(self, target: CallItem) -> list[CallItem]:
+        """Кто вызывает ``target``: места вызовов — в файле вызывающего."""
         lines = _Lines()
         out = []
-        for call in self._request("callHierarchy/incomingCalls", {"item": item.raw}) or []:
+        for call in self._request("callHierarchy/incomingCalls", {"item": target.raw}) or []:
             caller = call.get("from") or {}
             uri = caller.get(_URI, "")
             sites = [
@@ -257,12 +257,12 @@ class TyServer:
             out.append(self._call_item(caller, lines, sites))
         return out
 
-    def outgoing_calls(self, item: CallItem) -> list[CallItem]:
-        """Что вызывает ``item``: места вызовов — в файле самого ``item``."""
+    def outgoing_calls(self, target: CallItem) -> list[CallItem]:
+        """Что вызывает ``target``: места вызовов — в файле самого ``target``."""
         lines = _Lines()
-        uri = item.raw.get(_URI, "")
+        uri = target.raw.get(_URI, "")
         out = []
-        for call in self._request("callHierarchy/outgoingCalls", {"item": item.raw}) or []:
+        for call in self._request("callHierarchy/outgoingCalls", {"item": target.raw}) or []:
             sites = [
                 self._location(uri, span.get("start", {}), lines)
                 for span in call.get("fromRanges", [])

@@ -445,13 +445,14 @@ class Console(events.AgentEvents):  # noqa: WPS338
         self,
         *,
         no_color: bool = False,
-        file: IO[str] | None = None,
+        # Как у print() и rich.Console: поток вывода называется file.
+        file: IO[str] | None = None,  # noqa: WPS110
         force_terminal: bool | None = None,
         width: int | None = None,
         auto_refresh: bool = True,
     ):
         """Консоль поверх rich; ``file`` — куда печатать (по умолчанию — stdout)."""
-        self._c = _SafeConsole(
+        self._console = _SafeConsole(
             no_color=no_color,
             highlight=False,
             emoji=False,
@@ -460,10 +461,10 @@ class Console(events.AgentEvents):  # noqa: WPS338
             width=width,
         )
         # Точные цвета или, в терминале на 16 цветов, цвета ANSI его темы.
-        self._p = theme.palette_for(self._c.color_system)
-        self._c.push_theme(Theme(theme.markdown_styles(self._p)))
+        self._palette = theme.palette_for(self._console.color_system)
+        self._console.push_theme(Theme(theme.markdown_styles(self._palette)))
         self._no_color = no_color
-        self._live_ok = self._c.is_terminal and not self._c.is_dumb_terminal
+        self._live_ok = self._console.is_terminal and not self._console.is_dumb_terminal
         self._auto_refresh = auto_refresh
         self._live: _LiveArea | None = None
         self._md: MarkdownStream | None = None  # потоковый ответ (живой режим)
@@ -550,7 +551,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         """Печать в ленту (как у rich) — после итога идущей группы шагов."""
         self._flush_group()
         self._gap = False
-        self._c.print(*args, **kwargs)
+        self._console.print(*args, **kwargs)
         self._blank = not args
 
     def blank(self) -> None:
@@ -560,38 +561,42 @@ class Console(events.AgentEvents):  # noqa: WPS338
     def rule(self, title: str = "") -> None:
         """Горизонтальная черта во всю ширину, с заголовком или без."""
         self._flush_group()
-        self._c.rule(Text(title, style=self._p.muted) if title else "", style=self._p.dim)
+        self._console.rule(
+            Text(title, style=self._palette.muted) if title else "",
+            style=self._palette.dim,
+        )
         self._blank = False
 
     # Сообщения печатаются над временной областью, если она есть (например,
     # уведомление суб-агента во время его работы).
     def system(self, text: str) -> None:
         """Служебное сообщение."""
-        self._emit(Text(text, style=self._p.muted))
+        self._emit(Text(text, style=self._palette.muted))
 
     def error(self, text: str) -> None:
         """Сообщение об ошибке."""
-        danger = self._p.danger
+        danger = self._palette.danger
         self._emit(Text(f"{theme.ICON_FAIL} {text}", style=f"bold {danger}"))
 
     def warn(self, text: str) -> None:
         """Предупреждение."""
-        self._emit(Text(f"{theme.ICON_DANGER} {text}", style=self._p.warn))
+        self._emit(Text(f"{theme.ICON_DANGER} {text}", style=self._palette.warn))
 
-    def info(self, text: str) -> None:
+    # error/warn/info/success — как у logging: имя info здесь — часть привычного ряда.
+    def info(self, text: str) -> None:  # noqa: WPS110
         """Сведения для пользователя."""
-        self._emit(Text(text, style=self._p.muted))
+        self._emit(Text(text, style=self._palette.muted))
 
     def success(self, text: str) -> None:
         """Сообщение об успехе."""
-        ok = self._p.ok
+        ok = self._palette.ok
         self._emit(Text(f"{theme.ICON_OK} {text}", style=f"bold {ok}"))
 
     # ------------------------------ вывод ------------------------------ #
     def _out(self, renderable: RenderableType = "", **options: Any) -> None:
         """Печать над временной областью (если она есть)."""
         if self._live is None:
-            self._c.print(renderable, **options)
+            self._console.print(renderable, **options)
         else:
             self._live.print(renderable, **options)
         self._blank = isinstance(renderable, str) and not renderable
@@ -611,7 +616,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     def _fit(self, text: Text) -> Text:
         """Строка по ширине экрана: не переносится, а обрезается многоточием."""
-        text.truncate(max(self._c.width - 1, _MIN_WIDTH), overflow="ellipsis")
+        text.truncate(max(self._console.width - 1, _MIN_WIDTH), overflow="ellipsis")
         return text
 
     # ------------------------- временная область ------------------------ #
@@ -629,14 +634,14 @@ class Console(events.AgentEvents):  # noqa: WPS338
             hint=self._turn_hint if hint is None else hint,
             started=started,
             above=self._live_steps,
-            palette=self._p,
+            palette=self._palette,
         )
 
     def _start_live(self, view: _LiveView) -> None:
         self.stop_live()
         if not self._live_ok:
             return
-        area = _LiveArea(self._c, view, animate=self._auto_refresh)
+        area = _LiveArea(self._console, view, animate=self._auto_refresh)
         area.start()
         self._live = area
 
@@ -668,7 +673,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     # ------------------------------ баннер ------------------------------ #
     def _mode_color(self, mode: PermissionMode) -> str:
-        return self._p.warn if mode is PermissionMode.AUTO else self._p.brand
+        return self._palette.warn if mode is PermissionMode.AUTO else self._palette.brand
 
     def banner(
         self,
@@ -681,7 +686,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         mode: PermissionMode | None = None,
     ) -> None:
         """Приветственная панель; ``hints`` — пары (команда, краткое описание)."""
-        palette = self._p
+        palette = self._palette
         rows = [
             banner_art.title(palette),
             Text(f"v{version}", style=palette.dim),
@@ -698,15 +703,15 @@ class Console(events.AgentEvents):  # noqa: WPS338
                 ),
             )
         details = Group(*rows)
-        if self._c.width < _BANNER_MIN_WIDTH:
+        if self._console.width < _BANNER_MIN_WIDTH:
             body: RenderableType = details
         else:
             grid = Table.grid(padding=(0, 3))
             grid.add_column(vertical="middle", no_wrap=True)
             grid.add_column(vertical="middle")
-            grid.add_row(banner_art.rocket(palette, mono=self._c.no_color), details)
+            grid.add_row(banner_art.rocket(palette, mono=self._console.no_color), details)
             body = grid
-        self._c.print(
+        self._console.print(
             Panel(body, box=ROUNDED, border_style=palette.dim, padding=(1, 2), expand=False),
         )
         hint = Text(_SPACER)
@@ -715,7 +720,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
                 hint.append("   ")
             hint.append(cmd, style=palette.muted)
             hint.append(f" {desc}", style=palette.dim)
-        self._c.print(hint)
+        self._console.print(hint)
         if auto_approve:
             self.warn(
                 "авто-подтверждение включено (-y): изменения применяются без вопросов, "
@@ -730,8 +735,8 @@ class Console(events.AgentEvents):  # noqa: WPS338
     ) -> None:
         """Справка: таблица команд и клавиш."""
         table = Table.grid(padding=(0, 2))
-        table.add_column(style=self._p.fg, no_wrap=True)
-        table.add_column(style=self._p.muted)
+        table.add_column(style=self._palette.fg, no_wrap=True)
+        table.add_column(style=self._palette.muted)
         for name, desc in commands:
             # Text, а не строка: «/resume [id]» и описания скиллов — не разметка Rich.
             table.add_row(Text(name), Text(desc))
@@ -752,8 +757,8 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     def _gutter(self, lines: Lines, *, commit: bool = True) -> Lines:
         """Строки ответа: знак ✦ слева у первой строки ответа, отступ у остальных."""
-        brand = self._p.brand
-        mark = Segment(f"{theme.ICON_BRAND} ", self._c.get_style(f"bold {brand}"))
+        brand = self._palette.brand
+        mark = Segment(f"{theme.ICON_BRAND} ", self._console.get_style(f"bold {brand}"))
         pad = Segment(_SPACER)
         first = not self._answer_open
         out = []
@@ -765,7 +770,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         return out
 
     def _answer_width(self) -> int:
-        return max(self._c.width - 2, _MIN_WIDTH)
+        return max(self._console.width - 2, _MIN_WIDTH)
 
     @override
     def on_assistant_text(self, text: str) -> None:
@@ -773,8 +778,8 @@ class Console(events.AgentEvents):  # noqa: WPS338
         if not text.strip():
             return
         self._answer_start()
-        options = self._c.options.update_width(self._answer_width())
-        lines = self._c.render_lines(Markdown(sanitize(text)), options, pad=False)
+        options = self._console.options.update_width(self._answer_width())
+        lines = self._console.render_lines(Markdown(sanitize(text)), options, pad=False)
         self._out(SegmentLines(self._gutter(lines), new_lines=True))
         self._gap = True
 
@@ -800,14 +805,14 @@ class Console(events.AgentEvents):  # noqa: WPS338
             if not self._raw_started:
                 self._raw_started = True
                 self._answer_start()
-                self._c.file.write(f"{theme.ICON_BRAND} ")
+                self._console.file.write(f"{theme.ICON_BRAND} ")
                 self._blank = False
-            self._c.file.write(text)
-            self._c.file.flush()
+            self._console.file.write(text)
+            self._console.file.flush()
             return
         if self._md is None:
             self._answer_start()
-            self._md = MarkdownStream(self._c, width=self._answer_width())
+            self._md = MarkdownStream(self._console, width=self._answer_width())
             self._start_live(self._view("печатает", tail=self._answer_tail))
         lines = self._md.feed(text)
         if lines:
@@ -826,8 +831,8 @@ class Console(events.AgentEvents):  # noqa: WPS338
             self._gap = True
         if self._raw_started:
             self._raw_started = False
-            self._c.file.write("\n")
-            self._c.file.flush()
+            self._console.file.write("\n")
+            self._console.file.flush()
             self._gap = True
 
     # --------------------------- инструменты ---------------------------- #
@@ -880,7 +885,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
             return  # отказ или сбой — дальше вопрос пользователю с подробностями
         step = self._find(call)
         if step is None:
-            self._emit(Text(f"  {sanitize(review.approval)}", style=self._p.dim))
+            self._emit(Text(f"  {sanitize(review.approval)}", style=self._palette.dim))
         else:
             step.review = review  # строкой под шагом, когда он выполнится
 
@@ -930,7 +935,11 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     # -------- строки шагов -------- #
     def _stat(self, added: int, removed: int) -> Text:
-        return Text.assemble((f"+{added}", self._p.ok), " ", (f"−{removed}", self._p.danger))
+        return Text.assemble(
+            (f"+{added}", self._palette.ok),
+            " ",
+            (f"−{removed}", self._palette.danger),
+        )
 
     def _detail(self, call: events.ToolCallInfo, tool_result: ToolResult) -> str:
         """Итог удачного шага: у команды — последняя строка вывода (итог тестов, сборки).
@@ -960,7 +969,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         return sanitize(tool_result.summary or "ошибка")
 
     def _edit_line(self, call: events.ToolCallInfo, tool_result: ToolResult) -> Text:
-        palette = self._p
+        palette = self._palette
         path = _target(call)
         if not tool_result.ok:
             reason = sanitize(tool_result.summary or "ошибка")
@@ -991,14 +1000,14 @@ class Console(events.AgentEvents):  # noqa: WPS338
         else:
             lines = [self._tool_line(step, outcome)]
         if step.review is not None:
-            lines.append(Text(f"  {sanitize(step.review.approval)}", style=self._p.dim))
+            lines.append(Text(f"  {sanitize(step.review.approval)}", style=self._palette.dim))
         if not outcome.ok:
             lines += self._output_tail(outcome)
         return lines
 
     def _tool_line(self, step: _Step, outcome: ToolResult) -> Text:
         """Строка шага, кроме правки: что сделано, итог и время."""
-        palette = self._p
+        palette = self._palette
         call = step.call
         target = _target(call)
         head = f"$ {target}" if call.kind is ToolKind.COMMAND else f"{call.name} {target}"
@@ -1012,7 +1021,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         if step.seconds >= _SHOW_SECONDS:
             status.append(f"  ·  {step.seconds:.1f} с", style=palette.dim)
         # Не помещается в строку — короче команда, а не итог.
-        room = self._c.width - 1 - len(status) - 4
+        room = self._console.width - 1 - len(status) - 4
         head = head.strip()
         if len(head) > room:
             head = _clip(head, max(room, 24))
@@ -1030,7 +1039,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
             return []
         output = [line for line in sanitize(shown.text).splitlines() if line.strip()]
         output = [line for line in output if not _SEPARATOR_RE.match(line.strip())]
-        danger = self._p.danger
+        danger = self._palette.danger
         return [
             self._fit(Text.assemble(("  │ ", danger), (out_line, "")))
             for out_line in output[-_TAIL_LINES:]
@@ -1038,7 +1047,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     def _failed_line(self, step: _Step) -> Text:
         """Неудачный шаг внутри группы: ✘ что — почему."""
-        palette = self._p
+        palette = self._palette
         outcome = _step_outcome(step)
         call = step.call
         target = _target(call)
@@ -1051,7 +1060,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     def _read_lines(self, steps: Sequence[_Step]) -> list[Text]:
         """Итог группы чтений: «Изучил код» со счётчиками, цели, ошибки."""
-        palette = self._p
+        palette = self._palette
         if len(steps) == 1:
             return self._step_lines(steps[0])
         ok, failed = _split_done(steps)
@@ -1088,7 +1097,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         last = ok[-1]
         if len(ok) == 1:
             return self._edit_line(last.call, _step_outcome(last))
-        palette = self._p
+        palette = self._palette
         line = Text.assemble(
             (f"{theme.ICON_TOOL} ", palette.ok),
             (f"Изменил {_target(last.call)}", f"bold {palette.fg}"),
@@ -1100,7 +1109,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     def _files_lines(self, totals: dict[str, list[int]]) -> list[Text]:
         """Правки нескольких файлов: общий итог и строка на файл."""
-        palette = self._p
+        palette = self._palette
         files = _counted(len(totals), "файл", "файла", "файлов")
         head = Text.assemble(
             (f"{theme.ICON_TOOL} ", palette.ok),
@@ -1136,14 +1145,14 @@ class Console(events.AgentEvents):  # noqa: WPS338
         rows = []
         hidden = len(steps) - _LIVE_STEPS
         if hidden > 0:
-            rows.append(Text(f"  … ещё {hidden}", style=self._p.dim))
+            rows.append(Text(f"  … ещё {hidden}", style=self._palette.dim))
             steps = steps[-_LIVE_STEPS:]
         rows += [self._live_row(step) for step in steps]
         return rows
 
     def _live_row(self, step: _Step) -> Text:
         """Шаг во временной области: ✔/✘/◌, инструмент, цель и итог, если он есть."""
-        palette = self._p
+        palette = self._palette
         outcome = step.outcome
         if outcome is None:
             mark = (f"  {theme.ICON_PENDING} ", palette.warn)
@@ -1173,7 +1182,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         """Что показать над индикатором: идущую группу или шаги суб-агента."""
         group = self._group
         if group is not None and group.steps:
-            palette = self._p
+            palette = self._palette
             steps = list(group.steps)
             title = "Изучаю код" if group.kind == "read" else "Правлю файлы"
             calls = _counted(len(steps), "вызов", "вызова", "вызовов")
@@ -1254,7 +1263,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         lines = []
         if parts:
             summary = _COMMA.join(parts)
-            lines.append(Text(f"  {summary}", style=self._p.muted))
+            lines.append(Text(f"  {summary}", style=self._palette.muted))
         lines += [self._failed_line(step) for step in failed]
         return lines
 
@@ -1308,11 +1317,11 @@ class Console(events.AgentEvents):  # noqa: WPS338
         if stats.billed_tokens:
             parts.append(f"потрачено {format_tokens(stats.billed_tokens)} ток.")
         summary = "  ·  ".join(parts)
-        self._emit(Text(f"  {summary}", style=self._p.dim))
+        self._emit(Text(f"  {summary}", style=self._palette.dim))
 
     # -------------------------- подтверждения --------------------------- #
     def _stripe(self, *, dangerous: bool = False) -> tuple[str, str]:
-        return (f"  {theme.ICON_BAR} ", self._p.danger if dangerous else self._p.warn)
+        return (f"  {theme.ICON_BAR} ", self._palette.danger if dangerous else self._palette.warn)
 
     def _confirm_head(
         self,
@@ -1325,7 +1334,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         Однострочное превью команды показывается здесь же, как выполнится (с видимыми
         невидимыми символами). True — превью не помещается на экран.
         """
-        palette = self._p
+        palette = self._palette
         text = "" if preview is None else preview.text.rstrip("\n")
         if preview is not None and preview.kind != "diff" and text.strip() and "\n" not in text:
             head = visible_text(text, numbered=False, palette=palette)
@@ -1389,7 +1398,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         dangerous: bool,
     ) -> None:
         """Подробности вопроса о вызове: каталог, причина, цель, рецензент, история."""
-        palette = self._p
+        palette = self._palette
         labeled = self._confirm_labels(call, preview, dangerous=dangerous)
         width = max((len(label) for label, _, _ in labeled), default=0)
         for label, style, text in labeled:
@@ -1409,7 +1418,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         dangerous: bool,
     ) -> list[tuple[str, str, Text]]:
         """Подписанные строки вопроса о вызове: (подпись, её стиль, текст)."""
-        palette = self._p
+        palette = self._palette
         labeled = []
         where = _command_dir(call, preview)
         if where:  # где выполнится команда — тоже часть того, что подтверждается
@@ -1455,14 +1464,14 @@ class Console(events.AgentEvents):  # noqa: WPS338
         body.rstrip()
         body.no_wrap = False  # длинные строки — переносом
         body.overflow = "fold"
-        danger = self._p.danger
+        danger = self._palette.danger
         body.highlight_regex(_INVISIBLE_MARK_RE, f"bold {danger}")
         return Panel(
             body,
-            title=Text(preview.title or "изменения", style=self._p.fg),
+            title=Text(preview.title or "изменения", style=self._palette.fg),
             title_align="left",
             box=ROUNDED,
-            border_style=self._p.dim,
+            border_style=self._palette.dim,
             padding=(0, 1),
             expand=False,
         )
@@ -1472,7 +1481,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
         Возвращает True, если оно не помещается на экран (тогда предлагается просмотрщик).
         """
-        palette = self._p
+        palette = self._palette
         text = preview.text.rstrip("\n")
         lines = text.split("\n")
         title = preview.title or "превью"
@@ -1489,16 +1498,16 @@ class Console(events.AgentEvents):  # noqa: WPS338
             expand=False,
         )
         self._out(Padding(panel, (0, 0, 0, 4)))
-        width = max(self._c.size.width - 8, _MIN_WIDTH)
+        width = max(self._console.size.width - 8, _MIN_WIDTH)
         height = sum(max(1, -(-len(line) // width)) for line in lines)
-        return height > max(self._c.size.height - 8, 10)
+        return height > max(self._console.size.height - 8, 10)
 
     def _page(self, preview: Display) -> None:
         """Показать превью в просмотрщике (less и т.п.) — длинную команду целиком."""
-        body = visible_text(preview.text.rstrip("\n"), numbered=True, palette=self._p)
-        with self._input_guard(), self._c.pager(styles=True):
-            self._c.print(Text(preview.title or "превью", style=self._p.muted))
-            self._c.print(body)
+        body = visible_text(preview.text.rstrip("\n"), numbered=True, palette=self._palette)
+        with self._input_guard(), self._console.pager(styles=True):
+            self._console.print(Text(preview.title or "превью", style=self._palette.muted))
+            self._console.print(body)
 
     def ask(self, question: str, *, dangerous: bool = False) -> bool:
         """Вопрос да/нет. Ctrl+C/Ctrl+D — «нет»."""
@@ -1525,7 +1534,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         """
         self._flush_group()
         self.stop_live()
-        palette = self._p
+        palette = self._palette
         stripe = self._stripe(dangerous=dangerous)
         if self._no_keyboard():
             self._out(
@@ -1543,7 +1552,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
             return None
         notes = _question_notes(always, dangerous=dangerous, feedback=feedback, view=view)
         joined = " · ".join(notes)
-        if len(joined) + len(stripe[0]) < self._c.width:
+        if len(joined) + len(stripe[0]) < self._console.width:
             notes = [joined] if notes else []
         for note in notes:  # не помещаются в строку — по строке на подсказку
             self._out(Text.assemble(stripe, (note, palette.dim)))
@@ -1561,9 +1570,9 @@ class Console(events.AgentEvents):  # noqa: WPS338
         )
         try:
             with self._input_guard():
-                answer = self._c.input(prompt)
+                answer = self._console.input(prompt)
         except (EOFError, KeyboardInterrupt):
-            self._c.print()
+            self._console.print()
             return None
         finally:
             self._blank = False
@@ -1577,7 +1586,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         self.stop_live()
         if not _stdin_is_terminal():
             raise QuestionsUnavailableError("ввод не с клавиатуры")
-        palette = self._p
+        palette = self._palette
         answers: list[Answer] = []
         with self._input_guard():
             for number, question in enumerate(questions, 1):
@@ -1599,7 +1608,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     def _answered(self, question: Question, answer: Answer) -> Text:
         """Строка ленты после ответа: вопрос серым, ответ ярким."""
-        palette = self._p
+        palette = self._palette
         line = Text.assemble(
             (f"{theme.ICON_TOOL} ", palette.ok),
             (sanitize(question.text), palette.muted),
@@ -1621,7 +1630,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     def _question_body(self, question: Question) -> None:
         """Подробности к вопросу (например, план на одобрение) — Markdown в рамке."""
-        palette = self._p
+        palette = self._palette
         header = question.header or "подробности"
         self._emit(
             Panel(
@@ -1657,7 +1666,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
             try:
                 answer = self._plain_attempt(question, stripe)
             except (EOFError, KeyboardInterrupt):
-                self._c.print()
+                self._console.print()
                 return None
             finally:
                 self._blank = False
@@ -1672,7 +1681,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         stripe: tuple[str, str],
     ) -> None:
         """Вопрос запасного режима: заголовок и пронумерованные варианты."""
-        palette = self._p
+        palette = self._palette
         head = Text.assemble(
             stripe,
             ("? ", f"bold {palette.warn}"),
@@ -1702,12 +1711,12 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     def _plain_attempt(self, question: Question, stripe: tuple[str, str]) -> Answer | None:
         """Одна попытка ответа в запасном режиме; None — спросить заново."""
-        palette = self._p
+        palette = self._palette
         options = question.options
         custom = len(options) + 1
         hint = "номера через пробел" if question.multi_select else "номер"
         prompt = Text.assemble(stripe, (f"{hint} или ответ: ", palette.muted))
-        raw = self._c.input(prompt).strip()
+        raw = self._console.input(prompt).strip()
         numbers = raw.replace(",", " ").split()
         if not numbers:
             return None  # пусто или одни запятые — спросить заново
@@ -1720,7 +1729,9 @@ class Console(events.AgentEvents):  # noqa: WPS338
             return None
         text = ""
         if custom in picked:
-            text = self._c.input(Text.assemble(stripe, ("ваш ответ: ", palette.muted))).strip()
+            text = self._console.input(
+                Text.assemble(stripe, ("ваш ответ: ", palette.muted)),
+            ).strip()
             if not text:
                 return None
         labels = tuple(options[number - 1].label for number in picked if number != custom)
@@ -1747,7 +1758,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         return self._pick_chat_plain(chats, current_id)
 
     def _pick_chat_plain(self, chats: Sequence[ChatInfo], current_id: str) -> ChatInfo | None:
-        palette = self._p
+        palette = self._palette
         table = Table.grid(padding=(0, 2))
         table.add_column(style=palette.muted, justify="right", no_wrap=True)
         table.add_column(style=palette.dim, no_wrap=True)
@@ -1762,9 +1773,11 @@ class Console(events.AgentEvents):  # noqa: WPS338
         self.print(table)
         while True:
             try:
-                raw = self._c.input(Text("  номер чата (Enter — отмена): ", style=palette.muted))
+                raw = self._console.input(
+                    Text("  номер чата (Enter — отмена): ", style=palette.muted),
+                )
             except (EOFError, KeyboardInterrupt):
-                self._c.print()
+                self._console.print()
                 return None
             raw = raw.strip()
             if not raw:
@@ -1775,7 +1788,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     def chat_resumed(
         self,
-        info: ChatInfo,
+        chat: ChatInfo,
         messages: Sequence[Message],
         describe: Callable[[FunctionCall], events.ToolCallInfo] | None = None,
     ) -> None:
@@ -1786,11 +1799,11 @@ class Console(events.AgentEvents):  # noqa: WPS338
         ленте, но приглушены и без итогов: результатов в истории нет. Более ранние
         обмены — одной строкой со счётчиками: они сохранены в чате, но не печатаются.
         """
-        palette = self._p
+        palette = self._palette
         line = Text("↺ продолжаем чат ", style=palette.muted)
-        line.append(f"«{sanitize(info.title)}»", style=f"bold {palette.fg}")
+        line.append(f"«{sanitize(chat.title)}»", style=f"bold {palette.fg}")
         line.append(
-            f" · {chat_size(info.requests, info.messages)} · {format_when(info.updated_at)}",
+            f" · {chat_size(chat.requests, chat.messages)} · {format_when(chat.updated_at)}",
             style=palette.muted,
         )
         self.print(line)
@@ -1819,7 +1832,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         last: bool,
     ) -> None:
         """Обмен продолженного чата (``messages[0]`` — запрос); ответ ранних — сокращён."""
-        palette = self._p
+        palette = self._palette
         shown = clip_lines(
             request_text(messages[0].content),
             head=3,
@@ -1865,14 +1878,14 @@ class Console(events.AgentEvents):  # noqa: WPS338
         if len(entries) > RESUME_CALLS:
             hidden = sum(len(entry) for entry in entries[:-RESUME_CALLS])
             word = plural(hidden, "вызов", "вызова", "вызовов")
-            lines.append(Text(f"  … ещё {hidden} {word} инструментов", style=self._p.dim))
+            lines.append(Text(f"  … ещё {hidden} {word} инструментов", style=self._palette.dim))
             entries = entries[-RESUME_CALLS:]
         lines += [line for entry in entries for line in self._history_entry(entry)]
         return lines
 
     def _history_entry(self, entry: Sequence[events.ToolCallInfo]) -> list[Text]:
         """Строка шага (группы вызовов) из истории и, у группы чтений, её цели."""
-        palette = self._p
+        palette = self._palette
         head, detail = _history_head(entry)
         lines = [
             self._fit(Text.assemble((f"{theme.ICON_TOOL} ", palette.dim), (head, palette.muted))),

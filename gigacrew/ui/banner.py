@@ -129,7 +129,7 @@ def _append_cells(
         art.append(symbol, style=style)
 
 
-def rocket(p: Palette = MINT, *, mono: bool = False) -> Text:
+def rocket(palette: Palette = MINT, *, mono: bool = False) -> Text:
     """Ракета полублоками ▀▄: в клетке терминала два пикселя друг над другом.
 
     Поэтому пиксели квадратные, а ракета — 29×13 клеток. ``mono`` — без цвета: два
@@ -140,7 +140,7 @@ def rocket(p: Palette = MINT, *, mono: bool = False) -> Text:
     for index in range(0, len(rows), 2):
         if index:
             art.append("\n")
-        _append_cells(art, p, rows[index], rows[index + 1], mono=mono)
+        _append_cells(art, palette, rows[index], rows[index + 1], mono=mono)
     return art
 
 
@@ -156,9 +156,9 @@ _FONT: Mapping[str, tuple[str, str, str]] = MappingProxyType({
 })
 
 
-def title(p: Palette = MINT) -> Text:
+def title(palette: Palette = MINT) -> Text:
     """Название «gigacrew» крупными буквами: «giga» цветом знака, «crew» — основным."""
-    word = (("giga", f"bold {p.brand}"), ("crew", f"bold {p.fg}"))
+    word = (("giga", f"bold {palette.brand}"), ("crew", f"bold {palette.fg}"))
     text = Text()
     for row in range(3):
         if row:

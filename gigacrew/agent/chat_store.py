@@ -514,12 +514,12 @@ class ChatRecorder:
         self._version = None
         self.title = ""
 
-    def switch_to(self, info: ChatInfo) -> None:
+    def switch_to(self, chat: ChatInfo) -> None:
         """Дальнейшие сохранения идут в этот (продолженный) чат."""
-        self._chat_id = info.id
-        self._created_at = info.created_at
-        self._version = self.store.version(info.id)
-        self.title = info.title
+        self._chat_id = chat.id
+        self._created_at = chat.created_at
+        self._version = self.store.version(chat.id)
+        self.title = chat.title
 
     def save(self, conversation: Conversation, *, model: str = "") -> str | None:
         """Сохраняет диалог; возвращает предупреждение или None.

@@ -98,14 +98,15 @@ def _check_summary(summary: Summary, messages: Sequence[Message]) -> None:
         raise ValueError("граница сжатия не может приходиться на результат инструмента")
 
 
+# Версия 2 — несколько вызовов инструментов в сообщении (``function_calls``, API v2).
+# Версия 1 читается: её единственный ``function_call`` приводит :class:`Message`.
+# Ключ ``summary`` необязателен: версия gigacrew без сжатия его не видит и
+# отправляет журнал целиком, как раньше.
+FORMAT_VERSION = 2
+
+
 class Conversation:
     """История диалога: сообщения, расход токенов и граница сжатия контекста."""
-
-    # Версия 2 — несколько вызовов инструментов в сообщении (``function_calls``, API v2).
-    # Версия 1 читается: её единственный ``function_call`` приводит :class:`Message`.
-    # Ключ ``summary`` необязателен: версия gigacrew без сжатия его не видит и
-    # отправляет журнал целиком, как раньше.
-    FORMAT_VERSION = 2
 
     def __init__(
         self,
@@ -251,7 +252,7 @@ class Conversation:
     def to_dict(self) -> dict[str, Any]:
         """Диалог версионированным словарём для сохранения чата (см. :meth:`from_dict`)."""
         serialized: dict[str, Any] = {
-            "version": self.FORMAT_VERSION,
+            "version": FORMAT_VERSION,
             "messages": [message.model_dump(exclude_defaults=True) for message in self._messages],
             "last_usage": self._last_usage.model_dump() if self._last_usage else None,
         }
@@ -260,17 +261,17 @@ class Conversation:
         return serialized
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> Conversation:
+    def from_dict(cls, payload: Mapping[str, Any]) -> Conversation:
         """Диалог из словаря :meth:`to_dict`; неверный формат — :class:`ValueError`."""
-        version = data.get("version")
+        version = payload.get("version")
         if version not in _READABLE_VERSIONS:
             raise ValueError(f"Неподдерживаемая версия формата диалога: {version!r}")
         # Файл чата — тоже вход истории: «\udcee» в JSON читается одиночным суррогатом.
         messages = [
-            _clean_message(Message.model_validate(entry)) for entry in data.get("messages") or []
+            _clean_message(Message.model_validate(entry)) for entry in payload.get("messages") or []
         ]
-        usage = data.get("last_usage")
-        raw = data.get("summary")
+        usage = payload.get("last_usage")
+        raw = payload.get("summary")
         summary = None
         if raw is not None:
             if not isinstance(raw, Mapping):

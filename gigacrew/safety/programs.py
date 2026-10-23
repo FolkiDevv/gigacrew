@@ -774,9 +774,9 @@ _PAGERS = frozenset(("cat", "less", "more", ""))
 _SECRETISH = re.compile(r"KEY|TOKEN|SECRET|PASS|CRED|AUTH|COOKIE|SESSION|PRIVATE", re.IGNORECASE)
 
 
-def check_env(name: str, value: Word, *, reading: bool) -> Part | None:
+def check_env(name: str, word: Word, *, reading: bool) -> Part | None:
     """Префиксное присваивание ``NAME=value cmd`` (или ``export``): None — безвредно."""
-    if name in {"GIT_PAGER", "PAGER"} and value.static and value.value in _PAGERS:
+    if name in {"GIT_PAGER", "PAGER"} and word.static and word.value in _PAGERS:
         return None
     if name == "PYTHONPATH":
         return None  # проверяется у интерпретатора Python

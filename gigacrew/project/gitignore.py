@@ -190,7 +190,7 @@ class IgnoreStack:
         # как git (2.32+): .gitignore-симлинк в рабочем дереве не читается
         return self.push(rel_dir, _read_rules(directory / GITIGNORE_NAME, follow_symlink=False))
 
-    def is_ignored(self, rel_posix: str, is_dir: bool) -> bool:
+    def is_ignored(self, rel_posix: str, *, is_dir: bool) -> bool:
         """Путь (от корня проекта) исключён правилами; решает последнее совпадение."""
         ignored = False
         for base, rules in self.levels:

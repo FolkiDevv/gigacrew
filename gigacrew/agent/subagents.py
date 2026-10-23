@@ -133,10 +133,10 @@ class SubagentTrail:
 class SubagentEvents(AgentEvents):
     """События суб-агента → события основного агента (``parent``)."""
 
-    def __init__(self, parent: AgentEvents, info: SubagentInfo):
-        """События суб-агента ``info`` передаются в события ``parent``."""
+    def __init__(self, parent: AgentEvents, subagent: SubagentInfo):
+        """События суб-агента ``subagent`` передаются в события ``parent``."""
         self._parent = parent
-        self._subagent = info
+        self._subagent = subagent
         self._wrapping = False
         self.trail = SubagentTrail()
 

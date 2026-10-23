@@ -162,6 +162,8 @@ def external_path(path: str) -> str:
 # find_references
 # --------------------------------------------------------------------------- #
 class FindReferencesParams(BaseModel):
+    """Параметры find_references: имя символа, его вид и где искать."""
+
     query: str = Field(
         description=(
             "Name of the definition (exact, case-insensitive): 'ProjectIndex', 'refresh'; "
@@ -378,6 +380,8 @@ class FindReferencesTool(Tool[FindReferencesParams]):
 # goto_definition
 # --------------------------------------------------------------------------- #
 class GotoDefinitionParams(BaseModel):
+    """Параметры goto_definition: файл, строка и имя в ней."""
+
     path: str = Field(description="File relative to the project root")
     line: int = Field(description="Line number (1-based) where the name occurs")
     name: str = Field(
@@ -550,6 +554,8 @@ class GotoDefinitionTool(Tool[GotoDefinitionParams]):
 # call_hierarchy
 # --------------------------------------------------------------------------- #
 class CallHierarchyParams(BaseModel):
+    """Параметры call_hierarchy: функция или метод, направление и глубина."""
+
     query: str = Field(
         description="Function or method: 'helper', 'ProjectIndex.refresh' (exact name)",
     )

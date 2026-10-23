@@ -20,9 +20,9 @@ _HOUR_SECONDS = 3600
 _ELLIPSIS = "…"
 
 
-def plural(n: int, one: str, few: str, many: str) -> str:
+def plural(count: int, one: str, few: str, many: str) -> str:
     """Форма слова для числа: 1 шаг, 2 шага, 5 шагов."""
-    number = abs(n)
+    number = abs(count)
     if number % 10 == 1 and number % 100 != _TEEN_ONE:
         return one
     if 2 <= number % 10 <= 4 and not _TEEN_FEW_FIRST <= number % 100 <= _TEEN_FEW_LAST:
@@ -50,13 +50,13 @@ def mode_badge(mode: PermissionMode) -> str:
     return f"{icon} {mode.label}" if icon else mode.label
 
 
-def format_tokens(n: int) -> str:
+def format_tokens(count: int) -> str:
     """Компактная запись числа токенов: 950, 12.3k, 120k, 1.2M."""
-    if n < 1000:
-        return str(n)
-    scaled, suffix = n / 1000, "k"
+    if count < 1000:
+        return str(count)
+    scaled, suffix = count / 1000, "k"
     if round(scaled) >= 1000:
-        scaled, suffix = n / _MILLION, "M"
+        scaled, suffix = count / _MILLION, "M"
     text = f"{scaled:.1f}" if scaled < _FRACTION_LIMIT else f"{scaled:.0f}"
     return text.removesuffix(".0") + suffix
 
