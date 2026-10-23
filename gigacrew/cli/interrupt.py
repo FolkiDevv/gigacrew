@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+# interrupt_main есть только в _thread: в threading нет способа прервать основной поток.
+import _thread  # noqa: PLC2701
 import codecs
 import contextlib
 import os
@@ -29,13 +31,25 @@ import select
 import signal
 import sys
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from typing import Any
 
 _ESC = 0x1B
-_ERASE = (0x7F, 0x08)  # Backspace
+_ERASE = (0x7F, 0x8)  # Backspace
 _SEQUENCE_GAP_SECONDS = 0.03  # байты ESC-последовательности приходят пачкой
 _POLL_SECONDS = 0.1
+_POSIX = "posix"  # os.name POSIX-систем: терминал — через termios, иначе — msvcrt
+_READ_SIZE = 1024  # сколько байтов читать из терминала за раз
+
+# Байты ESC-последовательностей.
+_CSI_START = 0x5B  # «[»: ESC [ … — CSI-последовательность
+_SS3_START = 0x4F  # «O»: ESC O + один байт (F1–F4 и др.)
+_CSI_FINAL_MIN = 0x40  # финальный байт CSI — 0x40–0x7E; параметры — 0x20–0x3F
+_CSI_FINAL_MAX = 0x7E
+_BACKTAB_FINAL = 0x5A  # «Z»: ESC [ Z — Shift+Tab
+_UTF8_LEAD_MIN = 0xC0  # первый байт многобайтного символа UTF-8
+_UTF8_TAIL_MIN = 0x80  # байты продолжения UTF-8 — 0x80–0xBF
+_UTF8_TAIL_MAX = 0xBF
 
 
 class KeyParser:
@@ -51,7 +65,8 @@ class KeyParser:
         on_escape: Callable[[], None],
         more_pending: Callable[[], bool],
         on_backtab: Callable[[], None] | None = None,
-    ):
+    ) -> None:
+        """Создать разбор с обработчиками Esc и Shift+Tab."""
         self._on_escape = on_escape
         self._more_pending = more_pending
         self._on_backtab = on_backtab
@@ -63,69 +78,85 @@ class KeyParser:
         # "alt" — хвост многобайтного символа после ESC (Alt+буква).
         self._state = ""
 
-    def feed(self, data: bytes) -> None:
-        i = 0
-        while i < len(data):
-            byte = data[i]
-            if byte == _ESC:
-                if i + 1 < len(data) or self._more_pending():
-                    self._state = "esc"  # стрелка, Alt+клавиша и т.п.
-                else:
-                    self._state = ""
-                    self._on_escape()
-                i += 1
-                continue
-            if self._state:
-                if not self._skip_sequence_byte(byte):
-                    continue  # байт не относится к последовательности — разобрать заново
-                i += 1
-                continue
-            if byte in _ERASE:
-                if self._text:
-                    self._text.pop()
-                i += 1
-                continue
-            j = i
-            while j < len(data) and data[j] != _ESC and data[j] not in _ERASE:
-                j += 1
-            self._text.extend(self._decoder.decode(data[i:j]))
-            i = j
-
-    def _skip_sequence_byte(self, byte: int) -> bool:
-        """Поглощает байт ESC-последовательности. False — последовательность кончилась
-        раньше, и байт нужно обработать как обычный."""
-        state = self._state
-        if state == "esc":
-            if byte == 0x5B:  # [
-                self._state = "csi"
-                self._csi_params = False
-            elif byte == 0x4F:  # O
-                self._state = "ss3"
-            else:  # Alt+символ: сам символ отбрасываем целиком
-                self._state = "alt" if byte >= 0xC0 else ""
-            return True
-        if state == "csi":
-            if 0x40 <= byte <= 0x7E:  # финальный байт; параметры — 0x20–0x3F
-                self._state = ""
-                if byte == 0x5A and not self._csi_params and self._on_backtab is not None:
-                    self._on_backtab()  # ESC [ Z — Shift+Tab
-            else:
-                self._csi_params = True
-            return True
-        if state == "ss3":
-            self._state = ""
-            return True
-        # "alt": байты продолжения UTF-8
-        if 0x80 <= byte <= 0xBF:
-            return True
-        self._state = ""
-        return False
+    def feed(self, chunk: bytes) -> None:
+        """Разобрать очередную пачку прочитанных байтов."""
+        position = 0
+        while position < len(chunk):
+            position = self._feed_at(chunk, position)
 
     def take_text(self) -> str:
         """Набранный текст (без завершающих переводов строк); буфер очищается."""
         text = "".join(self._text).replace("\r", "\n").rstrip("\n")
         self._text.clear()
         return "".join(ch for ch in text if ch in "\n\t" or ch.isprintable())
+
+    def _feed_at(self, chunk: bytes, position: int) -> int:
+        """Разобрать байты пачки с позиции ``position``; вернуть позицию следующего."""
+        byte = chunk[position]
+        if byte == _ESC:
+            if position + 1 < len(chunk) or self._more_pending():
+                self._state = "esc"  # стрелка, Alt+клавиша и т.п.
+            else:
+                self._state = ""
+                self._on_escape()
+            return position + 1
+        if self._state:
+            if self._skip_sequence_byte(byte):
+                return position + 1
+            return position  # байт не относится к последовательности — разобрать заново
+        if byte in _ERASE:
+            if self._text:
+                self._text.pop()
+            return position + 1
+        return self._feed_text(chunk, position)
+
+    def _feed_text(self, chunk: bytes, start: int) -> int:
+        """Добавить в буфер текст до ближайшего ESC или Backspace; вернуть его конец."""
+        end = start
+        while end < len(chunk) and chunk[end] != _ESC and chunk[end] not in _ERASE:
+            end += 1
+        self._text.extend(self._decoder.decode(chunk[start:end]))
+        return end
+
+    def _skip_sequence_byte(self, byte: int) -> bool:
+        """Поглощает байт ESC-последовательности.
+
+        False — последовательность кончилась раньше, и байт нужно обработать как обычный.
+        """
+        state = self._state
+        if state == "esc":
+            self._skip_after_escape(byte)
+            return True
+        if state == "csi":
+            self._skip_csi_byte(byte)
+            return True
+        if state == "ss3":
+            self._state = ""
+            return True
+        # "alt": байты продолжения UTF-8
+        if _UTF8_TAIL_MIN <= byte <= _UTF8_TAIL_MAX:
+            return True
+        self._state = ""
+        return False
+
+    def _skip_after_escape(self, byte: int) -> None:
+        """Первый байт после ESC: вид последовательности."""
+        if byte == _CSI_START:
+            self._state = "csi"
+            self._csi_params = False
+        elif byte == _SS3_START:
+            self._state = "ss3"
+        else:  # Alt+символ: сам символ отбрасываем целиком
+            self._state = "alt" if byte >= _UTF8_LEAD_MIN else ""
+
+    def _skip_csi_byte(self, byte: int) -> None:
+        """Байт CSI-последовательности: параметр или финальный байт."""
+        if _CSI_FINAL_MIN <= byte <= _CSI_FINAL_MAX:
+            self._state = ""
+            if byte == _BACKTAB_FINAL and not self._csi_params and self._on_backtab is not None:
+                self._on_backtab()  # ESC [ Z — Shift+Tab
+        else:
+            self._csi_params = True
 
 
 def _interrupt_main() -> None:
@@ -135,8 +166,6 @@ def _interrupt_main() -> None:
         if main is not None:
             signal.pthread_kill(main, signal.SIGINT)
             return
-    import _thread
-
     _thread.interrupt_main()
 
 
@@ -150,7 +179,11 @@ class EscInterrupt:
         enabled: bool | None = None,
         interrupt: Callable[[], None] = _interrupt_main,
         on_backtab: Callable[[], object] | None = None,
-    ):
+    ) -> None:
+        """Подготовить чтение клавиш из ``fd`` (по умолчанию — stdin).
+
+        ``enabled`` None — включено, если ``fd`` — терминал и платформа поддерживается.
+        """
         if fd is None:
             try:
                 fd = sys.stdin.fileno()
@@ -178,6 +211,7 @@ class EscInterrupt:
 
     # ------------------------------------------------------------------ #
     def __enter__(self) -> EscInterrupt:
+        """Начало хода: терминал — в cbreak-режим, клавиши читает фоновый поток."""
         if not self.enabled:
             return self
         if self._thread is not None:
@@ -193,29 +227,21 @@ class EscInterrupt:
         return self
 
     def __exit__(self, *exc: object) -> None:
+        """Конец хода: прерываний больше нет, поток чтения остановлен, терминал прежний."""
         if not self.enabled or self._thread is None:
             return
         try:
             with self._lock:
                 self._armed = False  # после этого прерываний не будет
-        finally:
+        except BaseException:
             # Esc в самом конце хода: его SIGINT может прервать ожидание блокировки,
             # но поток чтения всё равно останавливается, а терминал — восстанавливается.
             self._shutdown()
-
-    def _shutdown(self) -> None:
-        self._armed = False
-        self._stop.set()
-        thread, self._thread = self._thread, None
-        try:
-            if thread is not None:
-                thread.join(timeout=1)
-        finally:
-            self._restore_mode()
-            self._saved_mode = None
+            raise
+        self._shutdown()
 
     @contextlib.contextmanager
-    def paused(self) -> Iterator[None]:
+    def paused(self) -> Generator[None]:
         """Временно вернуть терминал (для ``input()`` с вопросом пользователю)."""
         if not self.enabled or self._thread is None or self._pause.is_set():
             yield
@@ -235,6 +261,24 @@ class EscInterrupt:
         return self._parser.take_text()
 
     # ------------------------------------------------------------------ #
+    def _shutdown(self) -> None:
+        self._armed = False
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        try:
+            if thread is not None:
+                thread.join(timeout=1)
+        except BaseException:
+            self._release_terminal()  # и при прерванном ожидании потока
+            raise
+        self._release_terminal()
+
+    def _release_terminal(self) -> None:
+        """Вернуть терминал в сохранённый режим и забыть его."""
+        self._restore_mode()
+        self._saved_mode = None
+
     def _on_escape(self) -> None:
         with self._lock:
             if not self._armed:
@@ -258,19 +302,20 @@ class EscInterrupt:
                 continue
             if not self._readable(_POLL_SECONDS):
                 continue
-            data = self._read()
-            if not data:
-                if os.name == "posix":
+            chunk = self._read()
+            if not chunk:
+                if os.name == _POSIX:
                     break  # EOF
                 continue  # Windows: прочитаны только стрелки/F-клавиши
-            self._parser.feed(data)
+            self._parser.feed(chunk)
         self._idle.set()
 
     # --------------------------- платформа ---------------------------- #
     def _enter_raw(self) -> None:
-        if os.name == "posix":
-            import termios
-            import tty
+        if os.name == _POSIX:
+            # termios и tty есть только в POSIX: импорт — на этой ветке.
+            import termios  # noqa: PLC0415
+            import tty  # noqa: PLC0415
 
             if self._saved_mode is None:
                 self._saved_mode = termios.tcgetattr(self._fd)
@@ -278,36 +323,40 @@ class EscInterrupt:
             tty.setcbreak(self._fd, termios.TCSANOW)
 
     def _restore_mode(self) -> None:
-        if os.name == "posix" and self._saved_mode is not None:
-            import termios
+        if os.name == _POSIX and self._saved_mode is not None:
+            # termios есть только в POSIX: импорт — на этой ветке.
+            import termios  # noqa: PLC0415
 
             with contextlib.suppress(termios.error, OSError):
                 termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved_mode)
 
     def _readable(self, timeout: float) -> bool:
-        if os.name == "posix":
+        if os.name == _POSIX:
             ready, _, _ = select.select([self._fd], [], [], timeout)
             return bool(ready)
-        import msvcrt  # type: ignore[import-not-found]
+        # msvcrt есть только в Windows: импорт — на этой ветке.
+        import msvcrt  # noqa: PLC0415
 
-        if msvcrt.kbhit():
+        if msvcrt.kbhit():  # type: ignore[attr-defined, unused-ignore]
             return True
         self._stop.wait(timeout)
-        return bool(msvcrt.kbhit())
+        return bool(msvcrt.kbhit())  # type: ignore[attr-defined, unused-ignore]
 
     def _read(self) -> bytes:
-        if os.name == "posix":
+        if os.name == _POSIX:
             try:
-                return os.read(self._fd, 1024)
+                return os.read(self._fd, _READ_SIZE)
             except OSError:
                 return b""
-        import msvcrt  # type: ignore[import-not-found]
+        # msvcrt есть только в Windows: импорт — на этой ветке.
+        import msvcrt  # noqa: PLC0415
 
-        chars = []
-        while msvcrt.kbhit():
-            ch = msvcrt.getwch()
-            if ch in ("\x00", "\xe0"):  # стрелки и F-клавиши: префикс + код
-                if msvcrt.getwch() == "\x0f":  # Shift+Tab — как в POSIX-терминале
+        chars: list[str] = []
+        while msvcrt.kbhit():  # type: ignore[attr-defined, unused-ignore]
+            ch = msvcrt.getwch()  # type: ignore[attr-defined, unused-ignore]
+            if ch in {"\x00", "\xe0"}:  # стрелки и F-клавиши: префикс + код
+                # Shift+Tab — как в POSIX-терминале
+                if msvcrt.getwch() == "\x0f":  # type: ignore[attr-defined, unused-ignore]
                     chars.append("\x1b[Z")
                 continue
             chars.append(ch)
@@ -315,15 +364,17 @@ class EscInterrupt:
 
 
 def _supported() -> bool:
-    if os.name == "posix":
+    if os.name == _POSIX:
+        # Модули терминала есть не во всех сборках: проверяем, что импорт удаётся.
         try:
-            import termios  # noqa: F401
-            import tty  # noqa: F401
+            import termios  # noqa: F401, PLC0415
+            import tty  # noqa: F401, PLC0415
         except ImportError:
             return False
         return True
+    # msvcrt есть только в Windows: проверяем, что импорт удаётся.
     try:
-        import msvcrt  # type: ignore[import-not-found]  # noqa: F401
+        import msvcrt  # noqa: F401, PLC0415
     except ImportError:
         return False
     return True

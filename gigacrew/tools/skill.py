@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import override
 
 from pydantic import BaseModel, Field
 
@@ -30,9 +31,11 @@ MAX_SKILL_CHARS = 60_000  # как MAX_READ_CHARS у read_file
 MAX_LISTED_FILES = 50
 
 
-class SkillParams(BaseModel):
+# Без docstring: он ушёл бы в JSON-схему параметров, которую видит модель.
+class SkillParams(BaseModel):  # noqa: D101
     name: str = Field(description="Skill name from the Skills list in your context")
-    file: str | None = Field(
+    # Имя параметра — часть схемы инструмента, которую видит модель.
+    file: str | None = Field(  # noqa: WPS110
         default=None,
         description="A file of the skill directory to read (relative to it), e.g. a "
         "reference the skill mentions. Omit to load the skill itself",
@@ -65,40 +68,50 @@ def _read(path: Path, shown: str) -> str:
             text = fh.read(MAX_SKILL_CHARS + 1)
     except UnicodeDecodeError:
         raise ToolError(f"Не текстовый файл (не UTF-8): {shown}") from None
-    except OSError as e:
-        raise ToolError(f"Не удалось прочитать {shown}: {e}") from None
+    except OSError as exc:
+        raise ToolError(f"Не удалось прочитать {shown}: {exc}") from None
     if len(text) > MAX_SKILL_CHARS:
-        text = text[:MAX_SKILL_CHARS] + f"\n… (обрезано: файл длиннее {MAX_SKILL_CHARS} символов)"
+        head = text[:MAX_SKILL_CHARS]
+        text = f"{head}\n… (обрезано: файл длиннее {MAX_SKILL_CHARS} символов)"
     return text
 
 
-class SkillTool(Tool):
+class SkillTool(Tool[SkillParams]):
+    """Инструмент skill: инструкция скилла или файл из его каталога."""
+
     name = "skill"
     description = (
         "Loads a skill — ready-made instructions for a typical task — by its name from "
         "the Skills list in your context. Returns the instructions and the list of the "
         "skill's files; pass file to read one of them."
     )
-    Params = SkillParams
+    # Модель параметров, а не константа: имя задаёт базовый класс Tool.
+    Params = SkillParams  # noqa: WPS115
 
+    @override
     def describe(self, params: SkillParams) -> str:
+        """Имя скилла и запрошенный файл, если он задан."""
         return f"{params.name}/{params.file}" if params.file else params.name
 
+    @override
     def paths(self, params: SkillParams) -> tuple[str, ...]:
+        """Путей проекта нет: файлы скилла читаются из его каталога."""
         return ()
 
+    @override
     def run(self, params: SkillParams, ctx: ToolContext) -> ToolResult:
+        """Инструкция скилла со списком его файлов или содержимое одного файла."""
         skills = discover_skills(ctx.workspace)
         skill = find_skill(skills, params.name.strip())
         if skill is None:
-            names = ", ".join(s.name for s in skills) or "скиллов нет"
+            names = ", ".join(found.name for found in skills) or "скиллов нет"
             raise ToolError(f"Скилл не найден: {params.name}. Доступные: {names}")
         if params.file:
             try:
                 path = resolve_in_root(skill.directory, params.file)
             except SandboxError:
                 raise ToolError(
-                    f"Путь '{params.file}' выходит за пределы каталога скилла {skill.name}"
+                    f"Путь '{params.file}' выходит за пределы каталога скилла {skill.name}",
                 ) from None
             shown = f"{skill.name}/{params.file}"
             if not path.is_file():
@@ -112,6 +125,6 @@ class SkillTool(Tool):
             parts.append(
                 "Files of the skill (read with the skill tool and file; commands run in the "
                 "project root, so use the directory path above):\n"
-                + "\n".join(f"- {f}" for f in files)
+                + "\n".join(f"- {file_name}" for file_name in files),
             )
         return ToolResult(content="\n\n".join(parts), summary=f"скилл {skill.name}")

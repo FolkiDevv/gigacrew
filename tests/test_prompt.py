@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import os
 import threading
+from contextlib import ExitStack
+from pathlib import Path
+from typing import override
 
 import pytest
+from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
-from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.input import PipeInput, create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.styles import Style, merge_styles
+from prompt_toolkit.styles.defaults import default_ui_style
 
 from gigacrew.cli.commands import default_commands, mode_choices
 from gigacrew.cli.prompt import (
@@ -21,17 +27,18 @@ from gigacrew.cli.prompt import (
 )
 from gigacrew.permissions import PermissionMode
 from gigacrew.project.workspace import Workspace
+from gigacrew.ui import theme
 
 
 def _complete(text: str) -> list[tuple[str, str]]:
     completer = SlashCommandCompleter(default_commands())
     return [
-        (c.text, c.display_meta_text)
-        for c in completer.get_completions(Document(text), CompleteEvent())
+        (completion.text, completion.display_meta_text)
+        for completion in completer.get_completions(Document(text), CompleteEvent())
     ]
 
 
-def test_completes_commands_with_descriptions():
+def test_completes_commands_with_descriptions() -> None:
     assert _complete("/mod") == [
         ("/model", "сменить модель"),
         ("/mode", "режим: авто или план"),
@@ -53,7 +60,7 @@ def test_completes_commands_with_descriptions():
 
 
 @pytest.mark.parametrize("text", ["", "привет", "/home/x", "/model Alph", "текст /mo"])
-def test_no_completion_outside_command_name(text):
+def test_no_completion_outside_command_name(text: str) -> None:
     assert _complete(text) == []
 
 
@@ -65,12 +72,12 @@ def _complete_args(text: str) -> list[tuple[str, str]]:
     ]
     completer = SlashCommandCompleter(default_commands(), {"/model": lambda: models})
     return [
-        (c.text, c.display_meta_text)
-        for c in completer.get_completions(Document(text), CompleteEvent())
+        (completion.text, completion.display_meta_text)
+        for completion in completer.get_completions(Document(text), CompleteEvent())
     ]
 
 
-def test_completes_model_argument():
+def test_completes_model_argument() -> None:
     assert [name for name, _ in _complete_args("/model ")] == [
         "Alpha-2-Max",
         "Alpha-2-Pro",
@@ -86,11 +93,12 @@ def test_completes_model_argument():
 
 
 @pytest.mark.parametrize("text", ["/model", "/model a b", "/help ", "/nope Alph", "x /model "])
-def test_no_model_completion_elsewhere(text):
-    assert [name for name, _ in _complete_args(text)] == (["/model"] if text == "/model" else [])
+def test_no_model_completion_elsewhere(text: str) -> None:
+    expected = ["/model"] if text == "/model" else []
+    assert [name for name, _ in _complete_args(text)] == expected
 
 
-def test_history_creates_data_dir_lazily(tmp_path):
+def test_history_creates_data_dir_lazily(tmp_path: Path) -> None:
     ws = Workspace(tmp_path)
     history = LazyFileHistory(ws)
     assert list(history.load_history_strings()) == []
@@ -101,14 +109,14 @@ def test_history_creates_data_dir_lazily(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="права POSIX")
-def test_history_file_is_private(tmp_path):
+def test_history_file_is_private(tmp_path: Path) -> None:
     ws = Workspace(tmp_path)
     LazyFileHistory(ws).append_string("token=секрет")
     assert (ws.data_dir / "history").stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.skipif(os.name == "nt", reason="симлинки")
-def test_history_does_not_follow_symlink_shipped_with_repo(tmp_path):
+def test_history_does_not_follow_symlink_shipped_with_repo(tmp_path: Path) -> None:
     # .gigacode/history -> ../README.md: введённое (вставленные секреты) не дописывается в
     # файл репозитория и не читается из него
     readme = tmp_path / "README.md"
@@ -123,9 +131,10 @@ def test_history_does_not_follow_symlink_shipped_with_repo(tmp_path):
     assert list(history.get_strings()) == ["export API_TOKEN=sk-live-123"]  # в памяти
 
 
-def test_history_write_errors_are_swallowed(tmp_path):
+def test_history_write_errors_are_swallowed(tmp_path: Path) -> None:
     class ReadOnly(Workspace):
-        def ensure_data_dir(self):
+        @override
+        def ensure_data_dir(self) -> Path:
             raise PermissionError("только чтение")
 
     history = LazyFileHistory(ReadOnly(tmp_path))
@@ -134,7 +143,7 @@ def test_history_write_errors_are_swallowed(tmp_path):
     assert list(history.get_strings()) == ["a", "b"]  # в памяти осталась
 
 
-def _prompt(tmp_path, keys: str) -> str:
+def _prompt(tmp_path: Path, keys: str) -> str:
     with create_pipe_input() as pipe:
         session = create_prompt_session(
             commands=default_commands(),
@@ -147,15 +156,15 @@ def _prompt(tmp_path, keys: str) -> str:
         return session.prompt()
 
 
-def test_backslash_enter_inserts_newline(tmp_path):
-    assert _prompt(tmp_path, "строка 1\\\rстрока 2\r") == "строка 1\nстрока 2"
+def test_backslash_enter_inserts_newline(tmp_path: Path) -> None:
+    assert _prompt(tmp_path, "строка 1\N{REVERSE SOLIDUS}\rстрока 2\r") == "строка 1\nстрока 2"
 
 
-def test_alt_enter_inserts_newline(tmp_path):
+def test_alt_enter_inserts_newline(tmp_path: Path) -> None:
     assert _prompt(tmp_path, "a\x1b\rb\r") == "a\nb"
 
 
-def test_plain_enter_submits(tmp_path):
+def test_plain_enter_submits(tmp_path: Path) -> None:
     assert _prompt(tmp_path, "привет\r") == "привет"
     assert (tmp_path / ".gigacode" / "history").is_file()
 
@@ -168,33 +177,39 @@ def _styles(status: StatusInfo) -> dict[str, str]:
     ("used", "style"),
     [(1_000, "class:toolbar.ok"), (35_000, "class:toolbar.warn"), (55_000, "class:toolbar.danger")],
 )
-def test_toolbar_context_fill_colors(used, style):
+def test_toolbar_context_fill_colors(used: int, style: str) -> None:
     status = StatusInfo(model="Alpha", context_tokens=used, context_budget=60_000)
-    fill = [s for s, t in toolbar_fragments(status) if "/60k" in t]
+    fill = [
+        fragment_style
+        for fragment_style, fragment_text in toolbar_fragments(status)
+        if "/60k" in fragment_text
+    ]
     assert fill == [style]
 
 
-def test_toolbar_contents():
+def test_toolbar_contents() -> None:
     text = "".join(
-        t
-        for _, t in toolbar_fragments(
+        fragment_text
+        for _, fragment_text in toolbar_fragments(
             StatusInfo(
                 model="Alpha-2-Max",
                 context_tokens=12_345,
                 context_budget=60_000,
                 billed_tokens=45_100,
                 auto_approve=True,
-            )
+            ),
         )
     )
-    assert "Alpha-2-Max" in text and "12.3k/60k (21%)" in text
-    assert "потрачено 45.1k" in text and "авто-подтверждение" in text
+    assert "Alpha-2-Max" in text
+    assert "12.3k/60k (21%)" in text
+    assert "потрачено 45.1k" in text
+    assert "авто-подтверждение" in text
     assert "авто-подтверждение" not in "".join(
-        t for _, t in toolbar_fragments(StatusInfo(model="m"))
+        fragment_text for _, fragment_text in toolbar_fragments(StatusInfo(model="m"))
     )
 
 
-def test_double_escape_clears_input_into_history(tmp_path):
+def test_double_escape_clears_input_into_history(tmp_path: Path) -> None:
     with create_pipe_input() as pipe:
         session = create_prompt_session(
             commands=default_commands(),
@@ -208,7 +223,7 @@ def test_double_escape_clears_input_into_history(tmp_path):
     assert list(session.history.get_strings()) == ["черновик", "ok"]
 
 
-def test_default_text_is_prefilled(tmp_path):
+def test_default_text_is_prefilled(tmp_path: Path) -> None:
     with create_pipe_input() as pipe:
         session = create_prompt_session(
             commands=default_commands(),
@@ -221,14 +236,14 @@ def test_default_text_is_prefilled(tmp_path):
         assert session.prompt(default="набрано") == "набрано ещё"
 
 
-def test_completes_skills_after_commands():
+def test_completes_skills_after_commands() -> None:
     skills = [("/deploy", "выкатка на стенд"), ("/help", "скилл-тёзка"), ("/notes", "")]
     completer = SlashCommandCompleter(default_commands(), skills=lambda: skills)
 
     def complete(text: str) -> list[tuple[str, str]]:
         return [
-            (c.text, c.display_meta_text)
-            for c in completer.get_completions(Document(text), CompleteEvent())
+            (completion.text, completion.display_meta_text)
+            for completion in completer.get_completions(Document(text), CompleteEvent())
         ]
 
     assert complete("/de") == [("/deploy", "скилл · выкатка на стенд")]
@@ -238,16 +253,18 @@ def test_completes_skills_after_commands():
     assert complete("/deploy ") == []
 
 
-def test_completes_mode_argument():
+def test_completes_mode_argument() -> None:
     completer = SlashCommandCompleter(
-        default_commands(), {"/mode": lambda: mode_choices(PermissionMode.PLAN)}
+        default_commands(),
+        {"/mode": lambda: mode_choices(PermissionMode.PLAN)},
     )
     found = [
-        (c.text, c.display_meta_text)
-        for c in completer.get_completions(Document("/mode "), CompleteEvent())
+        (completion.text, completion.display_meta_text)
+        for completion in completer.get_completions(Document("/mode "), CompleteEvent())
     ]
     assert [name for name, _ in found] == ["auto", "plan"]
-    assert "текущий" in dict(found)["plan"] and "текущий" not in dict(found)["auto"]
+    assert "текущий" in dict(found)["plan"]
+    assert "текущий" not in dict(found)["auto"]
 
 
 @pytest.mark.parametrize(
@@ -257,13 +274,13 @@ def test_completes_mode_argument():
         (PermissionMode.PLAN, "class:toolbar.mode.plan", "⏸ план"),
     ],
 )
-def test_toolbar_shows_mode(mode, style, badge):
+def test_toolbar_shows_mode(mode: PermissionMode, style: str, badge: str) -> None:
     styles = _styles(StatusInfo(model="m", mode=mode))
     assert styles[badge] == style
     assert " (Shift+Tab)" in styles
 
 
-def _session_with_cycle(tmp_path, pipe, cycled: list[int]):
+def _session_with_cycle(tmp_path: Path, pipe: PipeInput, cycled: list[int]) -> PromptSession[str]:
     return create_prompt_session(
         commands=default_commands(),
         workspace=Workspace(tmp_path),
@@ -274,7 +291,7 @@ def _session_with_cycle(tmp_path, pipe, cycled: list[int]):
     )
 
 
-def test_shift_tab_cycles_mode_and_keeps_input(tmp_path):
+def test_shift_tab_cycles_mode_and_keeps_input(tmp_path: Path) -> None:
     cycled: list[int] = []
     with create_pipe_input() as pipe:
         session = _session_with_cycle(tmp_path, pipe, cycled)
@@ -283,7 +300,7 @@ def test_shift_tab_cycles_mode_and_keeps_input(tmp_path):
     assert cycled == [1, 1]
 
 
-def test_shift_tab_in_completion_menu_moves_back(tmp_path):
+def test_shift_tab_in_completion_menu_moves_back(tmp_path: Path) -> None:
     cycled: list[int] = []
     with create_pipe_input() as pipe:
         session = _session_with_cycle(tmp_path, pipe, cycled)
@@ -292,26 +309,23 @@ def test_shift_tab_in_completion_menu_moves_back(tmp_path):
         # Tab Tab — /model, затем /mode; Shift+Tab — назад по меню, к /model.
         timer = threading.Timer(0.3, pipe.send_text, ["\t\t\x1b[Z\r"])
         timer.start()
-        try:
+        with ExitStack() as cleanup:
+            cleanup.callback(timer.join)
             assert session.prompt() == "/model"
-        finally:
-            timer.join()
     assert cycled == []
 
 
 @pytest.mark.parametrize("palette", ["MINT", "MINT_ANSI"])
-def test_completion_menu_text_is_not_black(palette):
-    """У меню дополнения в стилях prompt_toolkit по умолчанию чёрный текст: свой фон
-    меню требует и своего цвета текста, иначе команды не видно на тёмном фоне."""
-    from prompt_toolkit.styles import Style, merge_styles
-    from prompt_toolkit.styles.defaults import default_ui_style
+def test_completion_menu_text_is_not_black(palette: str) -> None:
+    """У меню дополнения в стилях prompt_toolkit по умолчанию чёрный текст.
 
-    from gigacrew.ui import theme
-
+    Свой фон меню требует и своего цвета текста, иначе команды не видно на тёмном фоне.
+    """
     style = merge_styles(
-        [default_ui_style(), Style.from_dict(theme.prompt_styles(getattr(theme, palette)))]
+        [default_ui_style(), Style.from_dict(theme.prompt_styles(getattr(theme, palette)))],
     )
     for name in ("completion", "meta.completion", "multi-column-meta"):
         attrs = style.get_attrs_for_style_str(f"class:completion-menu class:completion-menu.{name}")
-        assert attrs.color not in ("", "000000", "ansiblack"), name
-        assert attrs.bgcolor and attrs.bgcolor != attrs.color, name
+        assert attrs.color not in {"", "000000", "ansiblack"}, name
+        assert attrs.bgcolor, name
+        assert attrs.bgcolor != attrs.color, name

@@ -12,6 +12,9 @@ from dataclasses import dataclass
 
 from gigacrew.llm.types import AssistantTurn, Message, ToolChoice, ToolSpec
 
+# Сколько символов тела ответа показать в тексте ошибки.
+_DETAIL_PREVIEW = 300
+
 
 class LLMError(RuntimeError):
     """Ошибка обращения к LLM (сеть, авторизация, формат ответа).
@@ -21,7 +24,7 @@ class LLMError(RuntimeError):
     """
 
 
-class PromptTooLong(LLMError):
+class PromptTooLongError(LLMError):
     """Запрос отклонён из-за размера (замер окна контекста, :meth:`LLMProvider.measure_prompt`).
 
     ``status`` — HTTP-статус ответа (None — таймаут/обрыв), ``detail`` — тело ответа:
@@ -29,10 +32,12 @@ class PromptTooLong(LLMError):
     """
 
     def __init__(self, status: int | None, detail: str):
+        """Запоминает статус и тело ответа; текст ошибки — с началом тела."""
         self.status = status
         self.detail = detail
-        code = status if status is not None else "нет ответа"
-        super().__init__(f"запрос слишком велик ({code}): {detail[:300]}")
+        code = "нет ответа" if status is None else status
+        shown = detail[:_DETAIL_PREVIEW]
+        super().__init__(f"запрос слишком велик ({code}): {shown}")
 
 
 @dataclass(frozen=True)
@@ -54,34 +59,35 @@ class LLMProvider(ABC):
     def model(self) -> str:
         """Идентификатор модели по умолчанию."""
 
-    def close(self) -> None:  # noqa: B027 — необязательный хук
+    # Необязательный хук: по умолчанию ничего не делает, а не абстрактный метод.
+    def close(self) -> None:  # noqa: B027
         """Освобождает ресурсы (соединения). По умолчанию ничего не делает."""
 
-    def connect(self) -> None:  # noqa: B027 — необязательный хук
-        """Подготовка к запросам: проверка токена, загрузка каталога моделей. По умолчанию
-        ничего.
+    # Необязательный хук: по умолчанию ничего не делает, а не абстрактный метод.
+    def connect(self) -> None:  # noqa: B027
+        """Подготовка к запросам: проверка токена, загрузка каталога моделей.
 
-        CLI вызывает его при запуске и перед каждым запросом пользователя — вне хода,
-        поэтому истёкший токен — понятная ошибка до хода, а не сбой посреди него. Ошибки —
-        :class:`LLMError`, Ctrl+C — ``KeyboardInterrupt``.
+        По умолчанию ничего. CLI вызывает его при запуске и перед каждым запросом
+        пользователя — вне хода, поэтому истёкший токен — понятная ошибка до хода, а не сбой
+        посреди него. Ошибки — :class:`LLMError`, Ctrl+C — ``KeyboardInterrupt``.
         """
 
     def list_models(self) -> list[str]:
         """Доступные чат-модели (для выбора и диагностики). По умолчанию — только текущая."""
         return [self.model]
 
-    def known_models(self) -> list[ModelInfo] | None:
+    # Необязательный хук: по умолчанию каталога нет (None), а не абстрактный метод.
+    def known_models(self) -> list[ModelInfo] | None:  # noqa: B027
         """Каталог моделей, если его даёт API: модель выбирается только из него.
 
         None (по умолчанию) — каталога нет, модель может быть любой.
         """
-        return None
 
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
-        """Отправляет ``text`` одним сообщением с минимальным ответом; возвращает
-        ``prompt_tokens`` по данным API — точный размер запроса для этой модели.
+        """Отправляет ``text`` одним сообщением с минимальным ответом.
 
-        Запрос, не уместившийся в окно, — :class:`PromptTooLong`; прочие ошибки —
+        Возвращает ``prompt_tokens`` по данным API — точный размер запроса для этой модели.
+        Запрос, не уместившийся в окно, — :class:`PromptTooLongError`; прочие ошибки —
         :class:`LLMError`. Провайдер с поддержкой замера выставляет ``supports_measure``.
         """
         raise NotImplementedError

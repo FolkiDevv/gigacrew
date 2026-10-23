@@ -16,25 +16,28 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Literal, override
 
 from pydantic import BaseModel, PrivateAttr
 
 from gigacrew.permissions import PermissionMode
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.fs import WriteFileParams, WriteFileTool
-from gigacrew.tools.questions import Question, QuestionOption, QuestionsUnavailable
+from gigacrew.tools.questions import Question, QuestionOption, QuestionsUnavailableError
 
 APPROVE = "Да, выполнять"
-_APPROVALS = {APPROVE: PermissionMode.AUTO}
+_APPROVALS: Mapping[str, PermissionMode] = MappingProxyType({APPROVE: PermissionMode.AUTO})
+_AUTO_MODE = PermissionMode.AUTO
 PLAN_QUESTION = Question(
     text="Выполнить этот план?",
     header="План",
     options=(
         QuestionOption(
-            APPROVE, f"Режим «{PermissionMode.AUTO.label}»: {PermissionMode.AUTO.description}"
+            APPROVE,
+            f"Режим «{_AUTO_MODE.label}»: {_AUTO_MODE.description}",
         ),
     ),
     custom_label="Замечания…",
@@ -85,13 +88,23 @@ class PlanReview:
     @property
     def continues(self) -> bool:
         """Работа в ходе продолжается: план выполняется или дорабатывается."""
-        return self.outcome in ("approved", "revise")
+        return self.outcome in {"approved", "revise"}
 
 
 # Без параметров: план читается из файла плана (docstring ушёл бы в схему). План из
 # аргумента ``plan`` — запасной путь, в схеме его нет.
-class ExitPlanModeParams(BaseModel):
+class ExitPlanModeParams(BaseModel):  # noqa: D101
     _plan: str = PrivateAttr("")
+
+    @property
+    def plan_argument(self) -> str:
+        """План из аргумента ``plan`` (запасной путь); пусто — не передан."""
+        return self._plan
+
+    @plan_argument.setter
+    def plan_argument(self, plan: str) -> None:
+        # Приватный атрибут pydantic: в классе — его объявление, а не значение.
+        self._plan = plan  # noqa: WPS601
 
 
 def _plan_path(ctx: ToolContext, plan: PlanFile) -> str:
@@ -107,21 +120,23 @@ def _read_plan(ctx: ToolContext, plan: PlanFile) -> str:
         text = plan.path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         text = ""
-    except (OSError, UnicodeDecodeError) as e:
-        raise ToolError(f"Не удалось прочитать файл плана {path}: {e}") from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ToolError(f"Не удалось прочитать файл плана {path}: {exc}") from None
     if not text:
         raise ToolError(
             f"План не записан: сначала запиши его в {path} инструментом write_file, "
-            "затем снова вызови exit_plan_mode (без аргументов)."
+            "затем снова вызови exit_plan_mode (без аргументов).",
         )
     return text
 
 
 def _take_plan_argument(ctx: ToolContext, plan: PlanFile, text: str) -> None:
-    """План в аргументе ``plan``: в пустой файл плана — записать (как write_file, с теми же
-    проверками пути). Файл с другим планом, не менявшийся с прошлого показа, — ошибка:
-    показ старого плана сбил бы пользователя, а перезапись могла бы стереть план
-    кратким пересказом. Записанный в этом цикле файл важнее аргумента.
+    """План в аргументе ``plan``: в пустой файл плана — записать.
+
+    Запись — как write_file, с теми же проверками пути. Файл с другим планом, не
+    менявшийся с прошлого показа, — ошибка: показ старого плана сбил бы пользователя,
+    а перезапись могла бы стереть план кратким пересказом. Записанный в этом цикле
+    файл важнее аргумента.
 
     Файл плана или папка планов — ссылка: не записывать. Запись идёт мимо проверки
     риска write_file, а ссылка увела бы её без вопроса в файл проекта.
@@ -135,8 +150,8 @@ def _take_plan_argument(ctx: ToolContext, plan: PlanFile, text: str) -> None:
         current = plan.path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         current = ""
-    except (OSError, UnicodeDecodeError) as e:
-        raise ToolError(f"Не удалось прочитать файл плана {path}: {e}") from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ToolError(f"Не удалось прочитать файл плана {path}: {exc}") from None
     if not current:
         WriteFileTool().run(WriteFileParams(path=path, content=text), ctx)
     elif current != text.strip():
@@ -144,7 +159,10 @@ def _take_plan_argument(ctx: ToolContext, plan: PlanFile, text: str) -> None:
 
 
 def review_plan(
-    ctx: ToolContext, plan_file: PlanFile, *, on_show: Callable[[], None] | None = None
+    ctx: ToolContext,
+    plan_file: PlanFile,
+    *,
+    on_show: Callable[[], None] | None = None,
 ) -> PlanReview:
     """Показать план из файла пользователю и узнать решение.
 
@@ -160,7 +178,9 @@ def review_plan(
     plan = _read_plan(ctx, plan_file)
     plan_file.reviews += 1
     no_approver = PlanReview(
-        "no_approver", NO_APPROVER_NOTE.format(path=path), "одобрить план некому"
+        "no_approver",
+        NO_APPROVER_NOTE.format(path=path),
+        "одобрить план некому",
     )
     if ctx.ask_user is None:
         plan_file.dirty = False
@@ -169,7 +189,7 @@ def review_plan(
         on_show()
     try:
         answers = ctx.ask_user([replace(PLAN_QUESTION, body=plan, source=path)])
-    except QuestionsUnavailable:
+    except QuestionsUnavailableError:
         plan_file.dirty = False
         return no_approver
     plan_file.dirty = False  # пользователь видел эту версию плана
@@ -181,7 +201,9 @@ def review_plan(
     if mode is None:
         feedback = answer.custom.strip()
         return PlanReview(
-            "revise", REVISE_NOTE.format(feedback=feedback, path=path), "план на доработку"
+            "revise",
+            REVISE_NOTE.format(feedback=feedback, path=path),
+            "план на доработку",
         )
     set_mode(mode)
     return PlanReview(
@@ -191,7 +213,9 @@ def review_plan(
     )
 
 
-class ExitPlanModeTool(Tool):
+class ExitPlanModeTool(Tool[ExitPlanModeParams]):
+    """Инструмент exit_plan_mode: показать план из файла плана на одобрение."""
+
     name = "exit_plan_mode"
     description = (
         "Plan mode only: hands the plan to the user for approval. First write the plan "
@@ -200,20 +224,25 @@ class ExitPlanModeTool(Tool):
         "the plan, the mode changes and you start the implementation right away; if the "
         "user sends remarks, fix the plan file with edit_file and call it again."
     )
-    Params = ExitPlanModeParams
+    # Модель параметров, а не константа: имя задаёт базовый класс Tool.
+    Params = ExitPlanModeParams  # noqa: WPS115
 
+    @override
     def parse(self, arguments: dict[str, Any]) -> ExitPlanModeParams:
+        """Параметры без полей; план из аргумента ``plan`` сохраняется отдельно."""
         params = ExitPlanModeParams.model_validate(arguments or {})
         plan = (arguments or {}).get("plan")
         if isinstance(plan, str):
-            params._plan = plan
+            params.plan_argument = plan
         return params
 
+    @override
     def run(self, params: ExitPlanModeParams, ctx: ToolContext) -> ToolResult:
+        """Показать план пользователю (в режиме планирования) и вернуть его решение."""
         plan_file = ctx.plan
         if plan_file is None or ctx.get_mode is None or ctx.get_mode() != PermissionMode.PLAN:
             raise ToolError(NOT_PLANNING_NOTE)
-        if params._plan.strip():
-            _take_plan_argument(ctx, plan_file, params._plan)
+        if params.plan_argument.strip():
+            _take_plan_argument(ctx, plan_file, params.plan_argument)
         review = review_plan(ctx, plan_file)
         return ToolResult(content=review.content, summary=review.summary)

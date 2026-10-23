@@ -15,6 +15,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from gigacrew.security import subprocess_env
+
 __all__ = ["repo_config_runs_programs", "repo_toplevel"]
 
 _TIMEOUT = 5
@@ -24,14 +26,12 @@ _RUNS_PROGRAM = re.compile(
     r"filter\..+\.(clean|smudge|process)|gpg(\..+)?\.program)$",
     re.IGNORECASE,
 )
-_FALSE = frozenset({"", "false", "no", "off", "0"})
-_LOCAL_SCOPES = frozenset({"local", "worktree", "command"})
+_DISABLED = frozenset(("", "false", "no", "off", "0"))
+_LOCAL_SCOPES = frozenset(("local", "worktree", "command"))
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
     """Служебный запуск git в ``cwd``; None — git не запустился."""
-    from gigacrew.tools.process import subprocess_env
-
     try:
         return subprocess.run(
             ["git", *args],
@@ -47,8 +47,10 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
 
 
 def repo_toplevel(cwd: Path) -> Path | None:
-    """Корень рабочего дерева репозитория, который git найдёт из ``cwd``. None — ``cwd``
-    не в рабочем дереве (или git не запустился)."""
+    """Корень рабочего дерева репозитория, который git найдёт из ``cwd``.
+
+    None — ``cwd`` не в рабочем дереве (или git не запустился).
+    """
     res = _git(cwd, "rev-parse", "--show-toplevel")
     if res is None or res.returncode != 0:
         return None
@@ -57,8 +59,11 @@ def repo_toplevel(cwd: Path) -> Path | None:
 
 
 def repo_config_runs_programs(cwd: Path) -> bool | None:
-    """Есть ли в настройках репозитория (вокруг ``cwd``) или его подмодулей программы,
-    которые git запустит при чтении. None — не удалось выяснить (git не запустился)."""
+    """Есть ли программы, которые git запустит при чтении.
+
+    Ищет их в настройках репозитория (вокруг ``cwd``) и его подмодулей. None — не удалось
+    выяснить (git не запустился).
+    """
     return _runs_programs(cwd, depth=0)
 
 
@@ -80,7 +85,9 @@ def _runs_programs(cwd: Path, *, depth: int) -> bool | None:
 
 def _submodules(cwd: Path) -> list[Path] | None:
     """Рабочие деревья подмодулей репозитория (вокруг ``cwd``), в которые зайдёт git.
-    ``[]`` — подмодулей нет или ``cwd`` не в рабочем дереве; None — не удалось выяснить."""
+
+    ``[]`` — подмодулей нет или ``cwd`` не в рабочем дереве; None — не удалось выяснить.
+    """
     top = repo_toplevel(cwd)
     if top is None:
         return []
@@ -105,12 +112,12 @@ def _config_runs_programs(cwd: Path) -> bool | None:
         return None
     # -z --show-scope: «область\0ключ\nзначение\0» подряд
     tokens = res.stdout.decode("utf-8", errors="replace").split("\0")
-    for scope, entry in zip(tokens[0::2], tokens[1::2], strict=False):
+    for scope, entry in zip(tokens[::2], tokens[1::2], strict=False):
         if scope not in _LOCAL_SCOPES:
             continue
-        key, _, value = entry.partition("\n")
+        key, _, setting = entry.partition("\n")
         if _RUNS_PROGRAM.match(key.strip()):
-            if key.strip().lower() == "core.fsmonitor" and value.strip().lower() in _FALSE:
+            if key.strip().lower() == "core.fsmonitor" and setting.strip().lower() in _DISABLED:
                 continue
             return True
     return False

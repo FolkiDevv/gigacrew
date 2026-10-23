@@ -6,9 +6,19 @@
 
 Формат::
 
-    {"version": 1, "models": {"model-large": {"context_window": 126998,
-        "upper_bound": 128319, "capped": false, "probes": 8,
-        "measured_at": "2026-10-09T12:00:00+03:00", "base_url": "https://..."}}}
+    {
+        "version": 1,
+        "models": {
+            "model-large": {
+                "context_window": 126998,
+                "upper_bound": 128319,
+                "capped": false,
+                "probes": 8,
+                "measured_at": "2026-10-09T12:00:00+03:00",
+                "base_url": "https://...",
+            }
+        },
+    }
 """
 
 from __future__ import annotations
@@ -29,6 +39,7 @@ FILE_NAME = "models.json"
 
 
 def default_path() -> Path:
+    """Файл замеров по умолчанию: ``~/.gigacode/models.json``."""
     return Path.home() / USER_DIR_NAME / FILE_NAME
 
 
@@ -46,6 +57,7 @@ class ModelWindows:
         *,
         base_url: str = "",
     ):
+        """Хранилище с начальными записями ``entries`` для эндпоинта ``base_url``."""
         self.path = path
         self._entries: dict[str, dict[str, Any]] = dict(entries or {})
         # Текущий эндпоинт: замер с другого эндпоинта (иное окно у той же модели) не берётся.
@@ -55,7 +67,10 @@ class ModelWindows:
 
     @classmethod
     def load(
-        cls, path: Path | None = None, *, base_url: str = ""
+        cls,
+        path: Path | None = None,
+        *,
+        base_url: str = "",
     ) -> tuple[ModelWindows, str | None]:
         """Читает файл (по умолчанию :func:`default_path`).
 
@@ -67,8 +82,8 @@ class ModelWindows:
             entries = _read(path)
         except FileNotFoundError:
             return cls(path, base_url=base_url), None
-        except (OSError, ValueError) as e:
-            warning = f"не удалось прочитать {path}: {e} — окна моделей замеряются заново"
+        except (OSError, ValueError) as exc:
+            warning = f"не удалось прочитать {path}: {exc} — окна моделей замеряются заново"
             return cls(path, base_url=base_url), warning
         return cls(path, entries, base_url=base_url), None
 
@@ -82,36 +97,40 @@ class ModelWindows:
         legacy: int | None = None  # замер без поля base_url (до его появления)
         entry = self._entries.get(model)
         if isinstance(entry, dict):
-            value = entry.get("context_window")
+            window = entry.get("context_window")
             measured_at = entry.get("base_url")
-            if isinstance(value, int) and value > 0:
+            if isinstance(window, int) and window > 0:
                 if not measured_at:
-                    legacy = value
+                    legacy = window
                 elif not self.base_url or measured_at == self.base_url:
-                    return value
+                    return window
         return self._reported.get(model, legacy)
 
     def report(self, windows: Mapping[str, int | None]) -> None:
         """Окна моделей, которые сообщил API: только в памяти, в файл не пишутся.
-        Заменяют прежние; не положительные числа и None пропускаются."""
+
+        Заменяют прежние; не положительные числа и None пропускаются.
+        """
         self._reported = {
             str(name): window
             for name, window in windows.items()
             if isinstance(window, int) and not isinstance(window, bool) and window > 0
         }
 
-    def record(self, result: ProbeResult, *, base_url: str = "") -> None:
-        """Запоминает замер и сохраняет файл. Ошибки записи — ``OSError``
-        (в памяти замер остаётся)."""
+    def record(self, measurement: ProbeResult, *, base_url: str = "") -> None:
+        """Запоминает замер и сохраняет файл.
+
+        Ошибки записи — ``OSError`` (в памяти замер остаётся).
+        """
         entry = {
-            "context_window": result.window,
-            "upper_bound": result.upper_bound,
-            "capped": result.capped,
-            "probes": result.probes,
+            "context_window": measurement.window,
+            "upper_bound": measurement.upper_bound,
+            "capped": measurement.capped,
+            "probes": measurement.probes,
             "measured_at": datetime.now().astimezone().replace(microsecond=0).isoformat(),
             "base_url": base_url,
         }
-        self._entries[result.model] = entry
+        self._entries[measurement.model] = entry
         if self.path is None:
             return
         try:
@@ -120,28 +139,29 @@ class ModelWindows:
             entries = {}
         except (OSError, ValueError):
             entries = {}  # битый файл перезаписывается
-        entries[result.model] = entry
+        entries[measurement.model] = entry
         _write(self.path, entries)
 
 
 def _read(path: Path) -> dict[str, dict[str, Any]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("version") != FORMAT_VERSION:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict) or document.get("version") != FORMAT_VERSION:
         raise ValueError("неподдерживаемая версия формата")
-    models = data.get("models")
+    models = document.get("models")
     if not isinstance(models, dict):
-        raise ValueError("поле models — не объект")
-    return {str(k): v for k, v in models.items() if isinstance(v, dict)}
+        # ValueError, а не TypeError: вызывающие считают файл битым по ValueError.
+        raise ValueError("поле models — не объект")  # noqa: TRY004
+    return {str(name): entry for name, entry in models.items() if isinstance(entry, dict)}
 
 
 def _write(path: Path, entries: dict[str, dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {"version": FORMAT_VERSION, "models": dict(sorted(entries.items()))}
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent)
+    document = {"version": FORMAT_VERSION, "models": dict(sorted(entries.items()))}
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, ensure_ascii=False, indent=2)
+        Path(tmp_name).replace(path)
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        Path(tmp_name).unlink(missing_ok=True)
         raise

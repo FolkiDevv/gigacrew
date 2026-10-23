@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+from types import MappingProxyType
 
 __all__ = ["CommandLevel", "Part", "Verdict", "worst"]
 
@@ -25,15 +26,16 @@ class CommandLevel(IntEnum):
 
     @property
     def label(self) -> str:
+        """Название уровня для пользователя."""
         return _LABELS[self]
 
 
-_LABELS = {
+_LABELS = MappingProxyType({
     CommandLevel.READ: "только чтение",
     CommandLevel.EXEC: "выполняет код проекта",
     CommandLevel.WRITE: "меняет файлы",
     CommandLevel.DANGER: "опасно",
-}
+})
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,7 @@ class Verdict:
 
     @property
     def known(self) -> bool:
+        """Уровень известен (не «не знаю»)."""
         return self.level is not None
 
     @property
@@ -90,17 +93,21 @@ class Verdict:
             self.level is CommandLevel.WRITE
             and self.redirects_edit
             and bool(self.parts)
-            and all(p.level is CommandLevel.READ or p.edits for p in self.parts)
+            and all(part.level is CommandLevel.READ or part.edits for part in self.parts)
         )
 
     @property
     def signatures(self) -> tuple[str, ...]:
         """Сигнатуры частей уровня EXEC (без подготовки окружения), по порядку."""
         out: list[str] = []
-        for p in self.parts:
-            if p.level is CommandLevel.EXEC and not p.prelude and p.signature:
-                if p.signature not in out:
-                    out.append(p.signature)
+        for part in self.parts:
+            if (
+                part.level is CommandLevel.EXEC
+                and not part.prelude
+                and part.signature
+                and part.signature not in out
+            ):
+                out.append(part.signature)
         return tuple(out)
 
 

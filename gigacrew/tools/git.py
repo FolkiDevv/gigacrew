@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 from pathlib import Path
+from typing import override
 
 from pydantic import BaseModel, Field
 
@@ -17,8 +18,8 @@ from gigacrew.tools.process import run_process, truncate_middle
 # намеренно не входят — их при необходимости вызывают через run_shell с
 # подтверждением. Формы разрешённых, теряющие работу (restore, checkout -- <пути>,
 # branch -D, stash drop/clear), — опасные: о них спрашивают и с -y.
-_READ_ONLY = {"status", "diff", "log", "show"}
-_ALLOWED = _READ_ONLY | {
+_READ_ONLY = frozenset(("status", "diff", "log", "show"))
+_ALLOWED = _READ_ONLY | frozenset((
     "branch",
     "stash",
     "add",
@@ -26,29 +27,27 @@ _ALLOWED = _READ_ONLY | {
     "checkout",
     "switch",
     "restore",
-}
+))
 
 # Подкоманды, которых нет в инструменте, а в исследовании они обычно читают (у reflog есть и
 # изменяющие формы): для них — подсказка про run_shell, там их проверяет классификатор.
-_READ_ELSEWHERE = frozenset(
-    {
-        "blame",
-        "grep",
-        "ls-files",
-        "ls-tree",
-        "rev-parse",
-        "rev-list",
-        "shortlog",
-        "describe",
-        "reflog",
-        "merge-base",
-        "cat-file",
-        "show-ref",
-        "name-rev",
-        "for-each-ref",
-        "whatchanged",
-    }
-)
+_READ_ELSEWHERE = frozenset((
+    "blame",
+    "grep",
+    "ls-files",
+    "ls-tree",
+    "rev-parse",
+    "rev-list",
+    "shortlog",
+    "describe",
+    "reflog",
+    "merge-base",
+    "cat-file",
+    "show-ref",
+    "name-rev",
+    "for-each-ref",
+    "whatchanged",
+))
 
 # Опции, позволяющие писать/читать файлы вне проекта или запускать внешние
 # программы. Запрещены для всех подкоманд (включая сокращения: git принимает
@@ -61,7 +60,7 @@ _FORBIDDEN_OPTIONS = (
 )
 
 # Флаги `git branch`, которые только показывают ветки.
-_BRANCH_LIST_FLAGS = {
+_BRANCH_LIST_FLAGS = frozenset((
     "-a",
     "-r",
     "-v",
@@ -74,7 +73,7 @@ _BRANCH_LIST_FLAGS = {
     "--show-current",
     "--no-color",
     "--color",
-}
+))
 
 _MAX_OUTPUT = 30_000
 _TIMEOUT = 60
@@ -84,11 +83,27 @@ _TIMEOUT = 60
 # diff — на `diff` (и без --ext-diff); неявный bare-репозиторий (HEAD, config,
 # objects/ обычными файлами в каталоге проекта) не распознаётся.
 _SAFE_CONFIG = ("-c", "core.fsmonitor=false", "-c", "safe.bareRepository=explicit")
-_NO_EXT_DIFF = {"diff", "log", "show"}
+_NO_EXT_DIFF = frozenset(("diff", "log", "show"))
+
+# Разбор аргументов: `--` завершает опции, `--name` — длинная опция, `-x` — короткая.
+_OPTIONS_END = "--"
+_LONG_OPTION = "--"
+_SHORT_OPTION = "-"
+_NO_VALUED: frozenset[str] = frozenset()
+# Опции checkout, чьё значение — следующее слово (имя ветки), а не путь.
+_CHECKOUT_VALUED = frozenset(("-b", "-B", "--orphan"))
+# Опции commit, читающие файл: -F/--file (сообщение), -t/--template.
+_COMMIT_FILE_OPTIONS = ("--file", "--template")
+_COMMIT_VALUED_SHORT = "mFtcC"  # короткие опции commit со значением
+_COMMIT_FILE_SHORT = "Ft"
+_COMMIT_OPTIONAL_SHORT = "Su"  # необязательное значение — только слитно
+
+_LOST = "незакоммиченные правки будут потеряны"
+_OVERWRITE = "ветка с этим именем будет перезаписана"
 
 
 def _is_forbidden(arg: str) -> bool:
-    if not arg.startswith("--") or arg == "--":
+    if not arg.startswith(_LONG_OPTION) or arg == _OPTIONS_END:
         return False
     name = arg.split("=", 1)[0]
     return any(
@@ -96,24 +111,35 @@ def _is_forbidden(arg: str) -> bool:
     )
 
 
-def _options(args: list[str], valued: frozenset[str] = frozenset()) -> tuple[set[str], list[str]]:
-    """(опции, позиционные до ``--``): ``--name`` без значения, буквы ``-abc`` по отдельности.
-    Слово после опции из ``valued`` — её значение, а не позиционный аргумент."""
+def _option_flags(arg: str) -> set[str]:
+    """Опции в одном слове: ``--name`` без значения, ``-abc`` — целиком и по буквам."""
+    if arg.startswith(_LONG_OPTION):
+        return {arg.split("=", 1)[0]}
+    flags = {arg}
+    if arg[1:].isalpha():
+        flags.update(f"{_SHORT_OPTION}{letter}" for letter in arg[1:])
+    return flags
+
+
+def _options(
+    args: list[str],
+    valued: frozenset[str] = _NO_VALUED,
+) -> tuple[set[str], list[str]]:
+    """Разбирает аргументы: (опции, позиционные до ``--``).
+
+    Опции — ``--name`` без значения и буквы ``-abc`` по отдельности. Слово после опции из
+    ``valued`` — её значение, а не позиционный аргумент.
+    """
     flags: set[str] = set()
     positional: list[str] = []
     skip = False
     for arg in args:
-        if arg == "--":
+        if arg == _OPTIONS_END:
             break
         if skip:
             skip = False
-        elif arg.startswith("--"):
-            flags.add(arg.split("=", 1)[0])
-            skip = arg in valued
-        elif arg.startswith("-") and arg != "-":
-            flags.add(arg)
-            if arg[1:].isalpha():
-                flags.update("-" + ch for ch in arg[1:])
+        elif arg.startswith(_SHORT_OPTION) and arg != _SHORT_OPTION:
+            flags.update(_option_flags(arg))
             skip = arg in valued
         else:
             positional.append(arg)
@@ -123,47 +149,59 @@ def _options(args: list[str], valued: frozenset[str] = frozenset()) -> tuple[set
 def _has(flags: set[str], *names: str) -> bool:
     """Есть ли опция; длинную git принимает и сокращённой (`--del` — это `--delete`)."""
     return any(
-        f == n or (f.startswith("--") and len(f) >= 3 and n.startswith(f))
-        for f in flags
-        for n in names
+        flag == name or (flag.startswith(_LONG_OPTION) and len(flag) >= 3 and name.startswith(flag))
+        for flag in flags
+        for name in names
     )
 
 
 def _discards_work(sub: str, args: list[str], root: Path) -> str:
-    """Почему вызов теряет работу (правки, ветки, отложенное) — как у классификатора
-    run_shell; "" — не теряет. Такие вызовы спрашиваются и с ``-y``."""
-    flags, positional = _options(args, frozenset({"-b", "-B", "--orphan"}))
-    lost = "незакоммиченные правки будут потеряны"
+    """Почему вызов теряет работу (правки, ветки, отложенное); "" — не теряет.
+
+    Решение — как у классификатора run_shell. Такие вызовы спрашиваются и с ``-y``.
+    """
+    flags, positional = _options(args, _CHECKOUT_VALUED)
+    if sub == "checkout":
+        return _checkout_discards(args, flags, positional, root)
+    if sub == "stash" and positional[:1] in (["drop"], ["clear"]):
+        return f"git stash {positional[0]}: удаление отложенных правок"
+    return _flags_discard(sub, flags)
+
+
+def _flags_discard(sub: str, flags: set[str]) -> str:
+    """Потеря работы, видная по одним опциям: branch, restore, switch."""
     if sub == "branch" and (
         "-D" in flags or (_has(flags, "-d", "--delete") and _has(flags, "-f", "--force"))
     ):
         return "git branch -D: удаление ветки без проверки слияния"
-    overwrite = "ветка с этим именем будет перезаписана"
     if sub == "branch" and _has(flags, "-f", "--force", "-M", "-C"):
-        return f"git branch -f: {overwrite}"
-    if sub == "stash" and positional[:1] in (["drop"], ["clear"]):
-        return f"git stash {positional[0]}: удаление отложенных правок"
-    if sub == "checkout":
-        if _has(flags, "-f", "--force"):
-            return f"git checkout -f: {lost}"
-        if "-B" in flags:
-            return f"git checkout -B: {overwrite}"
-        paths = args[args.index("--") + 1 :] if "--" in args else []
-        # `checkout <ревизия> <пути>`, `checkout <файл>` или шаблон путей — это не ветка
-        if (
-            paths
-            or len(positional) > 1
-            or any(
-                p.startswith(":") or set(p) & set("*?[") or (root / p).exists() for p in positional
-            )
-        ):
-            return f"git checkout <файл>: {lost}"
+        return f"git branch -f: {_OVERWRITE}"
     if sub == "restore" and (not _has(flags, "-S", "--staged") or _has(flags, "-W", "--worktree")):
-        return f"git restore: {lost}"
+        return f"git restore: {_LOST}"
     if sub == "switch" and _has(flags, "--discard-changes", "-f", "--force"):
-        return f"git switch --discard-changes: {lost}"
+        return f"git switch --discard-changes: {_LOST}"
     if sub == "switch" and _has(flags, "-C", "--force-create"):
-        return f"git switch -C: {overwrite}"
+        return f"git switch -C: {_OVERWRITE}"
+    return ""
+
+
+def _checkout_discards(args: list[str], flags: set[str], positional: list[str], root: Path) -> str:
+    """Потеря работы у `git checkout`: -f, -B или пути вместо ветки."""
+    if _has(flags, "-f", "--force"):
+        return f"git checkout -f: {_LOST}"
+    if "-B" in flags:
+        return f"git checkout -B: {_OVERWRITE}"
+    paths = args[args.index(_OPTIONS_END) + 1 :] if _OPTIONS_END in args else []
+    # `checkout <ревизия> <пути>`, `checkout <файл>` или шаблон путей — это не ветка
+    if (
+        paths
+        or len(positional) > 1
+        or any(
+            word.startswith(":") or set(word) & set("*?[") or (root / word).exists()
+            for word in positional
+        )
+    ):
+        return f"git checkout <файл>: {_LOST}"
     return ""
 
 
@@ -171,76 +209,88 @@ def _reading(sub: str, args: list[str]) -> bool:
     return (
         sub in _READ_ONLY
         or (sub == "branch" and _branch_is_listing(args))
-        or (sub == "stash" and bool(args) and args[0] in ("list", "show"))
+        or (sub == "stash" and bool(args) and args[0] in {"list", "show"})
     )
+
+
+def _commit_option(arg: str) -> tuple[bool, str, bool] | None:
+    """Опция `git commit` со значением в слове ``arg``; None — слово не такая опция.
+
+    Итог — (значение — файл, значение в самом слове, значение — следующее слово).
+    """
+    if arg.startswith(_LONG_OPTION):
+        name, eq, attached = arg.partition("=")
+        if len(name) >= 3 and any(option.startswith(name) for option in _COMMIT_FILE_OPTIONS):
+            return True, attached, not eq
+        return None
+    if arg.startswith(_SHORT_OPTION):
+        # сгруппированные короткие: значение — остаток слова или следующее слово
+        for position, letter in enumerate(arg[1:], 1):
+            if letter in _COMMIT_VALUED_SHORT:
+                attached = arg[position + 1 :]
+                return letter in _COMMIT_FILE_SHORT, attached, not attached
+            if letter in _COMMIT_OPTIONAL_SHORT:
+                return None
+    return None
 
 
 def _commit_files(args: list[str]) -> list[str]:
     """Файлы, которые читает `git commit`: -F/--file (сообщение), -t/--template."""
-    out: list[str] = []
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg == "--":
-            break
-        if arg.startswith("--"):
-            name, eq, value = arg.partition("=")
-            if len(name) >= 3 and any(o.startswith(name) for o in ("--file", "--template")):
-                if not eq and i + 1 < len(args):
-                    value, i = args[i + 1], i + 1
-                out.append(value)
-        elif arg.startswith("-"):
-            # сгруппированные короткие: значение — остаток слова или следующее слово
-            for j, ch in enumerate(arg[1:], 1):
-                if ch in "mFtcC":
-                    value = arg[j + 1 :]
-                    if not value and i + 1 < len(args):
-                        value, i = args[i + 1], i + 1
-                    if ch in "Ft":
-                        out.append(value)
-                    break
-                if ch in "Su":  # необязательное значение — только слитно
-                    break
-        i += 1
-    return out
+    files: list[str] = []
+    position = 0
+    while position < len(args) and args[position] != _OPTIONS_END:
+        option = _commit_option(args[position])
+        if option is not None:
+            reads_file, option_value, value_follows = option
+            if value_follows and position + 1 < len(args):
+                position += 1
+                option_value = args[position]
+            if reads_file:
+                files.append(option_value)
+        position += 1
+    return files
 
 
 def _outside_path(sub: str, args: list[str], root: Path) -> str | None:
-    """Аргумент, который ведёт за пределы проекта: путь у читающих подкоманд (с ним git
-    сам переходит в --no-index или читает чужой репозиторий) или файл `commit -F/-t`."""
+    """Аргумент, который ведёт за пределы проекта; None — такого нет.
+
+    Это путь у читающих подкоманд (с ним git сам переходит в --no-index или читает чужой
+    репозиторий) или файл `commit -F/-t`.
+    """
     if _reading(sub, args) and sub != "branch":
-        candidates = [a for a in args if not a.startswith("-")]  # ревизии и пути
+        candidates = [arg for arg in args if not arg.startswith(_SHORT_OPTION)]  # ревизии и пути
     elif sub == "commit":
         candidates = _commit_files(args)
     else:
         return None
-    for value in candidates:
+    for word in candidates:
         # `<ревизия>:./путь` и `<ревизия>:../путь` — относительно рабочего каталога
-        _, colon, path = value.partition(":")
+        _, colon, path = word.partition(":")
         relative = colon and path.startswith(("./", "../"))
-        for candidate in (value, path) if relative else (value,):
+        for candidate in (word, path) if relative else (word,):
             try:
                 resolve_in_root(root, candidate)
             except (SandboxError, OSError, ValueError):
-                return value
+                return word
     return None
 
 
 def _branch_is_listing(args: list[str]) -> bool:
-    flags = [a for a in args if a.startswith("-")]
-    positional = [a for a in args if not a.startswith("-")]
-    if any(f.split("=", 1)[0] not in _BRANCH_LIST_FLAGS for f in flags):
+    flags = [arg for arg in args if arg.startswith(_SHORT_OPTION)]
+    positional = [arg for arg in args if not arg.startswith(_SHORT_OPTION)]
+    if any(flag.split("=", 1)[0] not in _BRANCH_LIST_FLAGS for flag in flags):
         return False
     # `git branch foo` создаёт ветку; позиционные аргументы — только шаблоны для --list
     return not positional or bool({"-l", "--list"} & set(flags))
 
 
-class GitParams(BaseModel):
+# Докстринг pydantic-модели попал бы в JSON-схему параметров, которую получает модель.
+class GitParams(BaseModel):  # noqa: D101
     subcommand: str = Field(
         description=(
             "git subcommand: status, diff, log, show, branch, add, commit, checkout, "
             "switch, restore, stash"
-        )
+        ),
     )
     args: list[str] = Field(
         default_factory=list,
@@ -248,7 +298,9 @@ class GitParams(BaseModel):
     )
 
 
-class GitTool(Tool):
+class GitTool(Tool[GitParams]):
+    """Безопасное подмножество операций git в репозитории проекта."""
+
     name = "git"
     description = (
         "Runs git operations in the project repository. Supported: status, diff, log, "
@@ -260,7 +312,9 @@ class GitTool(Tool):
     )
     Params = GitParams
 
+    @override
     def assess(self, params: GitParams, ctx: ToolContext) -> Assessment:
+        """Риск вызова: чтение своего репозитория — безопасно, потеря работы — опасно."""
         # Читающая подкоманда, которой нет в инструменте, — ошибка с подсказкой до решения по
         # режиму: иначе в режиме плана и у explore `git blame` отклонялся бы как изменение.
         # Изменяющие (push, merge…) по-прежнему блокирует режим.
@@ -286,8 +340,47 @@ class GitTool(Tool):
             return Assessment(RiskLevel.WRITE)
         return Assessment(RiskLevel.SAFE)
 
+    @override
     def risk(self, params: GitParams, ctx: ToolContext) -> RiskLevel:
+        """Уровень риска из :meth:`assess`."""
         return self.assess(params, ctx).risk
+
+    @override
+    def describe(self, params: GitParams) -> str:
+        """Подкоманда с аргументами в кавычках, как в shell."""
+        # с кавычками, как в shell: `commit -m 'fix bug'`, а не `commit -m fix bug`
+        return f"{params.subcommand} {shlex.join(params.args)}".strip()
+
+    @override
+    def preview(self, params: GitParams, ctx: ToolContext) -> Display | None:
+        """Команда для подтверждения; None — чтение, подтверждать нечего."""
+        # Сначала валидация: недопустимую команду не предлагаем подтверждать.
+        self._check(params, ctx)
+        if self.risk(params, ctx) >= RiskLevel.WRITE:
+            return Display(f"$ git {self.describe(params)}", title="команда")
+        return None
+
+    @override
+    def run(self, params: GitParams, ctx: ToolContext) -> ToolResult:
+        """Запускает git в корне проекта и возвращает его вывод."""
+        self._check(params, ctx)
+        cmd = self._command(params)
+        try:
+            res = run_process(cmd, cwd=ctx.root, timeout=_TIMEOUT)
+        except FileNotFoundError as exc:
+            raise ToolError("git не установлен или недоступен в PATH.") from exc
+        if res.timed_out:
+            return ToolResult(content="git: таймаут", ok=False, summary="git таймаут")
+
+        stderr = f"\n[stderr]\n{res.stderr}" if res.stderr else ""
+        combined = f"{res.stdout}{stderr}"
+        out = truncate_middle(combined.strip(), _MAX_OUTPUT) or "(нет вывода)"
+        return ToolResult(
+            content=f"exit code: {res.returncode}\n{out}",
+            ok=res.returncode == 0,
+            summary=f"git {params.subcommand} → код {res.returncode}",
+            display=Display(out, title=f"git {params.subcommand}"),
+        )
 
     def _check(self, params: GitParams, ctx: ToolContext) -> None:
         sub = params.subcommand
@@ -300,7 +393,7 @@ class GitTool(Tool):
             )
             raise ToolError(
                 f"Подкоманда git '{sub}' не поддерживается этим инструментом. Доступно: "
-                f"{sorted(_ALLOWED)}.{hint}"
+                f"{sorted(_ALLOWED)}.{hint}",
             )
         # Опции проверяются и после `--`: `stash list` отбрасывает `--` и передаёт следующие
         # слова в `git log` как опции. Путь, названный как запрещённая опция, не пройдёт.
@@ -310,11 +403,11 @@ class GitTool(Tool):
         outside = _outside_path(sub, params.args, ctx.root)
         if outside is not None:
             raise ToolError(
-                f"Путь '{outside}' — вне проекта: инструмент git работает только с файлами проекта."
+                f"Путь '{outside}' — вне проекта: инструмент git работает только с файлами "
+                "проекта.",
             )
 
-    @staticmethod
-    def _command(params: GitParams) -> list[str]:
+    def _command(self, params: GitParams) -> list[str]:
         sub, args = params.subcommand, list(params.args)
         if sub == "log" and not args:
             args = ["--oneline", "-n", "20"]  # компактный лог по умолчанию
@@ -323,33 +416,3 @@ class GitTool(Tool):
         elif sub == "stash" and args[:1] in (["show"], ["list"]):
             args = [args[0], "--no-ext-diff", *args[1:]]  # list передаёт опции git log
         return ["git", *_SAFE_CONFIG, sub, *args]
-
-    def describe(self, params: GitParams) -> str:
-        # с кавычками, как в shell: `commit -m 'fix bug'`, а не `commit -m fix bug`
-        return f"{params.subcommand} {shlex.join(params.args)}".strip()
-
-    def preview(self, params: GitParams, ctx: ToolContext) -> Display | None:
-        # Сначала валидация: недопустимую команду не предлагаем подтверждать.
-        self._check(params, ctx)
-        if self.risk(params, ctx) >= RiskLevel.WRITE:
-            return Display(f"$ git {self.describe(params)}", title="команда")
-        return None
-
-    def run(self, params: GitParams, ctx: ToolContext) -> ToolResult:
-        self._check(params, ctx)
-        cmd = self._command(params)
-        try:
-            res = run_process(cmd, cwd=ctx.root, timeout=_TIMEOUT)
-        except FileNotFoundError as e:
-            raise ToolError("git не установлен или недоступен в PATH.") from e
-        if res.timed_out:
-            return ToolResult(content="git: таймаут", ok=False, summary="git таймаут")
-
-        out = res.stdout + (("\n[stderr]\n" + res.stderr) if res.stderr else "")
-        out = truncate_middle(out.strip(), _MAX_OUTPUT) or "(нет вывода)"
-        return ToolResult(
-            content=f"exit code: {res.returncode}\n{out}",
-            ok=res.returncode == 0,
-            summary=f"git {params.subcommand} → код {res.returncode}",
-            display=Display(out, title=f"git {params.subcommand}"),
-        )

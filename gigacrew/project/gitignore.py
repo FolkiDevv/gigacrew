@@ -1,4 +1,4 @@
-"""Правила ``.gitignore``: разбор, стек правил по каталогам, glob → regex.
+r"""Правила ``.gitignore``: разбор, стек правил по каталогам, glob → regex.
 
 Поддерживается то, что встречается в реальных проектах: комментарии, ``!`` —
 отрицание, хвостовой ``/`` — только каталоги, ``/`` в начале или середине — шаблон
@@ -24,7 +24,7 @@ _MAX_RULES_BYTES = 1_000_000  # больше — явно не файл прав
 
 @functools.lru_cache(maxsize=1024)
 def compile_glob(pattern: str) -> re.Pattern[str]:
-    """glob → regex: ``**`` — любое число каталогов, ``*``/``?`` — в пределах сегмента.
+    r"""Glob → regex: ``**`` — любое число каталогов, ``*``/``?`` — в пределах сегмента.
 
     Как в ``.gitignore``, ``**`` пересекает ``/`` только целым сегментом пути
     (``**/x``, ``a/**``, ``a/**/b``); в остальных местах (``foo**bar``) это ``*``.
@@ -33,76 +33,98 @@ def compile_glob(pattern: str) -> re.Pattern[str]:
     компилируется (``[z-a]``), сравнивается как обычная строка.
     """
     out: list[str] = []
-    i, n = 0, len(pattern)
-    while i < n:
-        c = pattern[i]
-        if c == "\\" and i + 1 < n:
-            out.append(re.escape(pattern[i + 1]))
-            i += 2
-            continue
-        if c == "*":
-            whole_segment = (i == 0 or pattern[i - 1] == "/") and (
-                i + 2 == n or pattern[i + 2 : i + 3] == "/"
-            )
-            if pattern.startswith("**", i) and whole_segment:
-                i += 2
-                if i < n and pattern[i] == "/":
-                    i += 1
-                    out.append("(?:.*/)?")
-                else:
-                    out.append(".*")
-                continue
-            while i + 1 < n and pattern[i + 1] == "*":
-                i += 1  # "***", "**" внутри сегмента — то же, что "*"
-            out.append("[^/]*")
-        elif c == "?":
-            out.append("[^/]")
-        elif c == "[":
-            j = i + 1
-            if j < n and pattern[j] in "!^":
-                j += 1
-            if j < n and pattern[j] == "]":
-                j += 1
-            while j < n and pattern[j] != "]":
-                j += 1
-            if j >= n:
-                out.append(re.escape(c))
-            else:
-                body = pattern[i + 1 : j]
-                if body[0] in "!^":
-                    body = "^" + body[1:]
-                out.append("[" + body.replace("\\", "\\\\") + "]")
-                i = j
-        else:
-            out.append(re.escape(c))
-        i += 1
+    index = 0
+    while index < len(pattern):
+        fragment, index = _glob_token(pattern, index)
+        out.append(fragment)
+    source = "".join(out)
     try:
-        return re.compile("".join(out) + r"\Z")
+        return re.compile(rf"{source}\Z")
     except re.error:
-        return re.compile(re.escape(pattern) + r"\Z")
+        literal = re.escape(pattern)
+        return re.compile(rf"{literal}\Z")
+
+
+def _glob_token(pattern: str, index: int) -> tuple[str, int]:
+    """Элемент glob с позиции ``index`` → (фрагмент regex, позиция следующего элемента)."""
+    char = pattern[index]
+    after = index + 1
+    if char == "\\" and after < len(pattern):
+        return re.escape(pattern[after]), after + 1
+    if char == "*":
+        return _glob_star(pattern, index)
+    if char == "?":
+        return "[^/]", after
+    if char == "[":
+        return _glob_bracket(pattern, index)
+    return re.escape(char), after
+
+
+def _glob_star(pattern: str, index: int) -> tuple[str, int]:
+    """Звёздочки с позиции ``index`` → (фрагмент regex, позиция после них)."""
+    length = len(pattern)
+    whole_segment = (index == 0 or pattern[index - 1] == "/") and (
+        index + 2 == length or pattern[index + 2 : index + 3] == "/"
+    )
+    if pattern.startswith("**", index) and whole_segment:
+        after = index + 2
+        if after < length and pattern[after] == "/":
+            return "(?:.*/)?", after + 1
+        return ".*", after
+    end = index + 1
+    while end < length and pattern[end] == "*":
+        end += 1  # "***", "**" внутри сегмента — то же, что "*"
+    return "[^/]*", end
+
+
+def _glob_bracket(pattern: str, index: int) -> tuple[str, int]:
+    """Класс символов ``[...]`` с позиции ``index`` → (фрагмент regex, позиция после него).
+
+    Незакрытая ``[`` — обычный символ.
+    """
+    length = len(pattern)
+    start = index + 1
+    end = start
+    if end < length and pattern[end] in "!^":
+        end += 1
+    if end < length and pattern[end] == "]":
+        end += 1
+    while end < length and pattern[end] != "]":
+        end += 1
+    if end >= length:
+        return re.escape("["), start
+    body = pattern[start:end]
+    if body[0] in "!^":
+        negated = body[1:]
+        body = f"^{negated}"
+    escaped = body.replace("\\", r"\\")
+    return f"[{escaped}]", end + 1
 
 
 @dataclass(frozen=True)
 class IgnoreRule:
+    """Одно правило ``.gitignore``: шаблон, отрицание ``!``, «только каталоги»."""
+
     regex: re.Pattern[str]  # сравнивается с путём относительно каталога файла правил
     negate: bool = False
     dir_only: bool = False
 
-    def matches(self, rel_posix: str, is_dir: bool) -> bool:
+    def matches(self, rel_posix: str, *, is_dir: bool) -> bool:
+        """Путь (относительно каталога файла правил) подходит под правило."""
         if self.dir_only and not is_dir:
             return False
         return self.regex.match(rel_posix) is not None
 
 
 def _strip_trailing_spaces(line: str) -> str:
-    """Хвостовые пробелы отбрасываются, если не экранированы (``foo\\ ``)."""
+    r"""Хвостовые пробелы отбрасываются, если не экранированы (``foo\\ ``)."""
     end = len(line)
     while end > 0 and line[end - 1] == " ":
         backslashes = 0
-        k = end - 2
-        while k >= 0 and line[k] == "\\":
+        pos = end - 2
+        while pos >= 0 and line[pos] == "\\":
             backslashes += 1
-            k -= 1
+            pos -= 1
         if backslashes % 2:
             break
         end -= 1
@@ -115,11 +137,9 @@ def parse_rule(line: str) -> IgnoreRule | None:
     if not line or line.startswith("#"):
         return None
     negate = line.startswith("!")
-    if negate:
+    if negate or line.startswith((r"\!", r"\#")):
         line = line[1:]
-    elif line.startswith("\\!") or line.startswith("\\#"):
-        line = line[1:]
-    dir_only = line.endswith("/") and not line.endswith("\\/")
+    dir_only = line.endswith("/") and not line.endswith(r"\/")
     line = line.rstrip("/")
     if not line:
         return None
@@ -132,10 +152,14 @@ def parse_rule(line: str) -> IgnoreRule | None:
 
 
 def parse_rules(text: str) -> tuple[IgnoreRule, ...]:
+    """Текст ``.gitignore`` → правила по порядку (пустые строки и комментарии пропущены)."""
     return tuple(rule for rule in map(parse_rule, text.splitlines()) if rule is not None)
 
 
-def _read_rules(path: Path, *, follow_symlink: bool = True) -> tuple[IgnoreRule, ...]:
+_Rules = tuple[IgnoreRule, ...]
+
+
+def _read_rules(path: Path, *, follow_symlink: bool = True) -> _Rules:
     """Правила из файла; отсутствующий, нечитаемый или огромный файл — нет правил."""
     try:
         if not follow_symlink and path.is_symlink():
@@ -152,9 +176,10 @@ def _read_rules(path: Path, *, follow_symlink: bool = True) -> tuple[IgnoreRule,
 class IgnoreStack:
     """Правила, действующие в каталоге: пары (каталог от корня, правила), сверху вниз."""
 
-    levels: tuple[tuple[str, tuple[IgnoreRule, ...]], ...] = ()
+    levels: tuple[tuple[str, _Rules], ...] = ()
 
-    def push(self, rel_dir: str, rules: tuple[IgnoreRule, ...]) -> IgnoreStack:
+    def push(self, rel_dir: str, rules: _Rules) -> IgnoreStack:
+        """Стек с правилами каталога ``rel_dir`` поверх текущих (без правил — тот же стек)."""
         if not rules:
             return self
         return IgnoreStack((*self.levels, (rel_dir, rules)))
@@ -165,18 +190,18 @@ class IgnoreStack:
         # как git (2.32+): .gitignore-симлинк в рабочем дереве не читается
         return self.push(rel_dir, _read_rules(directory / GITIGNORE_NAME, follow_symlink=False))
 
-    def is_ignored(self, rel_posix: str, is_dir: bool) -> bool:
+    def is_ignored(self, rel_posix: str, *, is_dir: bool) -> bool:
         """Путь (от корня проекта) исключён правилами; решает последнее совпадение."""
         ignored = False
         for base, rules in self.levels:
             if base:
-                if not rel_posix.startswith(base + "/"):
+                if not rel_posix.startswith(f"{base}/"):
                     continue
                 sub = rel_posix[len(base) + 1 :]
             else:
                 sub = rel_posix
             for rule in rules:
-                if rule.matches(sub, is_dir):
+                if rule.matches(sub, is_dir=is_dir):
                     ignored = not rule.negate
         return ignored
 
@@ -193,6 +218,6 @@ def stack_for(root: Path, rel_dir: str) -> IgnoreStack:
     if not rel_dir:
         return stack
     parts = rel_dir.split("/")
-    for i in range(1, len(parts) + 1):
-        stack = stack.enter(root, "/".join(parts[:i]))
+    for depth in range(1, len(parts) + 1):
+        stack = stack.enter(root, "/".join(parts[:depth]))
     return stack

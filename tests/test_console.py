@@ -2,55 +2,92 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import re
+from collections.abc import Callable, Generator, Iterator
+from dataclasses import replace
+from pathlib import Path
+from typing import NoReturn, override
 
 import pytest
+from fakes import ScriptedProvider, text_turn, tool_turn
+from prompt_toolkit.output import ColorDepth
+from rich.console import ConsoleDimensions
 
-from gigacrew.agent.events import ToolCallInfo, TurnStats
-from gigacrew.tools.base import Display, ToolResult
+from gigacrew.agent.events import (
+    Approval,
+    CompactResult,
+    Review,
+    SubagentInfo,
+    ToolCallInfo,
+    TurnStats,
+)
+from gigacrew.agent.loop import Agent
+from gigacrew.config import Config
+from gigacrew.permissions import PermissionMode, ToolKind
+from gigacrew.project.workspace import Workspace
+from gigacrew.tools.base import Display, ToolContext, ToolResult, build_default_registry
+from gigacrew.tools.questions import Answer, Question, QuestionOption, QuestionsUnavailableError
+from gigacrew.tools.shell import RunShellParams, RunShellTool
+from gigacrew.ui import colors
 from gigacrew.ui.console import Console, sanitize
 from gigacrew.ui.format import clip_lines, format_tokens, plural
+from gigacrew.ui.theme import MINT, MINT_ANSI
 
 
-def _console():
+def _console() -> tuple[Console, io.StringIO]:
     buf = io.StringIO()
     return Console(no_color=True, file=buf), buf
 
 
-def test_sanitize_strips_escape_sequences():
+def _has_live_area(ui: Console) -> bool:
+    # Проверка через функцию, а не ``ui._live is None`` в тесте: после assert mypy
+    # держит суженный тип ``ui._live`` до конца теста, хотя вызовы UI его меняют.
+    return ui._live is not None
+
+
+def _echoing_input(ui: Console, answers: Iterator[str]) -> Callable[[str], str]:
+    # Ввод, как в терминале: приглашение остаётся в выводе, ответ — следующий заготовленный.
+    def echo_input(prompt: str) -> str:
+        ui._console.print(prompt)
+        return next(answers)
+
+    return echo_input
+
+
+def test_sanitize_strips_escape_sequences() -> None:
     assert sanitize("a\x1b[31mred\x1b[0m\tb\nc\x07\x9b") == "a[31mred[0m\tb\nc"
 
 
-def test_stream_and_output_are_sanitized():
+def test_stream_and_output_are_sanitized() -> None:
     ui, buf = _console()
     ui.on_stream_start()
     ui.on_stream_delta("hi \x1b]0;pwned\x07there")
     ui.on_stream_end()
-    from gigacrew.permissions import ToolKind
-
     ui.on_tool_result(
         ToolCallInfo("run_shell", "ls", ToolKind.COMMAND),
         ToolResult(content="", summary="ok", display=Display("\x1b[2Jcleared", title="$ ls")),
         previewed=False,
     )
     out = buf.getvalue()
-    assert "\x1b" not in out and "\x07" not in out
-    assert "there" in out and "cleared" in out
+    assert "\x1b" not in out
+    assert "\x07" not in out
+    assert "there" in out
+    assert "cleared" in out
 
 
-def test_edit_shows_file_and_line_counts_not_diff():
-    from gigacrew.permissions import ToolKind
-
+def test_edit_shows_file_and_line_counts_not_diff() -> None:
     ui, buf = _console()
     diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n-old\n+UNIQUE\n+new\n"
-    result = ToolResult(content="", summary="изменён a.py", display=Display(diff, "diff", "a.py"))
-    ui.on_tool_result(ToolCallInfo("edit_file", "a.py", ToolKind.EDIT), result, previewed=False)
+    edit = ToolResult(content="", summary="изменён a.py", display=Display(diff, "diff", "a.py"))
+    ui.on_tool_result(ToolCallInfo("edit_file", "a.py", ToolKind.EDIT), edit, previewed=False)
     out = buf.getvalue()
-    assert "● Изменил a.py  +2 −1" in out and "UNIQUE" not in out
+    assert "● Изменил a.py  +2 −1" in out
+    assert "UNIQUE" not in out
 
 
-def test_turn_stats_line():
+def test_turn_stats_line() -> None:
     ui, buf = _console()
     ui.on_turn_end(
         TurnStats(
@@ -60,18 +97,21 @@ def test_turn_stats_line():
             completion_tokens=20,
             context_tokens=12_345,
             duration_s=3.21,
-        )
+        ),
     )
     out = buf.getvalue()
-    assert "2 шага" in out and "1 инструмент " in out and "3.2 с" in out
-    assert "контекст ~12.3k" in out and "потрачено 220" in out
+    assert "2 шага" in out
+    assert "1 инструмент " in out
+    assert "3.2 с" in out
+    assert "контекст ~12.3k" in out
+    assert "потрачено 220" in out
 
 
 # ------------------------------ живой режим ------------------------------ #
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
-def _live_console(width: int = 60):
+def _live_console(width: int = 60) -> tuple[Console, io.StringIO]:
     buf = io.StringIO()
     return Console(file=buf, force_terminal=True, width=width, auto_refresh=False), buf
 
@@ -80,28 +120,34 @@ def _plain(buf: io.StringIO) -> str:
     return _ANSI_RE.sub("", buf.getvalue())
 
 
-def test_streamed_markdown_is_formatted():
+def test_streamed_markdown_is_formatted() -> None:
     ui, buf = _live_console()
     ui.on_stream_start()
-    for chunk in ["# Заго", "ловок\n\nЭто **жир", "ный** текст\n", "\n- пункт\n", "\nконец"]:
+    for chunk in ("# Заго", "ловок\n\nЭто **жир", "ный** текст\n", "\n- пункт\n", "\nконец"):
         ui.on_stream_delta(chunk)
     ui.on_stream_end()
     out = _plain(buf)
-    assert "Заголовок" in out and "жирный текст" in out and "конец" in out
-    assert "**" not in out and "# " not in out
+    assert "Заголовок" in out
+    assert "жирный текст" in out
+    assert "конец" in out
+    assert "**" not in out
+    assert "# " not in out
     assert "\x1b[1m" in buf.getvalue()  # жирный — настоящим стилем терминала
     assert ui._live is None
 
 
-def test_live_area_stopped_after_interrupt(tmp_path):
-    from fakes import ScriptedProvider, text_turn
-
-    from gigacrew.agent.loop import Agent
-    from gigacrew.config import Config
-    from gigacrew.tools.base import build_default_registry
-
+def test_live_area_stopped_after_interrupt(tmp_path: Path) -> None:
     class Interrupting(ScriptedProvider):
-        def stream(self, messages, tools=None, *, on_delta=None, **kwargs):
+        @override
+        def stream(
+            self,
+            messages: object,
+            tools: object = None,
+            *,
+            on_delta: Callable[[str], None] | None = None,
+            **kwargs: object,
+        ) -> NoReturn:
+            assert on_delta is not None
             on_delta("Начало ответа\n\nещё")
             raise KeyboardInterrupt
 
@@ -111,87 +157,93 @@ def test_live_area_stopped_after_interrupt(tmp_path):
     with pytest.raises(KeyboardInterrupt):
         agent.run_turn("привет")
     assert ui._live is None
-    assert "Начало ответа" in _plain(buf) and "ещё" in _plain(buf)
+    assert "Начало ответа" in _plain(buf)
+    assert "ещё" in _plain(buf)
 
 
-def test_tool_spinner_lifecycle():
+def test_tool_spinner_lifecycle() -> None:
     ui, _ = _live_console()
     call = ToolCallInfo("run_shell", "sleep 1")
     ui.on_tool_start(call)
-    assert ui._live is not None
+    assert _has_live_area(ui)
     ui.on_tool_end(call)
-    assert ui._live is None
+    assert not _has_live_area(ui)
     ui.stop_live()  # идемпотентно
 
 
-def test_single_live_area():
+def test_single_live_area() -> None:
     ui, _ = _live_console()
     ui.on_stream_start()
     first = ui._live
     ui.on_tool_start(ToolCallInfo("x"))
-    assert ui._live is not first and not first.active
+    assert ui._live is not first
+    assert first is not None
+    assert not first.active
     ui.stop_live()
 
 
-def test_progress_live_label_updates_and_stops_on_interrupt():
-    ui, buf = _live_console()
-    counter = {"n": 0}
-    with (
-        pytest.raises(KeyboardInterrupt),
-        ui.progress("индексирую", lambda: f"{counter['n']} файлов"),
-    ):
+def _interrupt_progress(ui: Console, counter: dict[str, int]) -> None:
+    with ui.progress("индексирую", lambda: f"{counter['n']} файлов"):
         assert ui._live is not None
         counter["n"] = 42
         ui._live._live.refresh()
         raise KeyboardInterrupt
+
+
+def test_progress_live_label_updates_and_stops_on_interrupt() -> None:
+    ui, buf = _live_console()
+    counter = {"n": 0}
+    with pytest.raises(KeyboardInterrupt):
+        _interrupt_progress(ui, counter)
     assert ui._live is None
     assert "индексирую: 42 файлов" in _plain(buf)
 
 
-def test_progress_without_terminal_prints_title_once():
+def test_progress_without_terminal_prints_title_once() -> None:
     ui, buf = _console()
     with ui.progress("индексирую", lambda: "1 файл"):
         assert ui._live is None
     assert buf.getvalue() == "индексирую…\n"
 
 
-def test_compaction_progress_and_result():
-    from gigacrew.agent.events import CompactResult
-
+def test_compaction_progress_and_result() -> None:
     ui, buf = _console()
     ui.on_compact_start(auto=True)
     ui.on_compact_end(CompactResult(before_tokens=24_000, after_tokens=6_500, messages=31))
     out = buf.getvalue()
     assert "контекст почти заполнен — сжимаю историю…" in out
-    assert "контекст сжат: ~24k → ~6.5k ток." in out and "31 сообщение" in out
+    assert "контекст сжат: ~24k → ~6.5k ток." in out
+    assert "31 сообщение" in out
 
     ui, buf = _live_console()
     ui.on_compact_start(auto=False)
-    assert ui._live is not None
+    assert _has_live_area(ui)
     ui.on_compact_end(None)  # не удалось — только убрать индикатор
-    assert ui._live is None and "сжат" not in _plain(buf)
+    assert not _has_live_area(ui)
+    assert "сжат" not in _plain(buf)
 
 
-def test_no_live_area_without_terminal():
+def test_no_live_area_without_terminal() -> None:
     ui, buf = _console()
     ui.on_stream_start()
     ui.on_tool_start(ToolCallInfo("x"))
     assert ui._live is None
     ui.on_stream_end()
-    assert buf.getvalue() == ""
+    assert not buf.getvalue()
 
 
-def test_command_shows_last_line_or_tail_of_failure():
-    from gigacrew.permissions import ToolKind
-
+def test_command_shows_last_line_or_tail_of_failure() -> None:
     ui, buf = _console()
-    text = "\n".join(f"line{i}" for i in range(100))
+    text = "\n".join(f"line{index}" for index in range(100))
     call = ToolCallInfo("run_shell", "seq 100", ToolKind.COMMAND)
     ui.on_tool_result(
-        call, ToolResult(content=text, summary="ok", display=Display(text)), previewed=False
+        call,
+        ToolResult(content=text, summary="ok", display=Display(text)),
+        previewed=False,
     )
     assert buf.getvalue() == "● $ seq 100  ✔ line99\n"
-    failed = text + "\n" + "=" * 30 + " short test summary " + "=" * 30
+    separator = "=" * 30
+    failed = f"{text}\n{separator} short test summary {separator}"
     ui.on_tool_result(
         call,
         ToolResult(content="", ok=False, summary="код 1", display=Display(failed), exit_code=1),
@@ -199,27 +251,29 @@ def test_command_shows_last_line_or_tail_of_failure():
     )
     out = buf.getvalue()
     assert "● $ seq 100  ✘ код 1" in out
-    assert "│ line97\n" in out and "│ line99\n" in out and "line96" not in out
+    assert "│ line97\n" in out
+    assert "│ line99\n" in out
+    assert "line96" not in out
     assert "short test summary" not in out  # строка-разделитель в хвост не идёт
 
 
-def test_confirm_question_includes_summary(monkeypatch):
-    from gigacrew.agent.events import Approval
-    from gigacrew.permissions import ToolKind
-
+def test_confirm_question_includes_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
     answers = iter(["д", "", "a", "a"])
-    monkeypatch.setattr(ui._c, "input", lambda prompt: (ui._c.print(prompt), next(answers))[1])
+    monkeypatch.setattr(ui._console, "input", _echoing_input(ui, answers))
     edit = ToolCallInfo("edit_file", "a.py", ToolKind.EDIT)
     assert ui.confirm(edit, None, dangerous=False).approval is Approval.YES
     out = buf.getvalue()
-    assert "▌ edit_file a.py\n" in out and "▌ ? Применить правку? [y/N/a]" in out
+    assert "▌ edit_file a.py\n" in out
+    assert "▌ ? Применить правку? [y/N/a]" in out
     assert "до конца сессии" in out
     danger = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND, reason="удаление без возврата")
     assert ui.confirm(danger, None, dangerous=True).approval is Approval.NO
     out = buf.getvalue()
-    assert "▌ $ rm -rf x\n" in out and "▌ почему опасно  удаление без возврата" in out
-    assert "▌ ⚠ Выполнить опасную команду? [y/N] " in out and "запомнить нельзя" in out
+    assert "▌ $ rm -rf x\n" in out
+    assert "▌ почему опасно  удаление без возврата" in out
+    assert "▌ ⚠ Выполнить опасную команду? [y/N] " in out
+    assert "запомнить нельзя" in out
     command = ToolCallInfo(
         "run_shell",
         "pytest -q",
@@ -230,36 +284,35 @@ def test_confirm_question_includes_summary(monkeypatch):
     )
     assert ui.confirm(command, None, dangerous=False).approval is Approval.ALWAYS
     out = buf.getvalue()
-    assert "▌ $ pytest -q\n" in out and "▌ ? Выполнить команду? [y/N/a]" in out
-    assert "▌ почему спрашиваю  выполняет код проекта" in out and "раньше: разрешали 2" in out
+    assert "▌ $ pytest -q\n" in out
+    assert "▌ ? Выполнить команду? [y/N/a]" in out
+    assert "▌ почему спрашиваю  выполняет код проекта" in out
+    assert "раньше: разрешали 2" in out
     assert "a — всегда разрешать «pytest»" in out
     assert (
         ui.confirm(danger, None, dangerous=True).approval is Approval.NO
     )  # «a» для опасного — нет
 
 
-def test_reviewer_lines(monkeypatch):
-    from gigacrew.agent.events import Approval, Review
-    from gigacrew.permissions import ToolKind
-
+def test_reviewer_lines(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
     command = ToolCallInfo("run_shell", "./deploy-check", ToolKind.COMMAND)
     ui.on_review_start(command)  # без терминала индикатора нет
-    ui.on_review_end(command, Review("R", True, "проверка проекта"))
-    ui.on_review_end(command, Review("R", False, "не просили"))  # отказ — в вопросе
+    ui.on_review_end(command, Review("R", allowed=True, reason="проверка проекта"))
+    ui.on_review_end(command, Review("R", allowed=False, reason="не просили"))  # отказ — в вопросе
     ui.on_review_end(command, None)
     assert buf.getvalue().strip() == "рецензент (R) разрешил: проверка проекта"
     # у шага — строкой под ним, когда он выполнится
     ui, buf = _console()
     ui.on_tool_call(command)
-    ui.on_review_end(command, Review("R", True, "проверка проекта"))
-    assert buf.getvalue() == ""
+    ui.on_review_end(command, Review("R", allowed=True, reason="проверка проекта"))
+    assert not buf.getvalue()
     ui.on_tool_result(command, ToolResult(content="", summary="ok", exit_code=0), previewed=False)
     assert buf.getvalue() == (
         "● $ ./deploy-check  ✔ код 0\n  рецензент (R) разрешил: проверка проекта\n"
     )
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "y")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "y")
     asked = ToolCallInfo(
         "run_shell",
         "./deploy-check",
@@ -272,35 +325,36 @@ def test_reviewer_lines(monkeypatch):
     assert out.index("почему спрашиваю") < out.index("рецензент (R): не просили")
 
 
-def test_confirm_free_text_is_feedback_and_no_answer_is_marked(monkeypatch):
-    from gigacrew.agent.events import Approval
-    from gigacrew.permissions import ToolKind
-
+def test_confirm_free_text_is_feedback_and_no_answer_is_marked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     ui, _ = _console()
     answers = iter(["Используй uv run pytest", "ф", "нет"])
-    monkeypatch.setattr(ui._c, "input", lambda prompt: next(answers))
+    monkeypatch.setattr(ui._console, "input", lambda prompt: next(answers))
     command = ToolCallInfo("run_shell", "pytest", ToolKind.COMMAND)
-    result = ui.confirm(command, None, dangerous=False)
-    assert result.approval is Approval.NO and result.feedback == "Используй uv run pytest"
+    outcome = ui.confirm(command, None, dangerous=False)
+    assert outcome.approval is Approval.NO
+    assert outcome.feedback == "Используй uv run pytest"
     assert ui.confirm(command, None, dangerous=False).approval is Approval.ALWAYS  # «ф» = «a»
-    assert ui.confirm(command, None, dangerous=False).feedback == ""
+    assert not ui.confirm(command, None, dangerous=False).feedback
 
-    def eof(prompt):
+    def eof(prompt: str) -> NoReturn:
         raise EOFError
 
-    monkeypatch.setattr(ui._c, "input", eof)
-    result = ui.confirm(command, None, dangerous=False)
-    assert result.approval is Approval.NO and not result.answered
+    monkeypatch.setattr(ui._console, "input", eof)
+    outcome = ui.confirm(command, None, dangerous=False)
+    assert outcome.approval is Approval.NO
+    assert not outcome.answered
 
 
-def test_format_helpers():
-    assert [format_tokens(n) for n in (950, 12_345, 120_000, 1_234_567)] == [
+def test_format_helpers() -> None:
+    assert [format_tokens(count) for count in (950, 12_345, 120_000, 1_234_567)] == [
         "950",
         "12.3k",
         "120k",
         "1.2M",
     ]
-    assert [plural(n, "шаг", "шага", "шагов") for n in (1, 2, 5, 11, 21, 112)] == [
+    assert [plural(count, "шаг", "шага", "шагов") for count in (1, 2, 5, 11, 21, 112)] == [
         "шаг",
         "шага",
         "шагов",
@@ -310,50 +364,56 @@ def test_format_helpers():
     ]
     assert clip_lines("a\nb") == "a\nb"
     assert len(clip_lines("x" * 10_000)) <= 300
-    long_lines = "\n".join(f"{i:03d} " + "x" * 290 for i in range(40)) + "\nИТОГ: 3 failed"
-    clipped = clip_lines(long_lines)
+    padding = "x" * 290
+    numbers = [format(index, "03d") for index in range(40)]
+    rows = "\n".join(f"{number} {padding}" for number in numbers)
+    clipped = clip_lines(f"{rows}\nИТОГ: 3 failed")
     assert len(clipped) <= 4000
-    assert clipped.startswith("000") and clipped.endswith("ИТОГ: 3 failed")
+    assert clipped.startswith("000")
+    assert clipped.endswith("ИТОГ: 3 failed")
 
 
-def test_animation_thread_stops():
+def test_animation_thread_stops() -> None:
     buf = io.StringIO()
     ui = Console(file=buf, force_terminal=True, width=60)  # с потоком анимации
     ui.on_stream_start()
     area = ui._live
     ui.on_stream_delta("текст\n\nещё\n")
     ui.on_stream_end()
-    assert area._thread is not None and not area._thread.is_alive()
+    assert area is not None
+    assert area._thread is not None
+    assert not area._thread.is_alive()
     assert "текст" in _plain(buf)
 
 
 # ---------------------------- вопросы агента ---------------------------- #
-from gigacrew.tools.questions import Answer, Question, QuestionOption  # noqa: E402
-
 _DB = Question(
     "Какую БД?",
     (QuestionOption("PostgreSQL", "с сервером"), QuestionOption("SQLite", "файл")),
     header="БД",
 )
 _PARTS = Question(
-    "Что добавить?", (QuestionOption("Логи"), QuestionOption("Метрики")), multi_select=True
+    "Что добавить?",
+    (QuestionOption("Логи"), QuestionOption("Метрики")),
+    multi_select=True,
 )
 
 
-def _asking_console(monkeypatch, *replies):
-    import gigacrew.ui.console as console_mod
-
-    monkeypatch.setattr(console_mod, "_stdin_is_terminal", lambda: True)
+def _asking_console(
+    monkeypatch: pytest.MonkeyPatch,
+    *replies: str | BaseException,
+) -> tuple[Console, io.StringIO]:
+    monkeypatch.setattr("gigacrew.ui.console._stdin_is_terminal", lambda: True)
     ui, buf = _console()
     queue = list(replies)
 
-    def fake_input(prompt):
-        item = queue.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        return item
+    def fake_input(prompt: str) -> str:
+        reply = queue.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
 
-    monkeypatch.setattr(ui._c, "input", fake_input)
+    monkeypatch.setattr(ui._console, "input", fake_input)
     return ui, buf
 
 
@@ -368,44 +428,48 @@ def _asking_console(monkeypatch, *replies):
         (["²"], [Answer(custom="²")]),  # не номер — свой ответ, без падения
     ],
 )
-def test_plain_questions(monkeypatch, replies, expected):
+def test_plain_questions(
+    monkeypatch: pytest.MonkeyPatch,
+    replies: list[str],
+    expected: list[Answer],
+) -> None:
     second = ["1, 2"] if len(expected) == 1 else ["1"]
     ui, buf = _asking_console(monkeypatch, *replies, *second)
     answers = ui.ask_user([_DB, _PARTS])
+    assert answers is not None
     assert answers[0] == expected[0]
     out = buf.getvalue()
-    assert "▌ ? Какую БД?   БД · 1 из 2" in out and "с сервером" in out
+    assert "▌ ? Какую БД?   БД · 1 из 2" in out
+    assert "с сервером" in out
     assert "3. Свой ответ" in out
     assert "● Какую БД?  " in out  # итог в ленте
 
 
-def test_plain_multi_select(monkeypatch):
+def test_plain_multi_select(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, _ = _asking_console(monkeypatch, "1", "1, 2")
-    assert ui.ask_user([_DB, _PARTS])[1] == Answer(("Логи", "Метрики"))
+    answers = ui.ask_user([_DB, _PARTS])
+    assert answers is not None
+    assert answers[1] == Answer(("Логи", "Метрики"))
 
 
-def test_questions_declined(monkeypatch):
+def test_questions_declined(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _asking_console(monkeypatch, KeyboardInterrupt())
     assert ui.ask_user([_DB, _PARTS]) is None
     assert "отказался" in buf.getvalue()
 
 
-def test_questions_need_keyboard(monkeypatch):
-    from gigacrew.tools.questions import QuestionsUnavailable
-
+def test_questions_need_keyboard() -> None:
     ui, _ = _console()
-    with pytest.raises(QuestionsUnavailable):
+    with pytest.raises(QuestionsUnavailableError):
         ui.ask_user([_DB])
 
 
-def test_questions_pause_esc_interrupt(monkeypatch):
-    import contextlib
-
+def test_questions_pause_esc_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, _ = _asking_console(monkeypatch, "1")
-    entered = []
+    entered: list[bool] = []
 
     @contextlib.contextmanager
-    def guard():
+    def guard() -> Generator[None]:
         entered.append(True)
         yield
 
@@ -414,69 +478,66 @@ def test_questions_pause_esc_interrupt(monkeypatch):
     assert entered == [True]
 
 
-def test_banner_shows_rocket_title_and_meta():
+def test_banner_shows_rocket_title_and_meta() -> None:
     ui, buf = _console()
     ui.banner(version="9.9.9", model="Alpha-Max", root="/work/proj", hints=[("/help", "справка")])
     out = _plain(buf)
-    assert "▄▄▄██▀▀▀▀█" in out and "┃╺┓" in out  # ракета и крупное название
-    assert "v9.9.9" in out and "Alpha-Max" in out and "/work/proj" in out
+    assert "▄▄▄██▀▀▀▀█" in out
+    assert "┃╺┓" in out
+    assert "v9.9.9" in out
+    assert "Alpha-Max" in out
+    assert "/work/proj" in out
     assert "/help справка" in out
 
 
-def test_banner_without_rocket_in_narrow_terminal():
+def test_banner_without_rocket_in_narrow_terminal() -> None:
     buf = io.StringIO()
     ui = Console(no_color=True, file=buf, width=60)
     ui.banner(version="1", model="m", root="/r")
     out = buf.getvalue()
-    assert "┃╺┓" in out and "▀" not in out
+    assert "┃╺┓" in out
+    assert "▀" not in out
 
 
-def test_banner_shows_mode():
-    from gigacrew.permissions import PermissionMode
-
+def test_banner_shows_mode() -> None:
     ui, buf = _console()
     ui.banner(version="1", model="m", root="/r", mode=PermissionMode.PLAN)
     assert "режим   ⏸ план   Shift+Tab — сменить" in _plain(buf)
 
 
-def test_question_body_is_shown_before_options(monkeypatch):
-    from dataclasses import replace
-
+def test_question_body_is_shown_before_options(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _asking_console(monkeypatch, "1")
     question = replace(
-        _DB, header="План", body="## Шаги\n1. **Поправить** `a.py`", source="plans/x.md"
+        _DB,
+        header="План",
+        body="## Шаги\n1. **Поправить** `a.py`",
+        source="plans/x.md",
     )
     assert ui.ask_user([question]) == [Answer(("PostgreSQL",))]
     out = buf.getvalue()
-    assert "План" in out and "Шаги" in out and "Поправить" in out and "**" not in out
+    assert "План" in out
+    assert "Шаги" in out
+    assert "Поправить" in out
+    assert "**" not in out
     assert "plans/x.md" in out  # файл — в подписи рамки
     assert out.index("Поправить") < out.index("? Какую БД?")
 
 
-def test_turn_indicator_shows_current_mode():
-    import contextlib
-
-    from gigacrew.permissions import PermissionMode
-
+def test_turn_indicator_shows_current_mode() -> None:
     ui, buf = _live_console(width=120)
     mode = [PermissionMode.AUTO]
     ui.set_interrupt_keys("Esc — прервать", contextlib.nullcontext)
     ui.set_mode_hint(lambda: f"{mode[0].label} (Shift+Tab)")
     ui.on_stream_start()
     mode[0] = PermissionMode.PLAN  # Shift+Tab во время хода
+    assert ui._live is not None
     ui._live._live.refresh()
     ui.stop_live()
     assert "Esc — прервать  ·  план (Shift+Tab)" in _plain(buf)
 
 
 # ------------------------------ суб-агенты ------------------------------ #
-def test_subagent_steps_nested_and_text_hidden(tmp_path):
-    from fakes import ScriptedProvider, text_turn, tool_turn
-
-    from gigacrew.agent.loop import Agent
-    from gigacrew.config import Config
-    from gigacrew.tools.base import build_default_registry
-
+def test_subagent_steps_nested_and_text_hidden(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
     provider = ScriptedProvider(
         [
@@ -485,7 +546,7 @@ def test_subagent_steps_nested_and_text_hidden(tmp_path):
             tool_turn("read_file", {"path": "nope.py"}),
             text_turn("СЕКРЕТНЫЙ ОТЧЁТ суб-агента"),
             text_turn("Итог основного"),
-        ]
+        ],
     )
     ui, buf = _live_console(width=100)
     cfg = Config(access_key="x", project_root=tmp_path, stream=True, auto_approve=True)
@@ -499,85 +560,81 @@ def test_subagent_steps_nested_and_text_hidden(tmp_path):
     assert ui._live is None
 
 
-def test_subagent_live_area_survives_confirm():
-    from gigacrew.agent.events import SubagentInfo
-
+def test_subagent_live_area_survives_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, _ = _live_console()
-    info = SubagentInfo("general", "правка")
-    ui.on_subagent_start(info)
-    assert ui._live is not None
-    seen = {}
+    subagent = SubagentInfo("general", "правка")
+    ui.on_subagent_start(subagent)
+    assert _has_live_area(ui)
+    seen: dict[str, object] = {}
 
-    def question(*args, **kwargs):
+    def question(*args: object, **kwargs: object) -> str:
         seen["live"] = ui._live
         return "y"
 
-    ui._question_raw = question
+    monkeypatch.setattr(ui, "_question_raw", question)
     ui.confirm(ToolCallInfo("edit_file", "a.py"), Display("+x", "diff", "a.py"), dangerous=False)
     assert seen["live"] is None  # вопрос — без временной области
-    ui.on_subagent_activity(info, "edit_file")
-    assert ui._live is not None  # индикатор суб-агента вернулся
-    ui.on_subagent_end(info, None)
-    assert ui._live is None
+    ui.on_subagent_activity(subagent, "edit_file")
+    assert _has_live_area(ui)  # индикатор суб-агента вернулся
+    ui.on_subagent_end(subagent, None)
+    assert not _has_live_area(ui)
 
 
-def test_subagent_hint_names_stop_keys():
-    import contextlib
-
-    from gigacrew.agent.events import SubagentInfo
-
+def test_subagent_hint_names_stop_keys() -> None:
     ui, _ = _live_console()
     assert "Esc" not in ui._subagent_hint()  # Esc не слушается — подсказки нет
     ui.set_interrupt_keys("Esc — прервать", contextlib.nullcontext, stop_subagent=True)
-    info = SubagentInfo("explore")
-    ui.on_subagent_start(info)
+    subagent = SubagentInfo("explore")
+    ui.on_subagent_start(subagent)
     assert "Esc — завершить с итогом" in ui._subagent_hint()
     assert "Ctrl+C — прервать всё" in ui._subagent_hint()
-    ui.on_subagent_activity(info, "подвожу итог", wrapping_up=True)
+    ui.on_subagent_activity(subagent, "подвожу итог", wrapping_up=True)
     assert "Esc — оборвать суб-агента" in ui._subagent_hint()
     assert ui._subagent_label() == "explore · подвожу итог"
-    ui.on_subagent_end(info, None)
+    ui.on_subagent_end(subagent, None)
 
 
 # ------------------- подтверждение: команда целиком ------------------- #
-def test_confirm_shows_long_command_entirely_and_offers_pager(monkeypatch):
-    from gigacrew.agent.events import Approval
-    from gigacrew.permissions import ToolKind
-
+def test_confirm_shows_long_command_entirely_and_offers_pager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     buf = io.StringIO()
     ui = Console(no_color=True, file=buf, width=80)
-    from rich.console import ConsoleDimensions
-
-    monkeypatch.setattr(type(ui._c), "size", property(lambda self: ConsoleDimensions(80, 24)))
-    body = "\n".join(f"print('line {i:03d}')" for i in range(200))
+    monkeypatch.setattr(type(ui._console), "size", property(lambda _: ConsoleDimensions(80, 24)))
+    numbers = [format(index, "03d") for index in range(200)]
+    body = "\n".join(f"print('line {number}')" for number in numbers)
     command = f"python3 - <<'EOF'\n{body}\nEOF"
-    pages = []
+    pages: list[str] = []
     monkeypatch.setattr(ui, "_page", lambda preview: pages.append(preview.text))
     answers = iter(["v", "y"])
-    monkeypatch.setattr(ui._c, "input", lambda prompt: (ui._c.print(prompt), next(answers))[1])
+    monkeypatch.setattr(ui._console, "input", _echoing_input(ui, answers))
     call = ToolCallInfo("run_shell", command[:70], ToolKind.COMMAND, purpose="печать строк")
-    result = ui.confirm(call, Display(f"$ {command}", title="команда"), dangerous=False)
-    assert result.approval is Approval.YES
+    outcome = ui.confirm(call, Display(f"$ {command}", title="команда"), dangerous=False)
+    assert outcome.approval is Approval.YES
     out = buf.getvalue()
-    assert all(f"line {i:03d}" in out for i in range(200))  # ничего не обрезано
-    assert "202 │ EOF" in out and "202 строки" in out  # номера строк и размер
-    assert "v — открыть целиком" in out and "[y/N/a/v]" in out
+    assert all(f"line {number}" in out for number in numbers)  # ничего не обрезано
+    assert "202 │ EOF" in out
+    assert "202 строки" in out
+    assert "v — открыть целиком" in out
+    assert "[y/N/a/v]" in out
     assert "▌ $ python3 - <<'EOF' …\n" in out  # первая строка команды — над рамкой
     assert "▌ зачем  печать строк  со слов модели" in out
     assert pages == [f"$ {command}"]  # просмотрщик открыт, потом вопрос задан снова
 
 
-def test_confirm_makes_invisible_characters_visible():
-    from gigacrew.permissions import ToolKind
-
+def test_confirm_makes_invisible_characters_visible(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
-    ui._c.input = lambda prompt: "n"
-    command = "ls ‮txt.exe\x1b[2K"
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
+    command = "ls \u202etxt.exe\x1b[2K"
     ui.confirm(
-        ToolCallInfo("run_shell", "ls", ToolKind.COMMAND), Display(f"$ {command}"), dangerous=True
+        ToolCallInfo("run_shell", "ls", ToolKind.COMMAND),
+        Display(f"$ {command}"),
+        dangerous=True,
     )
     out = buf.getvalue()
-    assert "⟨U+202E⟩" in out and "⟨U+001B⟩" in out and "‮" not in out
+    assert "⟨U+202E⟩" in out
+    assert "⟨U+001B⟩" in out
+    assert "\u202e" not in out
     assert "v — открыть" not in out  # короткая команда помещается на экран
 
 
@@ -587,34 +644,32 @@ def _read(path: str) -> ToolCallInfo:
 
 
 def _edit(path: str) -> ToolCallInfo:
-    from gigacrew.permissions import ToolKind
-
     return ToolCallInfo("edit_file", path, ToolKind.EDIT)
 
 
 def _diff(added: int, removed: int) -> Display:
-    body = "".join(f"-old{i}\n" for i in range(removed)) + "".join(
-        f"+new{i}\n" for i in range(added)
+    body = "".join(f"-old{index}\n" for index in range(removed)) + "".join(
+        f"+new{index}\n" for index in range(added)
     )
     return Display(f"--- a/x\n+++ b/x\n@@ -1 +1 @@\n{body}", "diff", "x")
 
 
-def _step(ui, call, result):
+def _step(ui: Console, call: ToolCallInfo, tool_result: ToolResult) -> None:
     ui.on_tool_call(call)
     ui.on_tool_start(call)
     ui.on_tool_end(call)
-    ui.on_tool_result(call, result, previewed=False)
+    ui.on_tool_result(call, tool_result, previewed=False)
 
 
-def test_read_calls_collapse_into_group_until_answer():
+def test_read_calls_collapse_into_group_until_answer() -> None:
     ui, buf = _console()
     _step(ui, _read("a.py"), ToolResult(content="", summary="прочитан a.py (3 строк)"))
     search = ToolCallInfo("search_content", "/foo/", read_only=True)
     _step(ui, search, ToolResult(content="", summary="совпадений: 2"))
     _step(ui, _read("nope.py"), ToolResult(content="", ok=False, summary="Файл не найден"))
-    assert buf.getvalue() == ""  # группа ещё идёт — в ленте ничего
+    assert not buf.getvalue()  # группа ещё идёт — в ленте ничего
     ui.on_assistant_text("Нашёл")
-    out = "".join(line.rstrip() + "\n" for line in buf.getvalue().splitlines())
+    out = "".join(f"{line.rstrip()}\n" for line in buf.getvalue().splitlines())
     assert out == (
         "● Изучил код  прочитал 1 файл, 1 поиск\n"
         "  a.py  /foo/\n"
@@ -624,14 +679,14 @@ def test_read_calls_collapse_into_group_until_answer():
     )
 
 
-def test_single_read_is_one_line_without_repeated_path():
+def test_single_read_is_one_line_without_repeated_path() -> None:
     ui, buf = _console()
     _step(ui, _read("a.py"), ToolResult(content="", summary="прочитан a.py (3 строк)"))
     ui.on_turn_end(TurnStats(steps=1))
     assert buf.getvalue().startswith("● read_file a.py  ✔ прочитан (3 строк)\n")
 
 
-def test_edits_collapse_per_file():
+def test_edits_collapse_per_file() -> None:
     ui, buf = _console()
     for path, stat in (("a.py", (3, 1)), ("b.py", (1, 0)), ("a.py", (2, 2))):
         _step(ui, _edit(path), ToolResult(content="", summary="изменён", display=_diff(*stat)))
@@ -640,28 +695,29 @@ def test_edits_collapse_per_file():
     assert buf.getvalue() == ("● Изменил 2 файла  +6 −3\n  a.py  +5 −3\n  b.py  +1 −0\n")
 
 
-def test_group_is_shown_in_live_area_while_running():
-    ui, buf = _live_console(width=100)
+def test_group_is_shown_in_live_area_while_running() -> None:
+    ui, _buf = _live_console(width=100)
     ui.on_stream_start()
     _step(ui, _read("a.py"), ToolResult(content="", summary="прочитан"))
     ui.on_tool_call(_read("b.py"))
     rows = [row.plain for row in ui._live_steps()]
     assert rows[0].startswith("● Изучаю код  2 вызова")
-    assert rows[1].startswith("  ✔ read_file  a.py") and rows[2].startswith("  ◌ read_file  b.py")
+    assert rows[1].startswith("  ✔ read_file  a.py")
+    assert rows[2].startswith("  ◌ read_file  b.py")
     ui.stop_live()
 
 
-def test_asked_call_leaves_group_and_gets_own_line(monkeypatch):
+def test_asked_call_leaves_group_and_gets_own_line(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: "y")
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "y")
     _step(ui, _edit("a.py"), ToolResult(content="", summary="изменён", display=_diff(1, 0)))
     asked = _edit("b.py")
     ui.on_tool_call(asked)
-    from dataclasses import replace
-
     ui.confirm(replace(asked, reason="хук требует подтверждения"), _diff(2, 0), dangerous=False)
     ui.on_tool_result(
-        asked, ToolResult(content="", summary="изменён", display=_diff(2, 0)), previewed=True
+        asked,
+        ToolResult(content="", summary="изменён", display=_diff(2, 0)),
+        previewed=True,
     )
     out = buf.getvalue()
     # группа до вопроса — итогом, спрошенная правка — своей строкой после ответа
@@ -669,80 +725,68 @@ def test_asked_call_leaves_group_and_gets_own_line(monkeypatch):
     assert out.rstrip().endswith("● Изменил b.py  +2 −0")
 
 
-def test_sixteen_color_terminal_gets_ansi_palette(monkeypatch):
-    from gigacrew.ui.theme import MINT, MINT_ANSI
-
+def test_sixteen_color_terminal_gets_ansi_palette(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("COLORTERM", raising=False)
     monkeypatch.setenv("TERM", "xterm")
     ui, _ = _live_console()
-    assert ui._p is MINT_ANSI
+    assert ui._palette is MINT_ANSI
     monkeypatch.setenv("COLORTERM", "truecolor")
     ui, _ = _live_console()
-    assert ui._p is MINT
+    assert ui._palette is MINT
 
 
-def test_prompt_toolkit_color_depth_follows_rich(monkeypatch):
-    from prompt_toolkit.output import ColorDepth
-
-    from gigacrew.ui import colors
-
+def test_prompt_toolkit_color_depth_follows_rich(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PROMPT_TOOLKIT_COLOR_DEPTH", raising=False)
     monkeypatch.delenv("NO_COLOR", raising=False)
-    for system, depth in [
+    for system, depth in (
         ("truecolor", ColorDepth.TRUE_COLOR),
         ("256", ColorDepth.DEPTH_8_BIT),
         ("standard", ColorDepth.DEPTH_4_BIT),
         (None, None),
-    ]:
-        monkeypatch.setattr(colors, "color_system", lambda s=system: s)
-        assert colors.prompt_color_depth(False) == depth
-    assert colors.prompt_color_depth(True) == ColorDepth.MONOCHROME
+    ):
+        monkeypatch.setattr(colors, "color_system", lambda detected=system: detected)
+        assert colors.prompt_color_depth(no_color=False) == depth
+    assert colors.prompt_color_depth(no_color=True) == ColorDepth.MONOCHROME
 
 
 # --------------- управляющие символы: все пути вывода в терминал --------------- #
 _ESC = "x\x1b[2K\x1b[1A\x1b]0;owned\x07\x9bевил"
 
 
-def _sink_tool_name(ui):
+def _sink_tool_name(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
     _step(ui, ToolCallInfo(f"read{_ESC}", "a.py"), ToolResult(content="", summary="ok"))
     ui.on_turn_end(TurnStats(steps=1))
 
 
-def _sink_diff_title(ui):
-    from gigacrew.permissions import ToolKind
-
-    ui._c.input = lambda prompt: "n"
+def _sink_diff_title(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     preview = Display("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n", "diff", f"a{_ESC}.py")
     ui.confirm(ToolCallInfo("edit_file", "a.py", ToolKind.EDIT), preview, dangerous=False)
 
 
-def _sink_exact_title(ui):
-    from gigacrew.permissions import ToolKind
-
-    ui._c.input = lambda prompt: "n"
+def _sink_exact_title(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     preview = Display("$ make\nmake test", title=f"команда · {_ESC}")
     ui.confirm(ToolCallInfo("run_shell", "make", ToolKind.COMMAND), preview, dangerous=False)
 
 
-def _sink_purpose(ui):
-    from gigacrew.permissions import ToolKind
-
-    ui._c.input = lambda prompt: "n"
+def _sink_purpose(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     call = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND, purpose=_ESC)
     ui.confirm(call, None, dangerous=True)
 
 
-def _sink_plain_question(ui):
-    ui._c.input = lambda prompt: "1"
+def _sink_plain_question(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "1")
     question = Question(f"Q{_ESC}?", (QuestionOption(f"A{_ESC}", f"d{_ESC}"), QuestionOption("B")))
     ui._ask_plain(question, 1, 1)
 
 
-def _sink_help(ui):
+def _sink_help(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
     ui.help([("/deploy [аргументы]", f"скилл · {_ESC}")])
 
 
-def _sink_messages(ui):
+def _sink_messages(ui: Console, monkeypatch: pytest.MonkeyPatch) -> None:
     ui.info(f"последние решения: {_ESC}")
     ui.warn(_ESC)
     ui.on_notice(_ESC, level="warn")
@@ -760,22 +804,29 @@ def _sink_messages(ui):
         _sink_messages,
     ],
 )
-def test_control_characters_never_reach_terminal(sink):
+def test_control_characters_never_reach_terminal(
+    sink: Callable[[Console, pytest.MonkeyPatch], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Rich (Text) не убирает ESC и C1: очистка — в одной точке на весь вывод консоли.
     ui, buf = _console()
-    sink(ui)
+    sink(ui, monkeypatch)
     out = buf.getvalue()
-    assert "x[2K[1A]0;owned" in out and "евил" in out  # текст виден, без управляющих
-    assert "\x1b" not in out and "\x07" not in out and "\x9b" not in out
+    assert "x[2K[1A]0;owned" in out
+    assert "евил" in out
+    assert "\x1b" not in out
+    assert "\x07" not in out
+    assert "\x9b" not in out
 
 
-def test_control_characters_stripped_in_live_terminal_but_own_codes_kept():
+def test_control_characters_stripped_in_live_terminal_but_own_codes_kept() -> None:
     ui, buf = _live_console()
     ui.on_tool_call(ToolCallInfo(f"read{_ESC}", "a.py", read_only=True))
     ui.on_tool_start(ToolCallInfo(f"read{_ESC}", "a.py", read_only=True))
     ui.stop_live()
     out = buf.getvalue()
-    assert "\x1b]0;owned" not in out and "\x07" not in out
+    assert "\x1b]0;owned" not in out
+    assert "\x07" not in out
     assert "\x1b[" in out  # свои последовательности Rich (цвет, курсор) — на месте
 
 
@@ -783,35 +834,36 @@ def test_control_characters_stripped_in_live_terminal_but_own_codes_kept():
 @pytest.mark.parametrize(
     "char",
     [
-        "​",  # нулевой ширины
-        "‍",  # соединитель нулевой ширины
-        "‏",  # RLM
-        "؜",  # ARABIC LETTER MARK — тоже управляет направлением текста
-        "­",  # мягкий перенос
-        "ᅟ",  # заполнитель хангыля
-        "ㅤ",
-        "️",  # селектор варианта
+        "\u200b",  # нулевой ширины
+        "\u200d",  # соединитель нулевой ширины
+        "\u200f",  # RLM
+        "\u061c",  # ARABIC LETTER MARK — тоже управляет направлением текста
+        "\u00ad",  # мягкий перенос
+        "\u115f",  # заполнитель хангыля
+        "\u3164",
+        "\ufe0f",  # селектор варианта
         "\U000e0041",  # символ-тег
-        " ",  # разделитель строк
+        "\u2028",  # разделитель строк
     ],
 )
-def test_confirm_marks_every_invisible_character_in_command(char):
-    from gigacrew.permissions import ToolKind
-
+def test_confirm_marks_every_invisible_character_in_command(
+    char: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     ui, buf = _console()
-    ui._c.input = lambda prompt: "n"
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     call = ToolCallInfo("run_shell", "rm", ToolKind.COMMAND)
     ui.confirm(call, Display(f"$ rm{char} -rf x"), dangerous=True)
     out = buf.getvalue()
-    assert f"$ rm⟨U+{ord(char):04X}⟩ -rf x" in out and char not in out
+    code = format(ord(char), "04X")
+    assert f"$ rm⟨U+{code}⟩ -rf x" in out
+    assert char not in out
 
 
-def test_confirm_marks_invisible_characters_in_diff():
-    from gigacrew.permissions import ToolKind
-
+def test_confirm_marks_invisible_characters_in_diff(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
-    ui._c.input = lambda prompt: "n"
-    diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-ok = 1\n+# ‮; rm -rf ~ ‬\x01\n"
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
+    diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-ok = 1\n+# \u202e; rm -rf ~ \u202c\x01\n"
     ui.confirm(
         ToolCallInfo("edit_file", "x.py", ToolKind.EDIT),
         Display(diff, "diff", "x.py"),
@@ -819,29 +871,31 @@ def test_confirm_marks_invisible_characters_in_diff():
     )
     out = buf.getvalue()
     assert "+# ⟨U+202E⟩; rm -rf ~ ⟨U+202C⟩⟨U+0001⟩" in out  # и управляющие — не молча
-    assert "‮" not in out and "-ok = 1" in out
+    assert "\u202e" not in out
+    assert "-ok = 1" in out
 
 
 @pytest.mark.parametrize("dangerous", [True, False])
 @pytest.mark.parametrize("command", ["rm -rf build", "make\nmake install"])
-def test_confirm_shows_directory_command_runs_in(tmp_path, dangerous, command):
-    from gigacrew.permissions import ToolKind
-    from gigacrew.project.workspace import Workspace
-    from gigacrew.tools.base import ToolContext
-    from gigacrew.tools.shell import RunShellParams, RunShellTool
-
+def test_confirm_shows_directory_command_runs_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dangerous: bool,
+    command: str,
+) -> None:
     (tmp_path / "vendor" / "lib").mkdir(parents=True)
     ctx = ToolContext(workspace=Workspace(tmp_path))
     tool = RunShellTool()
     ui, buf = _console()
-    ui._c.input = lambda prompt: "n"
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     call = ToolCallInfo("run_shell", command, ToolKind.COMMAND)
     params = RunShellParams(command=command, cwd="vendor/lib/")
     ui.confirm(call, tool.preview(params, ctx), dangerous=dangerous)
     assert "▌ каталог  vendor/lib\n" in buf.getvalue()
     # в корне проекта — без строки о каталоге
     ui, buf = _console()
-    ui._c.input = lambda prompt: "n"
+    monkeypatch.setattr(ui._console, "input", lambda prompt: "n")
     ui.confirm(call, tool.preview(RunShellParams(command=command), ctx), dangerous=dangerous)
     assert "каталог" not in buf.getvalue()
 
@@ -859,18 +913,25 @@ def test_confirm_shows_directory_command_runs_in(tmp_path, dangerous, command):
         ("д", True),
     ],
 )
-def test_ask_defaults_to_no(reply, expected):
+def test_ask_defaults_to_no(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    reply: str,
+    expected: bool,
+) -> None:
     ui, _ = _console()
-    ui._c.input = lambda prompt: reply
+    monkeypatch.setattr(ui._console, "input", lambda prompt: reply)
     assert ui.ask("Разрешить хуки?", dangerous=True) is expected
 
 
 @pytest.mark.parametrize("reply", ["н", "т", "нет", "N", ""])
-def test_confirm_russian_layout_no_is_a_plain_refusal(reply):
-    from gigacrew.agent.events import Approval
-    from gigacrew.permissions import ToolKind
-
+def test_confirm_russian_layout_no_is_a_plain_refusal(
+    reply: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     ui, _ = _console()
-    ui._c.input = lambda prompt: reply
-    result = ui.confirm(ToolCallInfo("run_shell", "ls", ToolKind.COMMAND), None, dangerous=False)
-    assert result.approval is Approval.NO and result.feedback == "" and result.answered
+    monkeypatch.setattr(ui._console, "input", lambda prompt: reply)
+    outcome = ui.confirm(ToolCallInfo("run_shell", "ls", ToolKind.COMMAND), None, dangerous=False)
+    assert outcome.approval is Approval.NO
+    assert not outcome.feedback
+    assert outcome.answered

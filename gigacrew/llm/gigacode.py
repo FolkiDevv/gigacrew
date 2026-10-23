@@ -24,7 +24,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -50,6 +50,10 @@ SAMPLING_KEYS = (
 )
 
 _API_VERSION = re.compile(r"/api/v\d+$")
+# Сколько символов некорректного значения из конфигурации показывать в ошибке.
+_SHOWN_CHARS = 200
+# Бэкенд не принял токен.
+_UNAUTHORIZED = 401
 
 
 def config_endpoint(base_url: str) -> str:
@@ -74,47 +78,51 @@ class CatalogueModel:
 
 @dataclass(frozen=True)
 class Catalogue:
+    """Каталог моделей бэкенда: модели, модель по умолчанию и адрес чата."""
+
     models: tuple[CatalogueModel, ...]
     default_model: str
     chat_url: str
 
     def get(self, model: str) -> CatalogueModel | None:
-        return next((m for m in self.models if m.id == model), None)
+        """Модель каталога по id; такой нет — None."""
+        return next((entry for entry in self.models if entry.id == model), None)
 
 
-def _mapping(value: Any) -> Mapping[str, Any]:
-    return value if isinstance(value, Mapping) else {}
+def _mapping(candidate: Any) -> Mapping[str, Any]:
+    return candidate if isinstance(candidate, Mapping) else {}
 
 
-def _window(value: Any) -> int | None:
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
+def _window(size: Any) -> int | None:
+    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+        return size
     return None
 
 
-def _number(value: Any) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
+def _number(raw: Any) -> int | float | None:
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
         return None
-    return value if math.isfinite(value) else None
+    return raw if math.isfinite(raw) else None
 
 
 def _parse_model(raw: Any) -> CatalogueModel:
     model_id = None
     if isinstance(raw, Mapping):
         # id — по контракту официального CLI; реальный бэкенд называет его model.
-        model_id = raw.get("id") if raw.get("id") is not None else raw.get("model")
+        model_id = raw.get("model") if raw.get("id") is None else raw.get("id")
     if (
         not isinstance(model_id, str)
         or not model_id.strip()
         or any(not ch.isprintable() for ch in model_id)
     ):
-        raise ApiError(f"в каталоге GigaCode модель без корректного id или model: {str(raw)[:200]}")
+        shown = str(raw)[:_SHOWN_CHARS]
+        raise ApiError(f"в каталоге GigaCode модель без корректного id или model: {shown}")
     window = _window(_mapping(raw.get("plugin_side")).get("context_window_size")) or _window(
-        raw.get("context_window_size")
+        raw.get("context_window_size"),
     )
     options = _mapping(raw.get("ai_api"))
     sampling = {
-        key: value for key in SAMPLING_KEYS if (value := _number(options.get(key))) is not None
+        key: number for key in SAMPLING_KEYS if (number := _number(options.get(key))) is not None
     }
     return CatalogueModel(
         id=model_id,
@@ -124,23 +132,25 @@ def _parse_model(raw: Any) -> CatalogueModel:
     )
 
 
-def _chat_endpoint(value: Any, config_url: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        return config_url.removesuffix("/config") + "/chat/completions"
-    url = urljoin(config_url, value.strip())  # относительный — от адреса конфигурации
+def _chat_endpoint(raw_url: Any, config_url: str) -> str:
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        base = config_url.removesuffix("/config")
+        return f"{base}/chat/completions"
+    url = urljoin(config_url, raw_url.strip())  # относительный — от адреса конфигурации
     parts = urlsplit(url)
-    if parts.scheme not in ("https", "http") or not parts.hostname:
-        raise ApiError(f"некорректный адрес чата в конфигурации GigaCode: {value[:200]}")
+    shown = raw_url[:_SHOWN_CHARS]
+    if parts.scheme not in {"https", "http"} or not parts.hostname:
+        raise ApiError(f"некорректный адрес чата в конфигурации GigaCode: {shown}")
     if parts.scheme == "http" and urlsplit(config_url).scheme == "https":
         # Конфигурация по https, а чат — нет: токен ушёл бы открытым текстом.
         raise ApiError(
             "адрес чата в конфигурации GigaCode — http при https-адресе конфигурации, "
-            f"токен ушёл бы открытым текстом: {value[:200]}"
+            f"токен ушёл бы открытым текстом: {shown}",
         )
     return url
 
 
-def parse_catalogue(data: Mapping[str, Any], config_url: str) -> Catalogue:
+def parse_catalogue(backend_config: Mapping[str, Any], config_url: str) -> Catalogue:
     """Каталог моделей из конфигурации бэкенда; некорректный — :class:`ApiError`.
 
     Модели — из ``chat.models``, иначе ``agent.models``, иначе ``models``; id модели —
@@ -150,12 +160,12 @@ def parse_catalogue(data: Mapping[str, Any], config_url: str) -> Catalogue:
     Адрес чата — ``chat.url`` или ``chatEndpoint``, иначе ``…/chat/completions`` рядом с
     конфигурацией. Незнакомые поля не мешают.
     """
-    chat = _mapping(data.get("chat"))
-    agent = _mapping(data.get("agent"))
+    chat = _mapping(backend_config.get("chat"))
+    agent = _mapping(backend_config.get("agent"))
     raw = next(
         (
             models
-            for models in (chat.get("models"), agent.get("models"), data.get("models"))
+            for models in (chat.get("models"), agent.get("models"), backend_config.get("models"))
             if isinstance(models, list) and models
         ),
         None,
@@ -163,21 +173,21 @@ def parse_catalogue(data: Mapping[str, Any], config_url: str) -> Catalogue:
     if raw is None:
         raise ApiError("бэкенд GigaCode не вернул ни одной модели в конфигурации")
     models: list[CatalogueModel] = []
-    for item in raw:
-        model = _parse_model(item)
-        if any(m.id == model.id for m in models):
+    for raw_model in raw:
+        model = _parse_model(raw_model)
+        if any(known.id == model.id for known in models):
             raise ApiError(f"в каталоге GigaCode модель {model.id} повторяется")
         models.append(model)
-    ids = {m.id for m in models}
+    ids = {known.id for known in models}
     default = next(
         (
-            d
-            for d in (chat.get("default_model"), data.get("default_model"))
-            if isinstance(d, str) and d in ids
+            candidate
+            for candidate in (chat.get("default_model"), backend_config.get("default_model"))
+            if isinstance(candidate, str) and candidate in ids
         ),
         models[0].id,
     )
-    url = _chat_endpoint(chat.get("url") or data.get("chatEndpoint"), config_url)
+    url = _chat_endpoint(chat.get("url") or backend_config.get("chatEndpoint"), config_url)
     return Catalogue(models=tuple(models), default_model=default, chat_url=url)
 
 
@@ -196,16 +206,23 @@ class GigaCodeProvider(HttpProvider):
         transport: httpx.BaseTransport | None = None,
         token_file: Path | None = None,
     ):
+        """Провайдер для ``config`` с ``GIGACREW_PROVIDER=gigacode``.
+
+        ``transport`` — подмена HTTP-транспорта (``httpx.MockTransport`` в тестах),
+        ``token_file`` — подмена пути к файлу токена.
+        """
         if config.provider != "gigacode":
             raise RuntimeError(
-                f"GIGACREW_PROVIDER={config.provider}: этот провайдер — для бэкенда GigaCode"
+                f"GIGACREW_PROVIDER={config.provider}: этот провайдер — для бэкенда GigaCode",
             )
         config.require_credentials()  # адрес и User-Agent заданы
         super().__init__(
-            config, transport=transport, headers={"User-Agent": config.user_agent or ""}
+            config,
+            transport=transport,
+            headers={"User-Agent": config.user_agent or ""},
         )
         self._config_url = config_endpoint(config.base_url)
-        self._token_file = token_file if token_file is not None else token_path(config.gigacode_dir)
+        self._token_file = token_path(config.gigacode_dir) if token_file is None else token_file
         self._session_id = str(uuid.uuid4())
         self._token: Token | None = None
         self._sent_token: Token | None = None  # токен последнего запроса (для 401)
@@ -213,29 +230,35 @@ class GigaCodeProvider(HttpProvider):
 
     @property
     def config_url(self) -> str:
+        """Адрес конфигурации бэкенда."""
         return self._config_url
 
     @property
     def token_file(self) -> Path:
+        """Файл токена официального CLI GigaCode."""
         return self._token_file
 
     @property
     def chat_endpoint(self) -> str:
         """Адрес чата из каталога ("" — каталог ещё не загружен)."""
-        return self._catalogue.chat_url if self._catalogue is not None else ""
+        return "" if self._catalogue is None else self._catalogue.chat_url
 
     @property
+    @override
     def model(self) -> str:
+        """Модель из настроек, иначе модель каталога по умолчанию ("" — он не загружен)."""
         if self._cfg.model:
             return self._cfg.model
-        return self._catalogue.default_model if self._catalogue is not None else ""
+        return "" if self._catalogue is None else self._catalogue.default_model
 
     # ------------------------------------------------------------------ #
-    # Подключение, каталог, токен
+    # Подключение и каталог
     # ------------------------------------------------------------------ #
+    @override
     def connect(self) -> None:
-        """Действующий токен из файла CLI и каталог моделей; токена нет или истёк —
-        :class:`ApiError` с просьбой пройти авторизацию в GigaCode.
+        """Действующий токен из файла CLI и каталог моделей.
+
+        Токена нет или истёк — :class:`ApiError` с просьбой пройти авторизацию в GigaCode.
 
         С ``request_hook`` токен проверяется только вместе с запросом: хук перед ним может
         обновить файл токена, и ранняя проверка отвергла бы ещё не обновлённый токен.
@@ -245,15 +268,80 @@ class GigaCodeProvider(HttpProvider):
         elif self.request_hook is None:
             self._token = load_token(self._token_file, self._config_url)
 
+    @override
     def list_models(self) -> list[str]:
         """Модели каталога (без сети; до :meth:`connect` — пусто)."""
-        return [m.id for m in self._catalogue.models] if self._catalogue is not None else []
+        if self._catalogue is None:
+            return []
+        return [entry.id for entry in self._catalogue.models]
 
+    @override
     def known_models(self) -> list[ModelInfo] | None:
+        """Модели каталога с окнами контекста (до :meth:`connect` — None)."""
         if self._catalogue is None:
             return None
-        return [ModelInfo(m.id, m.context_window) for m in self._catalogue.models]
+        return [ModelInfo(entry.id, entry.context_window) for entry in self._catalogue.models]
 
+    # ------------------------------------------------------------------ #
+    # Запросы чата
+    # ------------------------------------------------------------------ #
+    @override
+    def stream(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None = None,
+        *,
+        model: str | None = None,
+        temperature: float = 0.2,
+        tool_choice: ToolChoice = "auto",
+        on_delta: Callable[[str], None] | None = None,
+        on_notice: Callable[[str], None] | None = None,
+    ) -> AssistantTurn:
+        """Потоковая версия complete(); каталог загружается, если ещё не загружен."""
+        self._ensure_catalogue()  # модель по умолчанию — из каталога
+        return super().stream(
+            messages,
+            tools,
+            model=model,
+            temperature=temperature,
+            tool_choice=tool_choice,
+            on_delta=on_delta,
+            on_notice=on_notice,
+        )
+
+    @override
+    def measure_prompt(self, text: str, *, model: str | None = None) -> int:
+        """Размер ``text`` в токенах по данным API; каталог загружается, если ещё нет."""
+        self._ensure_catalogue()
+        return super().measure_prompt(text, model=model)
+
+    @override
+    def complete(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None = None,
+        *,
+        model: str | None = None,
+        temperature: float = 0.2,
+        tool_choice: ToolChoice = "auto",
+        on_notice: Callable[[str], None] | None = None,
+    ) -> AssistantTurn:
+        """Через поток.
+
+        Бэкенд рассчитан на поток, а ответ без потока разбирается тем же кодом.
+        """
+        return self.stream(
+            messages,
+            tools,
+            model=model,
+            temperature=temperature,
+            tool_choice=tool_choice,
+            on_notice=on_notice,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Токен и конфигурация
+    # ------------------------------------------------------------------ #
     def _current_token(self) -> Token:
         """Действующий токен: в памяти, а истёк или его нет — заново из файла."""
         if self._token is None or self._token.expired():
@@ -261,8 +349,10 @@ class GigaCodeProvider(HttpProvider):
         return self._token
 
     def _reload_rejected(self, rejected: Token) -> Token:
-        """Бэкенд ответил 401 на ``rejected``: файл мог обновиться — перечитать. Там тот
-        же токен — :class:`ApiError` с просьбой пройти авторизацию заново."""
+        """Бэкенд ответил 401 на ``rejected``: файл мог обновиться — перечитать.
+
+        Там тот же токен — :class:`ApiError` с просьбой пройти авторизацию заново.
+        """
         self._token = None
         token = load_token(self._token_file, self._config_url)
         if token.access_token == rejected.access_token:
@@ -270,6 +360,7 @@ class GigaCodeProvider(HttpProvider):
         self._token = token
         return token
 
+    @override
     def _before_request(self, kind: str, reason: str = "request") -> bool:
         """После хука токен перечитывается: хук мог обновить файл."""
         ran = super()._before_request(kind, reason)
@@ -281,40 +372,46 @@ class GigaCodeProvider(HttpProvider):
         headers = {"Accept": "*/*", "Authorization": f"Bearer {token.access_token}"}
         return self._request_with_retry(lambda: self._client.get(self._config_url, headers=headers))
 
-    def _load_config(self) -> None:
+    def _load_config(self) -> Catalogue:
         """``GET`` конфигурации: каталог моделей; 401 — перечитать токен и повторить раз."""
         self._before_request("config")
         token = self._current_token()
         resp = self._get_config(token)
-        if resp.status_code == 401:
+        if resp.status_code == _UNAUTHORIZED:
             self._before_request("config", "unauthorized")
             resp = self._get_config(self._reload_rejected(token))
-            if resp.status_code == 401:
+            if resp.status_code == _UNAUTHORIZED:
                 self._token = None
                 raise ApiError(f"GigaCode не принял токен (401): {login_hint(self._token_file)}")
         if not resp.is_success:
             raise ApiError(
                 f"Не удалось получить конфигурацию GigaCode ({resp.status_code}): "
-                f"{error_body(resp)}"
+                f"{error_body(resp)}",
             )
-        self._catalogue = parse_catalogue(self._json(resp), self._config_url)
+        catalogue = parse_catalogue(self._json(resp), self._config_url)
+        self._catalogue = catalogue
+        return catalogue
 
     def _ensure_catalogue(self) -> Catalogue:
         """Каталог для запроса; не загружен (запрос без :meth:`connect`) — загрузить."""
         if self._catalogue is None:
-            self._load_config()
-        assert self._catalogue is not None
+            return self._load_config()
         return self._catalogue
 
     # ------------------------------------------------------------------ #
     # Хуки HttpProvider
     # ------------------------------------------------------------------ #
+    @override
     def _chat_url(self) -> str:
         return self._ensure_catalogue().chat_url
 
+    @override
     def _auth_headers(self, *, force: bool = False) -> dict[str, str]:
-        """``Authorization`` с действующим токеном. ``force`` (чат ответил 401) —
-        перечитать файл: там тот же токен — ошибка с просьбой пройти авторизацию."""
+        """``Authorization`` с действующим токеном.
+
+        ``force`` (чат ответил 401) — перечитать файл: там тот же токен — ошибка с просьбой
+        пройти авторизацию.
+        """
         if force:
             # Отвергнут токен, ушедший в прошлом запросе, а не текущий: хук перед повтором
             # мог уже положить в файл новый.
@@ -325,9 +422,11 @@ class GigaCodeProvider(HttpProvider):
         return {"Authorization": f"Bearer {token.access_token}"}
 
     @property
+    @override
     def _refreshable(self) -> bool:
         return True
 
+    @override
     def _chat_headers(self, *, stream: bool) -> dict[str, str]:
         return {
             "Accept": "application/json",
@@ -335,6 +434,7 @@ class GigaCodeProvider(HttpProvider):
             "X-Session-Id": self._session_id,
         }
 
+    @override
     def _payload(
         self,
         messages: Sequence[Message],
@@ -348,83 +448,42 @@ class GigaCodeProvider(HttpProvider):
     ) -> dict[str, Any]:
         catalogue = self._ensure_catalogue()
         name = model or self.model
-        info = catalogue.get(name)
+        entry = catalogue.get(name)
         return openai_chat.chat_payload(
             messages,
             tools,
             model=name,
             temperature=temperature,
-            stream=stream and (info is None or info.streams),
+            stream=stream and (entry is None or entry.streams),
             tool_choice=tool_choice,
             reasoning=reasoning,
-            options=info.sampling if info is not None else None,
+            options=None if entry is None else entry.sampling,
         )
 
+    @override
     def _has_reasoning(self, payload: Mapping[str, Any]) -> bool:
         return openai_chat.has_reasoning(payload)
 
-    def _parse_response(self, data: dict[str, Any]) -> AssistantTurn:
-        return openai_chat.parse_response(data)
+    @override
+    def _parse_response(self, body: dict[str, Any]) -> AssistantTurn:
+        return openai_chat.parse_response(body)
 
+    @override
     def _consume_sse(self, resp: httpx.Response, emit: Callable[[str], None]) -> AssistantTurn:
         content_type = resp.headers.get("content-type", "")
         return openai_chat.consume_stream(resp.iter_lines(), emit, content_type=content_type)
 
+    @override
     def _probe_payload(self, text: str, model: str) -> dict[str, Any]:
-        info = self._ensure_catalogue().get(model)
-        return openai_chat.probe_payload(text, model, stream=info is None or info.streams)
+        entry = self._ensure_catalogue().get(model)
+        return openai_chat.probe_payload(text, model, stream=entry is None or entry.streams)
 
+    @override
     def _probe_usage(self, resp: httpx.Response) -> Usage:
         content_type = resp.headers.get("content-type", "")
         turn = openai_chat.consume_stream(
-            resp.text.splitlines(), lambda _s: None, content_type=content_type
+            resp.text.splitlines(),
+            lambda _piece: None,
+            content_type=content_type,
         )
         return turn.usage
-
-    # ------------------------------------------------------------------ #
-    def stream(
-        self,
-        messages: Sequence[Message],
-        tools: Sequence[ToolSpec] | None = None,
-        *,
-        model: str | None = None,
-        temperature: float = 0.2,
-        tool_choice: ToolChoice = "auto",
-        on_delta: Callable[[str], None] | None = None,
-        on_notice: Callable[[str], None] | None = None,
-    ) -> AssistantTurn:
-        self._ensure_catalogue()  # модель по умолчанию — из каталога
-        return super().stream(
-            messages,
-            tools,
-            model=model,
-            temperature=temperature,
-            tool_choice=tool_choice,
-            on_delta=on_delta,
-            on_notice=on_notice,
-        )
-
-    def measure_prompt(self, text: str, *, model: str | None = None) -> int:
-        self._ensure_catalogue()
-        return super().measure_prompt(text, model=model)
-
-    def complete(
-        self,
-        messages: Sequence[Message],
-        tools: Sequence[ToolSpec] | None = None,
-        *,
-        model: str | None = None,
-        temperature: float = 0.2,
-        tool_choice: ToolChoice = "auto",
-        on_notice: Callable[[str], None] | None = None,
-    ) -> AssistantTurn:
-        """Через поток: бэкенд рассчитан на него, а ответ без потока разбирается тем же
-        кодом."""
-        return self.stream(
-            messages,
-            tools,
-            model=model,
-            temperature=temperature,
-            tool_choice=tool_choice,
-            on_notice=on_notice,
-        )

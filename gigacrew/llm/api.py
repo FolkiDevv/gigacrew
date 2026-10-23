@@ -30,8 +30,8 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, override
 
 import httpx
 
@@ -53,21 +53,50 @@ _VERSION_SUFFIX = re.compile(r"/v\d+$")
 # Ключ и токен — значение заголовка: только видимые символы ASCII. Иначе httpx/h11
 # отвергнет заголовок, и в тексте ошибки окажется сам секрет.
 _CREDENTIAL = re.compile(r"[!-~]+")
+# Токен обновляется заранее — за столько секунд до истечения.
+_REFRESH_MARGIN = 30
+# Срок жизни токена, если ответ OAuth не называет время истечения: 25 минут, в секундах.
+_DEFAULT_TOKEN_TTL = 1500
+# Статус HTTP, начиная с которого ответ — ошибка.
+_ERROR_STATUS = 400
 
 
 def chat_url(base_url: str) -> str:
     """Адрес чата v2: хвост ``/vN`` базы заменяется на ``/v2`` (без хвоста — база как есть)."""
-    return _VERSION_SUFFIX.sub("/v2", base_url.rstrip("/")) + "/chat/completions"
+    base = _VERSION_SUFFIX.sub("/v2", base_url.rstrip("/"))
+    return f"{base}/chat/completions"
 
 
-def _strict_json(value: Any) -> bool:
-    """Сериализуется ли значение строгим JSON. ``json.loads`` (и ``resp.json()``) принимают
-    NaN и Infinity, а тело запроса httpx собирает без них — ValueError до отправки."""
+def _strict_json(candidate: Any) -> bool:
+    """Сериализуется ли значение строгим JSON.
+
+    ``json.loads`` (и ``resp.json()``) принимают NaN и Infinity, а тело запроса httpx
+    собирает без них — ValueError до отправки.
+    """
     try:
-        json.dumps(value, allow_nan=False)
+        json.dumps(candidate, allow_nan=False)
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _text_part(text: str) -> dict[str, Any]:
+    """Текстовая часть сообщения v2."""
+    return {"text": text}
+
+
+def _wire_message(role: str, parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Сообщение v2: роль и список частей."""
+    return {"role": role, "content": parts}
+
+
+def _chat_body(
+    model: str,
+    messages: list[dict[str, Any]],
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    """Тело запроса чата v2: модель, история и параметры генерации."""
+    return {"model": model, "messages": messages, "model_options": options}
 
 
 def _build_function_call(raw: Any) -> FunctionCall | None:
@@ -87,9 +116,65 @@ def _build_function_call(raw: Any) -> FunctionCall | None:
     return FunctionCall(name=raw["name"], arguments=args, id=str(call_id) if call_id else None)
 
 
-def _has_reasoning(payload: Mapping[str, Any]) -> bool:
-    """Есть ли в теле запроса рассуждения модели."""
-    return any(m.get("role") == "reasoning" for m in payload.get("messages") or ())
+def _assistant_payload(msg: Message) -> dict[str, Any]:
+    """Сообщение ассистента v2: текст, вызовы функций и состояние вызовов."""
+    parts: list[dict[str, Any]] = []
+    if msg.content:
+        parts.append(_text_part(msg.content))
+    for call in msg.function_calls:
+        fc: dict[str, Any] = {"name": call.name, "arguments": call.arguments}
+        if call.id:
+            fc["id"] = call.id
+        parts.append({"function_call": fc})
+    out = _wire_message("assistant", parts or [_text_part("")])
+    if msg.function_calls and msg.state_id:
+        out["tools_state_id"] = msg.state_id
+    return out
+
+
+def _append_function_result(
+    out: list[dict[str, Any]],
+    msg: Message,
+    result_object: dict[str, Any],
+    state_id: str | None,
+) -> None:
+    """Добавить в историю ``out`` результат вызова ``msg`` — часть ``function_result``.
+
+    Результаты, идущие подряд, — одно сообщение ``role: "tool"`` с ``tools_state_id``
+    их assistant-сообщения.
+    """
+    function_result: dict[str, Any] = {"name": msg.name or "", "result": result_object}
+    if msg.call_id:
+        function_result = {"id": msg.call_id, **function_result}
+    part = {"function_result": function_result}
+    if out and out[-1]["role"] == "tool":
+        out[-1]["content"].append(part)
+        return
+    tool = _wire_message("tool", [part])
+    if state_id:
+        tool["tools_state_id"] = state_id
+    out.append(tool)
+
+
+def _tool_to_payload(tool: ToolSpec) -> dict[str, Any]:
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+    }
+
+
+def _access_token(token_response: Mapping[str, Any]) -> str:
+    """``access_token`` из ответа OAuth; его нет или он негоден — :class:`ApiError`."""
+    token = token_response.get("access_token")
+    # Значения ответа не показываются: токен мог прийти под другим именем поля.
+    if not token:
+        fields = ", ".join(sorted(str(name) for name in token_response))[:ERROR_BODY_CHARS]
+        shown = fields or "нет"
+        raise ApiError(f"В ответе OAuth нет access_token (поля ответа: {shown})")
+    if not isinstance(token, str) or not _CREDENTIAL.fullmatch(token):
+        raise ApiError("access_token в ответе OAuth — не строка из видимых символов ASCII")
+    return token
 
 
 class _TurnBuilder:
@@ -113,48 +198,27 @@ class _TurnBuilder:
         """Пришло ли окончание ответа: причина завершения или расход токенов."""
         return self._finish_reason is not None or self._usage is not None
 
-    def add(self, data: Mapping[str, Any]) -> str:
+    def add(self, reply: Mapping[str, Any]) -> str:
         """Учесть ответ или кусок потока; возвращает пришедший в нём текст."""
         pieces: list[str] = []
-        for msg in data.get("messages") or []:
-            if not isinstance(msg, Mapping):
-                continue
-            content = msg.get("content")
-            if isinstance(content, str):
-                content = [{"text": content}]
-            if msg.get("role") == "reasoning":
-                self._reasoning += [
-                    part["text"]
-                    for part in content or []
-                    if isinstance(part, Mapping) and isinstance(part.get("text"), str)
-                ]
-                continue
-            if msg.get("role") != "assistant":
-                continue
-            state_id = msg.get("tools_state_id") or msg.get("tool_state_id")
-            if state_id:
-                self._state_id = str(state_id)
-            for part in content or []:
-                if not isinstance(part, Mapping):
-                    continue
-                text = part.get("text")
-                if isinstance(text, str) and text:
-                    pieces.append(text)
-                call = _build_function_call(part.get("function_call"))
-                if call is not None:
-                    self._calls[call.id or f"#{len(self._calls)}"] = call
-        if data.get("finish_reason"):
-            self._finish_reason = str(data["finish_reason"])
-        if data.get("usage"):
-            self._usage = data["usage"]
+        for msg in reply.get("messages") or []:
+            if isinstance(msg, Mapping):
+                self._add_message(msg, pieces)
+        if reply.get("finish_reason"):
+            self._finish_reason = str(reply["finish_reason"])
+        if reply.get("usage"):
+            self._usage = reply["usage"]
         text = self._filter.feed("".join(pieces))
         self._text.append(text)
         return text
 
     def turn(self, *, complete: bool = True) -> AssistantTurn:
-        """Ход ассистента. ``complete=False`` — поток кончился без окончания ответа:
-        без причины завершения ответ без вызовов — ``"incomplete"``, а не ``"stop"``
-        (вызовы приходят только в окончании и могли потеряться)."""
+        """Ход ассистента.
+
+        ``complete=False`` — поток кончился без окончания ответа: без причины завершения
+        ответ без вызовов — ``"incomplete"``, а не ``"stop"`` (вызовы приходят только в
+        окончании и могли потеряться).
+        """
         calls = list(self._calls.values())
         message = Message(
             role="assistant",
@@ -164,48 +228,137 @@ class _TurnBuilder:
             state_id=self._state_id if calls else None,
             reasoning="".join(self._reasoning),
         )
-        finish = self._finish_reason or (
-            "function_call" if calls else "stop" if complete else "incomplete"
-        )
+        if self._finish_reason:
+            finish = self._finish_reason
+        elif calls:
+            finish = "function_call"
+        elif complete:
+            finish = "stop"
+        else:
+            finish = "incomplete"
         return AssistantTurn(
-            message=message, finish_reason=finish, usage=Usage.from_raw(self._usage)
+            message=message,
+            finish_reason=finish,
+            usage=Usage.from_raw(self._usage),
         )
 
+    def _add_message(self, msg: Mapping[str, Any], pieces: list[str]) -> None:
+        """Учесть одно сообщение ответа; куски его текста — в ``pieces``."""
+        content = msg.get("content")
+        if isinstance(content, str):
+            content = [_text_part(content)]
+        role = msg.get("role")
+        if role == "reasoning":
+            self._add_reasoning(content)
+            return
+        if role != "assistant":
+            return
+        state_id = msg.get("tools_state_id") or msg.get("tool_state_id")
+        if state_id:
+            self._state_id = str(state_id)
+        self._add_parts(content, pieces)
 
-def _stream_error(event: str | None, data: Mapping[str, Any]) -> str | None:
+    def _add_reasoning(self, content: Any) -> None:
+        """Текст рассуждений из частей сообщения ``role: "reasoning"``."""
+        self._reasoning += [
+            part["text"]
+            for part in content or []
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+        ]
+
+    def _add_parts(self, content: Any, pieces: list[str]) -> None:
+        """Текст (в ``pieces``) и вызовы функций из частей сообщения ассистента."""
+        for part in content or []:
+            if not isinstance(part, Mapping):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                pieces.append(text)
+            call = _build_function_call(part.get("function_call"))
+            if call is not None:
+                self._calls[call.id or f"#{len(self._calls)}"] = call
+
+
+def _stream_error(event: str | None, chunk: Mapping[str, Any]) -> str | None:
     """Текст ошибки, если событие потока — ошибка API (иначе None)."""
     if event and "error" in event.lower():
-        return json.dumps(data, ensure_ascii=False)[:ERROR_BODY_CHARS]
-    if "messages" in data:
+        return json.dumps(chunk, ensure_ascii=False)[:ERROR_BODY_CHARS]
+    if "messages" in chunk:
         return None
-    status = data.get("status")
-    if data.get("error") or (isinstance(status, int) and status >= 400):
-        return json.dumps(data, ensure_ascii=False)[:ERROR_BODY_CHARS]
+    status = chunk.get("status")
+    if chunk.get("error") or (isinstance(status, int) and status >= _ERROR_STATUS):
+        return json.dumps(chunk, ensure_ascii=False)[:ERROR_BODY_CHARS]
     return None
 
 
+def _stream_chunks(lines: Iterable[str]) -> Iterator[tuple[str | None, dict[str, Any] | None]]:
+    """События SSE-потока с куском ответа — JSON-объектом; прочие данные пропускаются.
+
+    Маркер ``[DONE]`` — пара ``(событие, None)``, после неё событий нет. Ошибка API в
+    потоке — :class:`ApiError`.
+    """
+    for event, body in iter_sse_events(lines):
+        if body.strip() == "[DONE]":
+            yield event, None
+            return
+        try:
+            chunk = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        error = _stream_error(event, chunk)
+        if error is not None:
+            raise ApiError(f"API вернул ошибку в потоке: {error}")
+        yield event, chunk
+
+
 class ApiProvider(HttpProvider):
+    """Провайдер API v2: авторизация OAuth или mTLS, чат с function calling и поток SSE."""
+
     def __init__(self, config: Config, *, transport: httpx.BaseTransport | None = None):
         """``transport`` — подмена HTTP-транспорта (``httpx.MockTransport`` в тестах)."""
         if config.provider != "api":
             raise RuntimeError(
-                f"GIGACREW_PROVIDER={config.provider}: этот провайдер работает только с API v2"
+                f"GIGACREW_PROVIDER={config.provider}: этот провайдер работает только с API v2",
             )
         config.require_credentials()
         super().__init__(config, transport=transport)
         self._mtls = config.auth_mode == "mtls"
         self._token: str | None = None
-        self._token_exp: float = 0.0  # unix-время истечения токена
+        self._token_exp: float = 0  # unix-время истечения токена
 
+    @override
+    def list_models(self) -> list[str]:
+        """Чат-модели (``type == "chat"``): эмбеддеры и прочие в выборе не нужны."""
+        base_url = self._cfg.base_url
+        resp = self._request_with_retry(
+            lambda: self._client.get(
+                f"{base_url}/models",
+                headers=self._auth_headers(),
+            ),
+        )
+        if resp.status_code >= _ERROR_STATUS:
+            raise ApiError(
+                f"Не удалось получить список моделей ({resp.status_code}): {error_body(resp)}",
+            )
+        models = self._json(resp).get("data") or []
+        return [
+            entry["id"]
+            for entry in models
+            if isinstance(entry, dict) and "id" in entry and entry.get("type") == "chat"
+        ]
+
+    @override
     def _chat_url(self) -> str:
         return chat_url(self._cfg.base_url)
 
     # ------------------------------------------------------------------ #
     # Авторизация
     # ------------------------------------------------------------------ #
-    def _ensure_token(self, force: bool = False) -> str:
+    def _ensure_token(self, *, force: bool = False) -> str:
         # Обновляем заранее (за 30 с до истечения), чтобы не словить 401 на лету.
-        if not force and self._token and time.time() < self._token_exp - 30:
+        if not force and self._token and time.time() < self._token_exp - _REFRESH_MARGIN:
             return self._token
 
         # Хвост ключа из файла с CRLF (``$(cat key.txt)``) или пробел в .env — не часть ключа.
@@ -213,8 +366,21 @@ class ApiProvider(HttpProvider):
         if not _CREDENTIAL.fullmatch(key):
             raise ApiError(
                 "GIGACREW_ACCESS_KEY содержит пробелы, управляющие или не-ASCII символы — "
-                "проверьте ключ (значение не показывается)"
+                "проверьте ключ (значение не показывается)",
             )
+        token_response = self._json(self._request_token(key))
+        token = _access_token(token_response)
+        self._token = token
+        # expires_at приходит в миллисекундах unix-времени; если нет — живём 25 мин.
+        exp_ms = token_response.get("expires_at")
+        try:
+            self._token_exp = float(exp_ms) / 1000.0 if exp_ms else time.time() + _DEFAULT_TOKEN_TTL
+        except (TypeError, ValueError):
+            self._token_exp = time.time() + _DEFAULT_TOKEN_TTL
+        return token
+
+    def _request_token(self, key: str) -> httpx.Response:
+        """Обмен ключа ``key`` на токен OAuth; ответ с ошибкой — :class:`ApiError`."""
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
@@ -226,32 +392,17 @@ class ApiProvider(HttpProvider):
                 self._cfg.auth_url or "",
                 headers=headers,
                 data={"scope": self._cfg.scope} if self._cfg.scope else {},
-            )
+            ),
         )
         try:
             resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
+        except httpx.HTTPStatusError as exc:
             raise ApiError(
-                f"Не удалось получить токен API ({resp.status_code}): {error_body(resp)}"
-            ) from e
+                f"Не удалось получить токен API ({resp.status_code}): {error_body(resp)}",
+            ) from exc
+        return resp
 
-        data = self._json(resp)
-        token = data.get("access_token")
-        # Значения ответа не показываются: токен мог прийти под другим именем поля.
-        if not token:
-            fields = ", ".join(sorted(str(name) for name in data))[:ERROR_BODY_CHARS]
-            raise ApiError(f"В ответе OAuth нет access_token (поля ответа: {fields or 'нет'})")
-        if not isinstance(token, str) or not _CREDENTIAL.fullmatch(token):
-            raise ApiError("access_token в ответе OAuth — не строка из видимых символов ASCII")
-        self._token = token
-        # expires_at приходит в миллисекундах unix-времени; если нет — живём 25 мин.
-        exp_ms = data.get("expires_at")
-        try:
-            self._token_exp = float(exp_ms) / 1000.0 if exp_ms else time.time() + 25 * 60
-        except (TypeError, ValueError):
-            self._token_exp = time.time() + 25 * 60
-        return token
-
+    @override
     def _auth_headers(self, *, force: bool = False) -> dict[str, str]:
         """Заголовок авторизации для текущей схемы.
 
@@ -263,6 +414,7 @@ class ApiProvider(HttpProvider):
         return {"Authorization": f"Bearer {self._ensure_token(force=force)}"}
 
     @property
+    @override
     def _refreshable(self) -> bool:
         """Протухший токен (401) обновляется; клиентский сертификат обновлять нечего."""
         return not self._mtls
@@ -270,91 +422,69 @@ class ApiProvider(HttpProvider):
     # ------------------------------------------------------------------ #
     # Сериализация / разбор
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _result_object(content: str) -> dict[str, Any]:
+    @classmethod
+    def _result_object(cls, content: str) -> dict[str, Any]:
         """API требует, чтобы ``result`` части ``function_result`` был JSON-объектом.
 
         Объект передаётся как есть, всё остальное — текст, но и голые JSON-значения
         (``42``, ``true``, ``[]`` — например, листинг из одного файла ``1``) —
         заворачивается в ``{"result": ...}``: отвергнутое API сообщение осталось бы
         в истории и ломало бы каждый следующий запрос этого чата. Объект с NaN или
-        Infinity — тоже текст: строгим JSON тело запроса с ним не собрать."""
+        Infinity — тоже текст: строгим JSON тело запроса с ним не собрать.
+        """
         text = content or ""
         try:
-            value = json.loads(text)
+            parsed = json.loads(text)
         except ValueError:
-            value = None
-        return value if isinstance(value, dict) and _strict_json(value) else {"result": text}
-
-    @staticmethod
-    def _assistant_payload(msg: Message) -> dict[str, Any]:
-        parts: list[dict[str, Any]] = []
-        if msg.content:
-            parts.append({"text": msg.content})
-        for call in msg.function_calls:
-            fc: dict[str, Any] = {"name": call.name, "arguments": call.arguments}
-            if call.id:
-                fc["id"] = call.id
-            parts.append({"function_call": fc})
-        out: dict[str, Any] = {"role": "assistant", "content": parts or [{"text": ""}]}
-        if msg.function_calls and msg.state_id:
-            out["tools_state_id"] = msg.state_id
-        return out
+            parsed = None
+        return parsed if isinstance(parsed, dict) and _strict_json(parsed) else {"result": text}
 
     @classmethod
     def _messages_payload(
-        cls, messages: Sequence[Message], *, reasoning: bool = True
+        cls,
+        messages: Sequence[Message],
+        *,
+        reasoning: bool = True,
     ) -> list[dict[str, Any]]:
-        """История для запроса. Результаты вызовов одного assistant-сообщения (идут
-        подряд) склеиваются в одно сообщение ``role: "tool"`` с его ``tools_state_id``.
-        Рассуждения ответа — сообщение ``role: "reasoning"`` перед ним, как в ответе API."""
+        """История для запроса.
+
+        Результаты вызовов одного assistant-сообщения (идут подряд) склеиваются в одно
+        сообщение ``role: "tool"`` с его ``tools_state_id``. Рассуждения ответа — сообщение
+        ``role: "reasoning"`` перед ним, как в ответе API.
+        """
         out: list[dict[str, Any]] = []
         state_id: str | None = None  # состояние assistant-сообщения перед результатами
         for msg in messages:
             if msg.role == "function":
-                result: dict[str, Any] = {
-                    "name": msg.name or "",
-                    "result": cls._result_object(msg.content),
-                }
-                if msg.call_id:
-                    result = {"id": msg.call_id, **result}
-                part = {"function_result": result}
-                if out and out[-1]["role"] == "tool":
-                    out[-1]["content"].append(part)
-                else:
-                    tool: dict[str, Any] = {"role": "tool", "content": [part]}
-                    if state_id:
-                        tool["tools_state_id"] = state_id
-                    out.append(tool)
+                _append_function_result(out, msg, cls._result_object(msg.content), state_id)
                 continue
             if msg.role == "assistant":
                 if reasoning and msg.reasoning:
-                    out.append({"role": "reasoning", "content": [{"text": msg.reasoning}]})
-                out.append(cls._assistant_payload(msg))
+                    out.append(_wire_message("reasoning", [_text_part(msg.reasoning)]))
+                out.append(_assistant_payload(msg))
                 state_id = msg.state_id if msg.function_calls else None
                 continue
             state_id = None
-            out.append({"role": msg.role, "content": [{"text": msg.content or ""}]})
+            out.append(_wire_message(msg.role, [_text_part(msg.content or "")]))
         return out
 
-    @staticmethod
-    def _tool_to_payload(tool: ToolSpec) -> dict[str, Any]:
-        return {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.parameters,
-        }
+    @override
+    def _has_reasoning(self, payload: Mapping[str, Any]) -> bool:
+        """Есть ли в теле запроса рассуждения модели."""
+        return any(message.get("role") == "reasoning" for message in payload.get("messages") or ())
 
-    _has_reasoning = staticmethod(_has_reasoning)
-
-    @staticmethod
-    def _parse_response(data: dict[str, Any]) -> AssistantTurn:
-        if not isinstance(data.get("messages"), list):
-            raise ApiError(f"Неожиданный формат ответа API: {str(data)[:ERROR_BODY_CHARS]}")
+    @classmethod
+    @override
+    def _parse_response(cls, body: dict[str, Any]) -> AssistantTurn:
+        """Ход ассистента из целого ответа v2; без списка ``messages`` — :class:`ApiError`."""
+        if not isinstance(body.get("messages"), list):
+            shown = str(body)[:ERROR_BODY_CHARS]
+            raise ApiError(f"Неожиданный формат ответа API: {shown}")
         builder = _TurnBuilder()
-        builder.add(data)
+        builder.add(body)
         return builder.turn()
 
+    @override
     def _payload(
         self,
         messages: Sequence[Message],
@@ -368,15 +498,15 @@ class ApiProvider(HttpProvider):
     ) -> dict[str, Any]:
         """Тело запроса чата; ``reasoning=False`` — без рассуждений модели."""
         options: dict[str, Any] = {"temperature": temperature}
-        payload: dict[str, Any] = {
-            "model": model or self.model,
-            "messages": self._messages_payload(messages, reasoning=reasoning),
-            "model_options": options,
-        }
+        payload = _chat_body(
+            model or self.model,
+            self._messages_payload(messages, reasoning=reasoning),
+            options,
+        )
         if stream:
             payload["stream"] = True
         if tools:
-            specs = [self._tool_to_payload(t) for t in tools]
+            specs = [_tool_to_payload(tool) for tool in tools]
             payload["tools"] = [{"functions": {"specifications": specs}}]
             if tool_choice == "none":
                 payload["tool_config"] = {"mode": "none"}
@@ -384,18 +514,20 @@ class ApiProvider(HttpProvider):
                 options["parallel_tool_calls"] = True
         return payload
 
+    @override
     def _probe_payload(self, text: str, model: str) -> dict[str, Any]:
-        return {
-            "model": model,
-            "messages": [{"role": "user", "content": [{"text": text}]}],
-            "model_options": {"max_tokens": 1, "temperature": 0},
-        }
+        return _chat_body(
+            model,
+            [_wire_message("user", [_text_part(text)])],
+            {"max_tokens": 1, "temperature": 0},
+        )
 
     # ------------------------------------------------------------------ #
-    # Поток (SSE)
+    # Поток SSE
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _consume_sse(resp: httpx.Response, emit: Callable[[str], None]) -> AssistantTurn:
+    @classmethod
+    @override
+    def _consume_sse(cls, resp: httpx.Response, emit: Callable[[str], None]) -> AssistantTurn:
         """Разбирает SSE-поток, отдавая текстовые дельты в ``emit``.
 
         Формат: события ``response.message.delta`` — куски текста в тех же ``messages``,
@@ -408,19 +540,10 @@ class ApiProvider(HttpProvider):
         builder = _TurnBuilder()
         done = False
         try:
-            for event, data in iter_sse_events(resp.iter_lines()):
-                if data.strip() == "[DONE]":
+            for event, chunk in _stream_chunks(resp.iter_lines()):
+                if chunk is None:  # маркер [DONE]
                     done = True
                     break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(chunk, dict):
-                    continue
-                error = _stream_error(event, chunk)
-                if error is not None:
-                    raise ApiError(f"API вернул ошибку в потоке: {error}")
                 done = done or event == "response.message.done"
                 piece = builder.add(chunk)
                 if piece:
@@ -429,20 +552,3 @@ class ApiProvider(HttpProvider):
             if not (done or builder.finished):
                 raise
         return builder.turn(complete=done or builder.finished)
-
-    def list_models(self) -> list[str]:
-        """Чат-модели (``type == "chat"``): эмбеддеры и прочие в выборе не нужны."""
-        resp = self._request_with_retry(
-            lambda: self._client.get(
-                f"{self._cfg.base_url}/models",
-                headers=self._auth_headers(),
-            )
-        )
-        if resp.status_code >= 400:
-            raise ApiError(
-                f"Не удалось получить список моделей ({resp.status_code}): {error_body(resp)}"
-            )
-        models = self._json(resp).get("data") or []
-        return [
-            m["id"] for m in models if isinstance(m, dict) and "id" in m and m.get("type") == "chat"
-        ]

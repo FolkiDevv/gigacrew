@@ -1,5 +1,4 @@
-"""Инструменты навигации по индексу проекта: поиск определений, оглавление файла,
-карта проекта.
+"""Инструменты навигации по индексу проекта: поиск определений, оглавление файла, карта проекта.
 
 Связи между определениями (использования, переход к определению, вызовы) — в
 :mod:`gigacrew.tools.navigation`.
@@ -12,8 +11,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, override
 
 from pydantic import BaseModel, Field
 
@@ -24,76 +24,91 @@ from gigacrew.project.index import (
     STATUS_BINARY,
     STATUS_ERROR,
     STATUS_LARGE,
-    FileEntry,
     ProjectIndex,
-    RefreshStats,
-    SymbolHit,
     is_corruption,
 )
 from gigacrew.project.repomap import CHARS_PER_TOKEN, build_repo_map
+from gigacrew.project.secret_paths import is_secret_target
 from gigacrew.project.symbols import Symbol, language_of
-from gigacrew.safety.paths import is_secret_target
 from gigacrew.security import resolve_in_root
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from gigacrew.project.index import FileEntry, RefreshStats, SymbolHit
 
 MAX_SYMBOL_RESULTS = 200
 MAX_OUTLINE_FILES = 200  # больше файлов в каталоге — сводка по подкаталогам
 MAX_LISTED_FILES = 15  # файлов в строках «импортирует» / «импортируется в»
+_DEFAULT_SYMBOL_RESULTS = 50
 
 
 @contextmanager
-def open_index(ctx: ToolContext) -> Iterator[ProjectIndex]:
+def open_index(ctx: ToolContext) -> Generator[ProjectIndex]:
+    """Открывает индекс проекта; его сбои становятся ошибкой инструмента.
+
+    Повреждённый индекс удаляется: следующий вызов построит его заново.
+    """
     index = ProjectIndex(ctx.workspace)
     try:
         with index:
             yield index
-    except INDEX_ERRORS as e:
-        if is_corruption(e):
+    except INDEX_ERRORS as exc:
+        if is_corruption(exc):
             # Испорченные страницы данных видны только на запросе: без пересоздания
             # падал бы каждый вызов, а /index rebuild модели недоступна.
             index.discard()
             raise ToolError(
-                f"Индекс проекта был повреждён ({e}) и удалён — повторите вызов: "
-                "индекс построится заново."
-            ) from e
-        raise ToolError(f"Индекс проекта недоступен: {e}") from e
+                f"Индекс проекта был повреждён ({exc}) и удалён — повторите вызов: "
+                "индекс построится заново.",
+            ) from exc
+        raise ToolError(f"Индекс проекта недоступен: {exc}") from exc
 
 
 def refresh_note(stats: RefreshStats) -> str:
+    """Приписка к сводке о перечитанных файлах (пусто, если индекс уже был актуален)."""
     return f"; индекс обновлён (файлов: {stats.changed})" if stats.changed else ""
 
 
 def line_range(symbol: Symbol) -> str:
+    """Строки определения: ``12-30`` или одна ``12``, если конец неизвестен."""
     if symbol.end_line and symbol.end_line != symbol.line:
         return f"{symbol.line}-{symbol.end_line}"
     return str(symbol.line)
 
 
 def doc_note(symbol: Symbol) -> str:
+    """Первая строка докстринга комментарием (пусто, если её нет)."""
     return f"  # {symbol.doc}" if symbol.doc else ""
 
 
 def definition_line(hit: SymbolHit) -> str:
-    s = hit.symbol
-    return f"{hit.path}:{line_range(s)} {s.kind} {s.qualname} — {s.signature}{doc_note(s)}"
+    """Строка найденного определения: ``путь:строки вид имя — сигнатура``."""
+    symbol = hit.symbol
+    location = f"{hit.path}:{line_range(symbol)}"
+    return f"{location} {symbol.kind} {symbol.qualname} — {symbol.signature}{doc_note(symbol)}"
 
 
-def short_list(items: list[str]) -> str:
-    text = ", ".join(items[:MAX_LISTED_FILES])
-    if len(items) > MAX_LISTED_FILES:
-        text += f", … и ещё {len(items) - MAX_LISTED_FILES}"
+def short_list(paths: list[str]) -> str:
+    """Пути через запятую: не больше :data:`MAX_LISTED_FILES`, остальные — числом."""
+    text = ", ".join(paths[:MAX_LISTED_FILES])
+    hidden = len(paths) - MAX_LISTED_FILES
+    if hidden > 0:
+        return f"{text}, … и ещё {hidden}"
     return text
 
 
 # --------------------------------------------------------------------------- #
 # find_symbol
 # --------------------------------------------------------------------------- #
-class FindSymbolParams(BaseModel):
+# Докстринг pydantic-модели попал бы в JSON-схему параметров, которую получает модель.
+class FindSymbolParams(BaseModel):  # noqa: D101
     query: str = Field(
         description=(
             "Name or part of the name of a definition (case-insensitive): 'Agent', "
             "'run_turn'; a class method — 'Agent.run_turn'"
-        )
+        ),
     )
     kind: str | None = Field(
         default=None,
@@ -103,12 +118,18 @@ class FindSymbolParams(BaseModel):
         ),
     )
     glob: str | None = Field(
-        default=None, description="Limit to files matching a glob: '*.py' or 'src/**/*.ts'"
+        default=None,
+        description="Limit to files matching a glob: '*.py' or 'src/**/*.ts'",
     )
-    max_results: int = Field(default=50, description="Maximum number of results")
+    max_results: int = Field(
+        default=_DEFAULT_SYMBOL_RESULTS,
+        description="Maximum number of results",
+    )
 
 
-class FindSymbolTool(Tool):
+class FindSymbolTool(Tool[FindSymbolParams]):
+    """Поиск определений по имени в индексе проекта."""
+
     name = "find_symbol"
     read_only = True
     description = (
@@ -119,27 +140,34 @@ class FindSymbolTool(Tool):
     )
     Params = FindSymbolParams
 
+    @override
     def describe(self, params: FindSymbolParams) -> str:
+        """Запрос и вид определения, если он задан."""
         return f"{params.query} ({params.kind})" if params.kind else params.query
 
+    @override
     def run(self, params: FindSymbolParams, ctx: ToolContext) -> ToolResult:
+        """Ищет определения в обновлённом индексе."""
         if not params.query.strip():
             raise ToolError("Пустой запрос.")
         limit = min(max(params.max_results, 1), MAX_SYMBOL_RESULTS)
         with open_index(ctx) as index:
             refreshed = index.refresh()
             hits, total = index.find_symbols(
-                params.query, kind=params.kind, path_glob=params.glob, limit=limit
+                params.query,
+                kind=params.kind,
+                path_glob=params.glob,
+                limit=limit,
             )
-        if not hits:
+        if hits:
+            body = "\n".join(definition_line(hit) for hit in hits)
+            if total > len(hits):
+                body = f"{body}\n… показано {len(hits)} из {total}; уточните запрос, kind или glob"
+        else:
             body = (
                 "(определений не найдено). Индекс знает только определения; "
                 "использования ищите через search_content."
             )
-        else:
-            body = "\n".join(definition_line(h) for h in hits)
-            if total > len(hits):
-                body += f"\n… показано {len(hits)} из {total}; уточните запрос, kind или glob"
         return ToolResult(
             content=body,
             summary=f"найдено определений: {total}{refresh_note(refreshed)}",
@@ -149,7 +177,8 @@ class FindSymbolTool(Tool):
 # --------------------------------------------------------------------------- #
 # file_outline
 # --------------------------------------------------------------------------- #
-class FileOutlineParams(BaseModel):
+# Докстринг pydantic-модели попал бы в JSON-схему параметров, которую получает модель.
+class FileOutlineParams(BaseModel):  # noqa: D101
     path: str = Field(description="File or directory relative to the project root")
 
 
@@ -161,10 +190,13 @@ def _entry_line(entry: FileEntry, shown_path: str) -> str:
         details.append("слишком большой для разбора")
     elif entry.status == STATUS_BINARY:
         details.append("бинарный")
-    return f"{shown_path} ({', '.join(details)})"
+    joined = ", ".join(details)
+    return f"{shown_path} ({joined})"
 
 
-class FileOutlineTool(Tool):
+class FileOutlineTool(Tool[FileOutlineParams]):
+    """Оглавление файла или каталога по индексу проекта."""
+
     name = "file_outline"
     read_only = True
     description = (
@@ -176,7 +208,9 @@ class FileOutlineTool(Tool):
     )
     Params = FileOutlineParams
 
+    @override
     def run(self, params: FileOutlineParams, ctx: ToolContext) -> ToolResult:
+        """Строит оглавление файла или каталога по обновлённому индексу."""
         target = resolve_in_root(ctx.root, params.path)
         if not target.exists():
             raise ToolError(f"Путь не найден: {params.path}")
@@ -186,7 +220,7 @@ class FileOutlineTool(Tool):
             if is_excluded(ctx.root, target):
                 raise ToolError(
                     f"Файл исключён из индекса (.gitignore или служебный каталог): "
-                    f"{params.path}. Используйте read_file."
+                    f"{params.path}. Используйте read_file.",
                 )
         with open_index(ctx) as index:
             # импорты Python-файла сопоставляются с другими файлами проекта — нужен весь индекс
@@ -195,11 +229,15 @@ class FileOutlineTool(Tool):
             rel = target.relative_to(ctx.root).as_posix()
             rel = "" if rel == "." else rel
             if target.is_dir():
-                return self._directory(index, rel, refreshed)
-            return self._file(index, rel, params.path, refreshed)
+                return self._directory_outline(index, rel, refreshed)
+            return self._file_outline(index, rel, params.path, refreshed)
 
-    def _file(
-        self, index: ProjectIndex, rel: str, shown: str, refreshed: RefreshStats
+    def _file_outline(
+        self,
+        index: ProjectIndex,
+        rel: str,
+        shown: str,
+        refreshed: RefreshStats,
     ) -> ToolResult:
         entry = index.file_entry(rel)
         if entry is None:
@@ -207,54 +245,31 @@ class FileOutlineTool(Tool):
         header = _entry_line(entry, rel)
         if entry.language == "python":
             header += self._imports(index, rel)
-        if entry.status == STATUS_LARGE:
-            raise ToolError(
-                f"Файл слишком большой для разбора (>{MAX_INDEX_FILE_BYTES} байт): {shown}. "
-                "Используйте search_content или read_file с диапазоном строк."
-            )
-        if entry.status == STATUS_BINARY:
-            raise ToolError(f"Бинарный файл: {shown}")
-        if entry.status == STATUS_ERROR:
-            raise ToolError(f"Не удалось разобрать файл: {shown}. Используйте read_file.")
+        self._check_parsed(entry, shown)
         symbols = index.outline(rel)
-        if not symbols:
-            body = f"{header}\n(определений не найдено)"
+        if symbols:
+            lines = "\n".join(self._outline_line(symbol) for symbol in symbols)
+            body = f"{header}\n{lines}"
         else:
-            body = (
-                header
-                + "\n"
-                + "\n".join(
-                    f"{'  ' * s.depth}{line_range(s)}  {s.signature or s.kind + ' ' + s.name}"
-                    f"{doc_note(s)}"
-                    for s in symbols
-                )
-            )
+            body = f"{header}\n(определений не найдено)"
         return ToolResult(
             content=body,
             summary=f"{rel}: определений {len(symbols)}{refresh_note(refreshed)}",
         )
 
-    @staticmethod
-    def _imports(index: ProjectIndex, rel: str) -> str:
-        targets = sorted({e.target for e in index.imports_of(rel) if e.target not in (None, rel)})
-        users = [path for path, _ in index.imported_by(rel)]
-        text = ""
-        if targets:
-            text += f"\nимпортирует из проекта: {short_list(targets)}"  # type: ignore[arg-type]
-        if users:
-            text += f"\nимпортируется в ({len(users)}): {short_list(users)}"
-        return text
-
-    def _directory(self, index: ProjectIndex, rel: str, refreshed: RefreshStats) -> ToolResult:
+    def _directory_outline(
+        self,
+        index: ProjectIndex,
+        rel: str,
+        refreshed: RefreshStats,
+    ) -> ToolResult:
         entries = list(index.files_under(rel))
         prefix = f"{rel}/" if rel else ""
-        if not entries:
-            body = "(в индексе нет файлов этого каталога)"
-        elif len(entries) <= MAX_OUTLINE_FILES:
-            body = "\n".join(_entry_line(e, e.path[len(prefix) :]) for e in entries)
+        if entries:
+            body = self._listing(entries, prefix)
         else:
-            body = self._grouped(entries, prefix)
-        symbols = sum(e.symbols for e in entries)
+            body = "(в индексе нет файлов этого каталога)"
+        symbols = sum(entry.symbols for entry in entries)
         where = rel or "."
         return ToolResult(
             content=body,
@@ -262,26 +277,65 @@ class FileOutlineTool(Tool):
             f"{refresh_note(refreshed)}",
         )
 
-    @staticmethod
-    def _grouped(entries: list[FileEntry], prefix: str) -> str:
+    def _check_parsed(self, entry: FileEntry, shown: str) -> None:
+        """Файл, который индекс не разобрал, — ошибка с подсказкой, чем его читать."""
+        if entry.status == STATUS_LARGE:
+            raise ToolError(
+                f"Файл слишком большой для разбора (>{MAX_INDEX_FILE_BYTES} байт): {shown}. "
+                "Используйте search_content или read_file с диапазоном строк.",
+            )
+        if entry.status == STATUS_BINARY:
+            raise ToolError(f"Бинарный файл: {shown}")
+        if entry.status == STATUS_ERROR:
+            raise ToolError(f"Не удалось разобрать файл: {shown}. Используйте read_file.")
+
+    def _outline_line(self, symbol: Symbol) -> str:
+        indent = "  " * symbol.depth
+        title = symbol.signature or f"{symbol.kind} {symbol.name}"
+        return f"{indent}{line_range(symbol)}  {title}{doc_note(symbol)}"
+
+    def _imports(self, index: ProjectIndex, rel: str) -> str:
+        """Строки о связях Python-файла: что он импортирует из проекта и где импортируется сам."""
+        targets = sorted({
+            imported.target
+            for imported in index.imports_of(rel)
+            if imported.target not in {None, rel}
+        })
+        users = [path for path, _ in index.imported_by(rel)]
+        note = ""
+        if targets:
+            note = f"\nимпортирует из проекта: {short_list(targets)}"
+        if users:
+            note = f"{note}\nимпортируется в ({len(users)}): {short_list(users)}"
+        return note
+
+    def _listing(self, entries: list[FileEntry], prefix: str) -> str:
+        if len(entries) <= MAX_OUTLINE_FILES:
+            return "\n".join(_entry_line(entry, entry.path[len(prefix) :]) for entry in entries)
+        return self._grouped(entries, prefix)
+
+    def _grouped(self, entries: list[FileEntry], prefix: str) -> str:
         groups: dict[str, list[FileEntry]] = defaultdict(list)
         direct: list[FileEntry] = []
-        for e in entries:
-            rest = e.path[len(prefix) :]
+        for entry in entries:
+            rest = entry.path[len(prefix) :]
             if "/" in rest:
-                groups[rest.split("/", 1)[0]].append(e)
+                groups[rest.split("/", 1)[0]].append(entry)
             else:
-                direct.append(e)
-        lines = [
-            f"{name}/ (файлов: {len(items)}, определений: {sum(i.symbols for i in items)})"
-            for name, items in sorted(groups.items())
+                direct.append(entry)
+        lines: list[str] = []
+        for name, members in sorted(groups.items()):
+            symbols = sum(member.symbols for member in members)
+            lines.append(f"{name}/ (файлов: {len(members)}, определений: {symbols})")
+        lines += [
+            _entry_line(shown, shown.path[len(prefix) :]) for shown in direct[:MAX_OUTLINE_FILES]
         ]
-        lines += [_entry_line(e, e.path[len(prefix) :]) for e in direct[:MAX_OUTLINE_FILES]]
-        if len(direct) > MAX_OUTLINE_FILES:
-            lines.append(f"… и ещё {len(direct) - MAX_OUTLINE_FILES} файлов")
+        hidden = len(direct) - MAX_OUTLINE_FILES
+        if hidden > 0:
+            lines.append(f"… и ещё {hidden} файлов")
         lines.append(
             f"(всего файлов: {len(entries)} — показана сводка по подкаталогам; "
-            "уточните путь, чтобы увидеть файлы)"
+            "уточните путь, чтобы увидеть файлы)",
         )
         return "\n".join(lines)
 
@@ -291,9 +345,11 @@ class FileOutlineTool(Tool):
 # --------------------------------------------------------------------------- #
 MIN_MAP_TOKENS = 200
 MAX_MAP_TOKENS = 8_000
+_DEFAULT_MAP_TOKENS = 1500
 
 
-class RepoMapParams(BaseModel):
+# Докстринг pydantic-модели попал бы в JSON-схему параметров, которую получает модель.
+class RepoMapParams(BaseModel):  # noqa: D101
     focus: list[str] = Field(
         default_factory=list,
         description=(
@@ -301,10 +357,15 @@ class RepoMapParams(BaseModel):
             "names ('ProjectIndex', 'run_turn'). Empty — what matters in the whole project."
         ),
     )
-    max_tokens: int = Field(default=1500, description="Size of the map (estimated tokens)")
+    max_tokens: int = Field(
+        default=_DEFAULT_MAP_TOKENS,
+        description="Size of the map (estimated tokens)",
+    )
 
 
-class RepoMapTool(Tool):
+class RepoMapTool(Tool[RepoMapParams]):
+    """Карта проекта: важнейшие определения, ранжированные по использованиям."""
+
     name = "repo_map"
     read_only = True
     description = (
@@ -316,45 +377,59 @@ class RepoMapTool(Tool):
     )
     Params = RepoMapParams
 
+    @override
     def describe(self, params: RepoMapParams) -> str:
+        """Фокус карты или «весь проект»."""
         return ", ".join(params.focus) if params.focus else "весь проект"
 
+    @override
     def run(self, params: RepoMapParams, ctx: ToolContext) -> ToolResult:
+        """Строит карту проекта по обновлённому индексу."""
         tokens = min(max(params.max_tokens, MIN_MAP_TOKENS), MAX_MAP_TOKENS)
         with open_index(ctx) as index:
             refreshed = index.refresh()
-            files: list[str] = []
-            names: list[str] = []
-            for item in (f.strip() for f in params.focus):
-                if not item:
-                    continue
-                target = resolve_in_root(ctx.root, item)
-                rel = target.relative_to(ctx.root).as_posix()
-                if target.is_file():
-                    files.append(rel)
-                elif target.is_dir():
-                    files += [e.path for e in index.files_under("" if rel == "." else rel)]
-                else:
-                    names.append(item.rsplit(".", 1)[-1])
+            files, names = self._split_focus(params.focus, index, ctx.root)
             repo_map = build_repo_map(
                 index,
                 focus_files=files,
                 focus_names=names,
                 max_chars=tokens * CHARS_PER_TOKEN,
             )
-        if not repo_map.text:
-            body = (
-                "(в индексе нет определений)"
-                if repo_map.total == 0
-                else "(определения не поместились в объём карты — увеличьте max_tokens)"
-            )
-        else:
+        if repo_map.text:
             body = (
                 f"карта проекта: определений {repo_map.definitions} из {repo_map.total}, "
                 f"файлов {repo_map.files}\n{repo_map.text}"
             )
+        elif repo_map.total == 0:
+            body = "(в индексе нет определений)"
+        else:
+            body = "(определения не поместились в объём карты — увеличьте max_tokens)"
         return ToolResult(
             content=body,
             summary=f"карта: определений {repo_map.definitions}, файлов {repo_map.files}"
             f"{refresh_note(refreshed)}",
         )
+
+    def _split_focus(
+        self,
+        focus: list[str],
+        index: ProjectIndex,
+        root: Path,
+    ) -> tuple[list[str], list[str]]:
+        """Фокус карты: (файлы проекта, имена). Каталог раскрывается в свои файлы."""
+        files: list[str] = []
+        names: list[str] = []
+        for raw in focus:
+            part = raw.strip()
+            if not part:
+                continue
+            target = resolve_in_root(root, part)
+            rel = target.relative_to(root).as_posix()
+            if target.is_file():
+                files.append(rel)
+            elif target.is_dir():
+                under = "" if rel == "." else rel
+                files += [entry.path for entry in index.files_under(under)]
+            else:
+                names.append(part.rsplit(".", 1)[-1])
+        return files, names

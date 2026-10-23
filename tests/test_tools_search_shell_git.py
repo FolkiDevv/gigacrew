@@ -2,90 +2,117 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
+from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
 
-from gigacrew.permissions import Decision, PermissionMode, decide
+from gigacrew.agent.loop import Agent
+from gigacrew.config import Config
+from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide
+from gigacrew.project.workspace import Workspace
+from gigacrew.safety.gitconfig import repo_config_runs_programs
 from gigacrew.security import RiskLevel
-from gigacrew.tools.base import ToolError
+from gigacrew.tools import git as git_module
+from gigacrew.tools.base import ToolContext, ToolError, build_default_registry
 from gigacrew.tools.fs import WriteFileTool
 from gigacrew.tools.git import GitTool
-from gigacrew.tools.search import SearchContentTool
+from gigacrew.tools.search import SearchContentParams, SearchContentTool
 from gigacrew.tools.shell import RunShellTool
 
+# Автор коммитов и разрешение file:// — для подмодуля из локального каталога.
+_SUBMODULE_GIT_OPTIONS = (
+    "-c",
+    "user.email=t@t.t",
+    "-c",
+    "user.name=t",
+    "-c",
+    "protocol.file.allow=always",
+)
 
-def _write(ctx, path, content):
-    w = WriteFileTool()
-    w.run(w.parse({"path": path, "content": content}), ctx)
+# Вызов git: подкоманда и её аргументы.
+type _GitCall = tuple[str, list[str]]
+
+
+def _write(ctx: ToolContext, path: str, content: str) -> None:
+    writer = WriteFileTool()
+    writer.run(writer.parse({"path": path, "content": content}), ctx)
 
 
 # ------------------------------- search ------------------------------- #
-def test_search_content_finds_matches(ctx):
+def test_search_content_finds_matches(ctx: ToolContext) -> None:
     _write(ctx, "a.py", "def foo():\n    return 42\n")
     _write(ctx, "b.py", "x = foo()\n")
-    s = SearchContentTool()
-    out = s.run(s.parse({"pattern": r"foo"}), ctx)
+    search = SearchContentTool()
+    out = search.run(search.parse({"pattern": r"foo"}), ctx)
     assert "a.py:1:" in out.content
     assert "b.py:1:" in out.content
 
 
-def test_search_glob_filter(ctx):
+def test_search_glob_filter(ctx: ToolContext) -> None:
     _write(ctx, "a.py", "needle")
     _write(ctx, "a.txt", "needle")
-    s = SearchContentTool()
-    out = s.run(s.parse({"pattern": "needle", "glob": "*.py"}), ctx)
-    assert "a.py" in out.content and "a.txt" not in out.content
+    search = SearchContentTool()
+    out = search.run(search.parse({"pattern": "needle", "glob": "*.py"}), ctx)
+    assert "a.py" in out.content
+    assert "a.txt" not in out.content
 
 
-def test_search_skips_ignored_binary_large_and_secrets(ctx):
+def test_search_skips_ignored_binary_large_and_secrets(ctx: ToolContext) -> None:
     _write(ctx, "src/a.py", "needle")
     _write(ctx, "node_modules/m.js", "needle")
     _write(ctx, ".env", "needle=secret")
     _write(ctx, ".env.example", "needle=")
     (ctx.root / "bin.dat").write_bytes(b"needle\0\1\2")
     (ctx.root / "big.txt").write_text("needle\n" * 200_000, encoding="utf-8")
-    s = SearchContentTool()
-    out = s.run(s.parse({"pattern": "needle"}), ctx).content
-    files = sorted({ln.split(":", 1)[0] for ln in out.splitlines() if not ln.startswith("…")})
+    search = SearchContentTool()
+    out = search.run(search.parse({"pattern": "needle"}), ctx).content
+    hits = [line for line in out.splitlines() if not line.startswith("…")]
+    files = sorted({line.split(":", 1)[0] for line in hits})
     assert files == [".env.example", "src/a.py"]
     assert "пропущено больших файлов (>1 МБ): 1" in out  # модель знает, где не искали
 
 
-def test_search_glob_with_path(ctx):
+def test_search_glob_with_path(ctx: ToolContext) -> None:
     _write(ctx, "src/x/a.py", "needle")
     _write(ctx, "lib/b.py", "needle")
-    s = SearchContentTool()
-    out = s.run(s.parse({"pattern": "needle", "glob": "src/**/*.py"}), ctx).content
-    assert "src/x/a.py" in out and "lib/b.py" not in out
+    search = SearchContentTool()
+    out = search.run(search.parse({"pattern": "needle", "glob": "src/**/*.py"}), ctx).content
+    assert "src/x/a.py" in out
+    assert "lib/b.py" not in out
 
 
-def test_search_max_results_is_clamped(ctx):
+def test_search_max_results_is_clamped(ctx: ToolContext) -> None:
     _write(ctx, "a.txt", "hit\n" * 2000)
-    s = SearchContentTool()
-    out = s.run(s.parse({"pattern": "hit", "max_results": 10**6}), ctx).content
+    search = SearchContentTool()
+    out = search.run(search.parse({"pattern": "hit", "max_results": 10**6}), ctx).content
     assert len([ln for ln in out.splitlines() if ln.startswith("a.txt:")]) == 500
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="симлинки")
-def test_search_does_not_follow_symlinks_outside(ctx, tmp_path_factory):
+def test_search_does_not_follow_symlinks_outside(
+    ctx: ToolContext,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
     outside = tmp_path_factory.mktemp("outside") / "secret.txt"
     outside.write_text("needle", encoding="utf-8")
     (ctx.root / "link.txt").symlink_to(outside)
-    s = SearchContentTool()
-    out = s.run(s.parse({"pattern": "needle"}), ctx).content
+    search = SearchContentTool()
+    out = search.run(search.parse({"pattern": "needle"}), ctx).content
     assert "link.txt" not in out
 
 
-def test_search_invalid_regex(ctx):
-    s = SearchContentTool()
+def test_search_invalid_regex(ctx: ToolContext) -> None:
+    search = SearchContentTool()
     with pytest.raises(ToolError):
-        s.run(s.parse({"pattern": "([unclosed"}), ctx)
+        search.run(search.parse({"pattern": "([unclosed"}), ctx)
 
 
 # ------------------------------- shell -------------------------------- #
-def test_shell_echo(ctx):
+def test_shell_echo(ctx: ToolContext) -> None:
     sh = RunShellTool()
     res = sh.run(sh.parse({"command": "echo hello"}), ctx)
     assert res.ok
@@ -93,22 +120,20 @@ def test_shell_echo(ctx):
     assert "exit code: 0" in res.content
 
 
-def test_shell_nonzero_exit(ctx):
+def test_shell_nonzero_exit(ctx: ToolContext) -> None:
     sh = RunShellTool()
     res = sh.run(sh.parse({"command": "exit 3"}), ctx)
     assert not res.ok
     assert "exit code: 3" in res.content
 
 
-def test_shell_runs_in_project_root(ctx):
+def test_shell_runs_in_project_root(ctx: ToolContext) -> None:
     sh = RunShellTool()
     res = sh.run(sh.parse({"command": "pwd"}), ctx)
     assert str(ctx.root) in res.content
 
 
-def test_shell_dangerous_classification(ctx):
-    from gigacrew.security import RiskLevel
-
+def test_shell_dangerous_classification(ctx: ToolContext) -> None:
     sh = RunShellTool()
     safe = sh.parse({"command": "ls -la"})
     write = sh.parse({"command": "touch x"})
@@ -118,7 +143,7 @@ def test_shell_dangerous_classification(ctx):
     assert sh.risk(danger, ctx) == RiskLevel.DANGEROUS
 
 
-def test_shell_runs_in_cwd_and_rejects_outside(ctx):
+def test_shell_runs_in_cwd_and_rejects_outside(ctx: ToolContext) -> None:
     (ctx.root / "sub").mkdir()
     sh = RunShellTool()
     res = sh.run(sh.parse({"command": "pwd", "cwd": "sub"}), ctx)
@@ -127,12 +152,14 @@ def test_shell_runs_in_cwd_and_rejects_outside(ctx):
     with pytest.raises(ToolError):
         sh.run(sh.parse({"command": "pwd", "cwd": "../.."}), ctx)
     verdict = sh.assess(sh.parse({"command": "cd sub && ls"}), ctx).verdict
-    assert verdict is not None and verdict.cwd == "sub" and verdict.command == "ls"
+    assert verdict is not None
+    assert verdict.cwd == "sub"
+    assert verdict.command == "ls"
 
 
 # -------------------------------- git --------------------------------- #
 @pytest.fixture
-def git_repo(ctx):
+def git_repo(ctx: ToolContext) -> ToolContext:
     root = ctx.root
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=root, check=True)
@@ -140,38 +167,38 @@ def git_repo(ctx):
     return ctx
 
 
-def test_git_status(git_repo):
+def test_git_status(git_repo: ToolContext) -> None:
     ctx = git_repo
     _write(ctx, "f.txt", "hi")
-    g = GitTool()
-    res = g.run(g.parse({"subcommand": "status"}), ctx)
+    git = GitTool()
+    res = git.run(git.parse({"subcommand": "status"}), ctx)
     assert res.ok
     assert "f.txt" in res.content
 
 
-def test_git_add_and_commit(git_repo):
+def test_git_add_and_commit(git_repo: ToolContext) -> None:
     ctx = git_repo
     _write(ctx, "f.txt", "hi")
-    g = GitTool()
-    g.run(g.parse({"subcommand": "add", "args": ["f.txt"]}), ctx)
-    res = g.run(g.parse({"subcommand": "commit", "args": ["-m", "init"]}), ctx)
+    git = GitTool()
+    git.run(git.parse({"subcommand": "add", "args": ["f.txt"]}), ctx)
+    res = git.run(git.parse({"subcommand": "commit", "args": ["-m", "init"]}), ctx)
     assert res.ok
-    log = g.run(g.parse({"subcommand": "log"}), ctx)
+    log = git.run(git.parse({"subcommand": "log"}), ctx)
     assert "init" in log.content
 
 
-def test_git_disallowed_subcommand(git_repo):
-    g = GitTool()
+def test_git_disallowed_subcommand(git_repo: ToolContext) -> None:
+    git = GitTool()
     with pytest.raises(ToolError):
-        g.run(g.parse({"subcommand": "push"}), git_repo)
+        git.run(git.parse({"subcommand": "push"}), git_repo)
 
 
-def _git(ctx, *args):
+def _git(ctx: ToolContext, *args: str) -> None:
     subprocess.run(["git", *args], cwd=ctx.root, check=True, capture_output=True)
 
 
 @pytest.fixture
-def stashed_repo(git_repo):
+def stashed_repo(git_repo: ToolContext) -> ToolContext:
     """Репозиторий с коммитом и одной отложенной правкой (refs/stash есть)."""
     _write(git_repo, "f.txt", "one\n")
     _git(git_repo, "add", "f.txt")
@@ -183,7 +210,7 @@ def stashed_repo(git_repo):
 
 @pytest.mark.parametrize("dashdash", [False, True])
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("stash", ["list"]),
         ("stash", ["show"]),
@@ -192,22 +219,28 @@ def stashed_repo(git_repo):
         ("show", []),
     ],
 )
-def test_git_forbidden_options_rejected_after_double_dash(stashed_repo, sub, args, dashdash):
+def test_git_forbidden_options_rejected_after_double_dash(
+    stashed_repo: ToolContext,
+    sub: str,
+    args: list[str],
+    *,
+    dashdash: bool,
+) -> None:
     """`stash list` передаёт слова после `--` в `git log` как опции: --output записал бы файл."""
     target = stashed_repo.root / "written.txt"
     extra = ["--"] if dashdash else []
     params_args = [*args, *extra, "--pretty=format:CHOSEN", f"--output={target}"]
-    g = GitTool()
-    params = g.parse({"subcommand": sub, "args": params_args})
+    git = GitTool()
+    params = git.parse({"subcommand": sub, "args": params_args})
     with pytest.raises(ToolError, match="запрещена"):
-        g.preview(params, stashed_repo)
+        git.preview(params, stashed_repo)
     with pytest.raises(ToolError, match="запрещена"):
-        g.run(params, stashed_repo)
+        git.run(params, stashed_repo)
     assert not target.exists()
 
 
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("add", ["--pathspec-from-file=/etc/hostname"]),
         ("add", ["--pathspec-from=x"]),  # сокращение опции
@@ -216,17 +249,21 @@ def test_git_forbidden_options_rejected_after_double_dash(stashed_repo, sub, arg
         ("show", ["--no-index"]),
     ],
 )
-def test_git_forbidden_options_for_every_subcommand(stashed_repo, sub, args):
-    g = GitTool()
-    params = g.parse({"subcommand": sub, "args": args})
+def test_git_forbidden_options_for_every_subcommand(
+    stashed_repo: ToolContext,
+    sub: str,
+    args: list[str],
+) -> None:
+    git = GitTool()
+    params = git.parse({"subcommand": sub, "args": args})
     with pytest.raises(ToolError, match="запрещена"):
-        g.preview(params, stashed_repo)
+        git.preview(params, stashed_repo)
     with pytest.raises(ToolError, match="запрещена"):
-        g.run(params, stashed_repo)
+        git.run(params, stashed_repo)
 
 
 @pytest.mark.parametrize(
-    "sub, args, reason",
+    ("sub", "args", "reason"),
     [
         ("branch", ["-D", "feature"], "git branch -D: удаление ветки без проверки слияния"),
         ("branch", ["--delete", "--force", "feature"], "git branch -D"),
@@ -260,20 +297,31 @@ def test_git_forbidden_options_for_every_subcommand(stashed_repo, sub, args):
         ("switch", ["--force-create", "main"], "git switch -C"),
     ],
 )
-def test_git_destructive_operations_are_dangerous(stashed_repo, sub, args, reason):
+def test_git_destructive_operations_are_dangerous(
+    stashed_repo: ToolContext,
+    sub: str,
+    args: list[str],
+    reason: str,
+) -> None:
     """Как и через run_shell: -y и хук `allow` не запускают их без вопроса."""
-    g = GitTool()
-    assessment = g.assess(g.parse({"subcommand": sub, "args": args}), stashed_repo)
+    git = GitTool()
+    assessment = git.assess(git.parse({"subcommand": sub, "args": args}), stashed_repo)
     assert assessment.risk is RiskLevel.DANGEROUS
     assert assessment.reason.startswith(reason)
-    decision = decide(PermissionMode.AUTO, assessment.risk, g.kind, auto_approve=True)
+    decision = decide(PermissionMode.AUTO, assessment.risk, git.kind, auto_approve=True)
     assert decision is Decision.ASK
-    hooked = decide(PermissionMode.AUTO, assessment.risk, g.kind, auto_approve=False, hook="allow")
+    hooked = decide(
+        PermissionMode.AUTO,
+        assessment.risk,
+        git.kind,
+        auto_approve=False,
+        hook="allow",
+    )
     assert hooked is Decision.ASK
 
 
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("branch", ["-d", "feature"]),
         ("branch", ["-m", "new"]),
@@ -294,44 +342,45 @@ def test_git_destructive_operations_are_dangerous(stashed_repo, sub, args, reaso
         ("commit", ["-qm", "/etc/passwd", "--trailer", "x"]),
     ],
 )
-def test_git_changes_that_keep_work_are_write(stashed_repo, sub, args):
-    g = GitTool()
-    params = g.parse({"subcommand": sub, "args": args})
-    assessment = g.assess(params, stashed_repo)
+def test_git_changes_that_keep_work_are_write(
+    stashed_repo: ToolContext,
+    sub: str,
+    args: list[str],
+) -> None:
+    git = GitTool()
+    params = git.parse({"subcommand": sub, "args": args})
+    assessment = git.assess(params, stashed_repo)
     assert assessment.risk is RiskLevel.WRITE
-    assert assessment.reason == ""
-    assert g.preview(params, stashed_repo).text == f"$ git {g.describe(params)}"
+    assert not assessment.reason
+    preview = git.preview(params, stashed_repo)
+    assert preview is not None
+    assert preview.text == f"$ git {git.describe(params)}"
 
 
-def test_git_restore_with_yes_flag_still_asks(stashed_repo):
+def test_git_restore_with_yes_flag_still_asks(stashed_repo: ToolContext) -> None:
     """Агент с -y: `restore .` спрашивает (как опасное), а правка остаётся при отказе."""
-    from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
-
-    from gigacrew.agent.loop import Agent
-    from gigacrew.config import Config
-    from gigacrew.tools.base import build_default_registry
-
     root = stashed_repo.root
     _write(stashed_repo, "f.txt", "three\n")
     provider = ScriptedProvider(
-        [tool_turn("git", {"subcommand": "restore", "args": ["."]}), text_turn("ок")]
+        [tool_turn("git", {"subcommand": "restore", "args": ["."]}), text_turn("ок")],
     )
     events = RecordingEvents(confirm_answer=False)
     cfg = Config(access_key="x", project_root=root, stream=False, auto_approve=True)
     Agent(provider, build_default_registry(), cfg, events).run_turn("откати правки")
-    assert len(events.confirms) == 1 and events.confirms[0][2] is True  # dangerous
+    assert len(events.confirms) == 1
+    assert events.confirms[0][2] is True
     assert (root / "f.txt").read_text(encoding="utf-8") == "three\n"
 
 
 @pytest.fixture
-def outside_secret(tmp_path_factory):
+def outside_secret(tmp_path_factory: pytest.TempPathFactory) -> Path:
     secret = tmp_path_factory.mktemp("outside") / "secret.txt"
     secret.write_text("SECRET-LINE\n", encoding="utf-8")
     return secret
 
 
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("diff", ["{abs}", "f.txt"]),  # путь вне дерева — git сам включает --no-index
         ("diff", ["--", "{abs}", "/dev/null"]),
@@ -347,28 +396,37 @@ def outside_secret(tmp_path_factory):
         ("commit", ["-t{abs}"]),
     ],
 )
-def test_git_paths_outside_project_are_refused(stashed_repo, outside_secret, sub, args):
-    rel = f"../{outside_secret.parent.name}/{outside_secret.name}"
-    args = [a.format(abs=outside_secret, rel=rel) for a in args]
-    g = GitTool()
-    params = g.parse({"subcommand": sub, "args": args})
+def test_git_paths_outside_project_are_refused(
+    stashed_repo: ToolContext,
+    outside_secret: Path,
+    sub: str,
+    args: list[str],
+) -> None:
+    outside_dir = outside_secret.parent.name
+    rel = f"../{outside_dir}/{outside_secret.name}"
+    resolved_args = [arg.format(abs=outside_secret, rel=rel) for arg in args]
+    git = GitTool()
+    params = git.parse({"subcommand": sub, "args": resolved_args})
     with pytest.raises(ToolError, match="вне проекта"):
-        g.preview(params, stashed_repo)
+        git.preview(params, stashed_repo)
     with pytest.raises(ToolError, match="вне проекта"):
-        g.run(params, stashed_repo)
+        git.run(params, stashed_repo)
 
 
-def test_git_paths_outside_project_are_refused_outside_a_repository(ctx, outside_secret):
+def test_git_paths_outside_project_are_refused_outside_a_repository(
+    ctx: ToolContext,
+    outside_secret: Path,
+) -> None:
     """Вне репозитория `git diff a b` — это `--no-index`: содержимое любого файла."""
     _write(ctx, "f.txt", "x\n")
-    g = GitTool()
-    params = g.parse({"subcommand": "diff", "args": [str(outside_secret), "/dev/null"]})
+    git = GitTool()
+    params = git.parse({"subcommand": "diff", "args": [str(outside_secret), "/dev/null"]})
     with pytest.raises(ToolError, match="вне проекта"):
-        g.run(params, ctx)
+        git.run(params, ctx)
 
 
 @pytest.mark.parametrize(
-    "sub, args",
+    ("sub", "args"),
     [
         ("diff", ["f.txt"]),
         ("diff", ["HEAD", "--", "f.txt"]),
@@ -377,26 +435,31 @@ def test_git_paths_outside_project_are_refused_outside_a_repository(ctx, outside
         ("stash", ["show", "-p"]),
     ],
 )
-def test_git_reads_inside_project_stay_safe(stashed_repo, sub, args):
-    g = GitTool()
-    params = g.parse({"subcommand": sub, "args": args})
-    assert g.assess(params, stashed_repo).risk is RiskLevel.SAFE
-    assert g.run(params, stashed_repo).ok is True
+def test_git_reads_inside_project_stay_safe(
+    stashed_repo: ToolContext,
+    sub: str,
+    args: list[str],
+) -> None:
+    git = GitTool()
+    params = git.parse({"subcommand": sub, "args": args})
+    assert git.assess(params, stashed_repo).risk is RiskLevel.SAFE
+    assert git.run(params, stashed_repo).ok is True
 
 
-@pytest.mark.parametrize("sub, args", [("status", []), ("diff", []), ("log", [])])
-def test_git_reads_outside_a_repository_are_not_safe(ctx, sub, args):
-    g = GitTool()
-    assessment = g.assess(g.parse({"subcommand": sub, "args": args}), ctx)
+@pytest.mark.parametrize(("sub", "args"), [("status", []), ("diff", []), ("log", [])])
+def test_git_reads_outside_a_repository_are_not_safe(
+    ctx: ToolContext,
+    sub: str,
+    args: list[str],
+) -> None:
+    git = GitTool()
+    assessment = git.assess(git.parse({"subcommand": sub, "args": args}), ctx)
     assert assessment.risk is RiskLevel.WRITE
     assert assessment.reason == "git: каталог проекта — не репозиторий git"
 
 
-def test_git_reads_in_enclosing_repository_are_not_safe(tmp_path):
+def test_git_reads_in_enclosing_repository_are_not_safe(tmp_path: Path) -> None:
     """Проект — подкаталог чужого репозитория: git показал бы и файлы вне проекта."""
-    from gigacrew.project.workspace import Workspace
-    from gigacrew.tools.base import ToolContext
-
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     (tmp_path / ".netrc").write_text("password hunter2\n", encoding="utf-8")
     project = tmp_path / "proj"
@@ -406,37 +469,42 @@ def test_git_reads_in_enclosing_repository_are_not_safe(tmp_path):
     commit = ["git", "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", "i"]
     subprocess.run(commit, cwd=tmp_path, check=True)
     ctx = ToolContext(workspace=Workspace(project))
-    g = GitTool()
-    for sub, args in [("status", []), ("log", ["-p"]), ("show", ["HEAD:./../.netrc"])]:
-        assessment = g.assess(g.parse({"subcommand": sub, "args": args}), ctx)
+    git = GitTool()
+    reads: tuple[_GitCall, ...] = (
+        ("status", []),
+        ("log", ["-p"]),
+        ("show", ["HEAD:./../.netrc"]),
+    )
+    for sub, args in reads:
+        assessment = git.assess(git.parse({"subcommand": sub, "args": args}), ctx)
         assert assessment.risk is RiskLevel.WRITE
         assert assessment.reason.startswith("git: проект — подкаталог репозитория ")
-        assert decide(PermissionMode.PLAN, assessment.risk, g.kind, auto_approve=False) is (
+        assert decide(PermissionMode.PLAN, assessment.risk, git.kind, auto_approve=False) is (
             Decision.BLOCK
         )
 
 
-def test_git_command_disables_external_programs():
-    g = GitTool()
-    cmd = g._command(g.parse({"subcommand": "diff", "args": ["--", "a.py"]}))
+def test_git_command_disables_external_programs() -> None:
+    git = GitTool()
+    cmd = git._command(git.parse({"subcommand": "diff", "args": ["--", "a.py"]}))
     assert cmd[:5] == ["git", "-c", "core.fsmonitor=false", "-c", "safe.bareRepository=explicit"]
     assert cmd[5:] == ["diff", "--no-ext-diff", "--", "a.py"]
-    assert g._command(g.parse({"subcommand": "log"}))[5:] == [
+    assert git._command(git.parse({"subcommand": "log"}))[5:] == [
         "log",
         "--no-ext-diff",
         "--oneline",
         "-n",
         "20",
     ]
-    stash = g._command(g.parse({"subcommand": "stash", "args": ["show", "-p"]}))
+    stash = git._command(git.parse({"subcommand": "stash", "args": ["show", "-p"]}))
     assert stash[5:] == ["stash", "show", "--no-ext-diff", "-p"]
     # stash list передаёт опции git log: -p показал бы дифф внешней программой
-    stash = g._command(g.parse({"subcommand": "stash", "args": ["list", "-p"]}))
+    stash = git._command(git.parse({"subcommand": "stash", "args": ["list", "-p"]}))
     assert stash[5:] == ["stash", "list", "--no-ext-diff", "-p"]
-    assert g._command(g.parse({"subcommand": "status"}))[5:] == ["status"]
+    assert git._command(git.parse({"subcommand": "status"}))[5:] == ["status"]
 
 
-def _marker_script(root, name):
+def _marker_script(root: Path, name: str) -> tuple[Path, Path]:
     script = root / f"{name}.sh"
     marker = root / f"{name}.marker"
     script.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 0\n', encoding="utf-8")
@@ -445,42 +513,48 @@ def _marker_script(root, name):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
-def test_git_status_does_not_run_fsmonitor_hook(git_repo):
+def test_git_status_does_not_run_fsmonitor_hook(git_repo: ToolContext) -> None:
     """Подменённый .git/config не запускает команду на `git status` (SAFE, без вопроса)."""
     root = git_repo.root
     hook, marker = _marker_script(root, "fsmonitor")
     subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=root, check=True)
-    subprocess.run(["git", "status"], cwd=root, capture_output=True)
+    subprocess.run(["git", "status"], cwd=root, capture_output=True, check=False)
     if not marker.exists():
         pytest.skip("эта версия git не запускает fsmonitor-хук")
     marker.unlink()
-    g = GitTool()
-    g.run(g.parse({"subcommand": "status"}), git_repo)
+    git = GitTool()
+    git.run(git.parse({"subcommand": "status"}), git_repo)
     assert not marker.exists()
 
 
 @pytest.mark.parametrize(
-    "sub, args", [("diff", []), ("log", ["-p"]), ("show", []), ("status", []), ("stash", ["list"])]
+    ("sub", "args"),
+    [("diff", []), ("log", ["-p"]), ("show", []), ("status", []), ("stash", ["list"])],
 )
-def test_git_reads_with_textconv_in_repo_config_are_not_safe(stashed_repo, sub, args):
-    """textconv из .git/config запускается на чтении: оно уже не SAFE (и в репозитории)."""
-    g = GitTool()
-    params = g.parse({"subcommand": sub, "args": args})
-    assert g.risk(params, stashed_repo) is RiskLevel.SAFE
+def test_git_reads_with_textconv_in_repo_config_are_not_safe(
+    stashed_repo: ToolContext,
+    sub: str,
+    args: list[str],
+) -> None:
+    """Textconv из .git/config запускается на чтении: оно уже не SAFE (и в репозитории)."""
+    git = GitTool()
+    params = git.parse({"subcommand": sub, "args": args})
+    assert git.risk(params, stashed_repo) is RiskLevel.SAFE
     _git(stashed_repo, "config", "diff.evil.textconv", "sh -c id")
-    assert g.risk(params, stashed_repo) is RiskLevel.WRITE
+    assert git.risk(params, stashed_repo) is RiskLevel.WRITE
 
 
-def test_git_reads_are_not_safe_when_repo_config_is_unknown(stashed_repo, monkeypatch):
-    import gigacrew.tools.git as git_module
-
+def test_git_reads_are_not_safe_when_repo_config_is_unknown(
+    stashed_repo: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(git_module, "repo_config_runs_programs", lambda root: None)
-    g = GitTool()
-    assert g.risk(g.parse({"subcommand": "diff"}), stashed_repo) is RiskLevel.WRITE
+    git = GitTool()
+    assert git.risk(git.parse({"subcommand": "diff"}), stashed_repo) is RiskLevel.WRITE
 
 
 @pytest.mark.parametrize(
-    "args, risk",
+    ("args", "risk"),
     [
         (["--set-upstream-to=origin/main"], RiskLevel.WRITE),
         (["--unset-upstream"], RiskLevel.WRITE),
@@ -492,45 +566,43 @@ def test_git_reads_are_not_safe_when_repo_config_is_unknown(stashed_repo, monkey
         (["-l", "feat*"], RiskLevel.SAFE),
     ],
 )
-def test_git_branch_only_listing_flags_are_safe(stashed_repo, args, risk):
+def test_git_branch_only_listing_flags_are_safe(
+    stashed_repo: ToolContext,
+    args: list[str],
+    risk: RiskLevel,
+) -> None:
     """Флаги без позиционных аргументов: изменяющие ветки — не список, даже без имени."""
-    g = GitTool()
-    assert g.risk(g.parse({"subcommand": "branch", "args": args}), stashed_repo) is risk
+    git = GitTool()
+    assert git.risk(git.parse({"subcommand": "branch", "args": args}), stashed_repo) is risk
 
 
-def test_git_tool_is_not_an_edit():
+def test_git_tool_is_not_an_edit() -> None:
     """Правки файлов в «авто» идут без вопроса; git commit/restore — не правка файла."""
-    from gigacrew.permissions import ToolKind
-
     assert GitTool.kind is ToolKind.OTHER
     assert decide(PermissionMode.AUTO, RiskLevel.WRITE, GitTool.kind, auto_approve=False) is (
         Decision.ASK
     )
 
 
-def test_git_commit_in_auto_mode_is_confirmed(stashed_repo):
-    from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
-
-    from gigacrew.agent.loop import Agent
-    from gigacrew.config import Config
-    from gigacrew.tools.base import build_default_registry
-
+def test_git_commit_in_auto_mode_is_confirmed(stashed_repo: ToolContext) -> None:
     root = stashed_repo.root
     _git(stashed_repo, "add", "f.txt")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True).stdout
+    rev_parse = ["git", "rev-parse", "HEAD"]
+    head = subprocess.run(rev_parse, cwd=root, capture_output=True, check=False).stdout
     provider = ScriptedProvider(
-        [tool_turn("git", {"subcommand": "commit", "args": ["-m", "x"]}), text_turn("ок")]
+        [tool_turn("git", {"subcommand": "commit", "args": ["-m", "x"]}), text_turn("ок")],
     )
     events = RecordingEvents(confirm_answer=False)
     cfg = Config(access_key="x", project_root=root, stream=False, auto_approve=False)
     Agent(provider, build_default_registry(), cfg, events).run_turn("закоммить")
-    assert len(events.confirms) == 1 and events.confirms[0][2] is False
-    after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True).stdout
+    assert len(events.confirms) == 1
+    assert events.confirms[0][2] is False
+    after = subprocess.run(rev_parse, cwd=root, capture_output=True, check=False).stdout
     assert after == head
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
-def test_git_diff_does_not_run_external_diff(git_repo):
+def test_git_diff_does_not_run_external_diff(git_repo: ToolContext) -> None:
     root = git_repo.root
     _write(git_repo, "f.txt", "one\n")
     subprocess.run(["git", "add", "f.txt"], cwd=root, check=True)
@@ -538,136 +610,137 @@ def test_git_diff_does_not_run_external_diff(git_repo):
     _write(git_repo, "f.txt", "two\n")
     ext, marker = _marker_script(root, "extdiff")
     subprocess.run(["git", "config", "diff.external", str(ext)], cwd=root, check=True)
-    subprocess.run(["git", "diff"], cwd=root, capture_output=True)
+    subprocess.run(["git", "diff"], cwd=root, capture_output=True, check=False)
     assert marker.exists()  # голый git внешнюю программу запускает
     marker.unlink()
-    g = GitTool()
-    res = g.run(g.parse({"subcommand": "diff"}), git_repo)
+    git = GitTool()
+    res = git.run(git.parse({"subcommand": "diff"}), git_repo)
     assert not marker.exists()
-    assert "-one" in res.content and "+two" in res.content
+    assert "-one" in res.content
+    assert "+two" in res.content
 
 
-def _project_with_submodule(base, *, filter_program=None):
-    """Проект с подмодулем libs/lib; программа фильтра — только в настройках подмодуля."""
-    from gigacrew.project.workspace import Workspace
-    from gigacrew.tools.base import ToolContext
+def _git_in(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *_SUBMODULE_GIT_OPTIONS, *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
 
-    def git(cwd, *args):
-        ident = ["-c", "user.email=t@t.t", "-c", "user.name=t", "-c", "protocol.file.allow=always"]
-        subprocess.run(["git", *ident, *args], cwd=cwd, check=True, capture_output=True)
 
+def _library_repo(base: Path) -> Path:
+    """Репозиторий lib с одним коммитом: data.txt и фильтр x для *.txt в .gitattributes."""
     lib = base / "lib"
     lib.mkdir()
-    git(lib, "init", "-q")
+    _git_in(lib, "init", "-q")
     (lib / "data.txt").write_text("v1\n", encoding="utf-8")
     (lib / ".gitattributes").write_text("*.txt filter=x\n", encoding="utf-8")
-    git(lib, "add", ".")
-    git(lib, "commit", "-qm", "i")
+    _git_in(lib, "add", ".")
+    _git_in(lib, "commit", "-qm", "i")
+    return lib
+
+
+def _project_with_submodule(base: Path, *, filter_program: Path | None = None) -> ToolContext:
+    """Проект с подмодулем libs/lib; программа фильтра — только в настройках подмодуля."""
+    lib = _library_repo(base)
     root = base / "proj"
     root.mkdir()
-    git(root, "init", "-q")
-    git(root, "submodule", "add", "-q", str(lib), "libs/lib")
-    git(root, "commit", "-qm", "s")
+    _git_in(root, "init", "-q")
+    _git_in(root, "submodule", "add", "-q", str(lib), "libs/lib")
+    _git_in(root, "commit", "-qm", "s")
     if filter_program is not None:
-        git(root / "libs" / "lib", "config", "filter.x.clean", str(filter_program))
+        _git_in(root / "libs" / "lib", "config", "filter.x.clean", str(filter_program))
     (root / "libs" / "lib" / "data.txt").write_text("v2\n", encoding="utf-8")
     return ToolContext(workspace=Workspace(root))
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
-def test_git_status_with_program_in_submodule_config_is_not_safe(tmp_path):
+def test_git_status_with_program_in_submodule_config_is_not_safe(tmp_path: Path) -> None:
     """`git status` заходит в подмодули и запускает фильтры из .git/modules/<имя>/config."""
-    from gigacrew.safety.gitconfig import repo_config_runs_programs
-
     script, marker = _marker_script(tmp_path, "clean")
     ctx = _project_with_submodule(tmp_path, filter_program=script)
     subprocess.run(["git", "status"], cwd=ctx.root, check=True, capture_output=True)
     assert marker.exists()  # голый git программу из настроек подмодуля запускает
     assert repo_config_runs_programs(ctx.root) is True
     assert repo_config_runs_programs(ctx.root / "libs") is True  # и из подкаталога
-    g = GitTool()
-    assert g.risk(g.parse({"subcommand": "status"}), ctx) is RiskLevel.WRITE
+    git = GitTool()
+    assert git.risk(git.parse({"subcommand": "status"}), ctx) is RiskLevel.WRITE
     sh = RunShellTool()  # тот же признак у классификатора run_shell
     assert sh.risk(sh.parse({"command": "git status"}), ctx) is not RiskLevel.SAFE
 
 
-def test_git_status_with_clean_submodule_stays_safe(tmp_path):
-    from gigacrew.safety.gitconfig import repo_config_runs_programs
-
+def test_git_status_with_clean_submodule_stays_safe(tmp_path: Path) -> None:
     ctx = _project_with_submodule(tmp_path)
     assert repo_config_runs_programs(ctx.root) is False
-    g = GitTool()
-    assert g.risk(g.parse({"subcommand": "status"}), ctx) is RiskLevel.SAFE
+    git = GitTool()
+    assert git.risk(git.parse({"subcommand": "status"}), ctx) is RiskLevel.SAFE
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
-def test_git_ignores_implicit_bare_repository(ctx):
+def test_git_ignores_implicit_bare_repository(ctx: ToolContext) -> None:
     """HEAD/config/objects обычными файлами в проекте не делают его bare-репозиторием."""
-    if subprocess.run(["git", "--version"], capture_output=True).returncode:
+    if subprocess.run(["git", "--version"], capture_output=True, check=False).returncode:
         pytest.skip("нет git")
     bare = ctx.root / "planted"
     subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
     hook, marker = _marker_script(ctx.root, "planted")
     subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=bare, check=True)
     res = subprocess.run(
-        ["git", "-c", "safe.bareRepository=explicit", "status"], cwd=bare, capture_output=True
+        ["git", "-c", "safe.bareRepository=explicit", "status"],
+        cwd=bare,
+        capture_output=True,
+        check=False,
     )
     if res.returncode == 0:
         pytest.skip("эта версия git не знает safe.bareRepository")
-    from gigacrew.project.workspace import Workspace
-    from gigacrew.tools.base import ToolContext
-
-    g = GitTool()
-    out = g.run(g.parse({"subcommand": "log"}), ToolContext(workspace=Workspace(bare)))
-    assert not out.ok and "safe.bareRepository" in out.content and not marker.exists()
+    git = GitTool()
+    out = git.run(git.parse({"subcommand": "log"}), ToolContext(workspace=Workspace(bare)))
+    assert not out.ok
+    assert "safe.bareRepository" in out.content
+    assert not marker.exists()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="FIFO")
-def test_search_skips_fifo(ctx):
-    import os
-
+def test_search_skips_fifo(ctx: ToolContext) -> None:
     os.mkfifo(ctx.root / "pipe")
     _write(ctx, "a.txt", "needle")
-    s = SearchContentTool()
-    out = s.run(s.parse({"pattern": "needle"}), ctx).content
+    search = SearchContentTool()
+    out = search.run(search.parse({"pattern": "needle"}), ctx).content
     assert "a.txt" in out
 
 
-def test_search_skips_symlinks_to_secrets(tmp_path):
-    import os
-
-    import pytest as _pytest
-
-    from gigacrew.project.workspace import Workspace
-    from gigacrew.tools.base import ToolContext
-    from gigacrew.tools.search import SearchContentParams, SearchContentTool
-
+def test_search_skips_symlinks_to_secrets(tmp_path: Path) -> None:
     if os.name == "nt":
-        _pytest.skip("симлинки")
+        pytest.skip("симлинки")
     (tmp_path / ".env").write_text("TOKEN=s3cr3t\n", encoding="utf-8")
     (tmp_path / "config.txt").symlink_to(tmp_path / ".env")
     ctx = ToolContext(workspace=Workspace(tmp_path))
-    result = SearchContentTool().run(SearchContentParams(pattern="s3cr3t"), ctx)
-    assert "s3cr3t" not in result.content
+    found = SearchContentTool().run(SearchContentParams(pattern="s3cr3t"), ctx)
+    assert "s3cr3t" not in found.content
 
 
-def test_git_describe_quotes_arguments(ctx):
-    g = GitTool()
-    params = g.parse({"subcommand": "commit", "args": ["-m", "fix bug"]})
-    assert g.describe(params) == "commit -m 'fix bug'"
-    assert g.preview(params, ctx).text == "$ git commit -m 'fix bug'"
+def test_git_describe_quotes_arguments(ctx: ToolContext) -> None:
+    git = GitTool()
+    params = git.parse({"subcommand": "commit", "args": ["-m", "fix bug"]})
+    assert git.describe(params) == "commit -m 'fix bug'"
+    preview = git.preview(params, ctx)
+    assert preview is not None
+    assert preview.text == "$ git commit -m 'fix bug'"
 
 
-def test_search_limit_note_only_when_more_matches(ctx):
+def test_search_limit_note_only_when_more_matches(ctx: ToolContext) -> None:
     _write(ctx, "a.txt", "hit\n" * 3)
-    s = SearchContentTool()
-    exact = s.run(s.parse({"pattern": "hit", "max_results": 3}), ctx).content
-    assert "показаны первые" not in exact and exact.count("a.txt:") == 3
-    more = s.run(s.parse({"pattern": "hit", "max_results": 2}), ctx).content
-    assert more.count("a.txt:") == 2 and "показаны первые 2 совпадений" in more
+    search = SearchContentTool()
+    exact = search.run(search.parse({"pattern": "hit", "max_results": 3}), ctx).content
+    assert "показаны первые" not in exact
+    assert exact.count("a.txt:") == 3
+    more = search.run(search.parse({"pattern": "hit", "max_results": 2}), ctx).content
+    assert more.count("a.txt:") == 2
+    assert "показаны первые 2 совпадений" in more
 
 
-def test_search_line_numbers_match_read_file(ctx):
+def test_search_line_numbers_match_read_file(ctx: ToolContext) -> None:
     _write(ctx, "f.txt", "a\x0cb\nneedle\n")
-    s = SearchContentTool()
-    assert s.run(s.parse({"pattern": "needle"}), ctx).content == "f.txt:2:needle"
+    search = SearchContentTool()
+    assert search.run(search.parse({"pattern": "needle"}), ctx).content == "f.txt:2:needle"

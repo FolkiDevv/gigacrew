@@ -14,7 +14,9 @@ ANSI темы терминала (:func:`palette_for`).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, replace
+from types import MappingProxyType
 
 
 @dataclass(frozen=True)
@@ -65,9 +67,11 @@ MINT_ANSI = Palette(
 
 
 def palette_for(color_system: str | None) -> Palette:
-    """Палитра для цветовой системы терминала — как её называет rich
-    (``truecolor``, ``256``, ``standard``, ``windows``; None — без цвета)."""
-    return MINT_ANSI if color_system in ("standard", "windows") else MINT
+    """Палитра для цветовой системы терминала — как её называет rich.
+
+    Системы: ``truecolor``, ``256``, ``standard``, ``windows``; None — без цвета.
+    """
+    return MINT_ANSI if color_system in {"standard", "windows"} else MINT
 
 
 ICON_TOOL = "●"
@@ -79,25 +83,25 @@ ICON_BAR = "▌"  # полоса слева у всего, что ждёт от�
 ICON_DANGER = "⚠"
 SPINNER = "✦"
 # Значки режимов разрешений (ключ — PermissionMode.value).
-MODE_ICONS: dict[str, str] = {"auto": "⏵⏵", "plan": "⏸"}
+MODE_ICONS: Mapping[str, str] = MappingProxyType({"auto": "⏵⏵", "plan": "⏸"})
 
 
-def markdown_styles(p: Palette) -> dict[str, str]:
+def markdown_styles(palette: Palette) -> dict[str, str]:
     """Стили Markdown-ответа модели (имена стилей rich: markdown.*)."""
     return {
-        "markdown.h1": f"bold underline {p.brand}",
-        "markdown.h2": f"bold {p.brand}",
+        "markdown.h1": f"bold underline {palette.brand}",
+        "markdown.h2": f"bold {palette.brand}",
         "markdown.h3": "bold",
         "markdown.h4": "bold italic",
         "markdown.h5": "italic",
         "markdown.h6": "italic",
-        "markdown.code": p.soft,  # inline-код — без фона, читается в любой теме
-        "markdown.link": p.soft,
-        "markdown.link_url": f"underline {p.soft}",
-        "markdown.item.bullet": f"bold {p.brand}",
-        "markdown.item.number": f"bold {p.brand}",
-        "markdown.block_quote": f"italic {p.muted}",
-        "markdown.hr": p.dim,
+        "markdown.code": palette.soft,  # inline-код — без фона, читается в любой теме
+        "markdown.link": palette.soft,
+        "markdown.link_url": f"underline {palette.soft}",
+        "markdown.item.bullet": f"bold {palette.brand}",
+        "markdown.item.number": f"bold {palette.brand}",
+        "markdown.block_quote": f"italic {palette.muted}",
+        "markdown.hr": palette.dim,
     }
 
 
@@ -113,53 +117,63 @@ def _pt(color: str) -> str:
         return "ansidefault"
     if color == "dim":
         return "ansidefault dim"
-    return "ansi" + color.replace("_", "")
+    name = color.replace("_", "")
+    return f"ansi{name}"
 
 
-def prompt_styles(p: Palette) -> dict[str, str]:
+def _prompt_palette(palette: Palette) -> Palette:
+    """Та же палитра, все цвета которой переведены в цвета prompt_toolkit."""
+    return replace(
+        palette,
+        **{field.name: _pt(getattr(palette, field.name)) for field in fields(palette)},
+    )
+
+
+def prompt_styles(palette: Palette) -> dict[str, str]:
     """Стили строки ввода, меню вопросов и выбора чата (классы prompt_toolkit)."""
-    c = _pt
-    ansi = p is MINT_ANSI
+    colors = _prompt_palette(palette)
+    ansi = palette is MINT_ANSI
     # Меню дополнения — на своём тёмном фоне, поэтому и текст в нём свой, светлый:
     # цвет терминала по умолчанию в светлой теме был бы тёмным на тёмном.
     if ansi:
         menu, text, meta = "bg:ansiblack", "ansiwhite", "ansiwhite"
         scrollbar, thumb = "bg:ansibrightblack", "bg:ansiwhite"
     else:
-        menu, text, meta = "bg:#232826", "#E3E7E4", c(p.muted)
-        scrollbar, thumb = "bg:#2F3532", f"bg:{c(p.dim)}"
-    current = f"bg:{c(p.brand)} {'ansiblack' if ansi else '#111111'}"
+        menu, text, meta = "bg:#232826", "#E3E7E4", colors.muted
+        scrollbar, thumb = "bg:#2F3532", f"bg:{colors.dim}"
+    current_fg = "ansiblack" if ansi else "#111111"
+    current = f"bg:{colors.brand} {current_fg}"
     return {
-        "prompt": f"bold {c(p.brand)}",
-        "continuation": c(p.dim),
-        "placeholder": c(p.dim),
-        "auto-suggestion": c(p.dim),
+        "prompt": f"bold {colors.brand}",
+        "continuation": colors.dim,
+        "placeholder": colors.dim,
+        "auto-suggestion": colors.dim,
         # По умолчанию у toolbar стиль reverse — цвета текста стали бы фоном.
-        "bottom-toolbar": f"noreverse {c(p.muted)}",
-        "toolbar.model": f"bold nodim {c(p.fg)}",
-        "toolbar.ok": c(p.ok),
-        "toolbar.warn": c(p.warn),
-        "toolbar.danger": f"bold {c(p.danger)}",
-        "toolbar.mode.auto": f"bold {c(p.warn)}",
-        "toolbar.mode.plan": f"bold {c(p.brand)}",
+        "bottom-toolbar": f"noreverse {colors.muted}",
+        "toolbar.model": f"bold nodim {colors.fg}",
+        "toolbar.ok": colors.ok,
+        "toolbar.warn": colors.warn,
+        "toolbar.danger": f"bold {colors.danger}",
+        "toolbar.mode.auto": f"bold {colors.warn}",
+        "toolbar.mode.plan": f"bold {colors.brand}",
         # меню вопросов агента (ask_user) и выбор чата
-        "question.bar": c(p.warn),
-        "question.mark": f"bold {c(p.warn)}",
-        "question.text": f"bold {c(p.fg)}",
-        "question.tag": c(p.muted),
-        "question.counter": f"bold {c(p.brand)}",
-        "choice": c(p.fg),
-        "choice.selected": f"bold {c(p.brand)}",
-        "choice.number": c(p.muted),
-        "choice.number.selected": c(p.brand),
-        "choice.box": c(p.dim),
-        "choice.box.checked": f"bold {c(p.brand)}",
-        "choice.checked": f"bold {c(p.fg)}",
-        "choice.description": c(p.muted),
-        "choice.description.faint": c(p.dim),
-        "choice.hint": c(p.dim),
-        "choice.error": c(p.warn),
-        "choice.custom": f"bold {c(p.fg)}",
+        "question.bar": colors.warn,
+        "question.mark": f"bold {colors.warn}",
+        "question.text": f"bold {colors.fg}",
+        "question.tag": colors.muted,
+        "question.counter": f"bold {colors.brand}",
+        "choice": colors.fg,
+        "choice.selected": f"bold {colors.brand}",
+        "choice.number": colors.muted,
+        "choice.number.selected": colors.brand,
+        "choice.box": colors.dim,
+        "choice.box.checked": f"bold {colors.brand}",
+        "choice.checked": f"bold {colors.fg}",
+        "choice.description": colors.muted,
+        "choice.description.faint": colors.dim,
+        "choice.hint": colors.dim,
+        "choice.error": colors.warn,
+        "choice.custom": f"bold {colors.fg}",
         "completion-menu": f"{menu} {text}",
         "completion-menu.completion": f"{menu} {text}",
         "completion-menu.completion.current": current,

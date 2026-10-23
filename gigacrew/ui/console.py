@@ -28,16 +28,16 @@
 
 from __future__ import annotations
 
-import contextlib
+import functools
 import re
 import sys
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import IO
+from typing import IO, Any, override
 
 from rich.box import ROUNDED
 from rich.console import Console as RichConsole
@@ -51,25 +51,16 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
+from gigacrew.agent import events
 from gigacrew.agent.chat_store import ChatInfo
 from gigacrew.agent.conversation import request_text
-from gigacrew.agent.events import (
-    AgentEvents,
-    Approval,
-    CompactResult,
-    ConfirmResult,
-    NoticeLevel,
-    Review,
-    SubagentInfo,
-    ToolCallInfo,
-    TurnStats,
-)
 from gigacrew.agent.hooks import short_command
 from gigacrew.llm.types import FunctionCall, Message
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolResult
-from gigacrew.tools.questions import Answer, Question, QuestionsUnavailable
+from gigacrew.tools.questions import Answer, Question, QuestionsUnavailableError
 from gigacrew.ui import banner as banner_art
+from gigacrew.ui import theme
 from gigacrew.ui.format import (
     chat_size,
     clip_lines,
@@ -82,19 +73,6 @@ from gigacrew.ui.markdown import Markdown
 from gigacrew.ui.markdown_stream import Lines, MarkdownStream
 from gigacrew.ui.spinner import INTERVAL as SPINNER_INTERVAL
 from gigacrew.ui.spinner import rocket_frame
-from gigacrew.ui.theme import (
-    ICON_BAR,
-    ICON_BRAND,
-    ICON_DANGER,
-    ICON_FAIL,
-    ICON_OK,
-    ICON_PENDING,
-    ICON_TOOL,
-    MINT,
-    Palette,
-    markdown_styles,
-    palette_for,
-)
 
 # Управляющие символы, которые нельзя пропускать в терминал из текста модели и
 # вывода команд: ESC-последовательности могут перекрасить/стереть экран,
@@ -106,8 +84,12 @@ _REFRESH_PER_SECOND = 2 / SPINNER_INTERVAL  # два обновления на �
 _TAIL_LINES = 3  # строк вывода упавшей команды
 _LIVE_STEPS = 5  # шагов группы во временной области
 _DETAIL_CHARS = 100  # итог шага (последняя строка вывода) — не длиннее
+_LABEL_CHARS = 50  # цель вызова в индикаторе — не длиннее
+_MIN_WIDTH = 20  # строка ленты, ответ модели и превью — не уже, как бы ни был узок экран
 _BANNER_MIN_WIDTH = 76  # уже — стартовый экран без ракеты
 _SHOW_SECONDS = 1.0  # время шага в ленте — от секунды
+_SPACER = "  "  # промежуток между частями строки и отступ под ней
+_COMMA = ", "
 # Вызовы, итог которых уже показан пользователю их же диалогом.
 _SELF_REPORTING = ("ask_user",)
 # Обзорные инструменты в счётчиках группы; read_file — «прочитал», остальное — поиски.
@@ -115,6 +97,8 @@ _OVERVIEW_TOOLS = ("file_outline", "repo_map", "list_dir")
 # Продолжение чата: сколько последних обменов показать и шагов (групп вызовов) в обмене.
 RESUME_EXCHANGES = 3
 RESUME_CALLS = 5
+_RESUME_REQUEST_CHARS = 600  # запрос продолженного чата — не длиннее
+_RESUME_ANSWER_CHARS = 1200  # ответ раннего обмена продолженного чата — не длиннее
 
 
 def sanitize(text: str) -> str:
@@ -123,7 +107,7 @@ def sanitize(text: str) -> str:
 
 
 class _SafeConsole(RichConsole):
-    """Консоль Rich, которая не пропускает в терминал управляющие символы из текста.
+    r"""Консоль Rich, которая не пропускает в терминал управляющие символы из текста.
 
     Rich (``Text``) убирает лишь BEL/BS/VT/FF/CR, а ESC и C1 оставляет. Очистка на
     месте каждой печати то и дело забывалась (имя инструмента от модели, заголовок
@@ -134,12 +118,13 @@ class _SafeConsole(RichConsole):
     обход неё, но ESC-последовательности она и не исполняет.
     """
 
+    @override
     def _render_buffer(self, buffer: Iterable[Segment]) -> str:
         return super()._render_buffer(
-            Segment(_CONTROL_RE.sub("", s.text), s.style)
-            if s.control is None and _CONTROL_RE.search(s.text)
-            else s
-            for s in buffer
+            Segment(_CONTROL_RE.sub("", segment.text), segment.style)
+            if segment.control is None and _CONTROL_RE.search(segment.text)
+            else segment
+            for segment in buffer
         )
 
 
@@ -151,9 +136,9 @@ class _SafeConsole(RichConsole):
 # разделители строк и абзацев, половинки суррогатных пар) и по свойству
 # Default_Ignorable_Code_Point (мягкий перенос, заполнители хангыля, селекторы вариантов).
 _INVISIBLE_CANDIDATE_RE = re.compile(r"[^\t\n\x20-\x7e]")
-_INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+_INVISIBLE_CATEGORIES = frozenset(("Cc", "Cf", "Zl", "Zp", "Cs"))
 _IGNORABLE_RE = re.compile(
-    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￸\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+    r"[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]",
 )
 _INVISIBLE_MARK_RE = re.compile(r"⟨U\+[0-9A-F]{4,6}⟩")
 # Многострочная команда длиннее — с номерами строк.
@@ -162,45 +147,55 @@ _NUMBER_LINES_FROM = 4
 
 def _invisible(text: str) -> Iterator[re.Match[str]]:
     """Невидимые символы строки по порядку."""
-    for m in _INVISIBLE_CANDIDATE_RE.finditer(text):
-        char = m.group()
+    for match in _INVISIBLE_CANDIDATE_RE.finditer(text):
+        char = match.group()
         if unicodedata.category(char) in _INVISIBLE_CATEGORIES or _IGNORABLE_RE.match(char):
-            yield m
+            yield match
 
 
 def _mark(char: str) -> str:
-    return f"⟨U+{ord(char):04X}⟩"
+    hex_code = format(ord(char), "04X")
+    return f"⟨U+{hex_code}⟩"
 
 
 def mark_invisible(text: str) -> str:
-    """Текст с видимыми невидимыми символами (``⟨U+202E⟩``); ``\\r\\n`` — как ``\\n``."""
+    r"""Текст с видимыми невидимыми символами (``⟨U+202E⟩``); ``\\r\\n`` — как ``\\n``."""
     text = text.replace("\r\n", "\n")
     out, pos = [], 0
-    for m in _invisible(text):
-        out += [text[pos : m.start()], _mark(m.group())]
-        pos = m.end()
+    for match in _invisible(text):
+        out += [text[pos : match.start()], _mark(match.group())]
+        pos = match.end()
     out.append(text[pos:])
     return "".join(out)
 
 
-def visible_text(text: str, *, numbered: bool | None = None, palette: Palette = MINT) -> Text:
-    """Текст как есть, но с видимыми невидимыми символами (``⟨U+202E⟩``) и, у длинного
-    многострочного, номерами строк. Ничего не обрезается: длинные строки переносятся."""
+def visible_text(
+    text: str,
+    *,
+    numbered: bool | None = None,
+    palette: theme.Palette = theme.MINT,
+) -> Text:
+    """Текст как есть, но с видимыми невидимыми символами (``⟨U+202E⟩``).
+
+    У длинного многострочного текста — ещё и номера строк. Ничего не обрезается:
+    длинные строки переносятся.
+    """
     lines = text.replace("\r\n", "\n").split("\n")
     if numbered is None:
         numbered = len(lines) >= _NUMBER_LINES_FROM
     width = len(str(len(lines)))
     out = Text(overflow="fold")
-    for i, line in enumerate(lines, 1):
+    for number, line in enumerate(lines, 1):
         if numbered:
-            out.append(f"{i:>{width}} │ ", style=palette.dim)
+            prefix = str(number).rjust(width)
+            out.append(f"{prefix} │ ", style=palette.dim)
         pos = 0
-        for m in _invisible(line):
-            out.append(line[pos : m.start()])
-            out.append(_mark(m.group()), style=f"bold {palette.danger}")
-            pos = m.end()
+        for match in _invisible(line):
+            out.append(line[pos : match.start()])
+            out.append(_mark(match.group()), style=f"bold {palette.danger}")
+            pos = match.end()
         out.append(line[pos:])
-        if i < len(lines):
+        if number < len(lines):
             out.append("\n")
     return out
 
@@ -220,26 +215,28 @@ class _LiveView:
         hint: str | Callable[[], str] = "Ctrl+C — прервать",
         started: float | None = None,
         above: Callable[[], list[Text]] | None = None,
-        palette: Palette = MINT,
+        palette: theme.Palette = theme.MINT,
     ):
         self._label = label
         self._tail = tail
         self._hint = hint
         self._above = above
-        self._p = palette
+        self._palette = palette
         # Отсчёт времени — с ``started`` (например, с запуска суб-агента, а не с
         # последнего перезапуска области после вопроса).
         self._started = time.monotonic() if started is None else started
 
-    def __rich_console__(self, console: RichConsole, options: ConsoleOptions) -> RenderResult:
-        p = self._p
+    # Протокол отрисовки rich: метод с этим именем вызывает сама rich.
+    def __rich_console__(self, console: RichConsole, options: ConsoleOptions) -> RenderResult:  # noqa: PLW3201
+        palette = self._palette
         elapsed = time.monotonic() - self._started
         label = self._label() if callable(self._label) else self._label
+        hint = self._hint() if callable(self._hint) else self._hint
         indicator = Text.assemble(
-            rocket_frame(elapsed, p),
-            (f"  {label.removesuffix('…')}… ", p.muted),
-            (f"{int(elapsed)} с", p.muted),
-            (f"  ·  {self._hint() if callable(self._hint) else self._hint}", p.dim),
+            rocket_frame(elapsed, palette),
+            (f"  {label.removesuffix('…')}… ", palette.muted),
+            (f"{int(elapsed)} с", palette.muted),
+            (f"  ·  {hint}", palette.dim),
         )
         room = max(console.size.height - 3, 1)  # индикатор + отступ + запас
         steps = self._above() if self._above else []
@@ -280,13 +277,7 @@ class _LiveArea:
         if self._thread is not None:
             self._thread.start()
 
-    def _animate(self) -> None:
-        while not self._stopped.wait(1 / _REFRESH_PER_SECOND):
-            with self._lock:
-                if not self._stopped.is_set():
-                    self._live.refresh()
-
-    def print(self, renderable, **options) -> None:
+    def print(self, renderable: RenderableType, **options: Any) -> None:
         with self._lock:
             self._live.console.print(renderable, **options)
 
@@ -297,16 +288,22 @@ class _LiveArea:
         with self._lock:
             self._live.stop()
 
+    def _animate(self) -> None:
+        while not self._stopped.wait(1 / _REFRESH_PER_SECOND):
+            with self._lock:
+                if not self._stopped.is_set():
+                    self._live.refresh()
+
 
 @dataclass
 class _Step:
     """Вызов инструмента в ленте: строка печатается, когда известен результат."""
 
-    call: ToolCallInfo
-    result: ToolResult | None = None
-    started: float = 0.0  # начало выполнения (on_tool_start)
-    seconds: float = 0.0
-    review: Review | None = None  # рецензент разрешил — строка под шагом
+    call: events.ToolCallInfo
+    outcome: ToolResult | None = None
+    started: float = 0  # начало выполнения (on_tool_start)
+    seconds: float = 0
+    review: events.Review | None = None  # рецензент разрешил — строка под шагом
 
 
 @dataclass
@@ -317,7 +314,7 @@ class _Group:
     steps: list[_Step] = field(default_factory=list)
 
 
-def _group_kind(call: ToolCallInfo) -> str:
+def _group_kind(call: events.ToolCallInfo) -> str:
     if call.read_only:
         return "read"
     if call.kind is ToolKind.EDIT:
@@ -325,19 +322,20 @@ def _group_kind(call: ToolCallInfo) -> str:
     return ""
 
 
-def _target(call: ToolCallInfo) -> str:
+def _target(call: events.ToolCallInfo) -> str:
     """Цель вызова одной строкой: путь, шаблон, первая строка команды (+ «…»)."""
     summary = sanitize(call.summary).strip()
     first = summary.split("\n", 1)[0].rstrip()
     return f"{first} …" if "\n" in summary else first
 
 
-def _diff_stat(result: ToolResult) -> tuple[int, int] | None:
+def _diff_stat(tool_result: ToolResult) -> tuple[int, int] | None:
     """Добавлено и удалено строк по диффу правки; None — диффа нет."""
-    shown = result.display
+    shown = tool_result.display
     if shown is None or shown.kind != "diff":
         return None
-    added = removed = 0
+    added = 0
+    removed = 0
     for line in shown.text.splitlines():
         if line.startswith("+") and not line.startswith("+++"):
             added += 1
@@ -347,25 +345,96 @@ def _diff_stat(result: ToolResult) -> tuple[int, int] | None:
 
 
 def _clip(text: str, limit: int = _DETAIL_CHARS) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    if len(text) <= limit:
+        return text
+    clipped = text[: limit - 1]
+    return f"{clipped}…"
 
 
-def _read_counts(calls: Sequence[ToolCallInfo]) -> str:
+def _counted(count: int, one: str, few: str, many: str) -> str:
+    """Число со словом в нужной форме: «3 файла»."""
+    word = plural(count, one, few, many)
+    return f"{count} {word}"
+
+
+def _read_counts(calls: Sequence[events.ToolCallInfo]) -> str:
     """«прочитал 2 файла, 3 поиска, 1 обзор» — по вызовам группы."""
-    reads = sum(1 for c in calls if c.name == "read_file")
-    overviews = sum(1 for c in calls if c.name in _OVERVIEW_TOOLS)
+    reads = sum(1 for call in calls if call.name == "read_file")
+    overviews = sum(1 for call in calls if call.name in _OVERVIEW_TOOLS)
     searches = len(calls) - reads - overviews
     parts = []
     if reads:
-        parts.append(f"прочитал {reads} {plural(reads, 'файл', 'файла', 'файлов')}")
+        files = _counted(reads, "файл", "файла", "файлов")
+        parts.append(f"прочитал {files}")
     if searches:
-        parts.append(f"{searches} {plural(searches, 'поиск', 'поиска', 'поисков')}")
+        parts.append(_counted(searches, "поиск", "поиска", "поисков"))
     if overviews:
-        parts.append(f"{overviews} {plural(overviews, 'обзор', 'обзора', 'обзоров')}")
-    return ", ".join(parts)
+        parts.append(_counted(overviews, "обзор", "обзора", "обзоров"))
+    return _COMMA.join(parts)
 
 
-class Console(AgentEvents):
+def _step_outcome(step: _Step) -> ToolResult:
+    """Результат шага, который уже выполнен: строки шага печатаются только после него."""
+    if step.outcome is None:
+        raise AssertionError
+    return step.outcome
+
+
+def _split_done(steps: Sequence[_Step]) -> tuple[list[_Step], list[_Step]]:
+    """Выполненные шаги: удачные и неудачные; шаги без результата пропускаются."""
+    ok = [step for step in steps if step.outcome is not None and step.outcome.ok]
+    failed = [step for step in steps if step.outcome is not None and not step.outcome.ok]
+    return ok, failed
+
+
+def _edit_totals(steps: Iterable[_Step]) -> dict[str, list[int]]:
+    """Добавлено и удалено строк по файлам — по выполненным правкам."""
+    totals: dict[str, list[int]] = {}
+    for step in steps:
+        stat = _diff_stat(_step_outcome(step)) or (0, 0)
+        total = totals.setdefault(_target(step.call), [0, 0])
+        total[0] += stat[0]
+        total[1] += stat[1]
+    return totals
+
+
+def _sum_totals(totals: dict[str, list[int]]) -> tuple[int, int]:
+    """Добавлено и удалено строк во всех файлах вместе."""
+    added = sum(file_added for file_added, _ in totals.values())
+    removed = sum(file_removed for _, file_removed in totals.values())
+    return added, removed
+
+
+def _subagent_parts(ok: Sequence[_Step]) -> list[str]:
+    """Счётчики удачных шагов суб-агента: чтения, правки по файлам, команды."""
+    parts = []
+    reads = [step.call for step in ok if step.call.read_only]
+    if reads:
+        parts.append(_read_counts(reads))
+    edits = _edit_totals(step for step in ok if step.call.kind is ToolKind.EDIT)
+    if len(edits) > 3:
+        files = _counted(len(edits), "файл", "файла", "файлов")
+        parts.append(f"изменил {files}")
+    elif edits:
+        shown = _COMMA.join(
+            f"{path} +{added} −{removed}" for path, (added, removed) in edits.items()
+        )
+        parts.append(f"изменил {shown}")
+    commands = sum(1 for step in ok if step.call.kind is ToolKind.COMMAND)
+    if commands:
+        parts.append(_counted(commands, "команда", "команды", "команд"))
+    return parts
+
+
+def _progress_label(title: str, detail: Callable[[], str] | None) -> str:
+    """Подпись индикатора долгой операции: заголовок и, если есть, подробности."""
+    if detail is None:
+        return title
+    return f"{title}: {detail()}"
+
+
+# Методы сгруппированы по разделам ленты: порядок по видимости разорвал бы разделы.
+class Console(events.AgentEvents):  # noqa: WPS338
     """Терминальный интерфейс на rich; реализует события агента.
 
     ``force_terminal``/``width``/``auto_refresh`` нужны тестам: живую область
@@ -376,12 +445,14 @@ class Console(AgentEvents):
         self,
         *,
         no_color: bool = False,
-        file: IO[str] | None = None,
+        # Как у print() и rich.Console: поток вывода называется file.
+        file: IO[str] | None = None,  # noqa: WPS110
         force_terminal: bool | None = None,
         width: int | None = None,
         auto_refresh: bool = True,
     ):
-        self._c = _SafeConsole(
+        """Консоль поверх rich; ``file`` — куда печатать (по умолчанию — stdout)."""
+        self._console = _SafeConsole(
             no_color=no_color,
             highlight=False,
             emoji=False,
@@ -390,10 +461,10 @@ class Console(AgentEvents):
             width=width,
         )
         # Точные цвета или, в терминале на 16 цветов, цвета ANSI его темы.
-        self._p = palette_for(self._c.color_system)
-        self._c.push_theme(Theme(markdown_styles(self._p)))
+        self._palette = theme.palette_for(self._console.color_system)
+        self._console.push_theme(Theme(theme.markdown_styles(self._palette)))
         self._no_color = no_color
-        self._live_ok = self._c.is_terminal and not self._c.is_dumb_terminal
+        self._live_ok = self._console.is_terminal and not self._console.is_dumb_terminal
         self._auto_refresh = auto_refresh
         self._live: _LiveArea | None = None
         self._md: MarkdownStream | None = None  # потоковый ответ (живой режим)
@@ -402,25 +473,27 @@ class Console(AgentEvents):
         self._blank = True  # последняя напечатанная строка — пустая
         self._gap = False  # после ответа модели — пустая строка перед следующим
         self._interrupt_hint = "Ctrl+C — прервать"
-        self._mode_hint: Callable[[], str] | None = None
-        self._input_guard: Callable[[], AbstractContextManager[None]] = contextlib.nullcontext
+        self._mode_hint_source: Callable[[], str] | None = None
+        self._input_guard: Callable[[], AbstractContextManager[None]] = nullcontext
         self._esc_stops_subagent = False
         # Шаги: идущая группа и вызов вне группы, ждущий результата.
         self._group: _Group | None = None
         self._step: _Step | None = None
         # Работающий суб-агент: кто, с какого момента, чем занят, подводит ли итог, шаги.
-        self._sub: SubagentInfo | None = None
-        self._sub_started = 0.0
+        self._sub: events.SubagentInfo | None = None
+        self._sub_started: float = 0
         self._sub_activity = ""
         self._sub_wrapping = False
         self._sub_steps: list[_Step] = []
         self._keyboard_only = False  # отвечать на вопросы — только с терминала (-p)
 
     def keyboard_only(self) -> None:
-        """Вопросы (подтверждения, выбор чата) — только с клавиатуры: ввод не с
-        терминала — ответа нет. Для ``-p``: stdin там не канал ввода (запрос — аргумент),
-        и строка «y» или «a» из перенаправленных в него данных не должна ничего
-        подтверждать. В REPL ввод не с терминала — это и запросы, и ответы."""
+        """Вопросы (подтверждения, выбор чата) — только с клавиатуры.
+
+        Ввод не с терминала — ответа нет. Для ``-p``: stdin там не канал ввода (запрос —
+        аргумент), и строка «y» или «a» из перенаправленных в него данных не должна ничего
+        подтверждать. В REPL ввод не с терминала — это и запросы, и ответы.
+        """
         self._keyboard_only = True
 
     def _no_keyboard(self) -> bool:
@@ -445,24 +518,28 @@ class Console(AgentEvents):
         self._esc_stops_subagent = stop_subagent
 
     def set_mode_hint(self, hint: Callable[[], str] | None) -> None:
-        """Режим разрешений в индикаторе хода; перечитывается при каждой отрисовке,
-        поэтому смена режима во время хода (Shift+Tab) видна сразу."""
-        self._mode_hint = hint
+        """Режим разрешений в индикаторе хода.
+
+        Перечитывается при каждой отрисовке, поэтому смена режима во время хода
+        (Shift+Tab) видна сразу.
+        """
+        self._mode_hint_source = hint
 
     def _turn_hint(self) -> str:
-        if self._mode_hint is None:
+        if self._mode_hint_source is None:
             return self._interrupt_hint
-        return f"{self._interrupt_hint}  ·  {self._mode_hint()}"
+        return f"{self._interrupt_hint}  ·  {self._mode_hint_source()}"
 
     def _subagent_hint(self) -> str:
         if not self._esc_stops_subagent:
             return self._turn_hint()
         keys = "Esc — оборвать суб-агента" if self._sub_wrapping else "Esc — завершить с итогом"
         hint = f"{keys}  ·  Ctrl+C — прервать всё"
-        return hint if self._mode_hint is None else f"{hint}  ·  {self._mode_hint()}"
+        return hint if self._mode_hint_source is None else f"{hint}  ·  {self._mode_hint_source()}"
 
     @property
     def no_color(self) -> bool:
+        """Вывод без цвета."""
         return self._no_color
 
     def interactive(self) -> bool:
@@ -470,44 +547,58 @@ class Console(AgentEvents):
         return _stdin_is_terminal()
 
     # ----------------------------- базовое ----------------------------- #
-    def print(self, *args, **kwargs) -> None:
+    def print(self, *args: Any, **kwargs: Any) -> None:
+        """Печать в ленту (как у rich) — после итога идущей группы шагов."""
         self._flush_group()
         self._gap = False
-        self._c.print(*args, **kwargs)
+        self._console.print(*args, **kwargs)
         self._blank = not args
 
     def blank(self) -> None:
+        """Пустая строка в ленте."""
         self.print()
 
     def rule(self, title: str = "") -> None:
+        """Горизонтальная черта во всю ширину, с заголовком или без."""
         self._flush_group()
-        self._c.rule(Text(title, style=self._p.muted) if title else "", style=self._p.dim)
+        self._console.rule(
+            Text(title, style=self._palette.muted) if title else "",
+            style=self._palette.dim,
+        )
         self._blank = False
 
     # Сообщения печатаются над временной областью, если она есть (например,
     # уведомление суб-агента во время его работы).
     def system(self, text: str) -> None:
-        self._emit(Text(text, style=self._p.muted))
+        """Служебное сообщение."""
+        self._emit(Text(text, style=self._palette.muted))
 
     def error(self, text: str) -> None:
-        self._emit(Text(f"{ICON_FAIL} {text}", style=f"bold {self._p.danger}"))
+        """Сообщение об ошибке."""
+        danger = self._palette.danger
+        self._emit(Text(f"{theme.ICON_FAIL} {text}", style=f"bold {danger}"))
 
     def warn(self, text: str) -> None:
-        self._emit(Text(f"{ICON_DANGER} {text}", style=self._p.warn))
+        """Предупреждение."""
+        self._emit(Text(f"{theme.ICON_DANGER} {text}", style=self._palette.warn))
 
-    def info(self, text: str) -> None:
-        self._emit(Text(text, style=self._p.muted))
+    # error/warn/info/success — как у logging: имя info здесь — часть привычного ряда.
+    def info(self, text: str) -> None:  # noqa: WPS110
+        """Сведения для пользователя."""
+        self._emit(Text(text, style=self._palette.muted))
 
     def success(self, text: str) -> None:
-        self._emit(Text(f"{ICON_OK} {text}", style=f"bold {self._p.ok}"))
+        """Сообщение об успехе."""
+        ok = self._palette.ok
+        self._emit(Text(f"{theme.ICON_OK} {text}", style=f"bold {ok}"))
 
     # ------------------------------ вывод ------------------------------ #
-    def _out(self, renderable: RenderableType = "", **options) -> None:
+    def _out(self, renderable: RenderableType = "", **options: Any) -> None:
         """Печать над временной областью (если она есть)."""
-        if self._live is not None:
-            self._live.print(renderable, **options)
+        if self._live is None:
+            self._console.print(renderable, **options)
         else:
-            self._c.print(renderable, **options)
+            self._live.print(renderable, **options)
         self._blank = isinstance(renderable, str) and not renderable
 
     def _gap_line(self) -> None:
@@ -517,7 +608,7 @@ class Console(AgentEvents):
             if not self._blank:
                 self._out()
 
-    def _emit(self, renderable: RenderableType, **options) -> None:
+    def _emit(self, renderable: RenderableType, **options: Any) -> None:
         """Строка ленты: сначала — итог идущей группы шагов и отступ после ответа."""
         self._flush_group()
         self._gap_line()
@@ -525,7 +616,7 @@ class Console(AgentEvents):
 
     def _fit(self, text: Text) -> Text:
         """Строка по ширине экрана: не переносится, а обрезается многоточием."""
-        text.truncate(max(self._c.width - 1, 20), overflow="ellipsis")
+        text.truncate(max(self._console.width - 1, _MIN_WIDTH), overflow="ellipsis")
         return text
 
     # ------------------------- временная область ------------------------ #
@@ -543,25 +634,26 @@ class Console(AgentEvents):
             hint=self._turn_hint if hint is None else hint,
             started=started,
             above=self._live_steps,
-            palette=self._p,
+            palette=self._palette,
         )
 
     def _start_live(self, view: _LiveView) -> None:
         self.stop_live()
         if not self._live_ok:
             return
-        area = _LiveArea(self._c, view, animate=self._auto_refresh)
+        area = _LiveArea(self._console, view, animate=self._auto_refresh)
         area.start()
         self._live = area
 
     def stop_live(self) -> None:
         """Убирает временную область (идемпотентно). Безопасно вызывать всегда."""
-        live, self._live = self._live, None
+        live = self._live
+        self._live = None
         if live is not None:
             live.stop()
 
-    @contextlib.contextmanager
-    def progress(self, title: str, detail: Callable[[], str] | None = None) -> Iterator[None]:
+    @contextmanager
+    def progress(self, title: str, detail: Callable[[], str] | None = None) -> Generator[None]:
         """Индикатор долгой операции вне хода агента (например, построения индекса).
 
         ``detail`` перечитывается при каждой отрисовке («1234 файлов»). Вне
@@ -572,9 +664,7 @@ class Console(AgentEvents):
             yield
             return
 
-        def label() -> str:
-            return f"{title}: {detail()}" if detail is not None else title
-
+        label = functools.partial(_progress_label, title, detail)
         self._start_live(self._view(label, hint=self._interrupt_hint))
         try:
             yield
@@ -583,7 +673,7 @@ class Console(AgentEvents):
 
     # ------------------------------ баннер ------------------------------ #
     def _mode_color(self, mode: PermissionMode) -> str:
-        return self._p.warn if mode is PermissionMode.AUTO else self._p.brand
+        return self._palette.warn if mode is PermissionMode.AUTO else self._palette.brand
 
     def banner(
         self,
@@ -596,53 +686,57 @@ class Console(AgentEvents):
         mode: PermissionMode | None = None,
     ) -> None:
         """Приветственная панель; ``hints`` — пары (команда, краткое описание)."""
-        p = self._p
+        palette = self._palette
         rows = [
-            banner_art.title(p),
-            Text(f"v{version}", style=p.dim),
+            banner_art.title(palette),
+            Text(f"v{version}", style=palette.dim),
             Text(""),
-            Text.assemble(("модель  ", p.muted), (model, f"bold {p.fg}")),
-            Text.assemble(("проект  ", p.muted), (root, p.fg)),
+            Text.assemble(("модель  ", palette.muted), (model, f"bold {palette.fg}")),
+            Text.assemble(("проект  ", palette.muted), (root, palette.fg)),
         ]
         if mode is not None:
             rows.append(
                 Text.assemble(
-                    ("режим   ", p.muted),
+                    ("режим   ", palette.muted),
                     (mode_badge(mode), f"bold {self._mode_color(mode)}"),
-                    ("   Shift+Tab — сменить", p.dim),
-                )
+                    ("   Shift+Tab — сменить", palette.dim),
+                ),
             )
-        info = Group(*rows)
-        if self._c.width < _BANNER_MIN_WIDTH:
-            body: RenderableType = info
+        details = Group(*rows)
+        if self._console.width < _BANNER_MIN_WIDTH:
+            body: RenderableType = details
         else:
             grid = Table.grid(padding=(0, 3))
             grid.add_column(vertical="middle", no_wrap=True)
             grid.add_column(vertical="middle")
-            grid.add_row(banner_art.rocket(p, mono=self._c.no_color), info)
+            grid.add_row(banner_art.rocket(palette, mono=self._console.no_color), details)
             body = grid
-        self._c.print(Panel(body, box=ROUNDED, border_style=p.dim, padding=(1, 2), expand=False))
-        hint = Text("  ")
-        for i, (cmd, desc) in enumerate(hints):
-            if i:
+        self._console.print(
+            Panel(body, box=ROUNDED, border_style=palette.dim, padding=(1, 2), expand=False),
+        )
+        hint = Text(_SPACER)
+        for index, (cmd, desc) in enumerate(hints):
+            if index:
                 hint.append("   ")
-            hint.append(cmd, style=p.muted)
-            hint.append(f" {desc}", style=p.dim)
-        self._c.print(hint)
+            hint.append(cmd, style=palette.muted)
+            hint.append(f" {desc}", style=palette.dim)
+        self._console.print(hint)
         if auto_approve:
             self.warn(
                 "авто-подтверждение включено (-y): изменения применяются без вопросов, "
-                "опасные команды — с вопросом (--yes-all — и они без вопроса)"
+                "опасные команды — с вопросом (--yes-all — и они без вопроса)",
             )
         self.print()
 
     def help(
-        self, commands: Sequence[tuple[str, str]], keys: Sequence[tuple[str, str]] = ()
+        self,
+        commands: Sequence[tuple[str, str]],
+        keys: Sequence[tuple[str, str]] = (),
     ) -> None:
         """Справка: таблица команд и клавиш."""
         table = Table.grid(padding=(0, 2))
-        table.add_column(style=self._p.fg, no_wrap=True)
-        table.add_column(style=self._p.muted)
+        table.add_column(style=self._palette.fg, no_wrap=True)
+        table.add_column(style=self._palette.muted)
         for name, desc in commands:
             # Text, а не строка: «/resume [id]» и описания скиллов — не разметка Rich.
             table.add_row(Text(name), Text(desc))
@@ -663,8 +757,9 @@ class Console(AgentEvents):
 
     def _gutter(self, lines: Lines, *, commit: bool = True) -> Lines:
         """Строки ответа: знак ✦ слева у первой строки ответа, отступ у остальных."""
-        mark = Segment(f"{ICON_BRAND} ", self._c.get_style(f"bold {self._p.brand}"))
-        pad = Segment("  ")
+        brand = self._palette.brand
+        mark = Segment(f"{theme.ICON_BRAND} ", self._console.get_style(f"bold {brand}"))
+        pad = Segment(_SPACER)
         first = not self._answer_open
         out = []
         for line in lines:
@@ -675,19 +770,21 @@ class Console(AgentEvents):
         return out
 
     def _answer_width(self) -> int:
-        return max(self._c.width - 2, 20)
+        return max(self._console.width - 2, _MIN_WIDTH)
 
+    @override
     def on_assistant_text(self, text: str) -> None:
         """Печать ответа модели целиком (не потоковый режим)."""
         if not text.strip():
             return
         self._answer_start()
-        options = self._c.options.update_width(self._answer_width())
-        lines = self._c.render_lines(Markdown(sanitize(text)), options, pad=False)
+        options = self._console.options.update_width(self._answer_width())
+        lines = self._console.render_lines(Markdown(sanitize(text)), options, pad=False)
         self._out(SegmentLines(self._gutter(lines), new_lines=True))
         self._gap = True
 
     # ----------------------- потоковый вывод LLM ------------------------ #
+    @override
     def on_stream_start(self) -> None:
         """Запрос отправлен: индикатор ожидания до первого токена."""
         self._md = None
@@ -696,8 +793,9 @@ class Console(AgentEvents):
 
     def _answer_tail(self) -> Lines:
         md = self._md
-        return self._gutter(md.tail_lines(), commit=False) if md is not None else []
+        return [] if md is None else self._gutter(md.tail_lines(), commit=False)
 
+    @override
     def on_stream_delta(self, text: str) -> None:
         """Очередной кусок текста модели."""
         text = sanitize(text)
@@ -707,22 +805,24 @@ class Console(AgentEvents):
             if not self._raw_started:
                 self._raw_started = True
                 self._answer_start()
-                self._c.file.write(f"{ICON_BRAND} ")
+                self._console.file.write(f"{theme.ICON_BRAND} ")
                 self._blank = False
-            self._c.file.write(text)
-            self._c.file.flush()
+            self._console.file.write(text)
+            self._console.file.flush()
             return
         if self._md is None:
             self._answer_start()
-            self._md = MarkdownStream(self._c, width=self._answer_width())
+            self._md = MarkdownStream(self._console, width=self._answer_width())
             self._start_live(self._view("печатает", tail=self._answer_tail))
         lines = self._md.feed(text)
         if lines:
             self._out(SegmentLines(self._gutter(lines), new_lines=True))
 
+    @override
     def on_stream_end(self) -> None:
         """Ответ закончен (или прерван): убрать индикатор, дорисовать хвост."""
-        md, self._md = self._md, None
+        md = self._md
+        self._md = None
         self.stop_live()
         if md is not None:
             lines = md.finish()
@@ -731,14 +831,16 @@ class Console(AgentEvents):
             self._gap = True
         if self._raw_started:
             self._raw_started = False
-            self._c.file.write("\n")
-            self._c.file.flush()
+            self._console.file.write("\n")
+            self._console.file.flush()
             self._gap = True
 
     # --------------------------- инструменты ---------------------------- #
-    def _find(self, call: ToolCallInfo, steps: Sequence[_Step] = ()) -> _Step | None:
-        """Шаг вызова: тот же объект или (для копии с подробностями вопроса) последний
-        шаг без результата с тем же именем и описанием."""
+    def _find(self, call: events.ToolCallInfo, steps: Sequence[_Step] = ()) -> _Step | None:
+        """Шаг вызова: тот же объект или последний шаг без результата с тем же вызовом.
+
+        Второе — для копии вызова с подробностями вопроса: совпадают имя и описание.
+        """
         candidates = list(steps)
         if not candidates:
             if self._group is not None:
@@ -749,7 +851,7 @@ class Console(AgentEvents):
             if step.call is call:
                 return step
         for step in reversed(candidates):
-            if step.result is None and (step.call.name, step.call.summary) == (
+            if step.outcome is None and (step.call.name, step.call.summary) == (
                 call.name,
                 call.summary,
             ):
@@ -757,9 +859,10 @@ class Console(AgentEvents):
         return None
 
     def _in_group(self, step: _Step) -> bool:
-        return self._group is not None and any(s is step for s in self._group.steps)
+        return self._group is not None and any(grouped is step for grouped in self._group.steps)
 
-    def on_tool_call(self, call: ToolCallInfo) -> None:
+    @override
+    def on_tool_call(self, call: events.ToolCallInfo) -> None:
         kind = _group_kind(call)
         if self._group is not None and self._group.kind != kind:
             self._flush_group()
@@ -771,46 +874,57 @@ class Console(AgentEvents):
         else:
             self._step = step
 
-    def on_review_start(self, call: ToolCallInfo) -> None:
+    @override
+    def on_review_start(self, call: events.ToolCallInfo) -> None:
         self._start_live(self._view("рецензент проверяет команду"))
 
-    def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
+    @override
+    def on_review_end(self, call: events.ToolCallInfo, review: events.Review | None) -> None:
         self.stop_live()
         if review is None or not review.allowed:
             return  # отказ или сбой — дальше вопрос пользователю с подробностями
         step = self._find(call)
-        if step is not None:
-            step.review = review  # строкой под шагом, когда он выполнится
+        if step is None:
+            self._emit(Text(f"  {sanitize(review.approval)}", style=self._palette.dim))
         else:
-            self._emit(Text(f"  {sanitize(review.approval)}", style=self._p.dim))
+            step.review = review  # строкой под шагом, когда он выполнится
 
-    def on_tool_start(self, call: ToolCallInfo) -> None:
+    @override
+    def on_tool_start(self, call: events.ToolCallInfo) -> None:
         step = self._find(call)
         if step is not None:
             step.started = time.monotonic()
-        target = _clip(_target(call), 50)
+        target = _clip(_target(call), _LABEL_CHARS)
         if call.kind is ToolKind.COMMAND and target:
             label = f"$ {target}"
         else:
             label = f"{call.name} · {target}" if target else call.name
         self._start_live(self._view(label))
 
-    def on_tool_end(self, call: ToolCallInfo) -> None:
+    @override
+    def on_tool_end(self, call: events.ToolCallInfo) -> None:
         step = self._find(call)
         if step is not None and step.started:
             step.seconds = time.monotonic() - step.started
         self.stop_live()
 
-    def on_tool_result(self, call: ToolCallInfo, result: ToolResult, *, previewed: bool) -> None:
+    @override
+    def on_tool_result(
+        self,
+        call: events.ToolCallInfo,
+        tool_result: ToolResult,
+        *,
+        previewed: bool,
+    ) -> None:
         step = self._find(call)
         if step is None:  # результат без on_tool_call — строкой сразу
             step = _Step(call)
-        step.result = result
+        step.outcome = tool_result
         if self._in_group(step):
             return  # итог группы — когда она закончится
         if step is self._step:
             self._step = None
-        if call.name in _SELF_REPORTING and result.ok:
+        if call.name in _SELF_REPORTING and tool_result.ok:
             return
         for line in self._step_lines(step):
             self._emit(line)
@@ -821,174 +935,204 @@ class Console(AgentEvents):
 
     # -------- строки шагов -------- #
     def _stat(self, added: int, removed: int) -> Text:
-        return Text.assemble((f"+{added}", self._p.ok), " ", (f"−{removed}", self._p.danger))
+        return Text.assemble(
+            (f"+{added}", self._palette.ok),
+            " ",
+            (f"−{removed}", self._palette.danger),
+        )
 
-    def _detail(self, call: ToolCallInfo, result: ToolResult) -> str:
-        """Итог удачного шага: у команды — последняя строка вывода (итог тестов, сборки),
-        у прочего — размер вывода, код выхода или итог без цели."""
-        shown = result.display
+    def _detail(self, call: events.ToolCallInfo, tool_result: ToolResult) -> str:
+        """Итог удачного шага: у команды — последняя строка вывода (итог тестов, сборки).
+
+        У прочего — размер вывода, код выхода или итог без цели.
+        """
+        shown = tool_result.display
         if shown is not None and shown.kind == "text":
-            lines = [x.strip() for x in shown.text.splitlines() if x.strip()]
+            lines = [line.strip() for line in shown.text.splitlines() if line.strip()]
             if lines and call.kind is ToolKind.COMMAND:
                 return _clip(sanitize(lines[-1]))
             if lines:
-                n = len(lines)
-                return f"вывод: {n} {plural(n, 'строка', 'строки', 'строк')}"
-        if result.exit_code is not None:
-            return f"код {result.exit_code}"
-        summary = sanitize(result.summary or "готово")
+                count = _counted(len(lines), "строка", "строки", "строк")
+                return f"вывод: {count}"
+        if tool_result.exit_code is not None:
+            return f"код {tool_result.exit_code}"
+        summary = sanitize(tool_result.summary or "готово")
         target = _target(call)
         if target and target in summary:  # «прочитан a.py (12 строк)» — путь уже в шаге
             summary = summary.replace(target, " ").strip(" :")
             summary = re.sub(r"\s{2,}", " ", summary)
         return _clip(summary or "готово")
 
-    def _failure(self, result: ToolResult) -> str:
-        if result.exit_code is not None:
-            return f"код {result.exit_code}"
-        return sanitize(result.summary or "ошибка")
+    def _failure(self, tool_result: ToolResult) -> str:
+        if tool_result.exit_code is not None:
+            return f"код {tool_result.exit_code}"
+        return sanitize(tool_result.summary or "ошибка")
 
-    def _edit_line(self, call: ToolCallInfo, result: ToolResult) -> Text:
-        p = self._p
+    def _edit_line(self, call: events.ToolCallInfo, tool_result: ToolResult) -> Text:
+        palette = self._palette
         path = _target(call)
-        if not result.ok:
+        if not tool_result.ok:
+            reason = sanitize(tool_result.summary or "ошибка")
             return Text.assemble(
-                (f"{ICON_TOOL} ", p.danger),
-                (f"{call.name} {path}".strip(), f"bold {p.fg}"),
-                (f"  {ICON_FAIL} {sanitize(result.summary or 'ошибка')}", f"bold {p.danger}"),
+                (f"{theme.ICON_TOOL} ", palette.danger),
+                (f"{call.name} {path}".strip(), f"bold {palette.fg}"),
+                (f"  {theme.ICON_FAIL} {reason}", f"bold {palette.danger}"),
             )
-        verb = "Создал" if result.summary.startswith("создан") else "Изменил"
-        line = Text.assemble((f"{ICON_TOOL} ", p.ok), (f"{verb} {path}", f"bold {p.fg}"))
-        stat = _diff_stat(result)
+        verb = "Создал" if tool_result.summary.startswith("создан") else "Изменил"
+        line = Text.assemble(
+            (f"{theme.ICON_TOOL} ", palette.ok),
+            (f"{verb} {path}", f"bold {palette.fg}"),
+        )
+        stat = _diff_stat(tool_result)
         if stat is not None:
-            line.append("  ")
+            line.append(_SPACER)
             line.append_text(self._stat(*stat))
         return line
 
     def _step_lines(self, step: _Step) -> list[Text]:
-        """Шаг одной строкой: ● что сделано  ✔ итог · время; под ней — рецензент и,
-        если шаг упал, последние строки вывода."""
-        p = self._p
-        call, result = step.call, step.result
-        assert result is not None
-        if call.kind is ToolKind.EDIT:
-            lines = [self._edit_line(call, result)]
+        """Шаг одной строкой: ● что сделано  ✔ итог · время.
+
+        Под ней — рецензент и, если шаг упал, последние строки вывода.
+        """
+        outcome = _step_outcome(step)
+        if step.call.kind is ToolKind.EDIT:
+            lines = [self._edit_line(step.call, outcome)]
         else:
-            target = _target(call)
-            head = f"$ {target}" if call.kind is ToolKind.COMMAND else f"{call.name} {target}"
-            status = Text()
-            if result.ok:
-                status.append(f"{ICON_OK} ", style=p.ok)
-                status.append(self._detail(call, result), style=p.muted)
-            else:
-                status.append(f"{ICON_FAIL} {self._failure(result)}", style=f"bold {p.danger}")
-            if step.seconds >= _SHOW_SECONDS:
-                status.append(f"  ·  {step.seconds:.1f} с", style=p.dim)
-            # Не помещается в строку — короче команда, а не итог.
-            room = self._c.width - 1 - len(status) - 4
-            head = head.strip()
-            if len(head) > room:
-                head = _clip(head, max(room, 24))
-            line = Text.assemble(
-                (f"{ICON_TOOL} ", p.ok if result.ok else p.danger),
-                (head, f"bold {p.fg}"),
-                ("  ", ""),
-            )
-            lines = [self._fit(line + status)]
+            lines = [self._tool_line(step, outcome)]
         if step.review is not None:
-            lines.append(Text(f"  {sanitize(step.review.approval)}", style=p.dim))
-        if not result.ok and result.display is not None and result.display.kind == "text":
-            output = [x for x in sanitize(result.display.text).splitlines() if x.strip()]
-            output = [x for x in output if not _SEPARATOR_RE.match(x.strip())]
-            for out_line in output[-_TAIL_LINES:]:
-                lines.append(self._fit(Text.assemble(("  │ ", p.danger), (out_line, ""))))
+            lines.append(Text(f"  {sanitize(step.review.approval)}", style=self._palette.dim))
+        if not outcome.ok:
+            lines += self._output_tail(outcome)
         return lines
+
+    def _tool_line(self, step: _Step, outcome: ToolResult) -> Text:
+        """Строка шага, кроме правки: что сделано, итог и время."""
+        palette = self._palette
+        call = step.call
+        target = _target(call)
+        head = f"$ {target}" if call.kind is ToolKind.COMMAND else f"{call.name} {target}"
+        status = Text()
+        if outcome.ok:
+            status.append(f"{theme.ICON_OK} ", style=palette.ok)
+            status.append(self._detail(call, outcome), style=palette.muted)
+        else:
+            failure = self._failure(outcome)
+            status.append(f"{theme.ICON_FAIL} {failure}", style=f"bold {palette.danger}")
+        if step.seconds >= _SHOW_SECONDS:
+            status.append(f"  ·  {step.seconds:.1f} с", style=palette.dim)
+        # Не помещается в строку — короче команда, а не итог.
+        room = self._console.width - 1 - len(status) - 4
+        head = head.strip()
+        if len(head) > room:
+            head = _clip(head, max(room, 24))
+        line = Text.assemble(
+            (f"{theme.ICON_TOOL} ", palette.ok if outcome.ok else palette.danger),
+            (head, f"bold {palette.fg}"),
+            (_SPACER, ""),
+        )
+        return self._fit(line + status)
+
+    def _output_tail(self, outcome: ToolResult) -> list[Text]:
+        """Последние строки вывода упавшего шага, без строк-разделителей."""
+        shown = outcome.display
+        if shown is None or shown.kind != "text":
+            return []
+        output = [line for line in sanitize(shown.text).splitlines() if line.strip()]
+        output = [line for line in output if not _SEPARATOR_RE.match(line.strip())]
+        danger = self._palette.danger
+        return [
+            self._fit(Text.assemble(("  │ ", danger), (out_line, "")))
+            for out_line in output[-_TAIL_LINES:]
+        ]
 
     def _failed_line(self, step: _Step) -> Text:
         """Неудачный шаг внутри группы: ✘ что — почему."""
-        p = self._p
-        assert step.result is not None
+        palette = self._palette
+        outcome = _step_outcome(step)
+        call = step.call
+        target = _target(call)
         return Text.assemble(
-            (f"  {ICON_FAIL} ", f"bold {p.danger}"),
-            (f"{step.call.name} {_target(step.call)}".strip(), p.danger),
-            ("  ", ""),
-            (sanitize(step.result.summary or "ошибка"), p.danger),
+            (f"  {theme.ICON_FAIL} ", f"bold {palette.danger}"),
+            (f"{call.name} {target}".strip(), palette.danger),
+            (_SPACER, ""),
+            (sanitize(outcome.summary or "ошибка"), palette.danger),
         )
 
     def _read_lines(self, steps: Sequence[_Step]) -> list[Text]:
         """Итог группы чтений: «Изучил код» со счётчиками, цели, ошибки."""
-        p = self._p
+        palette = self._palette
         if len(steps) == 1:
             return self._step_lines(steps[0])
-        ok = [s for s in steps if s.result is not None and s.result.ok]
-        failed = [s for s in steps if s.result is not None and not s.result.ok]
+        ok, failed = _split_done(steps)
         head = Text.assemble(
-            (f"{ICON_TOOL} ", p.ok if ok else p.danger), ("Изучил код", f"bold {p.fg}")
+            (f"{theme.ICON_TOOL} ", palette.ok if ok else palette.danger),
+            ("Изучил код", f"bold {palette.fg}"),
         )
-        rest = _read_counts([s.call for s in ok])
-        seconds = sum(s.seconds for s in steps)
+        rest = _read_counts([step.call for step in ok])
+        seconds = sum(step.seconds for step in steps)
         if seconds >= _SHOW_SECONDS:
             rest = f"{rest}  ·  {seconds:.1f} с" if rest else f"{seconds:.1f} с"
         if rest:
-            head.append(f"  {rest}", style=p.muted)
+            head.append(f"  {rest}", style=palette.muted)
         lines = [head]
-        targets = list(dict.fromkeys(_target(s.call) for s in ok if _target(s.call)))
+        targets = list(dict.fromkeys(_target(step.call) for step in ok if _target(step.call)))
         if targets:
-            lines.append(self._fit(Text("  " + "  ".join(targets), style=p.muted)))
-        lines += [self._failed_line(s) for s in failed]
+            joined = _SPACER.join(targets)
+            lines.append(self._fit(Text(f"  {joined}", style=palette.muted)))
+        lines += [self._failed_line(step) for step in failed]
         return lines
 
     def _edit_lines(self, steps: Sequence[_Step]) -> list[Text]:
         """Итог группы правок: файл и +N −M; несколько файлов — строка на файл."""
-        p = self._p
-        ok = [s for s in steps if s.result is not None and s.result.ok]
-        failed = [s for s in steps if s.result is not None and not s.result.ok]
-        files: dict[str, list[int]] = {}
-        for s in ok:
-            stat = _diff_stat(s.result) or (0, 0)  # type: ignore[arg-type]
-            total = files.setdefault(_target(s.call), [0, 0])
-            total[0] += stat[0]
-            total[1] += stat[1]
-        if len(files) <= 1:
-            # Один файл (в том числе несколько правок подряд) — как одна правка.
-            lines = []
-            if ok:
-                last = ok[-1]
-                line = self._edit_line(last.call, last.result)  # type: ignore[arg-type]
-                if len(ok) > 1:
-                    line = Text.assemble(
-                        (f"{ICON_TOOL} ", p.ok), (f"Изменил {_target(last.call)}", f"bold {p.fg}")
-                    )
-                    added, removed = next(iter(files.values()))
-                    line.append("  ")
-                    line.append_text(self._stat(added, removed))
-                lines.append(line)
-            if not ok:  # все правки упали — каждая своей строкой
-                return [line for s in failed for line in self._step_lines(s)]
-            return lines + [self._failed_line(s) for s in failed]
-        n = len(files)
+        ok, failed = _split_done(steps)
+        if not ok:  # все правки упали — каждая своей строкой
+            return [line for step in failed for line in self._step_lines(step)]
+        totals = _edit_totals(ok)
+        # Один файл (в том числе несколько правок подряд) — как одна правка.
+        lines = [self._one_file_line(ok, totals)] if len(totals) <= 1 else self._files_lines(totals)
+        return lines + [self._failed_line(step) for step in failed]
+
+    def _one_file_line(self, ok: Sequence[_Step], totals: dict[str, list[int]]) -> Text:
+        """Удачные правки одного файла: одна — как есть, несколько — с суммой строк."""
+        last = ok[-1]
+        if len(ok) == 1:
+            return self._edit_line(last.call, _step_outcome(last))
+        palette = self._palette
+        line = Text.assemble(
+            (f"{theme.ICON_TOOL} ", palette.ok),
+            (f"Изменил {_target(last.call)}", f"bold {palette.fg}"),
+        )
+        added, removed = next(iter(totals.values()))
+        line.append(_SPACER)
+        line.append_text(self._stat(added, removed))
+        return line
+
+    def _files_lines(self, totals: dict[str, list[int]]) -> list[Text]:
+        """Правки нескольких файлов: общий итог и строка на файл."""
+        palette = self._palette
+        files = _counted(len(totals), "файл", "файла", "файлов")
         head = Text.assemble(
-            (f"{ICON_TOOL} ", p.ok),
-            (f"Изменил {n} {plural(n, 'файл', 'файла', 'файлов')}", f"bold {p.fg}"),
-            ("  ", ""),
+            (f"{theme.ICON_TOOL} ", palette.ok),
+            (f"Изменил {files}", f"bold {palette.fg}"),
+            (_SPACER, ""),
         )
-        head.append_text(
-            self._stat(sum(a for a, _ in files.values()), sum(r for _, r in files.values()))
-        )
+        head.append_text(self._stat(*_sum_totals(totals)))
         lines = [head]
-        width = max(len(path) for path in files)
-        for path, (added, removed) in files.items():
-            line = Text(f"  {path:<{width}}  ", style=p.fg)
+        width = max(len(path) for path in totals)
+        for path, (added, removed) in totals.items():
+            padded = path.ljust(width)
+            line = Text(f"  {padded}  ", style=palette.fg)
             line.append_text(self._stat(added, removed))
             lines.append(line)
-        return lines + [self._failed_line(s) for s in failed]
+        return lines
 
     def _flush_group(self) -> None:
         """Итог идущей группы — в ленту (идемпотентно)."""
-        group, self._group = self._group, None
+        group = self._group
+        self._group = None
         if group is None:
             return
-        steps = [s for s in group.steps if s.result is not None]
+        steps = [step for step in group.steps if step.outcome is not None]
         if not steps:
             return
         lines = self._read_lines(steps) if group.kind == "read" else self._edit_lines(steps)
@@ -998,45 +1142,54 @@ class Console(AgentEvents):
 
     def _live_rows(self, steps: Sequence[_Step]) -> list[Text]:
         """Последние шаги для временной области: ✔/✘/◌, инструмент, цель, итог."""
-        p = self._p
         rows = []
         hidden = len(steps) - _LIVE_STEPS
         if hidden > 0:
-            rows.append(Text(f"  … ещё {hidden}", style=p.dim))
+            rows.append(Text(f"  … ещё {hidden}", style=self._palette.dim))
             steps = steps[-_LIVE_STEPS:]
-        for s in steps:
-            result = s.result
-            if result is None:
-                mark = (f"  {ICON_PENDING} ", p.warn)
-            elif result.ok:
-                mark = (f"  {ICON_OK} ", p.ok)
-            else:
-                mark = (f"  {ICON_FAIL} ", p.danger)
-            row = Text.assemble(mark, (s.call.name, p.muted), ("  ", ""), (_target(s.call), p.fg))
-            if result is not None:
-                row.append("  ")
-                stat = _diff_stat(result) if result.ok else None
-                if stat is not None:
-                    row.append_text(self._stat(*stat))
-                else:
-                    row.append(
-                        sanitize(result.summary or ""), style=p.dim if result.ok else p.danger
-                    )
-            rows.append(self._fit(row))
+        rows += [self._live_row(step) for step in steps]
         return rows
+
+    def _live_row(self, step: _Step) -> Text:
+        """Шаг во временной области: ✔/✘/◌, инструмент, цель и итог, если он есть."""
+        palette = self._palette
+        outcome = step.outcome
+        if outcome is None:
+            mark = (f"  {theme.ICON_PENDING} ", palette.warn)
+        elif outcome.ok:
+            mark = (f"  {theme.ICON_OK} ", palette.ok)
+        else:
+            mark = (f"  {theme.ICON_FAIL} ", palette.danger)
+        row = Text.assemble(
+            mark,
+            (step.call.name, palette.muted),
+            (_SPACER, ""),
+            (_target(step.call), palette.fg),
+        )
+        if outcome is not None:
+            row.append(_SPACER)
+            stat = _diff_stat(outcome) if outcome.ok else None
+            if stat is None:
+                row.append(
+                    sanitize(outcome.summary or ""),
+                    style=palette.dim if outcome.ok else palette.danger,
+                )
+            else:
+                row.append_text(self._stat(*stat))
+        return self._fit(row)
 
     def _live_steps(self) -> list[Text]:
         """Что показать над индикатором: идущую группу или шаги суб-агента."""
         group = self._group
         if group is not None and group.steps:
-            p = self._p
+            palette = self._palette
             steps = list(group.steps)
-            n = len(steps)
             title = "Изучаю код" if group.kind == "read" else "Правлю файлы"
+            calls = _counted(len(steps), "вызов", "вызова", "вызовов")
             head = Text.assemble(
-                (f"{ICON_TOOL} ", p.warn),
-                (title, f"bold {p.fg}"),
-                (f"  {n} {plural(n, 'вызов', 'вызова', 'вызовов')}", p.muted),
+                (f"{theme.ICON_TOOL} ", palette.warn),
+                (title, f"bold {palette.fg}"),
+                (f"  {calls}", palette.muted),
             )
             return [head, *self._live_rows(steps)]
         if self._sub is not None and self._sub_steps:
@@ -1044,9 +1197,10 @@ class Console(AgentEvents):
         return []
 
     # ---------------------------- суб-агенты ----------------------------- #
-    def on_subagent_start(self, info: SubagentInfo) -> None:
+    @override
+    def on_subagent_start(self, subagent: events.SubagentInfo) -> None:
         self._flush_group()
-        self._sub = info
+        self._sub = subagent
         self._sub_started = time.monotonic()
         self._sub_activity = "думаю"
         self._sub_wrapping = False
@@ -1054,74 +1208,75 @@ class Console(AgentEvents):
         self._start_subagent_live()
 
     def _subagent_label(self) -> str:
-        name = self._sub.name if self._sub is not None else "суб-агент"
+        name = "суб-агент" if self._sub is None else self._sub.name
         return f"{name} · {self._sub_activity}"
 
     def _start_subagent_live(self) -> None:
         if self._sub is None:
             return
         self._start_live(
-            self._view(self._subagent_label, hint=self._subagent_hint, started=self._sub_started)
+            self._view(self._subagent_label, hint=self._subagent_hint, started=self._sub_started),
         )
 
+    @override
     def on_subagent_activity(
-        self, info: SubagentInfo, activity: str, *, wrapping_up: bool = False
+        self,
+        subagent: events.SubagentInfo,
+        activity: str,
+        *,
+        wrapping_up: bool = False,
     ) -> None:
         self._sub_activity = activity
         self._sub_wrapping = wrapping_up
         if self._live is None:  # область убрал вопрос пользователю — вернуть
             self._start_subagent_live()
 
-    def on_subagent_tool_call(self, info: SubagentInfo, call: ToolCallInfo) -> None:
+    @override
+    def on_subagent_tool_call(
+        self,
+        subagent: events.SubagentInfo,
+        call: events.ToolCallInfo,
+    ) -> None:
         self._sub_steps.append(_Step(call))
 
+    @override
     def on_subagent_tool_result(
-        self, info: SubagentInfo, call: ToolCallInfo, result: ToolResult, *, previewed: bool
+        self,
+        subagent: events.SubagentInfo,
+        call: events.ToolCallInfo,
+        tool_result: ToolResult,
+        *,
+        previewed: bool,
     ) -> None:
         step = self._find(call, self._sub_steps) if self._sub_steps else None
         if step is None:
             step = _Step(call)
             self._sub_steps.append(step)
-        step.result = result
+        step.outcome = tool_result
 
-    def on_subagent_end(self, info: SubagentInfo, stats: TurnStats | None) -> None:
+    @override
+    def on_subagent_end(
+        self,
+        subagent: events.SubagentInfo,
+        stats: events.TurnStats | None,
+    ) -> None:
         self.stop_live()  # до сброса: последняя отрисовка ещё читает метку
         self._sub = None
         self._sub_wrapping = False
 
     def _subagent_lines(self, steps: Sequence[_Step]) -> list[Text]:
         """Что сделал суб-агент — под строкой его вызова: счётчики, правки, неудачи."""
-        p = self._p
-        done = [s for s in steps if s.result is not None]
-        ok = [s for s in done if s.result.ok]  # type: ignore[union-attr]
-        parts = []
-        reads = [s for s in ok if s.call.read_only]
-        if reads:
-            parts.append(_read_counts([s.call for s in reads]))
-        edits: dict[str, list[int]] = {}
-        for s in ok:
-            if s.call.kind is ToolKind.EDIT:
-                stat = _diff_stat(s.result) or (0, 0)  # type: ignore[arg-type]
-                total = edits.setdefault(_target(s.call), [0, 0])
-                total[0] += stat[0]
-                total[1] += stat[1]
-        if edits:
-            if len(edits) <= 3:
-                shown = ", ".join(f"{path} +{a} −{r}" for path, (a, r) in edits.items())
-                parts.append(f"изменил {shown}")
-            else:
-                n = len(edits)
-                parts.append(f"изменил {n} {plural(n, 'файл', 'файла', 'файлов')}")
-        commands = sum(1 for s in ok if s.call.kind is ToolKind.COMMAND)
-        if commands:
-            parts.append(f"{commands} {plural(commands, 'команда', 'команды', 'команд')}")
+        ok, failed = _split_done(steps)
+        parts = _subagent_parts(ok)
         lines = []
         if parts:
-            lines.append(Text("  " + ", ".join(parts), style=p.muted))
-        lines += [self._failed_line(s) for s in done if not s.result.ok]  # type: ignore[union-attr]
+            summary = _COMMA.join(parts)
+            lines.append(Text(f"  {summary}", style=self._palette.muted))
+        lines += [self._failed_line(step) for step in failed]
         return lines
 
     # ---------------------------- статистика ---------------------------- #
+    @override
     def on_compact_start(self, *, auto: bool) -> None:
         title = "контекст почти заполнен — сжимаю историю" if auto else "сжимаю историю"
         if not self._live_ok:
@@ -1129,17 +1284,19 @@ class Console(AgentEvents):
             return
         self._start_live(self._view(title))
 
-    def on_compact_end(self, result: CompactResult | None) -> None:
+    @override
+    def on_compact_end(self, compacted: events.CompactResult | None) -> None:
         self.stop_live()
-        if result is None:
+        if compacted is None:
             return
-        n = result.messages
+        before = format_tokens(compacted.before_tokens)
+        after = format_tokens(compacted.after_tokens)
+        folded = _counted(compacted.messages, "сообщение", "сообщения", "сообщений")
         self.system(
-            f"✂ контекст сжат: ~{format_tokens(result.before_tokens)} → "
-            f"~{format_tokens(result.after_tokens)} ток. · в краткое содержание свёрнуто "
-            f"{n} {plural(n, 'сообщение', 'сообщения', 'сообщений')}"
+            f"✂ контекст сжат: ~{before} → ~{after} ток. · в краткое содержание свёрнуто {folded}",
         )
 
+    @override
     def on_hook_start(self, event: str, command: str) -> None:
         title = f"хук {event} · {sanitize(short_command(command))}"
         if not self._live_ok:
@@ -1147,132 +1304,182 @@ class Console(AgentEvents):
             return
         self._start_live(self._view(title))
 
+    @override
     def on_hook_end(self) -> None:
         self.stop_live()
 
-    def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:
+    @override
+    def on_notice(self, text: str, *, level: events.NoticeLevel = "info") -> None:
         # В тексте может быть вывод хуков пользователя — escape-последовательности убираются.
         {"info": self.info, "warn": self.warn, "error": self.error}[level](sanitize(text))
 
-    def on_turn_end(self, stats: TurnStats) -> None:
-        steps = stats.steps
-        parts = [f"{steps} {plural(steps, 'шаг', 'шага', 'шагов')}"]
+    @override
+    def on_turn_end(self, stats: events.TurnStats) -> None:
+        parts = [_counted(stats.steps, "шаг", "шага", "шагов")]
         if stats.tool_calls:
-            n = stats.tool_calls
-            parts.append(f"{n} {plural(n, 'инструмент', 'инструмента', 'инструментов')}")
+            parts.append(_counted(stats.tool_calls, "инструмент", "инструмента", "инструментов"))
         if stats.duration_s:
             parts.append(f"{stats.duration_s:.1f} с")
         if stats.context_tokens:
             parts.append(f"контекст ~{format_tokens(stats.context_tokens)}")
         if stats.billed_tokens:
             parts.append(f"потрачено {format_tokens(stats.billed_tokens)} ток.")
-        self._emit(Text("  " + "  ·  ".join(parts), style=self._p.dim))
+        summary = "  ·  ".join(parts)
+        self._emit(Text(f"  {summary}", style=self._palette.dim))
 
     # -------------------------- подтверждения --------------------------- #
-    def _bar(self, *, dangerous: bool = False) -> tuple[str, str]:
-        return (f"  {ICON_BAR} ", self._p.danger if dangerous else self._p.warn)
+    def _stripe(self, *, dangerous: bool = False) -> tuple[str, str]:
+        return (f"  {theme.ICON_BAR} ", self._palette.danger if dangerous else self._palette.warn)
 
-    def _confirm_head(self, call: ToolCallInfo, preview: Display | None, bar: tuple[str, str]):
-        """Что спрашивается — первой строкой вопроса. Однострочное превью команды
-        показывается здесь же, как выполнится (с видимыми невидимыми символами)."""
-        p = self._p
-        text = preview.text.rstrip("\n") if preview is not None else ""
+    def _confirm_head(
+        self,
+        call: events.ToolCallInfo,
+        preview: Display | None,
+        stripe: tuple[str, str],
+    ) -> bool:
+        """Что спрашивается — первой строкой вопроса.
+
+        Однострочное превью команды показывается здесь же, как выполнится (с видимыми
+        невидимыми символами). True — превью не помещается на экран.
+        """
+        palette = self._palette
+        text = "" if preview is None else preview.text.rstrip("\n")
         if preview is not None and preview.kind != "diff" and text.strip() and "\n" not in text:
-            head = visible_text(text, numbered=False, palette=p)
+            head = visible_text(text, numbered=False, palette=palette)
             head.stylize("bold")
-            self._out(Text.assemble(bar) + head)
+            self._out(Text.assemble(stripe) + head)
             return False
         target = _target(call)
         if call.kind is ToolKind.COMMAND:
             head_text = f"$ {target}"
         else:
             head_text = f"{call.name} {target}".strip()
-        self._out(Text.assemble(bar, (head_text, f"bold {p.fg}")))
-        if not text.strip():
+        self._out(Text.assemble(stripe, (head_text, f"bold {palette.fg}")))
+        if preview is None or not text.strip():
             return False
-        if preview is not None and preview.kind == "diff":
+        if preview.kind == "diff":
             self._out(Padding(self._diff_panel(preview), (0, 0, 0, 4)))
             return False
-        return self._exact_block(preview, border=bar[1])  # type: ignore[arg-type]
+        return self._exact_block(preview, border=stripe[1])
 
+    @override
     def confirm(
-        self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
-    ) -> ConfirmResult:
-        step = self._find(call)
-        if step is not None and self._group is not None and self._in_group(step):
-            # Спрошенный вызов — не часть группы: его строка — после ответа.
-            self._group.steps = [s for s in self._group.steps if s is not step]
-            self._step = step
+        self,
+        call: events.ToolCallInfo,
+        preview: Display | None,
+        *,
+        dangerous: bool,
+    ) -> events.ConfirmResult:
+        self._detach_step(call)
         self._flush_group()
         self.stop_live()  # превью печатается до вопроса — область уже не нужна
         self._gap_line()
-        p = self._p
-        bar = self._bar(dangerous=dangerous)
-        long_preview = self._confirm_head(call, preview, bar)
+        stripe = self._stripe(dangerous=dangerous)
+        long_preview = self._confirm_head(call, preview, stripe)
+        self._confirm_details(call, preview, stripe, dangerous=dangerous)
+        question = _confirm_question(call, dangerous=dangerous)
+        always = _always_note(call, dangerous=dangerous)
+        raw = self._confirm_answer(
+            question,
+            preview,
+            dangerous=dangerous,
+            always=always,
+            view=long_preview,
+        )
+        if raw is None:
+            return events.ConfirmResult(events.Approval.NO, answered=False)
+        return _confirm_result(raw, always)
+
+    def _detach_step(self, call: events.ToolCallInfo) -> None:
+        """Спрошенный вызов — не часть группы: его строка — после ответа."""
+        step = self._find(call)
+        if step is not None and self._group is not None and self._in_group(step):
+            self._group.steps = [grouped for grouped in self._group.steps if grouped is not step]
+            self._step = step
+
+    def _confirm_details(
+        self,
+        call: events.ToolCallInfo,
+        preview: Display | None,
+        stripe: tuple[str, str],
+        *,
+        dangerous: bool,
+    ) -> None:
+        """Подробности вопроса о вызове: каталог, причина, цель, рецензент, история."""
+        palette = self._palette
+        labeled = self._confirm_labels(call, preview, dangerous=dangerous)
+        width = max((len(label) for label, _, _ in labeled), default=0)
+        for label, style, text in labeled:
+            padded = label.ljust(width)
+            self._out(Text.assemble(stripe, (f"{padded}  ", style)) + text)
+        if call.review:
+            self._out(Text.assemble(stripe, (sanitize(call.review), palette.muted)))
+        if call.history:
+            self._out(Text.assemble(stripe, (sanitize(call.history), palette.muted)))
+        self._out(Text.assemble(stripe))
+
+    def _confirm_labels(
+        self,
+        call: events.ToolCallInfo,
+        preview: Display | None,
+        *,
+        dangerous: bool,
+    ) -> list[tuple[str, str, Text]]:
+        """Подписанные строки вопроса о вызове: (подпись, её стиль, текст)."""
+        palette = self._palette
         labeled = []
         where = _command_dir(call, preview)
         if where:  # где выполнится команда — тоже часть того, что подтверждается
-            labeled.append(("каталог", p.muted, Text(where, style=f"bold {p.fg}")))
+            labeled.append(("каталог", palette.muted, Text(where, style=f"bold {palette.fg}")))
         if call.reason:
             label = "почему опасно" if dangerous else "почему спрашиваю"
-            style = f"bold {p.danger}" if dangerous else p.muted
-            labeled.append((label, style, Text(sanitize(call.reason), style=p.fg)))
+            style = f"bold {palette.danger}" if dangerous else palette.muted
+            labeled.append((label, style, Text(sanitize(call.reason), style=palette.fg)))
         if call.purpose:
-            purpose = Text.assemble((sanitize(call.purpose), p.muted), ("  со слов модели", p.dim))
-            labeled.append(("зачем", p.muted, purpose))
-        width = max((len(label) for label, _, _ in labeled), default=0)
-        for label, style, text in labeled:
-            self._out(Text.assemble(bar, (f"{label:<{width}}  ", style)) + text)
-        if call.review:
-            self._out(Text.assemble(bar, (sanitize(call.review), p.muted)))
-        if call.history:
-            self._out(Text.assemble(bar, (sanitize(call.history), p.muted)))
-        self._out(Text.assemble(bar))
-        if call.kind is ToolKind.EDIT:
-            question = "Применить правку?"
-        elif call.kind is ToolKind.COMMAND:
-            question = "Выполнить опасную команду?" if dangerous else "Выполнить команду?"
-        else:
-            question = f"Выполнить {call.name}?"
-        always = None
-        if not dangerous:  # опасное «навсегда» не разрешается
-            if call.remember:
-                always = sanitize(call.remember)
-            else:
-                always = "не спрашивать этот вызов до конца сессии"
+            purpose = Text.assemble(
+                (sanitize(call.purpose), palette.muted),
+                ("  со слов модели", palette.dim),
+            )
+            labeled.append(("зачем", palette.muted, purpose))
+        return labeled
+
+    def _confirm_answer(
+        self,
+        question: str,
+        preview: Display | None,
+        *,
+        dangerous: bool,
+        always: str | None,
+        view: bool,
+    ) -> str | None:
+        """Ответ на вопрос о вызове как введён; «v» — превью в просмотрщике и вопрос снова."""
         while True:
             raw = self._question_raw(
-                question, dangerous=dangerous, always=always, feedback=True, view=long_preview
+                question,
+                dangerous=dangerous,
+                always=always,
+                feedback=True,
+                view=view,
             )
-            if raw is None:
-                return ConfirmResult(Approval.NO, answered=False)
-            answer = raw.strip().lower()
-            if preview is not None and answer in _VIEW:
-                self._page(preview)  # и спросить снова
-                continue
-            break
-        if answer in _YES:
-            return ConfirmResult(Approval.YES)
-        if always is not None and answer in _ALWAYS:
-            return ConfirmResult(Approval.ALWAYS)
-        if not answer or answer in _NO:
-            return ConfirmResult(Approval.NO)
-        # Свой ответ вместо y/n — отказ с объяснением: его получит модель.
-        return ConfirmResult(Approval.NO, feedback=raw.strip())
+            if raw is None or preview is None or raw.strip().lower() not in _VIEW_ANSWERS:
+                return raw
+            self._page(preview)  # и спросить снова
 
     def _diff_panel(self, preview: Display) -> Panel:
         # Невидимые символы правки — видимыми (как в команде), с подсветкой диффа.
         code = mark_invisible(preview.text).rstrip()
         body = Syntax(code, "diff", theme="ansi_dark", background_color="default").highlight(code)
         body.rstrip()
-        body.no_wrap, body.overflow = False, "fold"  # длинные строки — переносом
-        body.highlight_regex(_INVISIBLE_MARK_RE, f"bold {self._p.danger}")
+        body.no_wrap = False  # длинные строки — переносом
+        body.overflow = "fold"
+        danger = self._palette.danger
+        body.highlight_regex(_INVISIBLE_MARK_RE, f"bold {danger}")
         return Panel(
             body,
-            title=Text(preview.title or "изменения", style=self._p.fg),
+            title=Text(preview.title or "изменения", style=self._palette.fg),
             title_align="left",
             box=ROUNDED,
-            border_style=self._p.dim,
+            border_style=self._palette.dim,
             padding=(0, 1),
             expand=False,
         )
@@ -1282,16 +1489,16 @@ class Console(AgentEvents):
 
         Возвращает True, если оно не помещается на экран (тогда предлагается просмотрщик).
         """
-        p = self._p
+        palette = self._palette
         text = preview.text.rstrip("\n")
         lines = text.split("\n")
         title = preview.title or "превью"
         if len(lines) >= _NUMBER_LINES_FROM:
-            n = len(lines)
-            title += f" · {n} {plural(n, 'строка', 'строки', 'строк')}"
+            count = _counted(len(lines), "строка", "строки", "строк")
+            title = f"{title} · {count}"
         panel = Panel(
-            visible_text(text, palette=p),
-            title=Text(title, style=p.muted),
+            visible_text(text, palette=palette),
+            title=Text(title, style=palette.muted),
             title_align="left",
             box=ROUNDED,
             border_style=border,
@@ -1299,20 +1506,20 @@ class Console(AgentEvents):
             expand=False,
         )
         self._out(Padding(panel, (0, 0, 0, 4)))
-        width = max(self._c.size.width - 8, 20)
+        width = max(self._console.size.width - 8, _MIN_WIDTH)
         height = sum(max(1, -(-len(line) // width)) for line in lines)
-        return height > max(self._c.size.height - 8, 10)
+        return height > max(self._console.size.height - 8, 10)
 
     def _page(self, preview: Display) -> None:
         """Показать превью в просмотрщике (less и т.п.) — длинную команду целиком."""
-        body = visible_text(preview.text.rstrip("\n"), numbered=True, palette=self._p)
-        with self._input_guard(), self._c.pager(styles=True):
-            self._c.print(Text(preview.title or "превью", style=self._p.muted))
-            self._c.print(body)
+        body = visible_text(preview.text.rstrip("\n"), numbered=True, palette=self._palette)
+        with self._input_guard(), self._console.pager(styles=True):
+            self._console.print(Text(preview.title or "превью", style=self._palette.muted))
+            self._console.print(body)
 
     def ask(self, question: str, *, dangerous: bool = False) -> bool:
         """Вопрос да/нет. Ctrl+C/Ctrl+D — «нет»."""
-        return self._question(question, dangerous=dangerous) in _YES
+        return self._question(question, dangerous=dangerous) in _YES_ANSWERS
 
     def _question(self, question: str, *, dangerous: bool, always: str | None = None) -> str:
         """Ответ на вопрос (в нижнем регистре); Ctrl+C/Ctrl+D — пустой."""
@@ -1328,76 +1535,79 @@ class Console(AgentEvents):
         feedback: bool = False,
         view: bool = False,
     ) -> str | None:
-        """Ответ как введён; None — ответа не было (Ctrl+C/Ctrl+D, конец ввода, ввод не
-        с терминала там, где отвечать можно только с клавиатуры)."""
+        """Ответ как введён; None — ответа не было.
+
+        Ответа нет при Ctrl+C/Ctrl+D, конце ввода и вводе не с терминала там, где отвечать
+        можно только с клавиатуры.
+        """
         self._flush_group()
         self.stop_live()
-        p = self._p
-        bar = self._bar(dangerous=dangerous)
+        palette = self._palette
+        stripe = self._stripe(dangerous=dangerous)
         if self._no_keyboard():
             self._out(
                 Text.assemble(
-                    bar,
-                    (f"{question} ", f"bold {p.fg}"),
-                    ("— ответить можно только с клавиатуры, а ввод не с терминала: ", p.muted),
-                    ("нет", f"bold {p.fg}"),
-                )
+                    stripe,
+                    (f"{question} ", f"bold {palette.fg}"),
+                    (
+                        "— ответить можно только с клавиатуры, а ввод не с терминала: ",
+                        palette.muted,
+                    ),
+                    ("нет", f"bold {palette.fg}"),
+                ),
             )
             self._blank = False
             return None
-        notes = []
-        if always is not None:
-            notes.append(f"a — {always}")
-        elif dangerous and feedback:
-            notes.append("запомнить нельзя")
-        if view:
-            notes.append("v — открыть целиком в просмотрщике")
-        if feedback:
-            notes.append("или напишите, что сделать вместо этого")
+        notes = _question_notes(always, dangerous=dangerous, feedback=feedback, view=view)
         joined = " · ".join(notes)
-        if len(joined) + len(bar[0]) < self._c.width:
+        if len(joined) + len(stripe[0]) < self._console.width:
             notes = [joined] if notes else []
         for note in notes:  # не помещаются в строку — по строке на подсказку
-            self._out(Text.assemble(bar, (note, p.dim)))
-        mark = f"{ICON_DANGER} " if dangerous else "? "
-        keys = "y/N" + ("/a" if always is not None else "") + ("/v" if view else "")
+            self._out(Text.assemble(stripe, (note, palette.dim)))
+        mark = f"{theme.ICON_DANGER} " if dangerous else "? "
+        keys = "y/N"
+        if always is not None:
+            keys = f"{keys}/a"
+        if view:
+            keys = f"{keys}/v"
         prompt = Text.assemble(
-            bar,
-            (mark, f"bold {bar[1]}"),
-            (question, f"bold {p.fg}"),
-            (f" [{keys}] ", p.muted),
+            stripe,
+            (mark, f"bold {stripe[1]}"),
+            (question, f"bold {palette.fg}"),
+            (f" [{keys}] ", palette.muted),
         )
         try:
             with self._input_guard():
-                answer = self._c.input(prompt)
+                answer = self._console.input(prompt)
         except (EOFError, KeyboardInterrupt):
-            self._c.print()
+            self._console.print()
             return None
         finally:
             self._blank = False
         return answer
 
     # ---------------------------- вопросы агента ---------------------------- #
+    @override
     def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
         """Задаёт вопросы по очереди (меню со стрелками или ввод номера). None — отказ."""
         self._flush_group()
         self.stop_live()
         if not _stdin_is_terminal():
-            raise QuestionsUnavailable("ввод не с клавиатуры")
-        p = self._p
+            raise QuestionsUnavailableError("ввод не с клавиатуры")
+        palette = self._palette
         answers: list[Answer] = []
         with self._input_guard():
-            for i, question in enumerate(questions, 1):
+            for number, question in enumerate(questions, 1):
                 if question.body.strip():
                     self._question_body(question)
-                answer = self._ask_one(question, i, len(questions))
+                answer = self._ask_one(question, number, len(questions))
                 if answer is None:
                     self._emit(
                         Text.assemble(
-                            (f"{ICON_TOOL} ", p.dim),
-                            (sanitize(question.text), p.muted),
-                            ("  пользователь отказался отвечать", p.dim),
-                        )
+                            (f"{theme.ICON_TOOL} ", palette.dim),
+                            (sanitize(question.text), palette.muted),
+                            ("  пользователь отказался отвечать", palette.dim),
+                        ),
                     )
                     return None
                 self._emit(self._answered(question, answer))
@@ -1406,46 +1616,50 @@ class Console(AgentEvents):
 
     def _answered(self, question: Question, answer: Answer) -> Text:
         """Строка ленты после ответа: вопрос серым, ответ ярким."""
-        p = self._p
+        palette = self._palette
         line = Text.assemble(
-            (f"{ICON_TOOL} ", p.ok), (sanitize(question.text), p.muted), ("  ", "")
+            (f"{theme.ICON_TOOL} ", palette.ok),
+            (sanitize(question.text), palette.muted),
+            (_SPACER, ""),
         )
-        for i, label in enumerate(answer.selected):
-            if i:
-                line.append(", ", style=p.muted)
-            line.append(sanitize(label), style=f"bold {p.fg}")
+        for index, selected in enumerate(answer.selected):
+            if index:
+                line.append(_COMMA, style=palette.muted)
+            line.append(sanitize(selected), style=f"bold {palette.fg}")
         if answer.custom:
             if answer.selected:
-                line.append(", ", style=p.muted)
+                line.append(_COMMA, style=palette.muted)
             label = (question.custom_label or "Свой ответ…").rstrip("…").lower()
-            line.append(f"{label} ", style=p.muted)
-            line.append(f"«{sanitize(answer.custom)}»", style=f"bold {p.fg}")
+            line.append(f"{label} ", style=palette.muted)
+            line.append(f"«{sanitize(answer.custom)}»", style=f"bold {palette.fg}")
         if not answer.selected and not answer.custom:
-            line.append("(без ответа)", style=p.muted)
+            line.append("(без ответа)", style=palette.muted)
         return line
 
     def _question_body(self, question: Question) -> None:
         """Подробности к вопросу (например, план на одобрение) — Markdown в рамке."""
-        p = self._p
+        palette = self._palette
+        header = question.header or "подробности"
         self._emit(
             Panel(
                 Markdown(sanitize(question.body)),
-                title=Text(f" {question.header or 'подробности'} ", style=f"bold {p.brand}"),
+                title=Text(f" {header} ", style=f"bold {palette.brand}"),
                 title_align="left",
-                subtitle=Text(f" {sanitize(question.source)} ", style=p.dim)
+                subtitle=Text(f" {sanitize(question.source)} ", style=palette.dim)
                 if question.source
                 else None,
                 subtitle_align="right",
                 box=ROUNDED,
-                border_style=p.dim,
+                border_style=palette.dim,
                 padding=(1, 2),
-            )
+            ),
         )
 
     def _ask_one(self, question: Question, index: int, total: int) -> Answer | None:
         if self._live_ok:
             try:
-                from gigacrew.ui.choice import choose
+                # Меню на prompt_toolkit грузится лишь к первому вопросу: запуск быстрее.
+                from gigacrew.ui.choice import choose  # noqa: PLC0415
 
                 return choose(question, index, total, no_color=self._no_color)
             except (KeyboardInterrupt, EOFError):
@@ -1454,56 +1668,82 @@ class Console(AgentEvents):
 
     def _ask_plain(self, question: Question, index: int, total: int) -> Answer | None:
         """Запасной режим без интерактивного меню: номер(а) варианта или свой текст."""
-        p = self._p
-        bar = self._bar()
-        head = Text.assemble(bar, ("? ", f"bold {p.warn}"), (question.text, f"bold {p.fg}"))
+        stripe = self._stripe()
+        self._plain_menu(question, index, total, stripe)
+        while True:
+            try:
+                answer = self._plain_attempt(question, stripe)
+            except (EOFError, KeyboardInterrupt):
+                self._console.print()
+                return None
+            finally:
+                self._blank = False
+            if answer is not None:
+                return answer
+
+    def _plain_menu(
+        self,
+        question: Question,
+        index: int,
+        total: int,
+        stripe: tuple[str, str],
+    ) -> None:
+        """Вопрос запасного режима: заголовок и пронумерованные варианты."""
+        palette = self._palette
+        head = Text.assemble(
+            stripe,
+            ("? ", f"bold {palette.warn}"),
+            (question.text, f"bold {palette.fg}"),
+        )
         tag = question.header
         if total > 1:
             tag = f"{tag} · {index} из {total}" if tag else f"{index} из {total}"
         if tag:
-            head.append(f"   {tag}", style=p.muted)
+            head.append(f"   {tag}", style=palette.muted)
         self._out(head)
-        options = question.options
-        for k, option in enumerate(options, 1):
-            self._out(Text.assemble(bar, (f"  {k}. ", p.muted), (option.label, p.fg)))
+        for number, option in enumerate(question.options, 1):
+            self._out(
+                Text.assemble(stripe, (f"  {number}. ", palette.muted), (option.label, palette.fg)),
+            )
             if option.description:
-                self._out(Text.assemble(bar, (f"     {option.description}", p.dim)))
-        custom = len(options) + 1
+                self._out(Text.assemble(stripe, (f"     {option.description}", palette.dim)))
+        custom = len(question.options) + 1
         label = (question.custom_label or "Свой ответ…").rstrip("…")
         self._out(
             Text.assemble(
-                bar, (f"  {custom}. ", p.muted), (f"{label} (или просто напишите текст)", p.fg)
-            )
+                stripe,
+                (f"  {custom}. ", palette.muted),
+                (f"{label} (или просто напишите текст)", palette.fg),
+            ),
         )
+
+    def _plain_attempt(self, question: Question, stripe: tuple[str, str]) -> Answer | None:
+        """Одна попытка ответа в запасном режиме; None — спросить заново."""
+        palette = self._palette
+        options = question.options
+        custom = len(options) + 1
         hint = "номера через пробел" if question.multi_select else "номер"
-        while True:
-            try:
-                prompt = Text.assemble(bar, (f"{hint} или ответ: ", p.muted))
-                raw = self._c.input(prompt).strip()
-                if not raw:
-                    continue
-                numbers = raw.replace(",", " ").split()
-                if not numbers:
-                    continue  # одни запятые — спросить заново
-                # isdecimal, а не isdigit: «²» — цифра, но int() её не разберёт
-                if not all(n.isdecimal() and 1 <= int(n) <= custom for n in numbers):
-                    return Answer(custom=raw)  # не номера — это свой ответ
-                picked = sorted({int(n) for n in numbers})
-                if len(picked) > 1 and not question.multi_select:
-                    self.warn("здесь можно выбрать только один вариант")
-                    continue
-                text = ""
-                if custom in picked:
-                    text = self._c.input(Text.assemble(bar, ("ваш ответ: ", p.muted))).strip()
-                    if not text:
-                        continue
-                labels = tuple(options[n - 1].label for n in picked if n != custom)
-                return Answer(labels, text)
-            except (EOFError, KeyboardInterrupt):
-                self._c.print()
+        prompt = Text.assemble(stripe, (f"{hint} или ответ: ", palette.muted))
+        raw = self._console.input(prompt).strip()
+        numbers = raw.replace(",", " ").split()
+        if not numbers:
+            return None  # пусто или одни запятые — спросить заново
+        # isdecimal, а не isdigit: «²» — цифра, но int() её не разберёт
+        if not all(number.isdecimal() and 1 <= int(number) <= custom for number in numbers):
+            return Answer(custom=raw)  # не номера — это свой ответ
+        picked = sorted({int(number) for number in numbers})
+        if len(picked) > 1 and not question.multi_select:
+            self.warn("здесь можно выбрать только один вариант")
+            return None
+        text = ""
+        if custom in picked:
+            text = self._console.input(
+                Text.assemble(stripe, ("ваш ответ: ", palette.muted)),
+            ).strip()
+            if not text:
                 return None
-            finally:
-                self._blank = False
+        labels = tuple(options[number - 1].label for number in picked if number != custom)
+        return Answer(labels, text)
 
     # ---------------------------- сохранённые чаты ---------------------------- #
     def pick_chat(self, chats: Sequence[ChatInfo], current_id: str = "") -> ChatInfo | None:
@@ -1517,7 +1757,8 @@ class Console(AgentEvents):
             return None
         if self._live_ok and _stdin_is_terminal():
             try:
-                from gigacrew.ui.chat_picker import pick_chat
+                # Меню на prompt_toolkit грузится лишь к выбору чата: запуск быстрее.
+                from gigacrew.ui.chat_picker import pick_chat  # noqa: PLC0415
 
                 return pick_chat(chats, current_id, no_color=self._no_color)
             except (KeyboardInterrupt, EOFError):
@@ -1525,24 +1766,26 @@ class Console(AgentEvents):
         return self._pick_chat_plain(chats, current_id)
 
     def _pick_chat_plain(self, chats: Sequence[ChatInfo], current_id: str) -> ChatInfo | None:
-        p = self._p
+        palette = self._palette
         table = Table.grid(padding=(0, 2))
-        table.add_column(style=p.muted, justify="right", no_wrap=True)
-        table.add_column(style=p.dim, no_wrap=True)
+        table.add_column(style=palette.muted, justify="right", no_wrap=True)
+        table.add_column(style=palette.dim, no_wrap=True)
         table.add_column()
-        for k, chat in enumerate(chats, 1):
+        for number, chat in enumerate(chats, 1):
             meta = f"{format_when(chat.updated_at)} · {chat_size(chat.requests, chat.messages)}"
-            title = Text(sanitize(chat.title), style=p.fg)
+            title = Text(sanitize(chat.title), style=palette.fg)
             if chat.id == current_id:
-                title.append(" (текущий)", style=p.muted)
-            table.add_row(f"{k}.", meta, title)
-        self.print(Text(f"Чаты проекта · {len(chats)}", style=f"bold {p.brand}"))
+                title.append(" (текущий)", style=palette.muted)
+            table.add_row(f"{number}.", meta, title)
+        self.print(Text(f"Чаты проекта · {len(chats)}", style=f"bold {palette.brand}"))
         self.print(table)
         while True:
             try:
-                raw = self._c.input(Text("  номер чата (Enter — отмена): ", style=p.muted))
+                raw = self._console.input(
+                    Text("  номер чата (Enter — отмена): ", style=palette.muted),
+                )
             except (EOFError, KeyboardInterrupt):
-                self._c.print()
+                self._console.print()
                 return None
             raw = raw.strip()
             if not raw:
@@ -1553,9 +1796,9 @@ class Console(AgentEvents):
 
     def chat_resumed(
         self,
-        info: ChatInfo,
+        chat: ChatInfo,
         messages: Sequence[Message],
-        describe: Callable[[FunctionCall], ToolCallInfo] | None = None,
+        describe: Callable[[FunctionCall], events.ToolCallInfo] | None = None,
     ) -> None:
         """Сообщение о продолжении чата и последние обмены репликами.
 
@@ -1564,44 +1807,52 @@ class Console(AgentEvents):
         ленте, но приглушены и без итогов: результатов в истории нет. Более ранние
         обмены — одной строкой со счётчиками: они сохранены в чате, но не печатаются.
         """
-        p = self._p
-        line = Text("↺ продолжаем чат ", style=p.muted)
-        line.append(f"«{sanitize(info.title)}»", style=f"bold {p.fg}")
+        palette = self._palette
+        line = Text("↺ продолжаем чат ", style=palette.muted)
+        line.append(f"«{sanitize(chat.title)}»", style=f"bold {palette.fg}")
         line.append(
-            f" · {chat_size(info.requests, info.messages)} · {format_when(info.updated_at)}",
-            style=p.muted,
+            f" · {chat_size(chat.requests, chat.messages)} · {format_when(chat.updated_at)}",
+            style=palette.muted,
         )
         self.print(line)
         starts = _exchange_starts(messages)[-RESUME_EXCHANGES:]
         if starts and starts[0] > 0:
             earlier = messages[: starts[0]]
-            size = chat_size(sum(1 for m in earlier if m.is_request), len(earlier))
+            size = chat_size(sum(1 for message in earlier if message.is_request), len(earlier))
             self.print(
-                Text(f"  … раньше: {size} — сохранены в чате, на экран не выводятся", style=p.dim)
+                Text(
+                    f"  … раньше: {size} — сохранены в чате, на экран не выводятся",
+                    style=palette.dim,
+                ),
             )
-        for k, start in enumerate(starts):
-            end = starts[k + 1] if k + 1 < len(starts) else len(messages)
-            if k:
+        for index, start in enumerate(starts):
+            end = starts[index + 1] if index + 1 < len(starts) else len(messages)
+            if index:
                 self.print()
-            self._resumed_exchange(messages[start:end], describe, last=k == len(starts) - 1)
+            self._resumed_exchange(messages[start:end], describe, last=index == len(starts) - 1)
         self.print()
 
     def _resumed_exchange(
         self,
         messages: Sequence[Message],
-        describe: Callable[[FunctionCall], ToolCallInfo] | None,
+        describe: Callable[[FunctionCall], events.ToolCallInfo] | None,
         *,
         last: bool,
     ) -> None:
         """Обмен продолженного чата (``messages[0]`` — запрос); ответ ранних — сокращён."""
-        p = self._p
-        shown = clip_lines(request_text(messages[0].content), head=3, tail=2, max_chars=600)
-        self.print(Text.assemble(("❯ ", f"bold {p.brand}"), (sanitize(shown), p.fg)))
+        palette = self._palette
+        shown = clip_lines(
+            request_text(messages[0].content),
+            head=3,
+            tail=2,
+            max_chars=_RESUME_REQUEST_CHARS,
+        )
+        self.print(Text.assemble(("❯ ", f"bold {palette.brand}"), (sanitize(shown), palette.fg)))
         calls = [
-            describe(call) if describe is not None else ToolCallInfo(call.name)
-            for m in messages
-            if m.role == "assistant"
-            for call in m.function_calls
+            events.ToolCallInfo(call.name) if describe is None else describe(call)
+            for message in messages
+            if message.role == "assistant"
+            for call in message.function_calls
         ]
         for line in self._history_lines(calls):
             self.print(line)
@@ -1609,62 +1860,105 @@ class Console(AgentEvents):
         # предыдущий запрос здесь выглядел бы ответом на этот.
         answer = next(
             (
-                m.content
-                for m in reversed(messages)
-                if m.role == "assistant" and not m.function_calls and m.content.strip()
+                message.content
+                for message in reversed(messages)
+                if message.role == "assistant"
+                and not message.function_calls
+                and message.content.strip()
             ),
             "",
         )
         if not answer:
-            self.print(Text("  (ответа нет — ход не был завершён)", style=p.muted))
+            self.print(Text("  (ответа нет — ход не был завершён)", style=palette.muted))
             return
         if not last:
-            answer = clip_lines(answer, head=6, tail=2, max_chars=1200)
+            answer = clip_lines(answer, head=6, tail=2, max_chars=_RESUME_ANSWER_CHARS)
         self.on_assistant_text(answer)
         self._gap = False
 
-    def _history_lines(self, calls: Sequence[ToolCallInfo]) -> list[Text]:
-        """Шаги из истории: подряд идущие чтения и правки — одной строкой, как в ленте;
-        не больше :data:`RESUME_CALLS` строк, ранние — счётчиком."""
-        p = self._p
-        entries: list[list[ToolCallInfo]] = []
-        for call in calls:
-            kind = _group_kind(call)
-            if kind and entries and _group_kind(entries[-1][0]) == kind:
-                entries[-1].append(call)
-            else:
-                entries.append([call])
+    def _history_lines(self, calls: Sequence[events.ToolCallInfo]) -> list[Text]:
+        """Шаги из истории: подряд идущие чтения и правки — одной строкой, как в ленте.
+
+        Не больше :data:`RESUME_CALLS` строк, ранние — счётчиком.
+        """
+        entries = _history_entries(calls)
         lines = []
         if len(entries) > RESUME_CALLS:
             hidden = sum(len(entry) for entry in entries[:-RESUME_CALLS])
             word = plural(hidden, "вызов", "вызова", "вызовов")
-            lines.append(Text(f"  … ещё {hidden} {word} инструментов", style=p.dim))
+            lines.append(Text(f"  … ещё {hidden} {word} инструментов", style=self._palette.dim))
             entries = entries[-RESUME_CALLS:]
-        for entry in entries:
-            first = entry[0]
-            kind = _group_kind(first)
-            targets = list(dict.fromkeys(t for call in entry if (t := _target(call))))
-            detail = ""
-            if kind == "read" and len(entry) > 1:
-                head = f"Изучил код  {_read_counts(entry)}"
-                detail = "  ".join(targets)
-            elif kind == "edit" and targets:
-                n = len(targets)
-                files = ", ".join(targets)
-                head = f"Изменил {files}" if n <= 3 else f"Изменил {n} файлов: {files}"
-            elif first.kind is ToolKind.COMMAND and targets:
-                head = f"$ {targets[0]}"
-            else:
-                head = f"{first.name} {_target(first)}".strip()
-            lines.append(self._fit(Text.assemble((f"{ICON_TOOL} ", p.dim), (head, p.muted))))
-            if detail:
-                lines.append(self._fit(Text(f"  {detail}", style=p.dim)))
+        lines += [line for entry in entries for line in self._history_entry(entry)]
+        return lines
+
+    def _history_entry(self, entry: Sequence[events.ToolCallInfo]) -> list[Text]:
+        """Строка шага (группы вызовов) из истории и, у группы чтений, её цели."""
+        palette = self._palette
+        head, detail = _history_head(entry)
+        lines = [
+            self._fit(Text.assemble((f"{theme.ICON_TOOL} ", palette.dim), (head, palette.muted))),
+        ]
+        if detail:
+            lines.append(self._fit(Text(f"  {detail}", style=palette.dim)))
         return lines
 
 
-def _command_dir(call: ToolCallInfo, preview: Display | None) -> str:
-    """Каталог, где выполнится команда, если не корень проекта: превью команды
-    подписано «команда · <каталог>». Пусто — в корне (или это не команда)."""
+def _confirm_question(call: events.ToolCallInfo, *, dangerous: bool) -> str:
+    """Вопрос о вызове: применить правку, выполнить команду или инструмент."""
+    if call.kind is ToolKind.EDIT:
+        return "Применить правку?"
+    if call.kind is ToolKind.COMMAND:
+        return "Выполнить опасную команду?" if dangerous else "Выполнить команду?"
+    return f"Выполнить {call.name}?"
+
+
+def _always_note(call: events.ToolCallInfo, *, dangerous: bool) -> str | None:
+    """Что запомнит ответ «всегда»; None — так ответить нельзя."""
+    if dangerous:  # опасное «навсегда» не разрешается
+        return None
+    if call.remember:
+        return sanitize(call.remember)
+    return "не спрашивать этот вызов до конца сессии"
+
+
+def _confirm_result(raw: str, always: str | None) -> events.ConfirmResult:
+    """Решение по ответу на вопрос о вызове (ответ — как введён)."""
+    answer = raw.strip().lower()
+    if answer in _YES_ANSWERS:
+        return events.ConfirmResult(events.Approval.YES)
+    if always is not None and answer in _ALWAYS_ANSWERS:
+        return events.ConfirmResult(events.Approval.ALWAYS)
+    if not answer or answer in _NO_ANSWERS:
+        return events.ConfirmResult(events.Approval.NO)
+    # Свой ответ вместо y/n — отказ с объяснением: его получит модель.
+    return events.ConfirmResult(events.Approval.NO, feedback=raw.strip())
+
+
+def _question_notes(
+    always: str | None,
+    *,
+    dangerous: bool,
+    feedback: bool,
+    view: bool,
+) -> list[str]:
+    """Подсказки к вопросу: что запомнит «a», что откроет «v», можно ли ответить текстом."""
+    notes = []
+    if always is not None:
+        notes.append(f"a — {always}")
+    elif dangerous and feedback:
+        notes.append("запомнить нельзя")
+    if view:
+        notes.append("v — открыть целиком в просмотрщике")
+    if feedback:
+        notes.append("или напишите, что сделать вместо этого")
+    return notes
+
+
+def _command_dir(call: events.ToolCallInfo, preview: Display | None) -> str:
+    """Каталог, где выполнится команда, если не корень проекта.
+
+    Превью команды подписано «команда · <каталог>». Пусто — в корне (или это не команда).
+    """
     if call.kind is not ToolKind.COMMAND or preview is None:
         return ""
     head, sep, where = preview.title.partition(" · ")
@@ -1673,13 +1967,48 @@ def _command_dir(call: ToolCallInfo, preview: Display | None) -> str:
 
 def _exchange_starts(messages: Sequence[Message]) -> list[int]:
     """Индексы запросов пользователя с текстом — начала обменов (служебные — не запросы)."""
-    return [k for k, m in enumerate(messages) if m.is_request and m.content.strip()]
+    return [
+        index
+        for index, message in enumerate(messages)
+        if message.is_request and message.content.strip()
+    ]
 
 
-_YES = ("y", "yes", "д", "да")
-_NO = ("n", "no", "н", "нет", "т")  # н, т — клавиши y и n в русской раскладке: не «да»
-_ALWAYS = ("a", "always", "в", "всегда", "ф")  # ф — клавиша a в русской раскладке
-_VIEW = ("v", "view", "м", "показать")  # м — клавиша v в русской раскладке
+def _history_entries(calls: Sequence[events.ToolCallInfo]) -> list[list[events.ToolCallInfo]]:
+    """Вызовы из истории по группам: подряд идущие чтения и правки — вместе."""
+    entries: list[list[events.ToolCallInfo]] = []
+    for call in calls:
+        kind = _group_kind(call)
+        if kind and entries and _group_kind(entries[-1][0]) == kind:
+            entries[-1].append(call)
+        else:
+            entries.append([call])
+    return entries
+
+
+def _history_head(entry: Sequence[events.ToolCallInfo]) -> tuple[str, str]:
+    """Строка шага из истории и подробности под ней (цели группы чтений)."""
+    first = entry[0]
+    kind = _group_kind(first)
+    targets = list(dict.fromkeys(target for call in entry if (target := _target(call))))
+    if kind == "read" and len(entry) > 1:
+        counts = _read_counts(entry)
+        return f"Изучил код  {counts}", _SPACER.join(targets)
+    if kind == "edit" and targets:
+        files = _COMMA.join(targets)
+        if len(targets) <= 3:
+            return f"Изменил {files}", ""
+        return f"Изменил {len(targets)} файлов: {files}", ""
+    if first.kind is ToolKind.COMMAND and targets:
+        return f"$ {targets[0]}", ""
+    target = _target(first)
+    return f"{first.name} {target}".strip(), ""
+
+
+_YES_ANSWERS = ("y", "yes", "д", "да")
+_NO_ANSWERS = ("n", "no", "н", "нет", "т")  # н, т — клавиши y и n в русской раскладке: не «да»
+_ALWAYS_ANSWERS = ("a", "always", "в", "всегда", "ф")  # ф — клавиша a в русской раскладке
+_VIEW_ANSWERS = ("v", "view", "м", "показать")  # м — клавиша v в русской раскладке
 
 
 def _stdin_is_terminal() -> bool:

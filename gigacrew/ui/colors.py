@@ -9,18 +9,21 @@ rich сам понижает точные цвета, если терминал 
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
+
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.styles import Style
 from rich.console import Console
 
 from gigacrew.ui.theme import palette_for, prompt_styles
 
-_DEPTHS = {
+_DEPTHS: Mapping[str, ColorDepth] = MappingProxyType({
     "truecolor": ColorDepth.TRUE_COLOR,
     "256": ColorDepth.DEPTH_8_BIT,
     "standard": ColorDepth.DEPTH_4_BIT,
     "windows": ColorDepth.DEPTH_4_BIT,
-}
+})
 
 
 def color_system() -> str | None:
@@ -33,9 +36,12 @@ def prompt_style() -> Style:
     return Style.from_dict(prompt_styles(palette_for(color_system())))
 
 
-def prompt_color_depth(no_color: bool) -> ColorDepth | None:
-    """Глубина цвета для prompt_toolkit: та же, что у rich. None — решает prompt_toolkit
-    (не терминал); ``PROMPT_TOOLKIT_COLOR_DEPTH`` и ``NO_COLOR`` по-прежнему главнее."""
+def prompt_color_depth(*, no_color: bool) -> ColorDepth | None:
+    """Глубина цвета для prompt_toolkit: та же, что у rich.
+
+    None — решает prompt_toolkit (не терминал); ``PROMPT_TOOLKIT_COLOR_DEPTH``
+    и ``NO_COLOR`` по-прежнему главнее.
+    """
     if no_color:
         return ColorDepth.MONOCHROME
     env = ColorDepth.from_env()

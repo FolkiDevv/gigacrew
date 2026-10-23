@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 UV ?= uv
 
-.PHONY: help install dev lock run test test-all eval probe lint format check clean
+.PHONY: help install dev lock run test test-all eval probe lint audit format check clean
 
 help: ## Показать список команд
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -10,7 +10,7 @@ help: ## Показать список команд
 install: ## Установить runtime-зависимости в .venv (без dev-группы)
 	$(UV) sync --no-dev
 
-dev: ## Установить пакет + dev-группу (pytest, ruff)
+dev: ## Установить пакет + dev-группу (pytest, линтеры, mypy)
 	$(UV) sync
 
 lock: ## Обновить uv.lock после правки зависимостей в pyproject.toml
@@ -31,16 +31,28 @@ eval: ## Поведенческие сценарии на живых модел�
 probe: ## Пробы шлюза: рассуждения, top_p, кеш префикса (live)
 	$(UV) run pytest tests/test_api_probe_live.py -v $(ARGS)
 
-lint: ## Проверить стиль и ошибки (ruff)
+lint: ## Все статические проверки — как в CI (по образцу wemake-django-template)
 	$(UV) run ruff check .
-	$(UV) run ruff format --check .
+	$(UV) run ruff format --check --diff .
+	$(UV) run flake8 .
+	$(UV) run lint-imports
+	$(UV) run mypy
+	$(UV) run codespell .
+	$(UV) run typos .
+	$(UV) run yamllint -s .
+	$(UV) run dotenv-linter .env.example
+	$(UV) run deptry .
+	$(UV) lock --check
+	$(UV) pip check
+
+audit: ## Известные уязвимости зависимостей (pip-audit; в CI не блокирует)
+	$(UV) run pip-audit --skip-editable --desc
 
 format: ## Автоформатирование и автофиксы (ruff)
-	$(UV) run ruff format .
 	$(UV) run ruff check --fix .
+	$(UV) run ruff format .
 
 check: lint test ## Линт + офлайн-тесты (запускайте перед пушем)
-	$(UV) lock --check
 
 clean: ## Удалить кеши и артефакты сборки
 	rm -rf build dist *.egg-info .pytest_cache .ruff_cache .mypy_cache htmlcov .coverage

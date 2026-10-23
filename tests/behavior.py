@@ -38,24 +38,25 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, override
 
 from fakes import RecordingEvents
 
 from gigacrew.agent.context_window import CHARS_PER_TOKEN
+from gigacrew.agent.events import ToolCallInfo
 from gigacrew.agent.loop import PLAN_BLOCKED_NOTE, REJECTED_NOTE, SELF_CHECK_NOTE, Agent
 from gigacrew.agent.prompts import REVIEWER_PROMPT, SUBAGENT_PROMPT
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMProvider
 from gigacrew.llm.model_windows import ModelWindows
-from gigacrew.llm.types import AssistantTurn, FunctionCall, Message
+from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.index import INDEX_ERRORS, ProjectIndex
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety import CommandLevel, classify
-from gigacrew.tools.base import build_default_registry
+from gigacrew.tools.base import Display, build_default_registry
 from gigacrew.tools.plan import APPROVE, PLAN_QUESTION
 from gigacrew.tools.questions import Answer, Question
 
@@ -79,20 +80,18 @@ PLAN_BLOCKED_MARK = PLAN_BLOCKED_NOTE.split("{path}")[0]
 # Уведомление о паузе из-за лимита запросов шлюза (429).
 RATE_LIMIT_MARK = "(429)"
 # Инструменты исследования кода: их вызовы основным агентом — «работа вместо суб-агента».
-RESEARCH_TOOLS = frozenset(
-    {
-        "read_file",
-        "list_dir",
-        "find_files",
-        "search_content",
-        "find_symbol",
-        "find_references",
-        "goto_definition",
-        "call_hierarchy",
-        "file_outline",
-        "repo_map",
-    }
-)
+RESEARCH_TOOLS = frozenset((
+    "read_file",
+    "list_dir",
+    "find_files",
+    "search_content",
+    "find_symbol",
+    "find_references",
+    "goto_definition",
+    "call_hierarchy",
+    "file_outline",
+    "repo_map",
+))
 MAX_ANSWER_CHARS = 2_000
 # Начало системного промпта суб-агента: так запись запроса отличает его от основного.
 _SUBAGENT_MARK = SUBAGENT_PROMPT[:60]
@@ -110,10 +109,10 @@ def env_int(env: Mapping[str, str], name: str, default: int) -> int:
     if not raw:
         return default
     try:
-        value = int(raw)
+        number = int(raw)
     except ValueError:
         raise ValueError(f"{name}: ожидается целое число, получено {raw!r}") from None
-    return max(value, 1)
+    return max(number, 1)
 
 
 def report_dir(env: Mapping[str, str]) -> Path:
@@ -125,9 +124,8 @@ def report_dir(env: Mapping[str, str]) -> Path:
 # --------------------------------------------------------------------------- #
 # Учебный проект
 # --------------------------------------------------------------------------- #
-FIXTURE_FILES: dict[str, str] = {
-    ".gitignore": "__pycache__/\n.pytest_cache/\n.gigacode/\ndata/\n",
-    "README.md": """\
+# Тексты файлов проекта — в отдельных константах, их список — в FIXTURE_FILES.
+_README_MD = """\
 # shop
 
 Учебный интернет-магазин: корзина, заказы, оплата и хранилище заказов в JSON-файле.
@@ -138,8 +136,9 @@ FIXTURE_FILES: dict[str, str] = {
 - `shop/config.py` — настройки.
 
 Тесты: `python -m pytest -q`.
-""",
-    "pyproject.toml": """\
+"""
+
+_PYPROJECT_TOML = """\
 [project]
 name = "shop"
 version = "0.1.0"
@@ -148,9 +147,9 @@ requires-python = ">=3.11"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-""",
-    "shop/__init__.py": '"""Учебный интернет-магазин."""\n',
-    "shop/config.py": '''\
+"""
+
+_SHOP_CONFIG = '''\
 """Настройки магазина."""
 
 from dataclasses import dataclass
@@ -174,8 +173,9 @@ def load_settings(env: dict[str, str]) -> Settings:
         storage_path=Path(env.get("SHOP_STORAGE", "data/orders.json")),
         currency=env.get("SHOP_CURRENCY", "RUB"),
     )
-''',
-    "shop/errors.py": '''\
+'''
+
+_SHOP_ERRORS = '''\
 """Исключения магазина. HTTP-слой превращает их в ответы (shop/api.py)."""
 
 
@@ -197,8 +197,9 @@ class PaymentError(ShopError):
 
 class StorageError(ShopError):
     """Хранилище недоступно или повреждено."""
-''',
-    "shop/money.py": '''\
+'''
+
+_SHOP_MONEY = '''\
 """Деньги: суммы хранятся в копейках (int)."""
 
 from shop.errors import ValidationError
@@ -222,8 +223,9 @@ def parse_price(text: str) -> int:
 def format_price(kopecks: int, currency: str = "RUB") -> str:
     """1250 -> '12.50 RUB'."""
     return f"{kopecks // 100}.{kopecks % 100:02d} {currency}"
-''',
-    "shop/models.py": '''\
+'''
+
+_SHOP_MODELS = '''\
 """Модели данных магазина."""
 
 from dataclasses import dataclass, field
@@ -252,8 +254,9 @@ class Order:
     items: list[CartItem] = field(default_factory=list)
     total: int = 0
     status: str = "new"  # new -> paid | failed
-''',
-    "shop/cart.py": '''\
+'''
+
+_SHOP_CART = '''\
 """Корзина покупателя."""
 
 from shop.config import MAX_CART_ITEMS
@@ -291,8 +294,9 @@ class Cart:
 
     def total(self) -> int:
         return sum(item.total for item in self._items.values())
-''',
-    "shop/payments.py": '''\
+'''
+
+_SHOP_PAYMENTS = '''\
 """Платёжный шлюз (заглушка внешнего сервиса)."""
 
 from shop.errors import PaymentError
@@ -312,8 +316,9 @@ class PaymentGateway:
             raise PaymentError("платёж отклонён банком")
         self.charges.append((card, amount))
         return f"pay-{len(self.charges)}"
-''',
-    "shop/storage.py": '''\
+'''
+
+_SHOP_STORAGE = '''\
 """Хранилище заказов в JSON-файле."""
 
 import json
@@ -352,8 +357,9 @@ class JsonStorage:
         if order is None:
             raise NotFoundError(f"заказ {order_id} не найден")
         return order["status"]
-''',
-    "shop/orders.py": '''\
+'''
+
+_SHOP_ORDERS = '''\
 """Оформление заказов."""
 
 import uuid
@@ -384,8 +390,9 @@ class OrderService:
         order.status = "paid"
         self.storage.save_order(order)
         return order
-''',
-    "shop/api.py": '''\
+'''
+
+_SHOP_API = '''\
 """HTTP-слой: маршруты и превращение ошибок магазина в ответы."""
 
 from collections.abc import Callable
@@ -445,8 +452,9 @@ class App:
 
     def order_status(self, payload: dict) -> dict:
         return {"status": self.orders.storage.order_status(payload["order"])}
-''',
-    "tests/test_money.py": """\
+'''
+
+_TEST_MONEY = """\
 import pytest
 
 from shop.errors import ValidationError
@@ -468,8 +476,9 @@ def test_parse_price_rejects_garbage():
 
 def test_format_price():
     assert format_price(1250) == "12.50 RUB"
-""",
-    "tests/test_cart.py": """\
+"""
+
+_TEST_CART = """\
 import pytest
 
 from shop.cart import Cart
@@ -498,8 +507,25 @@ def test_limit():
 def test_remove_missing():
     with pytest.raises(NotFoundError):
         Cart().remove("nope")
-""",
-}
+"""
+
+FIXTURE_FILES: Mapping[str, str] = MappingProxyType({
+    ".gitignore": "__pycache__/\n.pytest_cache/\n.gigacode/\ndata/\n",
+    "README.md": _README_MD,
+    "pyproject.toml": _PYPROJECT_TOML,
+    "shop/__init__.py": '"""Учебный интернет-магазин."""\n',
+    "shop/config.py": _SHOP_CONFIG,
+    "shop/errors.py": _SHOP_ERRORS,
+    "shop/money.py": _SHOP_MONEY,
+    "shop/models.py": _SHOP_MODELS,
+    "shop/cart.py": _SHOP_CART,
+    "shop/payments.py": _SHOP_PAYMENTS,
+    "shop/storage.py": _SHOP_STORAGE,
+    "shop/orders.py": _SHOP_ORDERS,
+    "shop/api.py": _SHOP_API,
+    "tests/test_money.py": _TEST_MONEY,
+    "tests/test_cart.py": _TEST_CART,
+})
 
 
 def make_project(root: Path) -> Path:
@@ -522,7 +548,13 @@ def _git_init(root: Path) -> None:
         ["add", "-A"],
         [*identity, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "shop: исходная версия"],
     ):
-        done = subprocess.run([git, *args], cwd=root, capture_output=True, timeout=60)
+        done = subprocess.run(
+            [git, *args],
+            cwd=root,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
         if done.returncode != 0:
             return
 
@@ -533,7 +565,7 @@ def build_index(root: Path) -> None:
     try:
         index.refresh()
     except INDEX_ERRORS:
-        pass  # без индекса навигация работает медленнее, но работает
+        return  # без индекса навигация работает медленнее, но работает
     finally:
         index.close()
 
@@ -548,13 +580,14 @@ def run_fixture_tests(root: Path, timeout: int = 300) -> bool:
             capture_output=True,
             timeout=timeout,
             env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         return False
     return done.returncode == 0
 
 
-_SNAPSHOT_SKIP = frozenset({".git", ".gigacode", "__pycache__", ".pytest_cache"})
+_SNAPSHOT_SKIP = frozenset((".git", ".gigacode", "__pycache__", ".pytest_cache"))
 
 
 def snapshot(root: Path) -> dict[str, str]:
@@ -570,7 +603,8 @@ def snapshot(root: Path) -> dict[str, str]:
 
 def changed_files(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:
     """Добавленные, изменённые и удалённые файлы."""
-    return sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
+    paths = before.keys() | after.keys()
+    return sorted(path for path in paths if before.get(path) != after.get(path))
 
 
 # --------------------------------------------------------------------------- #
@@ -596,7 +630,7 @@ def is_safe_command(command: str, *, root: Path) -> bool:
     отказ: eval идёт без присмотра на машине разработчика.
     """
     verdict = classify(command, root=root)
-    if verdict.level not in (CommandLevel.READ, CommandLevel.EXEC) or not verdict.composable:
+    if verdict.level not in {CommandLevel.READ, CommandLevel.EXEC} or not verdict.composable:
         return False
     for part in verdict.parts:
         if _CLASSIFIER_GAPS.search(part.text):
@@ -642,22 +676,27 @@ class ScriptedUser(RecordingEvents):
         self.model_questions = 0  # вопросов модели через ask_user
         self.commands: list[tuple[str, bool]] = []  # (команда, подтверждена)
 
+    @override
     def on_stream_delta(self, text: str) -> None:
         """Куски потока не копятся: итоговый текст есть в истории."""
 
-    def ask_user(self, questions):
-        questions = list(questions)
-        self.questions.append(questions)
-        if is_plan_question(questions):
-            self.plans.append(questions[0].body)
+    @override
+    def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
+        """План — ответ по сценарию (по порядку), вопрос модели — первый вариант."""
+        asked = list(questions)
+        self.questions.append(asked)
+        if is_plan_question(asked):
+            self.plans.append(asked[0].body)
             if self._on_plan is not None:
                 self._on_plan()
             answer = self._plan_answers.pop(0) if self._plan_answers else None
             return None if answer is None else [answer]
-        self.model_questions += len(questions)
-        return [_first_option(q) for q in questions]
+        self.model_questions += len(asked)
+        return [_first_option(question) for question in asked]
 
-    def confirm(self, call, preview, *, dangerous):
+    @override
+    def confirm(self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool) -> bool:
+        """Подтверждает правки файлов и безопасные команды, остальное отклоняет."""
         self.confirms.append((call, preview, dangerous))
         if dangerous:
             return False
@@ -665,7 +704,7 @@ class ScriptedUser(RecordingEvents):
             return True
         if call.kind is ToolKind.COMMAND:
             # В описании вызова команда обрезана — полная только в превью.
-            command = preview.text.removeprefix("$ ") if preview is not None else call.summary
+            command = call.summary if preview is None else preview.text.removeprefix("$ ")
             allowed = is_safe_command(command, root=self._root)
             self.commands.append((command, allowed))
             return allowed
@@ -686,16 +725,31 @@ class RecordingProvider(LLMProvider):
         self.calls: list[dict[str, Any]] = []
 
     @property
+    @override
     def model(self) -> str:
         return self.inner.model
 
-    def complete(self, messages, tools=None, **kwargs) -> AssistantTurn:
+    @override
+    def complete(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None = None,
+        **kwargs: Any,
+    ) -> AssistantTurn:
         started = time.monotonic()
         turn = self.inner.complete(messages, tools, **kwargs)
         self._record(messages, tools, kwargs, turn, started)
         return turn
 
-    def stream(self, messages, tools=None, *, on_delta=None, **kwargs) -> AssistantTurn:
+    @override
+    def stream(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None = None,
+        *,
+        on_delta: Callable[[str], None] | None = None,
+        **kwargs: Any,
+    ) -> AssistantTurn:
         started = time.monotonic()
         turn = self.inner.stream(messages, tools, on_delta=on_delta, **kwargs)
         self._record(messages, tools, kwargs, turn, started)
@@ -704,7 +758,7 @@ class RecordingProvider(LLMProvider):
     def _record(
         self,
         messages: Sequence[Message],
-        tools: Any,
+        tools: Sequence[ToolSpec] | None,
         kwargs: Mapping[str, Any],
         turn: AssistantTurn,
         started: float,
@@ -728,7 +782,7 @@ class RecordingProvider(LLMProvider):
                 "text": bool(turn.message.content.strip()),
                 "tool_choice": kwargs.get("tool_choice", "auto"),
                 "duration_s": round(time.monotonic() - started, 2),
-            }
+            },
         )
 
 
@@ -783,7 +837,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(Turn(PROMO_TASK),),
         plan_answers=(None,),
         plan_only=True,
-        check=lambda r: r["plan_shown"] >= 1,
+        check=lambda record: record["plan_shown"] >= 1,
     ),
     Scenario(
         id="plan_detailed",
@@ -792,7 +846,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(Turn(f"{PROMO_TASK} {DETAILED_PLAN}"),),
         plan_answers=(None,),
         plan_only=True,
-        check=lambda r: r["plan_shown"] >= 1,
+        check=lambda record: record["plan_shown"] >= 1,
     ),
     Scenario(
         id="plan_remarks",
@@ -801,7 +855,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(Turn(PROMO_TASK),),
         plan_answers=(Answer((), custom=PLAN_REMARKS), None),
         plan_only=True,
-        check=lambda r: r["plan_shown"] >= 2 and r["plan_revised"],
+        check=lambda record: record["plan_shown"] >= 2 and record["plan_revised"],
     ),
     Scenario(
         id="plan_implement",
@@ -811,7 +865,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         plan_answers=(Answer((APPROVE,)),),
         files_expect={"shop/cart.py": "def clear"},
         run_tests=True,
-        check=lambda r: r["plan_shown"] >= 1 and bool(r["files_ok"]),
+        check=lambda record: record["plan_shown"] >= 1 and bool(record["files_ok"]),
     ),
     Scenario(
         id="plan_manual_exit",
@@ -824,7 +878,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         plan_answers=(None,),
         files_expect={"shop/cart.py": "def clear"},
         run_tests=True,
-        check=lambda r: bool(r["files_ok"]) and r["turns"][-1]["exit_calls"] == 0,
+        check=lambda record: bool(record["files_ok"]) and record["turns"][-1]["exit_calls"] == 0,
     ),
     Scenario(
         id="plan_question",
@@ -833,7 +887,9 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(Turn("Сколько товаров можно положить в корзину и где это проверяется?"),),
         expect=("50", "cart.py"),
         plan_only=True,
-        check=lambda r: r["plan_shown"] == 0 and not r["plan_written"] and r["answer_hits"] == 1.0,
+        check=lambda record: (
+            record["plan_shown"] == 0 and not record["plan_written"] and record["answer_hits"] == 1
+        ),
     ),
     Scenario(
         id="delegate_broad",
@@ -842,11 +898,11 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(
             Turn(
                 "Как в проекте устроена обработка ошибок: где какие исключения возникают и "
-                "как они превращаются в HTTP-ответы? Со ссылками path:line."
+                "как они превращаются в HTTP-ответы? Со ссылками path:line.",
             ),
         ),
         expect=("errors.py", "api.py", "storage.py", "payments.py"),
-        check=lambda r: r["explore_calls"] >= 1,
+        check=lambda record: record["explore_calls"] >= 1,
     ),
     Scenario(
         id="delegate_pinpoint",
@@ -854,7 +910,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         mode=PermissionMode.AUTO,
         turns=(Turn("Какое исключение бросает parse_price из shop/money.py на пустую строку?"),),
         expect=("ValidationError",),
-        check=lambda r: r["task_calls"] == 0 and r["answer_hits"] == 1.0,
+        check=lambda record: record["task_calls"] == 0 and record["answer_hits"] == 1,
     ),
     Scenario(
         id="plan_explore",
@@ -863,12 +919,12 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(
             Turn(
                 "Спланируй перевод хранилища заказов с JSON-файла на SQLite: что и где "
-                "придётся изменить."
+                "придётся изменить.",
             ),
         ),
         plan_answers=(None,),
         plan_only=True,
-        check=lambda r: r["explore_calls"] >= 1,
+        check=lambda record: record["explore_calls"] >= 1,
     ),
     Scenario(
         id="delegate_subtasks",
@@ -879,15 +935,17 @@ SCENARIOS: tuple[Scenario, ...] = (
         turns=(
             Turn(
                 "Напиши тесты для shop/payments.py (в tests/test_payments.py) и для "
-                "shop/storage.py (в tests/test_storage.py)."
+                "shop/storage.py (в tests/test_storage.py).",
             ),
         ),
         files_expect={"tests/test_payments.py": "def test", "tests/test_storage.py": "def test"},
         run_tests=True,
-        check=lambda r: bool(r["files_ok"]) and bool(r["tests_pass"]),
+        check=lambda record: bool(record["files_ok"]) and bool(record["tests_pass"]),
     ),
 )
-SCENARIO_BY_ID: dict[str, Scenario] = {scenario.id: scenario for scenario in SCENARIOS}
+SCENARIO_BY_ID: Mapping[str, Scenario] = MappingProxyType({
+    scenario.id: scenario for scenario in SCENARIOS
+})
 
 
 # --------------------------------------------------------------------------- #
@@ -919,17 +977,65 @@ def run_scenario(
     build_index(root)
     before = snapshot(root)
     at_plan: list[dict[str, str]] = []  # файлы проекта на момент первого показа плана
-
-    def on_plan() -> None:
-        if not at_plan:
-            at_plan.append(snapshot(root))
-
     recorder = RecordingProvider(provider)
-    user = ScriptedUser(scenario.plan_answers, root=root, on_plan=on_plan)
+    user = ScriptedUser(
+        scenario.plan_answers,
+        root=root,
+        on_plan=lambda: _remember_plan_snapshot(at_plan, root),
+    )
     agent = Agent(
-        recorder, build_default_registry(), config, user, windows=windows, chat_id=chat_id
+        recorder,
+        build_default_registry(),
+        config,
+        user,
+        windows=windows,
+        chat_id=chat_id,
     )
     turns: list[dict[str, Any]] = []
+    error, duration = _play_turns(scenario, agent, user, turns)
+    record = _metrics(
+        scenario,
+        agent,
+        user,
+        recorder,
+        turns,
+        root,
+        _file_changes(before, snapshot(root), at_plan),
+    )
+    record.update(
+        scenario=scenario.id,
+        model=config.model,
+        temperature=config.temperature,
+        window=None if windows is None else windows.get(config.model),
+        duration_s=round(duration, 1),
+        error=None if error is None else f"{type(error).__name__}: {error}",
+    )
+    if scenario.run_tests and error is None:
+        record["tests_pass"] = run_fixture_tests(root)
+    record["ok"] = error is None and bool(scenario.check(record))
+    return ScenarioResult(
+        record=record,
+        transcript=_transcript(agent, user, recorder),
+        error=error,
+    )
+
+
+def _remember_plan_snapshot(at_plan: list[dict[str, str]], root: Path) -> None:
+    """Запоминает файлы проекта при первом показе плана (повторные показы — без записи)."""
+    if not at_plan:
+        at_plan.append(snapshot(root))
+
+
+def _play_turns(
+    scenario: Scenario,
+    agent: Agent,
+    user: ScriptedUser,
+    turns: list[dict[str, Any]],
+) -> tuple[BaseException | None, float]:
+    """Ходы сценария по очереди: сбой (если был) и длительность прогона, с.
+
+    Сбой не пробрасывается, а возвращается: запись нужна и при нём.
+    """
     error: BaseException | None = None
     started = time.monotonic()
     try:
@@ -939,33 +1045,22 @@ def run_scenario(
             turns.append(_turn_start(agent, user))
             agent.run_turn(turn.text)
             _turn_end(turns[-1], agent, user)
-    except BaseException as e:  # запись нужна и при сбое; пробрасывает вызывающий
-        error = e
+    except BaseException as exc:  # запись нужна и при сбое; пробрасывает вызывающий
+        error = exc
         if turns and "mode_after" not in turns[-1]:
             _turn_end(turns[-1], agent, user)
-    duration = time.monotonic() - started
+    return error, time.monotonic() - started
 
-    after = snapshot(root)
-    record = _metrics(scenario, agent, user, recorder, turns, root, before, after, at_plan)
-    record.update(
-        scenario=scenario.id,
-        model=config.model,
-        temperature=config.temperature,
-        window=windows.get(config.model) if windows is not None else None,
-        duration_s=round(duration, 1),
-        error=None if error is None else f"{type(error).__name__}: {error}",
-    )
-    if scenario.run_tests and error is None:
-        record["tests_pass"] = run_fixture_tests(root)
-    record["ok"] = error is None and bool(scenario.check(record))
-    transcript = {
+
+def _transcript(agent: Agent, user: ScriptedUser, recorder: RecordingProvider) -> dict[str, Any]:
+    """История прогона для разбора: диалог, планы, уведомления, команды и запросы."""
+    return {
         "conversation": agent.conversation.to_dict(),
         "plans": user.plans,
         "notices": [list(notice) for notice in user.notices],
         "commands": [list(command) for command in user.commands],
         "requests": recorder.calls,
     }
-    return ScenarioResult(record=record, transcript=transcript, error=error)
 
 
 def _turn_start(agent: Agent, user: ScriptedUser) -> dict[str, Any]:
@@ -976,31 +1071,33 @@ def _turn_start(agent: Agent, user: ScriptedUser) -> dict[str, Any]:
     }
 
 
-def _turn_end(info: dict[str, Any], agent: Agent, user: ScriptedUser) -> None:
-    messages = agent.conversation.messages[info.pop("start") :]
+def _turn_end(turn_record: dict[str, Any], agent: Agent, user: ScriptedUser) -> None:
+    messages = agent.conversation.messages[turn_record.pop("start") :]
     last = messages[-1] if messages else None
     answer = next(
         (
-            m.content
-            for m in reversed(messages)
-            if m.role == "assistant" and not m.function_calls and m.content.strip()
+            message.content
+            for message in reversed(messages)
+            if message.role == "assistant"
+            and not message.function_calls
+            and message.content.strip()
         ),
         "",
     )
     stats = agent.last_turn
-    info.update(
+    turn_record.update(
         mode_after=agent.mode.value,
-        plan_shown=len(user.plans) - info.pop("plans_before"),
+        plan_shown=len(user.plans) - turn_record.pop("plans_before"),
         exit_calls=sum(1 for call in _calls(messages) if call.name == "exit_plan_mode"),
         ended_in_text=bool(
             last is not None
             and last.role == "assistant"
             and not last.function_calls
-            and last.content.strip()
+            and last.content.strip(),
         ),
         answer=answer[:MAX_ANSWER_CHARS],
-        steps=stats.steps if stats is not None else None,
-        stop_reason=stats.stop_reason if stats is not None else None,
+        steps=None if stats is None else stats.steps,
+        stop_reason=None if stats is None else stats.stop_reason,
     )
 
 
@@ -1012,8 +1109,8 @@ def _calls(messages: Iterable[Message]) -> Iterator[FunctionCall]:
 
 def _subagent_type(call: FunctionCall) -> str:
     """Тип суб-агента из вызова task (имя параметра — и прежнее, и будущее)."""
-    value = call.arguments.get("subagent_type") or call.arguments.get("agent") or ""
-    return str(value).strip().lower()
+    subagent = call.arguments.get("subagent_type") or call.arguments.get("agent") or ""
+    return str(subagent).strip().lower()
 
 
 def _targets(call: FunctionCall, root: Path, target: Path | None) -> bool:
@@ -1031,26 +1128,52 @@ def _targets(call: FunctionCall, root: Path, target: Path | None) -> bool:
 
 
 def well_formed(messages: Sequence[Message]) -> bool:
-    """Каждый вызов инструмента получил ровно один результат, сразу после своего хода
-    (без сообщений между ними — на такую историю API отвечает 422); результат с id — того
-    вызова, у которого этот id."""
+    """История корректна: у каждого вызова инструмента ровно один свой результат.
+
+    Каждый вызов инструмента получил ровно один результат, сразу после своего хода (без
+    сообщений между ними — на такую историю API отвечает 422); результат с id — того
+    вызова, у которого этот id.
+    """
     pending: list[str | None] = []  # id вызовов хода, ещё без результата
     for message in messages:
         if message.role == "function":
-            if not pending:
+            if not _take_result(pending, message.call_id):
                 return False
-            if message.call_id is not None and None not in pending:
-                if message.call_id not in pending:
-                    return False
-                pending.remove(message.call_id)
-            else:
-                pending.pop(0)
             continue
         if pending:
             return False
         if message.role == "assistant":
             pending = [call.id for call in message.function_calls]
     return not pending
+
+
+def _take_result(pending: list[str | None], call_id: str | None) -> bool:
+    """Снимает из ``pending`` вызов, на который пришёл результат; False — результат лишний.
+
+    Результат с id закрывает вызов с этим id (если у всех вызовов хода есть id), иначе —
+    первый ещё открытый вызов.
+    """
+    if not pending:
+        return False
+    if call_id is not None and None not in pending:
+        if call_id not in pending:
+            return False
+        pending.remove(call_id)
+    else:
+        pending.pop(0)
+    return True
+
+
+def _file_changes(
+    before: Mapping[str, str],
+    after: Mapping[str, str],
+    at_plan: Sequence[Mapping[str, str]],
+) -> dict[str, list[str]]:
+    """Изменённые файлы проекта: за весь прогон и до первого показа плана."""
+    return {
+        "changed_files": changed_files(before, after),
+        "changed_before_plan": changed_files(before, at_plan[0]) if at_plan else [],
+    }
 
 
 def _metrics(
@@ -1060,111 +1183,184 @@ def _metrics(
     recorder: RecordingProvider,
     turns: list[dict[str, Any]],
     root: Path,
-    before: Mapping[str, str],
-    after: Mapping[str, str],
-    at_plan: list[dict[str, str]],
+    changes: Mapping[str, list[str]],
 ) -> dict[str, Any]:
     messages = agent.conversation.messages
     calls = list(_calls(messages))
-    tasks = [call for call in calls if call.name == "task"]
-    explores = sum(1 for call in calls if call.name == "explore")
-    plan_path = agent.plan_path
-    try:
-        plan_text = plan_path.read_text(encoding="utf-8").strip() if plan_path else ""
-    except OSError:
-        plan_text = ""
-    results = [m.content for m in messages if m.role == "function"]
-    answer = turns[-1].get("answer", "") if turns else ""
-    hits = None
-    if scenario.expect:
-        found = sum(1 for item in scenario.expect if item.lower() in answer.lower())
-        hits = round(found / len(scenario.expect), 2)
-    files_ok = None
-    if scenario.files_expect:
-        files_ok = all(
-            (root / rel).is_file() and text in (root / rel).read_text(encoding="utf-8")
-            for rel, text in scenario.files_expect.items()
-        )
-    subagents = [info for kind, info in user.events if kind == "subagent_start"]
-    main_requests = [
-        c for c in recorder.calls if not (c["subagent"] or c["summary"] or c["reviewer"])
-    ]
+    tool_results = [message.content for message in messages if message.role == "function"]
     return {
-        # план
+        **_plan_metrics(agent, user, calls, turns, root, tool_results),
+        **_delegation_metrics(messages, calls, user),
+        **_usage_metrics(user, recorder, tool_results),
+        **_quality_metrics(scenario, agent, turns, root, changes),
+    }
+
+
+def _read_plan(plan_path: Path | None) -> str:
+    """Текст плана (пусто — файла нет или он не читается)."""
+    try:
+        return plan_path.read_text(encoding="utf-8").strip() if plan_path else ""
+    except OSError:
+        return ""
+
+
+def _plan_metrics(
+    agent: Agent,
+    user: ScriptedUser,
+    calls: Sequence[FunctionCall],
+    turns: Sequence[Mapping[str, Any]],
+    root: Path,
+    tool_results: Sequence[str],
+) -> dict[str, Any]:
+    """Метрики плана, самопроверок и режима."""
+    plan_path = agent.plan_path
+    plan_text = _read_plan(plan_path)
+    return {
         "plan_shown": len(user.plans),
         "plan_revised": len(user.plans) >= 2 and user.plans[-1] != user.plans[0],
         "plan_written": bool(plan_text),
         "plan_chars": len(plan_text),
         "exit_calls": sum(1 for call in calls if call.name == "exit_plan_mode"),
         "plan_writes": sum(
-            1 for c in calls if c.name == "write_file" and _targets(c, root, plan_path)
+            1 for call in calls if call.name == "write_file" and _targets(call, root, plan_path)
         ),
         "plan_edits": sum(
-            1 for c in calls if c.name == "edit_file" and _targets(c, root, plan_path)
+            1 for call in calls if call.name == "edit_file" and _targets(call, root, plan_path)
         ),
         "plan_reminders": sum(
             1 for _, text in user.notices if any(mark in text for mark in HARNESS_PLAN_NOTICES)
         ),
         # самопроверки и те из них, после которых модель продолжила работу (служебное
         # сообщение осталось в истории); остальные кончились ответом «OK»
-        "self_checks": sum(s.self_checks for s in user.stats),
-        "self_checks_resumed": sum(1 for m in messages if m.meta and SELF_CHECK_MARK in m.content),
-        "plan_turns_ended_in_text": sum(
+        "self_checks": sum(stats.self_checks for stats in user.stats),
+        "self_checks_resumed": sum(
             1
-            for t in turns
-            if t["mode_before"] == PermissionMode.PLAN.value
-            and t.get("mode_after") == PermissionMode.PLAN.value
-            and t.get("plan_shown") == 0
-            and t.get("ended_in_text")
+            for message in agent.conversation.messages
+            if message.meta and SELF_CHECK_MARK in message.content
         ),
-        "blocked_calls": sum(1 for text in results if text.startswith(PLAN_BLOCKED_MARK)),
+        "plan_turns_ended_in_text": sum(1 for turn in turns if _plan_turn_ended_in_text(turn)),
+        "blocked_calls": sum(1 for text in tool_results if text.startswith(PLAN_BLOCKED_MARK)),
         "final_mode": agent.mode.value,
-        # делегирование: запуски суб-агентов (task и explore) и из них — разведка
+    }
+
+
+def _plan_turn_ended_in_text(turn: Mapping[str, Any]) -> bool:
+    """Ход в режиме плана кончился текстом, а план показан не был."""
+    return bool(
+        turn["mode_before"] == PermissionMode.PLAN.value
+        and turn.get("mode_after") == PermissionMode.PLAN.value
+        and turn.get("plan_shown") == 0
+        and turn.get("ended_in_text"),
+    )
+
+
+def _delegation_metrics(
+    messages: Sequence[Message],
+    calls: Sequence[FunctionCall],
+    user: ScriptedUser,
+) -> dict[str, Any]:
+    """Делегирование: запуски суб-агентов (task и explore) и из них — разведка."""
+    tasks = [call for call in calls if call.name == "task"]
+    explores = sum(1 for call in calls if call.name == "explore")
+    return {
         "task_calls": len(tasks) + explores,
         "explore_calls": explores + sum(1 for call in tasks if _subagent_type(call) == "explore"),
         "general_calls": sum(
-            1 for call in tasks if _subagent_type(call) in ("general", "general-purpose")
+            1 for call in tasks if _subagent_type(call) in {"general", "general-purpose"}
         ),
         "task_batches": sum(
             1
-            for m in messages
-            if m.role == "assistant"
-            and sum(c.name in ("task", "explore") for c in m.function_calls) >= 2
+            for message in messages
+            if message.role == "assistant"
+            and sum(call.name in {"task", "explore"} for call in message.function_calls) >= 2
         ),
-        "subagent_runs": len(subagents),
+        "subagent_runs": sum(1 for kind, _ in user.events if kind == "subagent_start"),
         "subagent_tool_calls": sum(1 for kind, _ in user.events if kind == "subagent_tool_call"),
         "research_calls": sum(1 for call in calls if call.name in RESEARCH_TOOLS),
         "ask_user_calls": sum(1 for call in calls if call.name == "ask_user"),
         "model_questions": user.model_questions,
+    }
+
+
+def _usage_metrics(
+    user: ScriptedUser,
+    recorder: RecordingProvider,
+    tool_results: Sequence[str],
+) -> dict[str, Any]:
+    """Команды и отказы, расход запросов, токенов и времени."""
+    requests = recorder.calls
+    main_requests = [
+        request
+        for request in requests
+        if not (request["subagent"] or request["summary"] or request["reviewer"])
+    ]
+    return {
         # команды и отказы
         "commands": len(user.commands),
         "commands_rejected": sum(1 for _, allowed in user.commands if not allowed),
-        "rejected_calls": sum(1 for text in results if text.startswith(REJECTED_NOTE)),
+        "rejected_calls": sum(1 for text in tool_results if text.startswith(REJECTED_NOTE)),
         # расход
-        "requests": len(recorder.calls),
-        "requests_subagent": sum(1 for c in recorder.calls if c["subagent"]),
-        "summaries": sum(1 for c in recorder.calls if c["summary"]),
-        "reviews": sum(1 for c in recorder.calls if c["reviewer"]),
-        "prompt_tokens": sum(c["prompt_tokens"] for c in recorder.calls),
-        "completion_tokens": sum(c["completion_tokens"] for c in recorder.calls),
-        "cached_tokens": sum(c["cached_tokens"] for c in recorder.calls),
-        "text_with_calls": sum(1 for c in main_requests if c["text"] and c["calls"]),
-        "cut_retries": sum(s.cut_retries for s in user.stats),
+        "requests": len(requests),
+        "requests_subagent": sum(1 for request in requests if request["subagent"]),
+        "summaries": sum(1 for request in requests if request["summary"]),
+        "reviews": sum(1 for request in requests if request["reviewer"]),
+        "prompt_tokens": sum(request["prompt_tokens"] for request in requests),
+        "completion_tokens": sum(request["completion_tokens"] for request in requests),
+        "cached_tokens": sum(request["cached_tokens"] for request in requests),
+        "text_with_calls": sum(
+            1 for request in main_requests if request["text"] and request["calls"]
+        ),
+        "cut_retries": sum(stats.cut_retries for stats in user.stats),
         "rate_limit_waits": sum(1 for _, text in user.notices if RATE_LIMIT_MARK in text),
-        "max_completion_tokens": max((c["completion_tokens"] for c in recorder.calls), default=0),
-        "max_request_s": max((c["duration_s"] for c in recorder.calls), default=0.0),
-        "steps": sum(s.steps for s in user.stats),
-        "tool_calls": sum(s.tool_calls for s in user.stats),
-        "stop_reasons": [s.stop_reason for s in user.stats if s.stop_reason],
-        # качество
+        "max_completion_tokens": max(
+            (request["completion_tokens"] for request in requests),
+            default=0,
+        ),
+        "max_request_s": max((request["duration_s"] for request in requests), default=float(0)),
+        "steps": sum(stats.steps for stats in user.stats),
+        "tool_calls": sum(stats.tool_calls for stats in user.stats),
+        "stop_reasons": [stats.stop_reason for stats in user.stats if stats.stop_reason],
+    }
+
+
+def _answer_hits(expect: Sequence[str], answer: str) -> float | None:
+    """Доля ожидаемых подстрок в ответе (None — сценарий их не задаёт)."""
+    if not expect:
+        return None
+    found = sum(1 for expected in expect if expected.lower() in answer.lower())
+    return round(found / len(expect), 2)
+
+
+def _files_ok(root: Path, files_expect: Mapping[str, str]) -> bool | None:
+    """Есть ли в файлах проекта ожидаемые подстроки (None — сценарий их не задаёт)."""
+    if not files_expect:
+        return None
+    return all(
+        (root / rel).is_file() and text in (root / rel).read_text(encoding="utf-8")
+        for rel, text in files_expect.items()
+    )
+
+
+def _quality_metrics(
+    scenario: Scenario,
+    agent: Agent,
+    turns: Sequence[Mapping[str, Any]],
+    root: Path,
+    changes: Mapping[str, list[str]],
+) -> dict[str, Any]:
+    """Качество: ответ, изменённые файлы, ожидания сценария и целостность истории."""
+    messages = agent.conversation.messages
+    answer = turns[-1].get("answer", "") if turns else ""
+    return {
         "answer": answer[:MAX_ANSWER_CHARS],
-        "answer_hits": hits,
-        "changed_files": changed_files(before, after),
-        "changed_before_plan": changed_files(before, at_plan[0]) if at_plan else [],
-        "files_ok": files_ok,
+        "answer_hits": _answer_hits(scenario.expect, answer),
+        **changes,
+        "files_ok": _files_ok(root, scenario.files_expect),
         "tests_pass": None,
         "reminder_leaks": sum(
-            1 for m in messages if m.role == "assistant" and "system-reminder" in m.content
+            1
+            for message in messages
+            if message.role == "assistant" and "system-reminder" in message.content
         ),
         "well_formed": well_formed(messages) and not agent.conversation.pending_calls(),
         "turns": turns,
@@ -1197,10 +1393,18 @@ def git_revision(root: Path = REPO_ROOT) -> str:
         return ""
     try:
         sha = subprocess.run(
-            [git, "rev-parse", "--short", "HEAD"], cwd=root, capture_output=True, text=True
+            [git, "rev-parse", "--short", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
         ).stdout.strip()
         dirty = subprocess.run(
-            [git, "status", "--porcelain"], cwd=root, capture_output=True, text=True
+            [git, "status", "--porcelain"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
         ).stdout.strip()
     except OSError:
         return ""
@@ -1222,12 +1426,13 @@ class EvalSession:
     models: list[str]
     runs: int
     label: str = ""
-    stamp: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d-%H%M%S"))
+    stamp: str = field(default_factory=lambda: time.strftime("%Y%m%d-%H%M%S"))
     records: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def name(self) -> str:
-        return f"eval-{self.stamp}" + (f"-{_slug(self.label)}" if self.label else "")
+        suffix = f"-{_slug(self.label)}" if self.label else ""
+        return f"eval-{self.stamp}{suffix}"
 
     @property
     def path(self) -> Path:
@@ -1247,8 +1452,8 @@ class EvalSession:
             yes_all=False,
         )
 
-    def add(self, result: ScenarioResult, *, run: int) -> dict[str, Any]:
-        record = {**result.record, "run": run}
+    def add(self, scenario_result: ScenarioResult, *, run: int) -> dict[str, Any]:
+        record = {**scenario_result.record, "run": run}
         transcript = (
             self.directory
             / self.name
@@ -1256,7 +1461,8 @@ class EvalSession:
         )
         transcript.parent.mkdir(parents=True, exist_ok=True)
         transcript.write_text(
-            json.dumps(result.transcript, ensure_ascii=False, indent=1), encoding="utf-8"
+            json.dumps(scenario_result.transcript, ensure_ascii=False, indent=1),
+            encoding="utf-8",
         )
         record["transcript"] = transcript.relative_to(self.directory).as_posix()
         self.records.append(record)
@@ -1273,7 +1479,7 @@ class EvalSession:
             "models": self.models,
             "runs": self.runs,
             "windows": {model: self.windows.get(model) for model in self.models},
-            "scenarios": {s.id: s.goal for s in SCENARIOS},
+            "scenarios": {scenario.id: scenario.goal for scenario in SCENARIOS},
         }
 
     def write(self) -> Path:
@@ -1284,56 +1490,78 @@ class EvalSession:
 
 
 def load_report(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    report: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    return report
 
 
 Metric = str | Callable[[Mapping[str, Any]], float]
+# Запись прогона, прогоны одной группы (модель, сценарий) и значение столбца по ним.
+_Record = Mapping[str, Any]
+_Runs = Sequence[_Record]
+_Column = Callable[[_Runs], str]
+_Groups = dict[tuple[str, str], list[_Record]]
 
 
-def _value(record: Mapping[str, Any], metric: Metric) -> float:
+def _metric_value(record: Mapping[str, Any], metric: Metric) -> float:
     return float(metric(record) if callable(metric) else record.get(metric) or 0)
 
 
-def _rate(records: Sequence[Mapping[str, Any]], metric: Metric) -> str:
+def _rate(records: _Runs, metric: Metric) -> str:
     """Доля прогонов, где метрика истинна: «2/3» («—» — прогонов нет)."""
     if not records:
         return "—"
-    return f"{sum(1 for r in records if _value(r, metric))}/{len(records)}"
+    passed = sum(1 for record in records if _metric_value(record, metric))
+    return f"{passed}/{len(records)}"
 
 
-def _mean(records: Sequence[Mapping[str, Any]], metric: Metric, digits: int = 1) -> str:
+def _mean(records: _Runs, metric: Metric, digits: int = 1) -> str:
     if not records:
         return "—"
-    value = sum(_value(r, metric) for r in records) / len(records)
-    return f"{value:.{digits}f}"
+    mean = sum(_metric_value(record, metric) for record in records) / len(records)
+    return format(mean, f".{digits}f")
 
 
-def _cache(records: Sequence[Mapping[str, Any]]) -> str:
-    prompt = sum(r.get("prompt_tokens") or 0 for r in records)
-    cached = sum(r.get("cached_tokens") or 0 for r in records)
-    return f"{100 * cached / prompt:.0f}%" if prompt else "—"
+def _cache(records: _Runs) -> str:
+    prompt = sum(record.get("prompt_tokens") or 0 for record in records)
+    cached = sum(record.get("cached_tokens") or 0 for record in records)
+    if not prompt:
+        return "—"
+    share = 100 * cached / prompt
+    return f"{share:.0f}%"
 
 
 def _tokens(record: Mapping[str, Any]) -> float:
     return ((record.get("prompt_tokens") or 0) + (record.get("completion_tokens") or 0)) / 1000
 
 
-def _groups(records: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str], list]:
-    groups: dict[tuple[str, str], list] = {}
+def _groups(records: Iterable[_Record]) -> _Groups:
+    groups: _Groups = {}
     for record in records:
         groups.setdefault((record["model"], record["scenario"]), []).append(record)
     return groups
 
 
+# Порядок сценариев в таблицах — как в SCENARIOS.
+_SCENARIO_ORDER: Mapping[str, int] = MappingProxyType({
+    scenario.id: position for position, scenario in enumerate(SCENARIOS)
+})
+
+
+def _order_key(key: tuple[str, str]) -> tuple[str, int, str]:
+    """Ключ сортировки групп: модель, затем сценарий по порядку (неизвестные — в конце)."""
+    position = _SCENARIO_ORDER.get(key[1], len(_SCENARIO_ORDER))
+    return key[0], position, key[1]
+
+
 def _ordered(keys: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
-    order = {scenario.id: i for i, scenario in enumerate(SCENARIOS)}
-    return sorted(keys, key=lambda key: (key[0], order.get(key[1], len(order)), key[1]))
+    return sorted(keys, key=_order_key)
 
 
 def _table(rows: list[tuple[str, ...]]) -> list[str]:
-    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    columns = range(len(rows[0]))
+    widths = [max(len(row[column]) for row in rows) for column in columns]
     return [
-        "  ".join(cell.ljust(w) for cell, w in zip(row, widths, strict=True)).rstrip()
+        "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
         for row in rows
     ]
 
@@ -1371,7 +1599,7 @@ def summary_table(records: Sequence[Mapping[str, Any]]) -> list[str]:
             "tok,k",
             "cache",
             "time",
-        )
+        ),
     ]
     for key in _ordered(groups):
         runs = groups[key]
@@ -1380,9 +1608,9 @@ def summary_table(records: Sequence[Mapping[str, Any]]) -> list[str]:
                 key[0],
                 key[1],
                 _rate(runs, "ok"),
-                str(sum(1 for r in runs if r.get("error"))),
-                _rate(runs, lambda r: r["exit_calls"] > 0),
-                _rate(runs, lambda r: r["plan_shown"] > 0),
+                _errors(runs),
+                _rate(runs, lambda record: record["exit_calls"] > 0),
+                _rate(runs, lambda record: record["plan_shown"] > 0),
                 _mean(runs, "plan_reminders"),
                 _mean(runs, "self_checks"),
                 _mean(runs, "plan_turns_ended_in_text"),
@@ -1393,7 +1621,7 @@ def summary_table(records: Sequence[Mapping[str, Any]]) -> list[str]:
                 _mean(runs, _tokens),
                 _cache(runs),
                 _mean(runs, "duration_s", digits=0),
-            )
+            ),
         )
     goals = [f"  {scenario.id} — {scenario.goal}" for scenario in SCENARIOS]
     return [*_table(rows), "", SUMMARY_LEGEND, "Цели сценариев:", *goals]
@@ -1401,33 +1629,31 @@ def summary_table(records: Sequence[Mapping[str, Any]]) -> list[str]:
 
 def _describe(meta: Mapping[str, Any]) -> str:
     parts = [str(meta.get("created", "?"))]
-    for key in ("label", "git"):
-        if meta.get(key):
-            parts.append(str(meta[key]))
+    parts.extend(str(meta[key]) for key in ("label", "git") if meta.get(key))
     parts.append(f"T={meta.get('temperature')}")
     if meta.get("reasoning"):  # в отчётах до этапа 5 ключа нет
         parts.append(f"reasoning={meta['reasoning']}")
     return " · ".join(parts)
 
 
-def _errors(records: Sequence[Mapping[str, Any]]) -> str:
-    return str(sum(1 for r in records if r.get("error")))
+def _errors(records: _Runs) -> str:
+    return str(sum(1 for record in records if record.get("error")))
 
 
 # Столбцы сравнения: имя и значение по группе прогонов.
-_COMPARED: tuple[tuple[str, Callable[[Sequence[Mapping[str, Any]]], str]], ...] = (
-    ("ok", lambda g: _rate(g, "ok")),
+_COMPARED: tuple[tuple[str, _Column], ...] = (
+    ("ok", lambda runs: _rate(runs, "ok")),
     ("err", _errors),
-    ("exit", lambda g: _rate(g, lambda r: r["exit_calls"] > 0)),
-    ("shown", lambda g: _rate(g, lambda r: r["plan_shown"] > 0)),
-    ("rem", lambda g: _mean(g, "plan_reminders")),
-    ("chk", lambda g: _mean(g, "self_checks")),
-    ("txt", lambda g: _mean(g, "plan_turns_ended_in_text")),
-    ("expl", lambda g: _mean(g, "explore_calls")),
-    ("task", lambda g: _mean(g, "task_calls")),
-    ("res", lambda g: _mean(g, "research_calls")),
-    ("req", lambda g: _mean(g, "requests")),
-    ("tok,k", lambda g: _mean(g, _tokens)),
+    ("exit", lambda runs: _rate(runs, lambda record: record["exit_calls"] > 0)),
+    ("shown", lambda runs: _rate(runs, lambda record: record["plan_shown"] > 0)),
+    ("rem", lambda runs: _mean(runs, "plan_reminders")),
+    ("chk", lambda runs: _mean(runs, "self_checks")),
+    ("txt", lambda runs: _mean(runs, "plan_turns_ended_in_text")),
+    ("expl", lambda runs: _mean(runs, "explore_calls")),
+    ("task", lambda runs: _mean(runs, "task_calls")),
+    ("res", lambda runs: _mean(runs, "research_calls")),
+    ("req", lambda runs: _mean(runs, "requests")),
+    ("tok,k", lambda runs: _mean(runs, _tokens)),
 )
 
 
@@ -1436,8 +1662,9 @@ def compare_reports(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]
     before, after = _groups(old["runs"]), _groups(new["runs"])
     rows: list[tuple[str, ...]] = [("model", "scenario", *(name for name, _ in _COMPARED))]
     for key in _ordered(before.keys() | after.keys()):
-        a, b = before.get(key, []), after.get(key, [])
-        rows.append((key[0], key[1], *(f"{value(a)} → {value(b)}" for _, value in _COMPARED)))
+        old_runs, new_runs = before.get(key, []), after.get(key, [])
+        changes = (f"{column(old_runs)} → {column(new_runs)}" for _, column in _COMPARED)
+        rows.append((key[0], key[1], *changes))
     head = [f"было:  {_describe(old['meta'])}", f"стало: {_describe(new['meta'])}", ""]
     return head + _table(rows)
 
@@ -1452,18 +1679,26 @@ _CLIP = 100  # символов текста ошибки или ответа
 
 def _clip(text: str, limit: int = _CLIP) -> str:
     line = " ".join(str(text).split())
-    return line if len(line) <= limit else line[: limit - 1] + "…"
+    if len(line) <= limit:
+        return line
+    clipped = line[: limit - 1]
+    return f"{clipped}…"
 
 
-def _peak(records: Sequence[Mapping[str, Any]], metric: str, scale: float = 1.0) -> str:
+def _peak(records: _Runs, metric: str, scale: float = 1.0) -> str:
     """Максимум по прогонам («—» — метрики нет: отчёт старой версии)."""
-    values = [r[metric] for r in records if r.get(metric) is not None]
-    return f"{max(values) / scale:.1f}" if values else "—"
+    measured = [record[metric] for record in records if record.get(metric) is not None]
+    if not measured:
+        return "—"
+    peak = max(measured) / scale
+    return f"{peak:.1f}"
 
 
-def _stops(records: Sequence[Mapping[str, Any]]) -> str:
-    counts = Counter(reason for r in records for reason in r.get("stop_reasons") or ())
-    return ",".join(f"{reason}×{n}" if n > 1 else reason for reason, n in counts.most_common())
+def _stops(records: _Runs) -> str:
+    counts = Counter(reason for record in records for reason in record.get("stop_reasons") or ())
+    return ",".join(
+        f"{reason}×{count}" if count > 1 else reason for reason, count in counts.most_common()
+    )
 
 
 def _problem(record: Mapping[str, Any]) -> str:
@@ -1472,10 +1707,11 @@ def _problem(record: Mapping[str, Any]) -> str:
     if record.get("error"):
         parts.append(f"сбой «{_clip(record['error'])}»")
     if record.get("stop_reasons"):
-        parts.append("стоп " + ",".join(record["stop_reasons"]))
+        stops = ",".join(record["stop_reasons"])
+        parts.append(f"стоп {stops}")
     parts.append(
         f"shown={record.get('plan_shown', 0)} exit={record.get('exit_calls', 0)} "
-        f"chk={record.get('self_checks', 0)} task={record.get('task_calls', 0)}"
+        f"chk={record.get('self_checks', 0)} task={record.get('task_calls', 0)}",
     )
     if record.get("answer"):
         parts.append(f"ответ «{_clip(record['answer'], 60)}»")
@@ -1490,7 +1726,24 @@ def digest_report(report: Mapping[str, Any]) -> list[str]:
     ошибки.
     """
     runs = report["runs"]
-    groups = _groups(runs)
+    rows = _digest_rows(_groups(runs))
+    lines = [_describe(report["meta"]), *_table(rows)]
+    lines += _failed_lines(runs)
+    lines += _rate_limit_lines(runs)
+    lines += _frequent_error_lines(runs)
+    lines += [
+        "",
+        (
+            "rem — план не отправлен моделью; chk — самопроверок; txt — ходов плана, кончившихся "
+            "текстом; cut — повторов после оборванного ответа; out,k — пик вывода за запрос, "
+            "тыс. токенов; max,s — самый долгий запрос."
+        ),
+    ]
+    return lines
+
+
+def _digest_rows(groups: Mapping[tuple[str, str], _Runs]) -> list[tuple[str, ...]]:
+    """Сводка выжимки по модели и сценарию: заголовок и строка на каждую группу."""
     rows: list[tuple[str, ...]] = [
         (
             "model",
@@ -1506,80 +1759,102 @@ def digest_report(report: Mapping[str, Any]) -> list[str]:
             "out,k",
             "max,s",
             "stops",
-        )
+        ),
     ]
     for key in _ordered(groups):
-        g = groups[key]
+        runs = groups[key]
         rows.append(
             (
                 key[0],
                 key[1],
-                _rate(g, "ok"),
-                _errors(g),
-                _mean(g, "plan_reminders"),
-                _mean(g, "self_checks"),
-                _mean(g, "plan_turns_ended_in_text"),
-                _mean(g, "research_calls", digits=0),
-                _mean(g, "requests", digits=0),
-                str(sum(r.get("cut_retries") or 0 for r in g)),
-                _peak(g, "max_completion_tokens", scale=1000),
-                _peak(g, "max_request_s"),
-                _stops(g),
-            )
+                _rate(runs, "ok"),
+                _errors(runs),
+                _mean(runs, "plan_reminders"),
+                _mean(runs, "self_checks"),
+                _mean(runs, "plan_turns_ended_in_text"),
+                _mean(runs, "research_calls", digits=0),
+                _mean(runs, "requests", digits=0),
+                str(sum(record.get("cut_retries") or 0 for record in runs)),
+                _peak(runs, "max_completion_tokens", scale=1000),
+                _peak(runs, "max_request_s"),
+                _stops(runs),
+            ),
         )
-    lines = [_describe(report["meta"]), *_table(rows)]
+    return rows
+
+
+def _failed_lines(runs: _Runs) -> list[str]:
+    """Неуспешные прогоны по одному в строку (сверх ``DIGEST_PROBLEMS`` — числом)."""
     # Сначала провалы поведения, потом сбои: сбои ещё и сведены в «Частые ошибки» ниже,
     # и сотня одинаковых таймаутов не должна вытеснить единичный провал.
-    failed = sorted((r for r in runs if not r.get("ok")), key=lambda r: bool(r.get("error")))
-    if failed:
-        lines += ["", f"Неуспешные прогоны: {len(failed)} из {len(runs)}"]
-        lines += [_problem(r) for r in failed[:DIGEST_PROBLEMS]]
-        if len(failed) > DIGEST_PROBLEMS:
-            lines.append(f"… и ещё {len(failed) - DIGEST_PROBLEMS}")
-    waits = [r.get("rate_limit_waits") or 0 for r in runs]
-    if any(waits):
-        lines += [
-            "",
-            f"Пауз из-за лимита запросов (429): {sum(waits)} в {sum(1 for w in waits if w)} прогонах",
-        ]
-    errors = Counter(_clip(r["error"]) for r in runs if r.get("error"))
-    if errors:
-        lines += ["", "Частые ошибки:"]
-        lines += [f"{n}× {text}" for text, n in errors.most_common(DIGEST_ERRORS)]
-    lines += [
-        "",
-        "rem — план не отправлен моделью; chk — самопроверок; txt — ходов плана, кончившихся "
-        "текстом; cut — повторов после оборванного ответа; out,k — пик вывода за запрос, "
-        "тыс. токенов; max,s — самый долгий запрос.",
-    ]
+    failed = sorted(
+        (record for record in runs if not record.get("ok")),
+        key=lambda record: bool(record.get("error")),
+    )
+    if not failed:
+        return []
+    lines = ["", f"Неуспешные прогоны: {len(failed)} из {len(runs)}"]
+    lines += [_problem(record) for record in failed[:DIGEST_PROBLEMS]]
+    if len(failed) > DIGEST_PROBLEMS:
+        rest = len(failed) - DIGEST_PROBLEMS
+        lines.append(f"… и ещё {rest}")
     return lines
+
+
+def _rate_limit_lines(runs: _Runs) -> list[str]:
+    """Паузы из-за лимита запросов шлюза (429): сколько и в скольких прогонах."""
+    waits = [record.get("rate_limit_waits") or 0 for record in runs]
+    if not any(waits):
+        return []
+    total = sum(waits)
+    waited = sum(1 for wait in waits if wait)
+    return ["", f"Пауз из-за лимита запросов (429): {total} в {waited} прогонах"]
+
+
+def _frequent_error_lines(runs: _Runs) -> list[str]:
+    """Частые ошибки прогонов (до ``DIGEST_ERRORS``), с числом повторов."""
+    errors = Counter(_clip(record["error"]) for record in runs if record.get("error"))
+    if not errors:
+        return []
+    return [
+        "",
+        "Частые ошибки:",
+        *(f"{count}× {text}" for text, count in errors.most_common(DIGEST_ERRORS)),
+    ]
 
 
 # --------------------------------------------------------------------------- #
 # Пробы шлюза (test_api_probe_live.py)
 # --------------------------------------------------------------------------- #
-def reasoning_texts(data: Mapping[str, Any]) -> list[str]:
+def reasoning_texts(response: Mapping[str, Any]) -> list[str]:
     """Рассуждения модели из ответа API v2 (сообщения ``role: "reasoning"``)."""
     texts: list[str] = []
-    for message in data.get("messages") or []:
+    for message in response.get("messages") or []:
         if not isinstance(message, Mapping) or message.get("role") != "reasoning":
             continue
         content = message.get("content")
         parts = [{"text": content}] if isinstance(content, str) else content or []
-        for part in parts:
-            if isinstance(part, Mapping) and isinstance(part.get("text"), str):
-                texts.append(part["text"])
+        texts.extend(
+            part["text"]
+            for part in parts
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+        )
     return [text for text in texts if text.strip()]
 
 
 def with_reasoning(payload: Mapping[str, Any], text: str) -> dict[str, Any]:
-    """Копия запроса с рассуждениями (``role: "reasoning"``) перед последним ответом
-    ассистента — тем же сообщением, каким API отдаёт их в ответе."""
-    copy = json.loads(json.dumps(payload))
-    messages = copy["messages"]
-    index = max(i for i, message in enumerate(messages) if message["role"] == "assistant")
+    """Копия запроса с рассуждениями (``role: "reasoning"``) перед последним ответом.
+
+    Рассуждения встают перед последним ответом ассистента — тем же сообщением, каким API
+    отдаёт их в ответе.
+    """
+    patched: dict[str, Any] = json.loads(json.dumps(payload))
+    messages = patched["messages"]
+    index = max(
+        position for position, message in enumerate(messages) if message["role"] == "assistant"
+    )
     messages.insert(index, {"role": "reasoning", "content": [{"text": text}]})
-    return copy
+    return patched
 
 
 def _status(step: Mapping[str, Any] | None, base: int | None = None) -> str:
@@ -1590,90 +1865,159 @@ def _status(step: Mapping[str, Any] | None, base: int | None = None) -> str:
         return f"ошибка {step['status']}"
     tokens = step["input_tokens"]
     if base and tokens is not None:
-        return f"{tokens} ток. ({tokens - base:+d})"
+        growth = format(tokens - base, "+d")
+        return f"{tokens} ток. ({growth})"
     return f"{tokens} ток."
 
 
 def describe_probe(model: str, finding: Mapping[str, Any]) -> list[str]:
     """Находки проб по одной модели — строками для вывода."""
-    lines = [f"{model}:"]
-    if "reasoning_chars" in finding:
-        chars = finding["reasoning_chars"]
-        returned = f"да, {chars} симв. (~{chars // CHARS_PER_TOKEN} ток.)" if chars else "нет"
-        lines.append(f"  рассуждения в ответе с вызовом функции: {returned}")
+    return [
+        f"{model}:",
+        *_reasoning_lines(finding),
+        *_step_lines(finding),
+        *_sampling_lines(finding),
+        *_text_stream_lines(finding),
+        *_cache_lines(finding),
+    ]
+
+
+def _reasoning_lines(finding: Mapping[str, Any]) -> list[str]:
+    """Вернул ли шлюз рассуждения в ответе с вызовом функции."""
+    if "reasoning_chars" not in finding:
+        return []
+    chars = finding["reasoning_chars"]
+    returned = "нет"
+    if chars:
+        tokens = chars // CHARS_PER_TOKEN
+        returned = f"да, {chars} симв. (~{tokens} ток.)"
+    return [f"  рассуждения в ответе с вызовом функции: {returned}"]
+
+
+def _step_lines(finding: Mapping[str, Any]) -> list[str]:
+    """Второй шаг пробы: размер запроса с tools_state_id и без него."""
     steps = finding.get("step2")
-    if steps:
-        lines.append(
-            f"  второй шаг, input_tokens: с tools_state_id {_status(steps.get('with_state'))}, "
-            f"без него {_status(steps.get('without_state'))}"
-        )
-        # Порог «заметной» разницы — половина оценки рассуждений, но не меньше 5 токенов.
-        threshold = max(5, finding.get("reasoning_chars", 0) // CHARS_PER_TOKEN // 2)
-        with_state = steps["with_state"].get("input_tokens")
-        without = (steps.get("without_state") or {}).get("input_tokens")
-        if with_state and without:
-            delta = with_state - without
-            verdict = (
-                "похоже, шлюз сам подставляет скрытое состояние (рассуждения) по tools_state_id"
-                if delta >= threshold
-                else "признаков, что шлюз хранит рассуждения сам, нет"
-            )
-            lines.append(f"    разница {delta:+d} ток.: {verdict}")
-        if "with_state+reasoning" in steps:
-            lines.append(
-                "  рассуждения в запросе (role: reasoning): с tools_state_id "
-                f"{_status(steps['with_state+reasoning'], with_state)}, без него "
-                f"{_status(steps.get('without_state+reasoning'), without)}"
-            )
-    elif finding.get("tool_call") is False:
-        lines.append("  модель не вызвала функцию — шаги не сравнивались")
-    sampling = finding.get("sampling")
-    if sampling:
-        verdicts = (
-            f"{name} → {'принято' if step['status'] < 400 else 'ошибка ' + str(step['status'])}"
-            for name, step in sampling.items()
-        )
-        lines.append(f"  model_options: {'; '.join(verdicts)} (принято ≠ учтено)")
-    if "text_stream_finish" in finding:
-        finish = finding["text_stream_finish"]
+    if not steps:
+        if finding.get("tool_call") is False:
+            return ["  модель не вызвала функцию — шаги не сравнивались"]
+        return []
+    with_state_status = _status(steps.get("with_state"))
+    without_state_status = _status(steps.get("without_state"))
+    lines = [
+        (
+            f"  второй шаг, input_tokens: с tools_state_id {with_state_status}, "
+            f"без него {without_state_status}"
+        ),
+    ]
+    # Порог «заметной» разницы — половина оценки рассуждений, но не меньше 5 токенов.
+    threshold = max(5, finding.get("reasoning_chars", 0) // CHARS_PER_TOKEN // 2)
+    with_state = steps["with_state"].get("input_tokens")
+    without = (steps.get("without_state") or {}).get("input_tokens")
+    if with_state and without:
+        delta = with_state - without
         verdict = (
-            "окончание не приходит — каждый ответ сочтётся оборванным!"
-            if finish == "incomplete"
-            else "окончание приходит"
+            "похоже, шлюз сам подставляет скрытое состояние (рассуждения) по tools_state_id"
+            if delta >= threshold
+            else "признаков, что шлюз хранит рассуждения сам, нет"
         )
-        lines.append(f"  текстовый поток: finish_reason={finish} — {verdict}")
+        lines.append(f"    разница {format(delta, '+d')} ток.: {verdict}")
+    lines.extend(_reasoning_request_lines(steps, with_state, without))
+    return lines
+
+
+def _reasoning_request_lines(
+    steps: Mapping[str, Any],
+    with_state: int | None,
+    without: int | None,
+) -> list[str]:
+    """Шаг с рассуждениями в запросе (role: reasoning) — прирост к шагу без них."""
+    if "with_state+reasoning" not in steps:
+        return []
+    with_reasoning_status = _status(steps["with_state+reasoning"], with_state)
+    without_reasoning_status = _status(steps.get("without_state+reasoning"), without)
+    return [
+        (
+            "  рассуждения в запросе (role: reasoning): с tools_state_id "
+            f"{with_reasoning_status}, без него "
+            f"{without_reasoning_status}"
+        ),
+    ]
+
+
+def _sampling_verdict(step: Mapping[str, Any]) -> str:
+    """Принят ли параметр семплирования шлюзом."""
+    if step["status"] < 400:
+        return "принято"
+    return f"ошибка {step['status']}"
+
+
+def _sampling_lines(finding: Mapping[str, Any]) -> list[str]:
+    """Параметры семплирования (model_options): приняты ли они шлюзом."""
+    sampling = finding.get("sampling")
+    if not sampling:
+        return []
+    verdicts = "; ".join(f"{name} → {_sampling_verdict(step)}" for name, step in sampling.items())
+    return [f"  model_options: {verdicts} (принято ≠ учтено)"]
+
+
+def _text_stream_lines(finding: Mapping[str, Any]) -> list[str]:
+    """Приходит ли окончание текстового потока (finish_reason)."""
+    if "text_stream_finish" not in finding:
+        return []
+    finish = finding["text_stream_finish"]
+    verdict = (
+        "окончание не приходит — каждый ответ сочтётся оборванным!"
+        if finish == "incomplete"
+        else "окончание приходит"
+    )
+    return [f"  текстовый поток: finish_reason={finish} — {verdict}"]
+
+
+def _cache_lines(finding: Mapping[str, Any]) -> list[str]:
+    """Кеш префикса: сколько токенов повторного запроса взято из кеша."""
     cache = finding.get("cache")
-    if cache and len(cache) >= 2:
-        second = cache[-1]
-        share = (
-            f" ({100 * second['cached_tokens'] / second['input_tokens']:.0f}%)"
-            if second["input_tokens"]
-            else ""
-        )
-        lines.append(
+    if not cache or len(cache) < 2:
+        return []
+    second = cache[-1]
+    share = _cache_share(second["input_tokens"], second["cached_tokens"])
+    return [
+        (
             f"  кеш префикса: повтор запроса {second['input_tokens']} ток., из кеша "
             f"{second['cached_tokens']}{share}"
-        )
-    return lines
+        ),
+    ]
+
+
+def _cache_share(input_tokens: int, cached_tokens: int) -> str:
+    """Доля кеша в процентах — « (40%)»; пусто, если размер запроса неизвестен."""
+    if not input_tokens:
+        return ""
+    share = 100 * cached_tokens / input_tokens
+    return f" ({share:.0f}%)"
+
+
+def _say(text: str | None) -> None:
+    """Строка в стандартный вывод (CLI просмотра отчётов)."""
+    sys.stdout.write(f"{text}\n")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) == 2 and args[0] == "show":
         report = load_report(Path(args[1]))
-        print(_describe(report["meta"]))
-        print("\n".join(summary_table(report["runs"])))
+        _say(_describe(report["meta"]))
+        _say("\n".join(summary_table(report["runs"])))
         return 0
     if len(args) == 2 and args[0] == "digest":
-        print("\n".join(digest_report(load_report(Path(args[1])))))
+        _say("\n".join(digest_report(load_report(Path(args[1])))))
         return 0
     if len(args) == 3 and args[0] == "compare":
         lines = compare_reports(load_report(Path(args[1])), load_report(Path(args[2])))
-        print("\n".join(lines))
+        _say("\n".join(lines))
         return 0
-    print(__doc__)
+    _say(__doc__)
     return 2
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

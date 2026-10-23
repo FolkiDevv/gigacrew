@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 
 from gigacrew.agent.conversation import clean_text
 from gigacrew.permissions import PermissionMode
@@ -134,14 +135,8 @@ as text or as code blocks like ```python read_file(...)``` — such text is not 
 executed and only gets in the way.
 """
 
-SYSTEM_PROMPT = (
-    _INTRO
-    + "\n"
-    + _DELEGATION_RULES
-    + _WORK_RULES
-    + _ASK_USER_RULE
-    + _PROJECT_RULES
-    + """
+# Только основной агент: как отвечать пользователю.
+_REPLY_RULES = """
 # Replies
 - Reply in the language of the user's latest message, even though these \
 instructions and the project context are in English.
@@ -149,12 +144,21 @@ instructions and the project context are in English.
 - When the task is done, give a short summary of what you did and how it was \
 checked, without filler.
 """
+
+SYSTEM_PROMPT = (
+    _INTRO
+    + "\n"
+    + _DELEGATION_RULES
+    + _WORK_RULES
+    + _ASK_USER_RULE
+    + _PROJECT_RULES
+    + _REPLY_RULES
     + _CALLS_RULE
 )
 
 
-SUBAGENT_PROMPT = (
-    """\
+# Только суб-агенты: кто они и чем их работа отличается от работы основного агента.
+_SUBAGENT_INTRO = """\
 You are a subagent of gigacrew, a software engineering assistant working in a \
 terminal on the user's local machine. The task was given to you by the main \
 gigacrew agent, and your final reply goes to it, not to the user.
@@ -172,9 +176,9 @@ whole files). As soon as you have enough to answer — stop and write the report
 you, you are asked for the report — then write it right away, without tool calls.
 
 """
-    + _WORK_RULES
-    + _PROJECT_RULES
-    + """
+
+# Только суб-агенты: итоговый отчёт для основного агента.
+_FINAL_REPORT_RULES = """
 # Final report
 - Your last reply without a tool call is the report for the main agent. Write it \
 in the language of the task.
@@ -184,8 +188,8 @@ remains unclear or undone.
 - Do not retell files and do not paste large pieces of code — the main agent will \
 read what it needs. Keep the report short: usually up to 40 lines.
 """
-    + _CALLS_RULE
-)
+
+SUBAGENT_PROMPT = _SUBAGENT_INTRO + _WORK_RULES + _PROJECT_RULES + _FINAL_REPORT_RULES + _CALLS_RULE
 
 EXPLORE_PROMPT = """\
 # Agent explore: codebase research
@@ -236,7 +240,10 @@ one; read before you edit.
 checked and what did not work out.
 """
 
-SUBAGENT_PROMPTS: dict[str, str] = {"explore": EXPLORE_PROMPT, "general": GENERAL_PROMPT}
+SUBAGENT_PROMPTS: Mapping[str, str] = MappingProxyType({
+    "explore": EXPLORE_PROMPT,
+    "general": GENERAL_PROMPT,
+})
 
 
 PLAN_MODE_PROMPT = """\
@@ -356,7 +363,11 @@ has to be changed and where.
 
 
 def mode_prompt(
-    mode: PermissionMode, *, subagent: bool = False, read_only: bool = False, plan_path: str = ""
+    mode: PermissionMode,
+    *,
+    subagent: bool = False,
+    read_only: bool = False,
+    plan_path: str = "",
 ) -> str:
     """Правила текущего режима для системного промпта ("" — особых правил нет).
 
@@ -387,8 +398,7 @@ def build_project_context(workspace: Workspace) -> str:
     """
     root = workspace.root
     parts = [f"Project root: {root}"]
-    for doc in load_instructions(root):
-        parts.append(_instruction_block("Project instructions", doc))
+    parts.extend(_instruction_block("Project instructions", doc) for doc in load_instructions(root))
     skills = skills_prompt(discover_skills(workspace))
     if skills:
         parts.append(f"\n{skills}")
@@ -398,14 +408,14 @@ def build_project_context(workspace: Workspace) -> str:
         if tree.endswith(TREE_TRUNCATED):
             parts.append(
                 "(A large project, the tree is incomplete: a directory overview — "
-                "file_outline, files — find_files, definitions — find_symbol.)"
+                "file_outline, files — find_files, definitions — find_symbol.)",
             )
             repo_map = _repo_map(workspace)
             if repo_map:
                 parts.append(
                     "\nProject map — key definitions ranked by references (a map for "
                     "the task — repo_map, a whole file — file_outline):\n"
-                    f"{repo_map}"
+                    f"{repo_map}",
                 )
     return clean_text("\n".join(parts))
 
@@ -432,16 +442,20 @@ def skills_prompt(skills: Sequence[Skill]) -> str:
     if not skills:
         return ""
     lines = [
-        "Skills — ready-made instructions for typical tasks. When the task matches a "
-        "skill's description, load it with the skill tool before starting and follow it:"
+        (
+            "Skills — ready-made instructions for typical tasks. When the task matches a "
+            "skill's description, load it with the skill tool before starting and follow it:"
+        ),
     ]
     for skill in skills[:MAX_SKILLS_LISTED]:
         description = skill.description or "(no description)"
         if len(description) > MAX_SKILL_DESCRIPTION:
-            description = description[: MAX_SKILL_DESCRIPTION - 1].rstrip() + "…"
+            shortened = description[: MAX_SKILL_DESCRIPTION - 1].rstrip()
+            description = f"{shortened}…"
         lines.append(f"- {skill.name}: {description}")
     if len(skills) > MAX_SKILLS_LISTED:
-        lines.append(f"(and {len(skills) - MAX_SKILLS_LISTED} more — the skill tool lists all)")
+        unlisted = len(skills) - MAX_SKILLS_LISTED
+        lines.append(f"(and {unlisted} more — the skill tool lists all)")
     return "\n".join(lines)
 
 
@@ -459,8 +473,10 @@ def skill_invocation_prompt(skill: Skill, body: str, command_line: str, args: st
         args = ""
     parts = [
         command_line,
-        f"The user invoked the skill {skill.name} — follow its instructions "
-        f"(files of the skill are in {skill.directory}):",
+        (
+            f"The user invoked the skill {skill.name} — follow its instructions "
+            f"(files of the skill are in {skill.directory}):"
+        ),
         f'<skill name="{skill.name}">\n{body}\n</skill>',
     ]
     if args:
@@ -488,11 +504,13 @@ def nested_instructions_prompt(files: Sequence[InstructionFile]) -> str:
         return ""
     parts = [
         NESTED_HEADER,
-        "They apply to files of their directory and its subdirectories and win over the "
-        "root instructions.",
+        (
+            "They apply to files of their directory and its subdirectories and win over the "
+            "root instructions."
+        ),
     ]
     budget = MAX_NESTED_CHARS
-    skipped = []
+    skipped: list[str] = []
     for doc in files:
         if len(doc.content) > budget:
             skipped.append(doc.name)
@@ -501,9 +519,10 @@ def nested_instructions_prompt(files: Sequence[InstructionFile]) -> str:
         directory = doc.name.rpartition("/")[0]
         parts.append(_instruction_block(f"Instructions of directory {directory}", doc))
     if skipped:
+        skipped_names = ", ".join(skipped)
         parts.append(
             "\nToo large for the context (read them with read_file before working with "
-            f"files of these directories): {', '.join(skipped)}"
+            f"files of these directories): {skipped_names}",
         )
     return clean_text("\n".join(parts))
 

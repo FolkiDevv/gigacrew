@@ -11,14 +11,13 @@
 
 from __future__ import annotations
 
-import contextlib
 import difflib
 import re
-from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 
-from gigacrew.agent.chat_store import ChatRecorder, ChatStoreError, SavedChat
+from gigacrew.agent.chat_store import ChatInfo, ChatRecorder, ChatStoreError, SavedChat
 from gigacrew.agent.decisions import redact
 from gigacrew.agent.loop import Agent
 from gigacrew.agent.prompts import skill_invocation_prompt
@@ -38,10 +37,16 @@ from gigacrew.project.index import ProjectIndex
 from gigacrew.project.skills import COMMAND_NAME_PATTERN, SkillCatalog
 from gigacrew.ui.console import Console
 
+# Насколько неизвестная команда должна походить на известную, чтобы её подсказать.
+_SUGGESTION_CUTOFF = 0.6
+
 
 def save_chat(chats: ChatRecorder, agent: Agent, ui: Console) -> None:
-    """Сохранить чат. Если файл чата изменила другая сессия, диалог сохраняется новым
-    чатом — тогда и план этой сессии переезжает к нему (:meth:`Agent.continue_as`)."""
+    """Сохранить чат.
+
+    Если файл чата изменила другая сессия, диалог сохраняется новым чатом — тогда и план
+    этой сессии переезжает к нему (:meth:`Agent.continue_as`).
+    """
     warning = chats.save(agent.conversation, model=agent.model)
     if chats.chat_id != agent.chat_id:
         agent.continue_as(chats.chat_id)
@@ -51,6 +56,8 @@ def save_chat(chats: ChatRecorder, agent: Agent, ui: Console) -> None:
 
 @dataclass
 class CommandContext:
+    """Всё, что нужно обработчику слеш-команды: агент, интерфейс, чаты и настройки REPL."""
+
     agent: Agent
     ui: Console
     commands: CommandRegistry
@@ -71,6 +78,8 @@ Handler = Callable[[CommandContext, str], bool]
 
 @dataclass(frozen=True)
 class SlashCommand:
+    """Слеш-команда REPL: имя, описание для справки и обработчик."""
+
     name: str  # с ведущим слешем: "/model"
     summary: str  # кратко — для баннера и справки
     handler: Handler
@@ -79,22 +88,28 @@ class SlashCommand:
 
 
 class CommandRegistry:
+    """Зарегистрированные слеш-команды: поиск по имени и псевдонимам, выполнение строки."""
+
     def __init__(self) -> None:
+        """Создать пустой реестр."""
         self._commands: dict[str, SlashCommand] = {}
         self._lookup: dict[str, SlashCommand] = {}
 
     def register(self, command: SlashCommand) -> None:
-        for key in (command.name, *command.aliases):
-            key = key.lower()
+        """Добавить команду; занятое имя или псевдоним — :class:`ValueError`."""
+        for name in (command.name, *command.aliases):
+            key = name.lower()
             if key in self._lookup:
                 raise ValueError(f"Команда {key} уже зарегистрирована")
             self._lookup[key] = command
         self._commands[command.name] = command
 
     def get(self, name: str) -> SlashCommand | None:
+        """Команда по имени или псевдониму (без учёта регистра); None — такой нет."""
         return self._lookup.get(name.lower())
 
     def __iter__(self) -> Iterator[SlashCommand]:
+        """Команды в порядке регистрации (каждая — один раз, без псевдонимов)."""
         return iter(self._commands.values())
 
     def dispatch(self, line: str, ctx: CommandContext) -> bool:
@@ -104,10 +119,15 @@ class CommandRegistry:
         arg = parts[1].strip() if len(parts) > 1 else ""
         command = self.get(name)
         if command is None:
-            names = [n for cmd in self for n in (cmd.name, *cmd.aliases)]
+            names = [known for cmd in self for known in (cmd.name, *cmd.aliases)]
             if ctx.skills is not None:
                 names += [skill.command for skill in ctx.skills]
-            close = difflib.get_close_matches(name.lower(), names, n=1, cutoff=0.6)
+            close = difflib.get_close_matches(
+                name.lower(),
+                names,
+                n=1,
+                cutoff=_SUGGESTION_CUTOFF,
+            )
             hint = f" — возможно, {close[0]}?" if close else ""
             ctx.ui.error(f"неизвестная команда: {name}{hint} (список — /help)")
             return True
@@ -121,6 +141,7 @@ _REPL_COMMAND_RE = re.compile(rf"^/{COMMAND_NAME_PATTERN}$")
 
 
 def is_repl_command(line: str) -> bool:
+    """Строка — слеш-команда REPL (или скилл), а не обычный запрос агенту."""
     if not line.startswith("/"):
         return False
     first = line.split(maxsplit=1)[0]
@@ -143,8 +164,10 @@ def expand_skill(line: str, commands: CommandRegistry, skills: SkillCatalog) -> 
         return None
     try:
         body = skill.body()
-    except (OSError, UnicodeDecodeError) as e:
-        raise OSError(f"не удалось прочитать скилл {skill.name} ({skill.path}): {e}") from None
+    except (OSError, UnicodeDecodeError) as error:
+        raise OSError(
+            f"не удалось прочитать скилл {skill.name} ({skill.path}): {error}",
+        ) from None
     args = parts[1].strip() if len(parts) > 1 else ""
     return skill_invocation_prompt(skill, body, line.strip(), args)
 
@@ -153,14 +176,14 @@ def expand_skill(line: str, commands: CommandRegistry, skills: SkillCatalog) -> 
 def _help(ctx: CommandContext, _arg: str) -> bool:
     rows = []
     for cmd in ctx.commands:
-        alias = f" (также {', '.join(cmd.aliases)})" if cmd.aliases else ""
+        aliases = ", ".join(cmd.aliases)
+        alias = f" (также {aliases})" if cmd.aliases else ""
         rows.append((cmd.usage or cmd.name, f"{cmd.summary}{alias}"))
     if ctx.skills is not None:
-        rows += [
-            (f"{skill.command} [аргументы]", f"скилл · {skill.description or skill.path}")
-            for skill in ctx.skills
-            if ctx.commands.get(skill.command) is None
-        ]
+        for skill in ctx.skills:
+            if ctx.commands.get(skill.command) is None:
+                about = skill.description or skill.path
+                rows.append((f"{skill.command} [аргументы]", f"скилл · {about}"))
     ctx.ui.help(rows, KEY_HELP)
     return True
 
@@ -168,13 +191,15 @@ def _help(ctx: CommandContext, _arg: str) -> bool:
 def catalogue_ids(provider: LLMProvider) -> list[str] | None:
     """Модели каталога провайдера — выбрать можно только их; None — каталога нет."""
     models = provider.known_models()
-    return None if models is None else [m.id for m in models]
+    return None if models is None else [model.id for model in models]
 
 
 def _model(ctx: CommandContext, arg: str) -> bool:
     agent = ctx.agent
     catalogue = catalogue_ids(agent.provider)
-    known = catalogue if catalogue is not None else ctx.models.models if ctx.models else None
+    known = catalogue
+    if known is None and ctx.models:
+        known = ctx.models.models
     if not arg:
         lines = [f"текущая модель: {agent.model} ({describe_model(agent.model, agent.windows)})"]
         if known:
@@ -186,7 +211,8 @@ def _model(ctx: CommandContext, arg: str) -> bool:
         # имена моделей в API регистрозависимы: «model-large» → «Model-Large»
         arg = next((name for name in known if name.lower() == arg.lower()), arg)
     if catalogue is not None and arg not in catalogue:
-        ctx.ui.error(f"модели {arg} нет в каталоге бэкенда; доступны: {', '.join(catalogue)}")
+        available = ", ".join(catalogue)
+        ctx.ui.error(f"модели {arg} нет в каталоге бэкенда; доступны: {available}")
         return True
     agent.set_model(arg)
     if known and arg not in known:
@@ -200,32 +226,38 @@ def _model(ctx: CommandContext, arg: str) -> bool:
 
 def mode_choices(current: PermissionMode) -> list[tuple[str, str]]:
     """Варианты аргумента ``/mode`` для автодополнения: (имя, пояснение)."""
-    return [
-        (mode.value, f"{mode.label}{' · текущий' if mode is current else ''} — {mode.description}")
-        for mode in MODE_CYCLE
-    ]
+    choices = []
+    for mode in MODE_CYCLE:
+        marker = " · текущий" if mode is current else ""
+        choices.append((mode.value, f"{mode.label}{marker} — {mode.description}"))
+    return choices
 
 
 def _mode(ctx: CommandContext, arg: str) -> bool:
     agent = ctx.agent
     if not arg:
-        lines = [f"режим: {agent.mode.label} — {agent.mode.description}"]
-        if agent.mode is PermissionMode.AUTO and agent.reviewer.enabled:
-            lines.append(f"  {agent.reviewer.describe(agent.model)}")
+        current = agent.mode
+        lines = [f"режим: {current.label} — {current.description}"]
+        if current is PermissionMode.AUTO and agent.reviewer.enabled:
+            reviewer_text = agent.reviewer.describe(agent.model)
+            lines.append(f"  {reviewer_text}")
         lines.append("режимы (Shift+Tab — следующий по кругу):")
-        lines += [f"  • {m.value} — {m.label}: {m.description}" for m in MODE_CYCLE]
+        lines += [
+            f"  • {option.value} — {option.label}: {option.description}" for option in MODE_CYCLE
+        ]
         ctx.ui.info("\n".join(lines))
         _warn_reviewer(ctx)
         return True
     try:
         mode = parse_mode(arg)
-    except ValueError as e:
-        ctx.ui.error(f"{e} (использование: {MODE_USAGE})")
+    except ValueError as error:
+        ctx.ui.error(f"{error} (использование: {MODE_USAGE})")
         return True
     agent.set_mode(mode)
     text = f"режим: {mode.label} — {mode.description}"
     if mode is PermissionMode.AUTO and agent.reviewer.enabled:
-        text += f"\n  {agent.reviewer.describe(agent.model)}"
+        reviewer_text = agent.reviewer.describe(agent.model)
+        text = f"{text}\n  {reviewer_text}"
     ctx.ui.info(text)
     _warn_reviewer(ctx)
     return True
@@ -239,107 +271,144 @@ def _warn_reviewer(ctx: CommandContext) -> None:
 
 
 PERMISSIONS_USAGE = "/permissions [forget N | clear | log]"
-MODE_USAGE = "/mode [" + "|".join(mode.value for mode in MODE_CYCLE) + "]"
+_MODE_NAMES = "|".join(mode.value for mode in MODE_CYCLE)
+MODE_USAGE = f"/mode [{_MODE_NAMES}]"
 
 
 def _permissions(ctx: CommandContext, arg: str) -> bool:
     """Сохранённые разрешения «всегда» для команд и последние решения."""
-    memory = ctx.agent.decisions
     words = arg.split()
     action = words[0].lower() if words else ""
-    if action in ("forget", "rm", "удалить"):
-        # isdecimal, а не isdigit: «²» — цифра, но int() её не разберёт
-        if len(words) != 2 or not words[1].isdecimal():
-            ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
-            return True
-        try:
-            rule = memory.forget(int(words[1]))
-        except IndexError:
-            ctx.ui.error(f"нет разрешения №{words[1]} (список — /permissions)")
-        except OSError as e:
-            ctx.ui.error(f"не удалось сохранить: {e}")
-        else:
-            ctx.ui.info(f"разрешение удалено: {redact(rule.describe())}")
-        return True
-    if action in ("clear", "очистить"):
-        try:
-            n = memory.clear()
-        except OSError as e:
-            ctx.ui.error(f"не удалось сохранить: {e}")
-        else:
-            ctx.ui.info(f"удалено разрешений: {n}")
-        return True
-    if action in ("log", "журнал"):
-        items = memory.recent()
-        if not items:
-            ctx.ui.info("журнал решений пуст" + ("" if memory.log else " (не ведётся: --no-save)"))
-            return True
-        lines = []
-        for item in items:
-            mark = {"yes": "да", "always": "всегда", "no": "нет", "no_answer": "без ответа"}.get(
-                str(item.get("decision")), str(item.get("decision"))
-            )
-            review = item.get("review") if isinstance(item.get("review"), dict) else {}
-            if item.get("source") == "reviewer":
-                mark = "разрешил рецензент"
-            where = "" if item.get("cwd") in (None, ".") else f" [{item.get('cwd')}]"
-            text = f"  • {mark}{where}: {item.get('command', '')}"
-            if item.get("feedback"):
-                text += f" — «{item['feedback']}»"
-            elif item.get("source") == "reviewer" and review.get("reason"):
-                text += f" — {review['reason']}"
-            # Журнал прежних версий вырезал меньше форм секретов, пояснение рецензента
-            # не вырезается вовсе — на экран не выводим ни то, ни другое.
-            text = redact(text)
-            lines.append(text)
-        ctx.ui.info("последние решения:\n" + "\n".join(lines))
-        return True
-    if action:
+    if action in {"forget", "rm", "удалить"}:
+        _forget_permission(ctx, words)
+    elif action in {"clear", "очистить"}:
+        _clear_permissions(ctx)
+    elif action in {"log", "журнал"}:
+        _show_decisions(ctx)
+    elif action:
         ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
-        return True
-    if not memory.rules:
-        lines = ["сохранённых разрешений нет: ответ «a» на вопрос о команде запомнит её"]
     else:
+        _show_permissions(ctx)
+    return True
+
+
+def _forget_permission(ctx: CommandContext, words: list[str]) -> None:
+    """``/permissions forget N``: удалить разрешение с номером N из списка."""
+    # isdecimal, а не isdigit: «²» — цифра, но int() её не разберёт
+    if len(words) != 2 or not words[1].isdecimal():
+        ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
+        return
+    memory = ctx.agent.decisions
+    try:
+        rule = memory.forget(int(words[1]))
+    except IndexError:
+        ctx.ui.error(f"нет разрешения №{words[1]} (список — /permissions)")
+    except OSError as error:
+        ctx.ui.error(f"не удалось сохранить: {error}")
+    else:
+        ctx.ui.info(f"разрешение удалено: {redact(rule.describe())}")
+
+
+def _clear_permissions(ctx: CommandContext) -> None:
+    """``/permissions clear``: удалить все сохранённые разрешения."""
+    memory = ctx.agent.decisions
+    try:
+        removed = memory.clear()
+    except OSError as error:
+        ctx.ui.error(f"не удалось сохранить: {error}")
+    else:
+        ctx.ui.info(f"удалено разрешений: {removed}")
+
+
+def _show_decisions(ctx: CommandContext) -> None:
+    """``/permissions log``: последние решения из журнала."""
+    memory = ctx.agent.decisions
+    decisions = memory.recent()
+    if not decisions:
+        reason = "" if memory.log else " (не ведётся: --no-save)"
+        ctx.ui.info(f"журнал решений пуст{reason}")
+        return
+    lines = [_describe_decision(decision) for decision in decisions]
+    listing = "\n".join(lines)
+    ctx.ui.info(f"последние решения:\n{listing}")
+
+
+def _describe_decision(entry: Mapping[str, object]) -> str:
+    """Строка журнала решений для ``/permissions log`` (секреты вырезаны)."""
+    decision = str(entry.get("decision"))
+    mark = {"yes": "да", "always": "всегда", "no": "нет", "no_answer": "без ответа"}.get(
+        decision,
+        decision,
+    )
+    raw_review = entry.get("review")
+    review = raw_review if isinstance(raw_review, dict) else {}
+    if entry.get("source") == "reviewer":
+        mark = "разрешил рецензент"
+    cwd = entry.get("cwd")
+    where = "" if cwd in {None, "."} else f" [{cwd}]"
+    text = f"  • {mark}{where}: {entry.get('command', '')}"
+    if entry.get("feedback"):
+        text = f"{text} — «{entry['feedback']}»"
+    elif entry.get("source") == "reviewer" and review.get("reason"):
+        text = f"{text} — {review['reason']}"
+    # Журнал прежних версий вырезал меньше форм секретов, пояснение рецензента
+    # не вырезается вовсе — на экран не выводим ни то, ни другое.
+    return redact(text)
+
+
+def _show_permissions(ctx: CommandContext) -> None:
+    """``/permissions``: сохранённые разрешения и где они хранятся."""
+    memory = ctx.agent.decisions
+    if memory.rules:
         lines = ["разрешено без вопросов:"]
-        for i, rule in enumerate(memory.rules, 1):
+        for number, rule in enumerate(memory.rules, 1):
             used = f", применялось {rule.hits}" if rule.hits else ""
             # Правило — команда как есть: прежние версии сохраняли и команды с паролем.
-            lines.append(f"  {i}. {redact(rule.describe())}{used}")
+            lines.append(f"  {number}. {redact(rule.describe())}{used}")
         lines.append("удалить — /permissions forget N, все — /permissions clear")
+    else:
+        lines = ["сохранённых разрешений нет: ответ «a» на вопрос о команде запомнит её"]
     if memory.approvals_path is not None and memory.remember:
         lines.append(f"файл: {memory.approvals_path}")
     elif memory.directory is None or not memory.remember:
         lines.append("разрешения хранятся до конца сессии (GIGACREW_REMEMBER_APPROVALS=0)")
     ctx.ui.info("\n".join(lines))
-    return True
+
+
+def _start_new_chat(ctx: CommandContext) -> None:
+    """Сбросить историю агента и начать новый чат (для ``/clear``)."""
+    if ctx.chats is None:
+        ctx.agent.reset()
+    else:
+        ctx.chats.start_new()  # прежний чат остаётся сохранённым — его вернёт /resume
+        ctx.agent.reset(chat_id=ctx.chats.chat_id)
 
 
 def _clear(ctx: CommandContext, _arg: str) -> bool:
-    def switch() -> None:
-        if ctx.chats is None:
-            ctx.agent.reset()
-        else:
-            ctx.chats.start_new()  # прежний чат остаётся сохранённым — его вернёт /resume
-            ctx.agent.reset(chat_id=ctx.chats.chat_id)
-
-    restart_session(ctx.agent, ctx.ui, end_reason="clear", source="clear", switch=switch)
+    restart_session(
+        ctx.agent,
+        ctx.ui,
+        end_reason="clear",
+        source="clear",
+        switch=lambda: _start_new_chat(ctx),
+    )
     ctx.ui.info("история очищена, начат новый чат")
     return True
 
 
 def _compact(ctx: CommandContext, arg: str) -> bool:
     agent = ctx.agent
-    guard = ctx.interrupt if ctx.interrupt is not None else contextlib.nullcontext()
+    guard = nullcontext() if ctx.interrupt is None else ctx.interrupt
     try:
         with guard:
-            result = agent.compact(arg)
+            compacted = agent.compact(arg)
     except KeyboardInterrupt:
         ctx.ui.warn("сжатие прервано — история не изменилась")
         return True
-    except LLMError as e:
-        ctx.ui.error(f"не удалось сжать контекст: {e}")
+    except LLMError as error:
+        ctx.ui.error(f"не удалось сжать контекст: {error}")
         return True
-    if result is None:
+    if compacted is None:
         ctx.ui.info("сжимать нечего: история пуста или уже сжата")
         return True
     if ctx.chats is not None:  # краткое содержание — часть чата: сохраняем сразу
@@ -351,7 +420,11 @@ RESUME_LIMIT = 100  # сколько последних чатов показы�
 
 
 def resume_chat(
-    agent: Agent, chats: ChatRecorder, saved: SavedChat, *, keep_model: bool = False
+    agent: Agent,
+    chats: ChatRecorder,
+    saved: SavedChat,
+    *,
+    keep_model: bool = False,
 ) -> str | None:
     """Продолжить сохранённый чат: дальнейшие ходы дописываются в него же.
 
@@ -361,79 +434,89 @@ def resume_chat(
     """
     skipped = None
     # Сначала модель: сохранённый расход токенов чата посчитан в её токенах.
-    model = saved.info.model
+    model = saved.meta.model
     if model and not keep_model:
         catalogue = catalogue_ids(agent.provider)
         if catalogue is None or model in catalogue:
             agent.set_model(model)
         else:
             skipped = model
-    agent.reset(saved.conversation, chat_id=saved.info.id)
-    chats.switch_to(saved.info)
+    agent.reset(saved.conversation, chat_id=saved.meta.id)
+    chats.switch_to(saved.meta)
     return skipped
+
+
+def _choose_chat(ctx: CommandContext, chats: ChatRecorder, arg: str) -> ChatInfo | None:
+    """Чат для ``/resume``: по ссылке из аргумента или выбранный в списке; None — не выбран."""
+    if arg:
+        return chats.store.find(arg)
+    recent = chats.store.recent(limit=RESUME_LIMIT)
+    if not recent:
+        ctx.ui.info("сохранённых чатов пока нет")
+        return None
+    return ctx.ui.pick_chat(recent, chats.chat_id)
 
 
 def _resume(ctx: CommandContext, arg: str) -> bool:
     if ctx.chats is None:
         ctx.ui.warn("сохранённые чаты недоступны")
         return True
-    store = ctx.chats.store
-    try:
-        if arg:
-            info = store.find(arg)
-        else:
-            recent = store.recent(limit=RESUME_LIMIT)
-            if not recent:
-                ctx.ui.info("сохранённых чатов пока нет")
-                return True
-            info = ctx.ui.pick_chat(recent, ctx.chats.chat_id)
-            if info is None:
-                return True
-        saved = store.load(info.id)
-    except ChatStoreError as e:
-        ctx.ui.error(str(e))
-        return True
-    previous = ctx.agent.model
     chats = ctx.chats
+    try:
+        chosen = _choose_chat(ctx, chats, arg)
+        if chosen is None:
+            return True
+        saved = chats.store.load(chosen.id)
+    except ChatStoreError as error:
+        ctx.ui.error(str(error))
+        return True
+    agent = ctx.agent
+    previous = agent.model
     skipped = restart_session(
-        ctx.agent,
+        agent,
         ctx.ui,
         end_reason="resume",
         source="resume",
-        switch=lambda: resume_chat(ctx.agent, chats, saved),
+        switch=lambda: resume_chat(agent, chats, saved),
     )
-    ctx.ui.chat_resumed(saved.info, saved.conversation.messages, ctx.agent.call_info)
+    ctx.ui.chat_resumed(saved.meta, saved.conversation.messages, agent.call_info)
     if skipped:
-        ctx.ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {ctx.agent.model}")
-    if ctx.agent.model != previous:
-        ctx.ui.info(f"модель чата: {ctx.agent.model}")
+        ctx.ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {agent.model}")
+    if agent.model != previous:
+        ctx.ui.info(f"модель чата: {agent.model}")
         ensure_context_window(
-            ctx.agent, ctx.ui, interrupt=ctx.interrupt, declined=ctx.declined_windows
+            agent,
+            ctx.ui,
+            interrupt=ctx.interrupt,
+            declined=ctx.declined_windows,
         )
     return True
 
 
 def _index(ctx: CommandContext, arg: str) -> bool:
-    if arg not in ("", "rebuild"):
+    if arg not in {"", "rebuild"}:
         ctx.ui.error("использование: /index [rebuild]")
         return True
     workspace = ctx.agent.workspace
     index = ProjectIndex(workspace)
-    result = run_indexing(index, ctx.ui, ctx.interrupt, rebuild=arg == "rebuild")
-    if result is not None:
+    indexed = run_indexing(index, ctx.ui, ctx.interrupt, rebuild=arg == "rebuild")
+    if indexed is not None:
         ty = semantic.status(workspace) if ctx.agent.config.ty else "выключен (GIGACREW_TY=0)"
-        ctx.ui.info(describe_index(*result, ty_status=ty))
+        ctx.ui.info(describe_index(*indexed, ty_status=ty))
     return True
 
 
 def _hooks(ctx: CommandContext, arg: str) -> bool:
-    if arg not in ("", "reload"):
+    if arg not in {"", "reload"}:
         ctx.ui.error("использование: /hooks [reload]")
         return True
     if arg == "reload":
         agent = ctx.agent
         agent.hooks = load_hooks(
-            agent.workspace, ctx.ui, interactive=ctx.ui.interactive(), trust=ctx.trust_hooks
+            agent.workspace,
+            ctx.ui,
+            interactive=ctx.ui.interactive(),
+            trust=ctx.trust_hooks,
         )
         install_request_hook(agent.provider, agent.hooks, ctx.ui, agent.config)
         ctx.ui.info("настройки хуков перечитаны")
@@ -447,6 +530,7 @@ def _exit(ctx: CommandContext, _arg: str) -> bool:
 
 
 def default_commands() -> CommandRegistry:
+    """Реестр встроенных слеш-команд REPL."""
     registry = CommandRegistry()
     registry.register(SlashCommand("/help", "справка", _help))
     registry.register(SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"))
@@ -457,7 +541,7 @@ def default_commands() -> CommandRegistry:
             "разрешённые без вопросов команды и журнал решений",
             _permissions,
             usage=PERMISSIONS_USAGE,
-        )
+        ),
     )
     registry.register(SlashCommand("/clear", "новый чат", _clear))
     registry.register(
@@ -466,7 +550,7 @@ def default_commands() -> CommandRegistry:
             "сжать историю в краткое содержание",
             _compact,
             usage="/compact [пожелания]",
-        )
+        ),
     )
     registry.register(
         SlashCommand(
@@ -475,10 +559,10 @@ def default_commands() -> CommandRegistry:
             _resume,
             usage="/resume [id]",
             aliases=("/chats",),
-        )
+        ),
     )
     registry.register(
-        SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]")
+        SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]"),
     )
     registry.register(SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"))
     registry.register(SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")))

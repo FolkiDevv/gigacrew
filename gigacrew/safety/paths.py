@@ -13,11 +13,18 @@ import fnmatch
 import glob
 import os
 import re
-from enum import Enum
+from collections.abc import Iterator
 from pathlib import Path
 
 from gigacrew.project import files
-from gigacrew.project.files import is_secret_path
+from gigacrew.project.secret_paths import (
+    SECRET_DIRS,
+    SINKS,
+    Scope,
+    is_secret_location,
+    is_secret_name,
+    scope_of_path,
+)
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety.bash import Word
 
@@ -34,42 +41,6 @@ __all__ = [
 
 # Сколько совпадений шаблона проверять; больше — не знаем, что там.
 MAX_GLOB_MATCHES = 2000
-SINKS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty"})
-
-# Файлы с ключами и учётными данными (имя или путь). .env и .env.* — is_secret_path.
-_SECRET_NAME = re.compile(
-    r"^(\.netrc|_netrc|\.npmrc|\.pypirc|\.git-credentials|\.pgpass|\.my\.cnf|\.htpasswd|"
-    r"id_(rsa|dsa|ecdsa|ed25519)(_sk)?|credentials(\.json|\.ya?ml)?|kubeconfig|"
-    r"secrets?(\.(ya?ml|json|toml|ini|env|txt|cfg|conf))?|.*\.secrets?|"
-    r".*_history|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|ppk|gpg|asc))$",
-    re.IGNORECASE,
-)
-_SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".gcloud"})
-_PROC_ENV = re.compile(r"^/proc/[^/]+/(environ|cmdline|mem|maps)$")
-# Известные места учётных данных: пароли системы, ключи хоста ssh, токены gh и gcloud.
-_SECRET_PATH = re.compile(
-    r"^/etc/(g?shadow|sudoers)-?$|^/etc/ssh/ssh_host_[^/]*_key$|"
-    r"(^|/)\.config/(gh|hub)/hosts\.ya?ml$|(^|/)\.config/gcloud/"
-)
-
-
-class Scope(Enum):
-    INSIDE = "inside"
-    OUTSIDE = "outside"
-    SECRET = "secret"  # внутри проекта, но с ключами/паролями (.env, *.pem)
-    SECRET_OUTSIDE = "secret-outside"  # ~/.ssh, ~/.aws, /proc/*/environ
-    SINK = "sink"  # /dev/null и стандартные потоки
-    DYNAMIC = "dynamic"  # значение известно только при выполнении
-
-
-def is_secret_name(name: str) -> bool:
-    return bool(_SECRET_NAME.match(name)) and not name.casefold().endswith(".pub")
-
-
-def _is_secret(path: Path) -> bool:
-    if is_secret_path(path) or is_secret_name(path.name) or _SECRET_PATH.search(path.as_posix()):
-        return True
-    return any(part in _SECRET_DIRS for part in path.parts)
 
 
 def is_git_internal(path: Path, root: Path) -> bool:
@@ -82,53 +53,15 @@ def is_data_path(path: Path, root: Path) -> bool:
     return Workspace(root).is_data_path(path)
 
 
-def scope_of_path(path: Path, root: Path) -> Scope:
-    """Область абсолютного пути (симлинки раскрываются)."""
-    text = path.as_posix()
-    if text in SINKS:
+def _resolve(root: Path, cwd: str, path_text: str) -> Scope:
+    if path_text.startswith("~"):
+        # Path.expanduser падает на «~неизвестный», os.path.expanduser оставляет как есть.
+        lexical = Path(os.path.expanduser(path_text))  # noqa: PTH111
+        return Scope.SECRET_OUTSIDE if is_secret_location(lexical) else Scope.OUTSIDE
+    if path_text in SINKS:
         return Scope.SINK
-    if _PROC_ENV.match(text):
-        return Scope.SECRET_OUTSIDE
-    try:
-        resolved = path.resolve()
-    except (OSError, RuntimeError):
-        return Scope.DYNAMIC
-    if resolved != root and root not in resolved.parents:
-        return Scope.SECRET_OUTSIDE if _is_secret(resolved) or _is_secret(path) else Scope.OUTSIDE
-    if _is_secret(path) or _is_secret(resolved):
-        return Scope.SECRET
-    return Scope.INSIDE
-
-
-_SECRET_SCOPES = (Scope.SECRET, Scope.SECRET_OUTSIDE, Scope.DYNAMIC)
-
-
-def is_secret_target(root: Path, path: Path) -> bool:
-    """Файл с ключами или учётными данными — по тому же правилу, что у классификатора
-    команд (``cat .env`` там — непроверенная команда): ``.env*``, ``*.pem``, ``id_rsa``,
-    ``.npmrc``, ``credentials.json``, всё в ``.ssh/``, ``.aws/``… Симлинк проверяется и
-    по цели; путь, который не раскрыть, считается секретом. Так файлы с секретами
-    отказываются показывать все инструменты: чтение, поиск, навигация, индекс."""
-    return scope_of_path(path, root) in _SECRET_SCOPES
-
-
-def is_secret_entry(root: Path, path: Path) -> bool:
-    """:func:`is_secret_target` для файла из обхода каталогов проекта.
-
-    Обход не заходит в ссылки на каталоги, поэтому раскрывать путь нужно только у самой
-    ссылки: иначе проверка по имени. Так в разы быстрее — индекс проверяет каждый файл
-    проекта при каждом обновлении.
-    """
-    return _is_secret(path) or (path.is_symlink() and is_secret_target(root, path))
-
-
-def _resolve(root: Path, cwd: str, value: str) -> Scope:
-    if value.startswith("~"):
-        lexical = Path(os.path.expanduser(value))
-        return Scope.SECRET_OUTSIDE if _is_secret(lexical) else Scope.OUTSIDE
-    if value in SINKS:
-        return Scope.SINK
-    return scope_of_path(Path(value) if value.startswith("/") else root / cwd / value, root)
+    lexical_path = Path(path_text) if path_text.startswith("/") else root / cwd / path_text
+    return scope_of_path(lexical_path, root)
 
 
 def _worst(scopes: list[Scope]) -> Scope:
@@ -140,41 +73,46 @@ def _worst(scopes: list[Scope]) -> Scope:
         Scope.SINK,
         Scope.INSIDE,
     ]
-    for s in order:
-        if s in scopes:
-            return s
+    for candidate in order:
+        if candidate in scopes:
+            return candidate
     return Scope.INSIDE
 
 
-def scope(word: Word, *, root: Path, cwd: str = ".") -> Scope:
+# Проверки пути идут подряд, от простых к раскрытию шаблона: так их легче сверять с оболочкой.
+def scope(word: Word, *, root: Path, cwd: str = ".") -> Scope:  # noqa: WPS212
     """Область пути ``word`` для команды, запущенной в ``root/cwd``."""
     if not word.static:
         return Scope.DYNAMIC
-    value = word.value
+    pattern = word.text
     if not word.glob:
-        return _resolve(root, cwd, value)
+        return _resolve(root, cwd, pattern)
     # Шаблон: сегмент, начинающийся с точки, в dash совпадает с «..».
-    if any(seg.startswith(".") and re.search(r"[*?\[]", seg) for seg in value.split("/")):
+    if any(seg.startswith(".") and re.search(r"[*?\[]", seg) for seg in pattern.split("/")):
         return Scope.OUTSIDE
-    if value.startswith(("~", "/")):
-        base_scope = _resolve(root, cwd, value.split("*")[0].rsplit("/", 1)[0] or "/")
-        if base_scope not in (Scope.INSIDE,):
-            return Scope.OUTSIDE if base_scope != Scope.SECRET_OUTSIDE else base_scope
+    if pattern.startswith(("~", "/")):
+        base_scope = _resolve(root, cwd, pattern.split("*")[0].rsplit("/", 1)[0] or "/")
+        if base_scope != Scope.INSIDE:
+            return base_scope if base_scope == Scope.SECRET_OUTSIDE else Scope.OUTSIDE
     try:
-        matches = glob.glob(value, root_dir=root / cwd)
+        # glob.glob, как оболочка, не находит скрытые файлы по «*», а Path.glob находит.
+        matches = glob.glob(pattern, root_dir=root / cwd)  # noqa: PTH207
     except (OSError, ValueError):
         return Scope.DYNAMIC
     if len(matches) > MAX_GLOB_MATCHES:
         return Scope.DYNAMIC
     if not matches:  # без совпадений шаблон остаётся словом как есть
-        return _resolve(root, cwd, value)
-    return _worst([_resolve(root, cwd, m) for m in matches])
+        return _resolve(root, cwd, pattern)
+    return _worst([_resolve(root, cwd, match) for match in matches])
 
 
-def _walk(directory: Path, limit: int):
-    """Обход дерева целиком, как у ``grep -r`` и ``find``: служебные каталоги (build,
-    node_modules, .venv…) они не пропускают, значит, и проверка не пропускает. Отдаёт
-    (каталог, подкаталоги, файлы); None — дерево больше ``limit`` записей."""
+def _walk(directory: Path, limit: int) -> Iterator[tuple[Path, list[str], list[str]] | None]:
+    """Обход дерева целиком, как у ``grep -r`` и ``find``.
+
+    Служебные каталоги (build, node_modules, .venv…) они не пропускают, значит, и проверка
+    не пропускает. Отдаёт (каталог, подкаталоги, файлы); None — дерево больше ``limit``
+    записей.
+    """
     seen = 0
     for current, dirs, names in os.walk(directory):
         seen += len(names) + len(dirs)
@@ -184,8 +122,13 @@ def _walk(directory: Path, limit: int):
         yield Path(current), dirs, names
 
 
-def has_secrets_under(
-    directory: Path, root: Path, *, name_pattern: str | None = None, limit: int = 20000
+# Обход дерева и проверки найденных файлов — одним циклом, как идёт сама рекурсивная команда.
+def has_secrets_under(  # noqa: WPS231
+    directory: Path,
+    root: Path,
+    *,
+    name_pattern: str | None = None,
+    limit: int = 20000,
 ) -> bool:
     """Есть ли файлы с секретами в дереве каталога (рекурсивное чтение их покажет).
 
@@ -193,19 +136,19 @@ def has_secrets_under(
     другими именами не в счёт. Слишком большое дерево — считаем, что есть.
     """
     if not directory.is_dir():
-        return _is_secret(directory)
+        return is_secret_location(directory)
     for entry in _walk(directory, limit):
         if entry is None:
             return True
         current, dirs, names = entry
-        if any(d in _SECRET_DIRS for d in dirs):
+        if any(dirname in SECRET_DIRS for dirname in dirs):
             return True
         if ".git" in dirs and _git_config_has_credentials(current / ".git" / "config"):
             return True
         for name in names:
             if name_pattern is not None and not fnmatch.fnmatch(name, name_pattern):
                 continue
-            if is_secret_name(name) or is_secret_path(current / name):
+            if is_secret_name(name) or files.is_secret_path(current / name):
                 return True
     return False
 
@@ -221,8 +164,13 @@ def _git_config_has_credentials(path: Path) -> bool:
         return False
 
 
-def has_escaping_links(
-    directory: Path, root: Path, *, name_pattern: str | None = None, limit: int = 20000
+# Обход дерева и проверки ссылок — одним циклом, как идёт сама рекурсивная команда.
+def has_escaping_links(  # noqa: WPS231
+    directory: Path,
+    root: Path,
+    *,
+    name_pattern: str | None = None,
+    limit: int = 20000,
 ) -> bool:
     """Есть ли в дереве символические ссылки за пределы проекта (чтение по ним — наружу)."""
     if not directory.is_dir():
@@ -241,6 +189,6 @@ def has_escaping_links(
                 and not fnmatch.fnmatch(name, name_pattern)
             ):
                 continue
-            if scope_of_path(path, root) in (Scope.OUTSIDE, Scope.SECRET_OUTSIDE, Scope.DYNAMIC):
+            if scope_of_path(path, root) in {Scope.OUTSIDE, Scope.SECRET_OUTSIDE, Scope.DYNAMIC}:
                 return True
     return False

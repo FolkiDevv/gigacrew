@@ -1,3 +1,4 @@
+---
 name: CI
 
 on:
@@ -35,11 +36,45 @@ jobs:
         # --locked fails the build if uv.lock has drifted from pyproject.toml.
         run: uv sync --locked --dev
 
+      # The same checks as `make lint`, modelled on wemake-django-template.
       - name: ruff check
         run: uv run ruff check --output-format github
 
       - name: ruff format
-        run: uv run ruff format --check
+        run: uv run ruff format --check --diff
+
+      - name: wemake-python-styleguide
+        run: uv run flake8 .
+
+      - name: import-linter
+        run: uv run lint-imports
+
+      - name: mypy
+        run: uv run mypy
+
+      - name: codespell
+        run: uv run codespell .
+
+      - name: typos
+        run: uv run typos .
+
+      - name: yamllint
+        run: uv run yamllint -s .
+
+      - name: dotenv-linter
+        run: uv run dotenv-linter .env.example
+
+      - name: deptry
+        run: uv run deptry .
+
+      - name: pip check
+        run: uv pip check
+
+      - name: pip-audit
+        # Not blocking, as in the template: advisories without a fixed release would fail
+        # every PR. Read the report in the job log.
+        continue-on-error: true
+        run: uv run pip-audit --skip-editable --desc
 
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python }})

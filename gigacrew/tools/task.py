@@ -15,7 +15,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import override
 
 from pydantic import AliasChoices, BaseModel, Field
 
@@ -39,7 +42,7 @@ class SubagentSpec:
 
 # Суб-агенту недоступны: запуск суб-агентов (без вложенности), вопросы пользователю и
 # одобрение плана — пользователь говорит только с основным агентом.
-SUBAGENT_EXCLUDED: frozenset[str] = frozenset({"task", "explore", "ask_user", "exit_plan_mode"})
+SUBAGENT_EXCLUDED: frozenset[str] = frozenset(("task", "explore", "ask_user", "exit_plan_mode"))
 
 EXPLORE = SubagentSpec(
     name="explore",
@@ -48,23 +51,21 @@ EXPLORE = SubagentSpec(
         "status/diff/log, read-only shell commands. Returns a digest with paths and line "
         "numbers. For a research question prefer the explore tool"
     ),
-    tools=frozenset(
-        {
-            "read_file",
-            "list_dir",
-            "find_files",
-            "search_content",
-            "find_symbol",
-            "find_references",
-            "goto_definition",
-            "call_hierarchy",
-            "file_outline",
-            "repo_map",
-            "skill",
-            "git",  # изменяющие подкоманды блокирует read_only
-            "run_shell",  # только команды, признанные классификатором «только чтение»
-        }
-    ),
+    tools=frozenset((
+        "read_file",
+        "list_dir",
+        "find_files",
+        "search_content",
+        "find_symbol",
+        "find_references",
+        "goto_definition",
+        "call_hierarchy",
+        "file_outline",
+        "repo_map",
+        "skill",
+        "git",  # изменяющие подкоманды блокирует read_only
+        "run_shell",  # только команды, признанные классификатором «только чтение»
+    )),
     read_only=True,
 )
 GENERAL = SubagentSpec(
@@ -75,7 +76,16 @@ GENERAL = SubagentSpec(
     ),
 )
 
-SUBAGENTS: dict[str, SubagentSpec] = {spec.name: spec for spec in (EXPLORE, GENERAL)}
+SUBAGENTS: Mapping[str, SubagentSpec] = MappingProxyType({
+    spec.name: spec for spec in (EXPLORE, GENERAL)
+})
+
+# Длина описания вызова в UI и краткого названия задачи.
+_DESCRIBE_LIMIT = 70
+_TITLE_LIMIT = 60
+# Типы суб-агентов для описания параметра и сообщений об ошибке.
+_SUBAGENT_NAMES = ", ".join(SUBAGENTS)
+_SUBAGENT_CHOICES = " or ".join(SUBAGENTS)
 
 
 def allows_tool(spec: SubagentSpec, name: str) -> bool:
@@ -89,18 +99,20 @@ def _agents_list() -> str:
     return "; ".join(f"{spec.name} — {spec.description}" for spec in SUBAGENTS.values())
 
 
-class TaskParams(BaseModel):
+# Без docstring: он ушёл бы в JSON-схему параметров, которую видит модель.
+class TaskParams(BaseModel):  # noqa: D101
     # Прежнее имя параметра — agent: так его пишут старые чаты и модели по привычке.
-    subagent_type: str = Field(
+    # Плагин pydantic для mypy не выводит __init__ с AliasChoices; модель строит parse.
+    subagent_type: str = Field(  # type: ignore[pydantic-alias]
         validation_alias=AliasChoices("subagent_type", "agent"),
-        description=f"Subagent type: {' or '.join(SUBAGENTS)}.",
+        description=f"Subagent type: {_SUBAGENT_CHOICES}.",
     )
     prompt: str = Field(
         description=(
             "A complete brief — the subagent does NOT see this conversation: the goal and "
             "the concrete question(s); known starting points (paths, names, strings, "
             "errors); what is out of scope; what to return and when to stop."
-        )
+        ),
     )
     description: str = Field(
         "",
@@ -108,13 +120,14 @@ class TaskParams(BaseModel):
     )
 
 
-class ExploreParams(BaseModel):
+# Без docstring: он ушёл бы в JSON-схему параметров, которую видит модель.
+class ExploreParams(BaseModel):  # noqa: D101
     question: str = Field(
         description=(
             "What to find out about the code, as one full question, e.g. 'How is a "
             "request authenticated: where are credentials checked and where is the "
             "session created?'"
-        )
+        ),
     )
     hints: str = Field(
         "",
@@ -125,7 +138,9 @@ class ExploreParams(BaseModel):
     )
 
 
-class ExploreTool(Tool):
+class ExploreTool(Tool[ExploreParams]):
+    """Инструмент explore: вопрос о коде — суб-агенту «только чтение»."""
+
     name = "explore"
     description = (
         "Investigates the codebase to answer a question and returns a short report with "
@@ -137,12 +152,17 @@ class ExploreTool(Tool):
         "calls in one response. Not for a known file, symbol or string: use read_file, "
         "find_symbol or search_content directly."
     )
-    Params = ExploreParams
+    # Модель параметров, а не константа: имя задаёт базовый класс Tool.
+    Params = ExploreParams  # noqa: WPS115
 
+    @override
     def describe(self, params: ExploreParams) -> str:
-        return " ".join(params.question.split())[:70]
+        """Вопрос одной строкой, обрезанный для UI."""
+        return " ".join(params.question.split())[:_DESCRIBE_LIMIT]
 
+    @override
     def run(self, params: ExploreParams, ctx: ToolContext) -> ToolResult:
+        """Поручить вопрос суб-агенту explore и вернуть его отчёт."""
         question = params.question.strip()
         if not question:
             raise ToolError("Пустой вопрос: опиши в параметре question, что выяснить.")
@@ -153,7 +173,9 @@ class ExploreTool(Tool):
         return ctx.run_subagent(EXPLORE.name, task_title("", question), brief)
 
 
-class TaskTool(Tool):
+class TaskTool(Tool[TaskParams]):
+    """Инструмент task: самостоятельная подзадача — суб-агенту выбранного типа."""
+
     name = "task"
     description = (
         "Hands a self-contained subtask to a subagent that works in its own context and "
@@ -168,18 +190,24 @@ class TaskTool(Tool):
         "rerun the same task — narrow it to what remains. If the user stopped a subagent, "
         "do not run the same task again unless asked."
     )
-    Params = TaskParams
+    # Модель параметров, а не константа: имя задаёт базовый класс Tool.
+    Params = TaskParams  # noqa: WPS115
 
+    @override
     def describe(self, params: TaskParams) -> str:
+        """Тип суб-агента и краткое название задачи, обрезанные для UI."""
         kind = params.subagent_type.strip()
-        return f"{kind} · {task_title(params.description, params.prompt)}"[:70]
+        title = task_title(params.description, params.prompt)
+        return f"{kind} · {title}"[:_DESCRIBE_LIMIT]
 
+    @override
     def run(self, params: TaskParams, ctx: ToolContext) -> ToolResult:
+        """Поручить подзадачу суб-агенту и вернуть его отчёт."""
         agent = params.subagent_type.strip().lower()
         if agent not in SUBAGENTS:
+            requested = params.subagent_type.strip()
             raise ToolError(
-                f"неизвестный суб-агент {params.subagent_type.strip()!r}; "
-                f"доступны: {', '.join(SUBAGENTS)}."
+                f"неизвестный суб-агент {requested!r}; доступны: {_SUBAGENT_NAMES}.",
             )
         prompt = params.prompt.strip()
         if not prompt:
@@ -194,4 +222,4 @@ def task_title(description: str, prompt: str) -> str:
     title = description.strip()
     if not title:
         title = next((line.strip() for line in prompt.splitlines() if line.strip()), "")
-    return title[:60]
+    return title[:_TITLE_LIMIT]

@@ -32,43 +32,120 @@ MISSING_RESULT = "No result: the call was not executed."
 _REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
 _SSE_PREFIXES = ("data:", "event:", "id:", "retry:", ":")
 _NDJSON_TYPES = ("application/x-ndjson", "application/ndjson", "application/stream+json")
+# Ключи и значения формата, общие для запроса и ответа.
+_ROLE = "role"
+_CONTENT = "content"
+_FUNCTION = "function"
+# Длина случайной или хешированной части id вызова (шестнадцатеричные символы).
+_CALL_ID_HEX = 24
+# Причины завершения: ответ упёрся в лимит длины; модель вызывает инструменты.
+_LENGTH_REASONS = frozenset(("length", "max_tokens"))
+_CALL_REASONS = frozenset(("tool_calls", "function_call"))
 
 
 # ------------------------------------------------------------------ #
 # Запрос
 # ------------------------------------------------------------------ #
 def _call_id(call: FunctionCall, message: int, position: int) -> str:
-    """Id вызова для запроса: свой у вызова, иначе стабильный по месту и содержимому
-    (чаты, сохранённые без id) — тот же у вызова и его результата."""
+    """Id вызова для запроса: свой у вызова, иначе стабильный по месту и содержимому.
+
+    Стабильный id (чаты, сохранённые без id) — тот же у вызова и его результата.
+    """
     if call.id:
         return call.id
     raw = json.dumps([message, position, call.name, call.arguments], sort_keys=True, default=str)
-    return f"call_{hashlib.sha1(raw.encode()).hexdigest()[:24]}"
+    # Хеш — только стабильный id, не защита.
+    digest = hashlib.sha1(raw.encode(), usedforsecurity=False).hexdigest()[:_CALL_ID_HEX]
+    return f"call_{digest}"
 
 
 def _assistant(msg: Message, ids: list[str], *, reasoning: bool) -> dict[str, Any]:
-    out: dict[str, Any] = {"role": "assistant", "content": msg.content or None}
+    """Ход ассистента для запроса: текст, вызовы с id ``ids`` и рассуждения."""
+    out: dict[str, Any] = {_ROLE: "assistant", _CONTENT: msg.content or None}
     if msg.function_calls:
         out["tool_calls"] = [
             {
                 "id": call_id,
-                "type": "function",
-                "function": {
+                "type": _FUNCTION,
+                _FUNCTION: {
                     "name": call.name,
                     "arguments": json.dumps(call.arguments, ensure_ascii=False),
                 },
             }
             for call, call_id in zip(msg.function_calls, ids, strict=True)
         ]
-    elif out["content"] is None:
-        out["content"] = ""
+    elif out[_CONTENT] is None:
+        out[_CONTENT] = ""
     if reasoning and msg.reasoning:
         out["reasoning_content"] = msg.reasoning
     return out
 
 
+class _History:
+    """История для запроса, собираемая по сообщениям (:func:`messages_payload`)."""
+
+    def __init__(self, *, reasoning: bool) -> None:
+        self.payload: list[dict[str, Any]] = []
+        self._reasoning = reasoning
+        self._pending: list[tuple[str, str]] = []  # (id, имя) вызовов без результата
+
+    def add(self, index: int, msg: Message) -> None:
+        """Добавляет сообщение ``msg``; ``index`` — его номер в истории."""
+        if msg.role == "function":
+            self._add_result(msg)
+            return
+        self.close_pending()
+        if msg.role == "assistant":
+            self._add_assistant(index, msg)
+        elif msg.role == "user":
+            self._add_user(msg.content or "")
+        else:
+            self.payload.append({_ROLE: msg.role, _CONTENT: msg.content or ""})
+
+    def close_pending(self) -> None:
+        """Закрывает заглушкой вызовы, оставшиеся без результата."""
+        self.payload.extend(
+            {_ROLE: "tool", "tool_call_id": call_id, _CONTENT: MISSING_RESULT}
+            for call_id, _ in self._pending
+        )
+        self._pending.clear()
+
+    def _add_assistant(self, index: int, msg: Message) -> None:
+        calls = msg.function_calls
+        ids = [_call_id(call, index, position) for position, call in enumerate(calls)]
+        self.payload.append(_assistant(msg, ids, reasoning=self._reasoning))
+        self._pending = [(call_id, call.name) for call_id, call in zip(ids, calls, strict=True)]
+
+    def _add_result(self, msg: Message) -> None:
+        position = next(
+            (
+                pending_position
+                for pending_position, (pending_id, _) in enumerate(self._pending)
+                if pending_id == msg.call_id
+            ),
+            None,
+        )
+        if position is None and self._pending:
+            position = 0
+        if position is None:
+            name = msg.name or "a tool call"
+            self._add_user(f"Result of {name}:\n{msg.content}")
+            return
+        call_id, _ = self._pending.pop(position)
+        self.payload.append({_ROLE: "tool", "tool_call_id": call_id, _CONTENT: msg.content or ""})
+
+    def _add_user(self, text: str) -> None:
+        if self.payload and self.payload[-1][_ROLE] == "user":
+            previous = self.payload[-1][_CONTENT]
+            self.payload[-1][_CONTENT] = f"{previous}\n\n{text}"
+        else:
+            self.payload.append({_ROLE: "user", _CONTENT: text})
+
+
 def messages_payload(
-    messages: Sequence[Message], *, reasoning: bool = True
+    messages: Sequence[Message],
+    *,
+    reasoning: bool = True,
 ) -> list[dict[str, Any]]:
     """История для запроса.
 
@@ -78,51 +155,19 @@ def messages_payload(
     сообщения пользователя склеиваются — иначе запрос не примет строгий шаблон чата.
     ``reasoning=False`` — без рассуждений модели.
     """
-    out: list[dict[str, Any]] = []
-    pending: list[tuple[str, str]] = []  # (id, имя) вызовов без результата
-
-    def close_pending() -> None:
-        out.extend(
-            {"role": "tool", "tool_call_id": call_id, "content": MISSING_RESULT}
-            for call_id, _name in pending
-        )
-        pending.clear()
-
-    def add_user(text: str) -> None:
-        if out and out[-1]["role"] == "user":
-            out[-1]["content"] = f"{out[-1]['content']}\n\n{text}"
-        else:
-            out.append({"role": "user", "content": text})
-
+    history = _History(reasoning=reasoning)
     for index, msg in enumerate(messages):
-        if msg.role == "function":
-            match = next((i for i, (cid, _) in enumerate(pending) if cid == msg.call_id), None)
-            if match is None and pending:
-                match = 0
-            if match is None:
-                add_user(f"Result of {msg.name or 'a tool call'}:\n{msg.content}")
-                continue
-            call_id, _name = pending.pop(match)
-            out.append({"role": "tool", "tool_call_id": call_id, "content": msg.content or ""})
-            continue
-        close_pending()
-        if msg.role == "assistant":
-            ids = [_call_id(call, index, k) for k, call in enumerate(msg.function_calls)]
-            out.append(_assistant(msg, ids, reasoning=reasoning))
-            pending = [(cid, call.name) for cid, call in zip(ids, msg.function_calls, strict=True)]
-        elif msg.role == "user":
-            add_user(msg.content or "")
-        else:
-            out.append({"role": msg.role, "content": msg.content or ""})
-    close_pending()
-    return out
+        history.add(index, msg)
+    history.close_pending()
+    return history.payload
 
 
 def tools_payload(tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
+    """Схемы инструментов для запроса: ``[{"type": "function", "function": {...}}]``."""
     return [
         {
-            "type": "function",
-            "function": {
+            "type": _FUNCTION,
+            _FUNCTION: {
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.parameters,
@@ -132,7 +177,8 @@ def tools_payload(tools: Sequence[ToolSpec]) -> list[dict[str, Any]]:
     ]
 
 
-def chat_payload(
+# Параметры — поля тела запроса, их передают по имени: объединять их в объект незачем.
+def chat_payload(  # noqa: WPS211
     messages: Sequence[Message],
     tools: Sequence[ToolSpec] | None,
     *,
@@ -143,8 +189,11 @@ def chat_payload(
     reasoning: bool = True,
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Тело запроса chat/completions. ``options`` — параметры генерации модели (из
-    каталога): поля gigacrew (модель, температура, поток) важнее."""
+    """Тело запроса chat/completions.
+
+    ``options`` — параметры генерации модели (из каталога): поля gigacrew (модель,
+    температура, поток) важнее.
+    """
     payload: dict[str, Any] = dict(options or {})
     payload.update(
         model=model,
@@ -164,7 +213,7 @@ def probe_payload(text: str, model: str, *, stream: bool) -> dict[str, Any]:
     """Проба замера окна: ``text`` одним сообщением, ответ в 1 токен."""
     payload: dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": text}],
+        "messages": [{_ROLE: "user", _CONTENT: text}],
         "max_tokens": 1,
         "temperature": 0,
         "stream": stream,
@@ -177,8 +226,8 @@ def probe_payload(text: str, model: str, *, stream: bool) -> dict[str, Any]:
 def has_reasoning(payload: Mapping[str, Any]) -> bool:
     """Есть ли в теле запроса рассуждения модели."""
     return any(
-        isinstance(m, Mapping) and bool(m.get("reasoning_content"))
-        for m in payload.get("messages") or ()
+        isinstance(message, Mapping) and bool(message.get("reasoning_content"))
+        for message in payload.get("messages") or ()
     )
 
 
@@ -196,13 +245,19 @@ def parse_arguments(text: str) -> dict[str, Any]:
         return {}
     decoder = json.JSONDecoder(strict=False)
     try:
-        value = decoder.decode(text)
+        decoded = decoder.decode(text)
     except ValueError:
-        try:
-            value, _end = decoder.raw_decode(text)
-        except ValueError:
-            return {}
-    return value if isinstance(value, dict) else {}
+        decoded = _leading_value(decoder, text)
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _leading_value(decoder: json.JSONDecoder, text: str) -> Any:
+    """Первое JSON-значение в начале ``text`` (за ним — лишнее); мусор — None."""
+    try:
+        decoded, _end = decoder.raw_decode(text)
+    except ValueError:
+        return None
+    return decoded
 
 
 def _text_of(content: Any) -> str:
@@ -225,6 +280,40 @@ def _error_text(chunk: Mapping[str, Any], event: str | None = None) -> str | Non
     return None
 
 
+def _first_choice(chunk: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Вариант ответа с ``index`` 0 из ``choices`` куска; нет — None."""
+    choices = chunk.get("choices")
+    for choice in choices if isinstance(choices, list) else ():
+        if isinstance(choice, Mapping) and choice.get("index", 0) == 0:
+            return choice
+    return None
+
+
+def _finish(
+    reason: str | None,
+    calls: list[FunctionCall],
+    *,
+    ended: bool,
+) -> tuple[str, list[FunctionCall]]:
+    """Причина завершения хода и вызовы, которые можно выполнять.
+
+    ``ended`` — ответ дошёл до конца: без причины завершения он закончен, а не оборван.
+    Оборванный ответ (лимит длины, поток без окончания, фильтр) теряет вызовы.
+    """
+    if reason in _LENGTH_REASONS:
+        return "length", []
+    if reason is None:
+        if ended:
+            return ("function_call" if calls else "stop"), calls
+        return "incomplete", []
+    if reason in _CALL_REASONS:
+        return ("function_call" if calls else "incomplete"), calls
+    if reason == "content_filter":
+        return reason, []
+    # stop и нестандартные причины
+    return ("function_call" if calls else reason), calls
+
+
 class _CallParts:
     """Вызов, собираемый по кускам потока."""
 
@@ -235,20 +324,33 @@ class _CallParts:
         self.parsed: dict[str, Any] | None = None  # аргументы пришли объектом
 
     def call(self) -> FunctionCall | None:
+        """Собранный вызов; без имени — None."""
         if not self.name:
             return None
-        arguments = (
-            self.parsed if self.parsed is not None else parse_arguments("".join(self.arguments))
-        )
-        return FunctionCall(
-            name=self.name, arguments=arguments, id=self.id or f"call_{uuid.uuid4().hex[:24]}"
-        )
+        arguments = parse_arguments("".join(self.arguments)) if self.parsed is None else self.parsed
+        call_id = self.id
+        if not call_id:
+            suffix = uuid.uuid4().hex[:_CALL_ID_HEX]
+            call_id = f"call_{suffix}"
+        return FunctionCall(name=self.name, arguments=arguments, id=call_id)
+
+    def add_function(self, function: Mapping[str, Any]) -> None:
+        """Учитывает поле ``function`` куска: имя и часть аргументов (или их объект)."""
+        name = function.get("name")
+        if isinstance(name, str) and name and not self.name:
+            self.name = name  # имя не склеивается: сервер может повторять его в кусках
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            self.arguments.append(arguments)
+        elif isinstance(arguments, Mapping):
+            self.parsed = dict(arguments)
 
 
 class ChunkBuilder:
     """Собирает ход ассистента из кусков потока (или из целого ответа)."""
 
     def __init__(self) -> None:
+        """Пустой ход: ни текста, ни вызовов, ни причины завершения."""
         self._text: list[str] = []
         self._reasoning: list[str] = []
         self._filter = LeakedTagFilter()
@@ -267,37 +369,56 @@ class ChunkBuilder:
         usage = chunk.get("usage")
         if isinstance(usage, Mapping) and usage:
             self._usage = usage
-        choice = self._first_choice(chunk)
+        choice = _first_choice(chunk)
         if choice is None:
             return ""
         part = choice.get("delta")
         if not isinstance(part, Mapping):
             part = choice.get("message")
-        text = ""
-        if isinstance(part, Mapping):
-            for key in _REASONING_KEYS:
-                value = part.get(key)
-                if isinstance(value, str) and value:
-                    self._reasoning.append(value)
-                    break
-            calls = part.get("tool_calls")
-            for raw in calls if isinstance(calls, list) else ():
-                if isinstance(raw, Mapping):
-                    self._add_call(raw)
-            text = self._filter.feed(_text_of(part.get("content")))
-            self._text.append(text)
+        text = self._add_part(part) if isinstance(part, Mapping) else ""
         reason = choice.get("finish_reason")
         if isinstance(reason, str) and reason:
             self._finish_reason = reason
         return text
 
-    @staticmethod
-    def _first_choice(chunk: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        choices = chunk.get("choices")
-        for choice in choices if isinstance(choices, list) else ():
-            if isinstance(choice, Mapping) and choice.get("index", 0) == 0:
-                return choice
-        return None
+    def turn(self, *, done: bool = True) -> AssistantTurn:
+        """Ход ассистента.
+
+        ``done`` — ответ дошёл до конца (``[DONE]``, конец целого ответа): без причины
+        завершения он закончен, а не оборван.
+
+        Оборванный ответ (лимит длины, поток без окончания, фильтр) теряет вызовы: их
+        аргументы могли не дойти, а агент выполняет вызовы при любой причине завершения.
+        """
+        assembled = (parts.call() for parts in self._calls)
+        calls = [call for call in assembled if call is not None]
+        finish, calls = _finish(self._finish_reason, calls, ended=done or self.finished)
+        message = Message(
+            role="assistant",
+            content="".join(self._text) + self._filter.pending,  # недособранное начало
+            function_calls=calls,
+            reasoning="".join(self._reasoning),
+        )
+        return AssistantTurn(
+            message=message,
+            finish_reason=finish,
+            usage=Usage.from_raw(self._usage),
+        )
+
+    def _add_part(self, part: Mapping[str, Any]) -> str:
+        """Рассуждения, вызовы и текст из ``delta``/``message``; возвращает текст для показа."""
+        for key in _REASONING_KEYS:
+            reasoning = part.get(key)
+            if isinstance(reasoning, str) and reasoning:
+                self._reasoning.append(reasoning)
+                break
+        calls = part.get("tool_calls")
+        for raw in calls if isinstance(calls, list) else ():
+            if isinstance(raw, Mapping):
+                self._add_call(raw)
+        text = self._filter.feed(_text_of(part.get(_CONTENT)))
+        self._text.append(text)
+        return text
 
     def _add_call(self, raw: Mapping[str, Any]) -> None:
         """Кусок вызова: по ``index``; без него — новый вызов при новом id, иначе к последнему.
@@ -307,81 +428,48 @@ class ChunkBuilder:
         """
         index = raw.get("index")
         call_id = str(raw["id"]) if raw.get("id") else ""
-        function = raw.get("function")
+        function = raw.get(_FUNCTION)
         named = isinstance(function, Mapping) and bool(function.get("name"))
+        parts = self._parts_for(index, call_id, named=named)
+        if call_id and not parts.id:
+            parts.id = call_id
+        if isinstance(function, Mapping):
+            parts.add_function(function)
+
+    def _parts_for(self, index: object, call_id: str, *, named: bool) -> _CallParts:
+        """Вызов, к которому относится кусок: уже собираемый или новый."""
         parts: _CallParts | None = None
         if isinstance(index, int) and not isinstance(index, bool):
             parts = self._by_index.get(index)
             if parts is None or (named and call_id and parts.id and parts.id != call_id):
-                parts = self._by_index[index] = self._new_call()
+                parts = self._new_call()
+                self._by_index[index] = parts
         elif call_id:
-            parts = next((p for p in self._calls if p.id == call_id), None)
+            parts = next((known for known in self._calls if known.id == call_id), None)
             if parts is None and self._calls and not self._calls[-1].id:
                 parts = self._calls[-1]  # id пришёл не в первом куске
         elif self._calls:
             parts = self._calls[-1]
         if parts is None:
             parts = self._new_call()
-        if call_id and not parts.id:
-            parts.id = call_id
-        if not isinstance(function, Mapping):
-            return
-        name = function.get("name")
-        if isinstance(name, str) and name and not parts.name:
-            parts.name = name  # имя не склеивается: сервер может повторять его в кусках
-        arguments = function.get("arguments")
-        if isinstance(arguments, str):
-            parts.arguments.append(arguments)
-        elif isinstance(arguments, Mapping):
-            parts.parsed = dict(arguments)
+        return parts
 
     def _new_call(self) -> _CallParts:
         parts = _CallParts()
         self._calls.append(parts)
         return parts
 
-    def turn(self, *, done: bool = True) -> AssistantTurn:
-        """Ход ассистента. ``done`` — ответ дошёл до конца (``[DONE]``, конец целого
-        ответа): без причины завершения он закончен, а не оборван.
 
-        Оборванный ответ (лимит длины, поток без окончания, фильтр) теряет вызовы: их
-        аргументы могли не дойти, а агент выполняет вызовы при любой причине завершения.
-        """
-        calls = [call for call in (parts.call() for parts in self._calls) if call is not None]
-        reason = self._finish_reason
-        if reason in ("length", "max_tokens"):
-            finish, calls = "length", []
-        elif reason is None:
-            if done or self.finished:
-                finish = "function_call" if calls else "stop"
-            else:
-                finish, calls = "incomplete", []
-        elif reason in ("tool_calls", "function_call"):
-            finish = "function_call" if calls else "incomplete"
-        elif reason == "content_filter":
-            finish, calls = reason, []
-        else:  # stop и нестандартные причины
-            finish = "function_call" if calls else reason
-        message = Message(
-            role="assistant",
-            content="".join(self._text) + self._filter.pending,  # недособранное начало
-            function_calls=calls,
-            reasoning="".join(self._reasoning),
-        )
-        return AssistantTurn(
-            message=message, finish_reason=finish, usage=Usage.from_raw(self._usage)
-        )
-
-
-def parse_response(data: Mapping[str, Any]) -> AssistantTurn:
+def parse_response(body: Mapping[str, Any]) -> AssistantTurn:
     """Ход ассистента из целого ответа."""
-    error = _error_text(data)
+    error = _error_text(body)
     if error is not None:
         raise ApiError(f"API вернул ошибку: {error}")
-    if not isinstance(data.get("choices"), list):
-        raise ApiError(f"Неожиданный формат ответа API: {str(data)[:ERROR_BODY_CHARS]}")
+    if not isinstance(body.get("choices"), list):
+        shown = str(body)[:ERROR_BODY_CHARS]
+        raise ApiError(f"Неожиданный формат ответа API: {shown}")
     builder = ChunkBuilder()
-    builder.add(data)
+    builder.add(body)
     return builder.turn(done=True)
 
 
@@ -393,8 +481,10 @@ def _is_object(text: str) -> bool:
 
 
 def _stream_kind(content_type: str, first: str) -> str:
-    """Формат тела: ``sse``, ``ndjson`` или ``json`` (цельный ответ) — по content-type и
-    первой непустой строке."""
+    """Формат тела: ``sse``, ``ndjson`` или ``json`` (цельный ответ).
+
+    Определяется по content-type и первой непустой строке.
+    """
     kind = content_type.split(";", 1)[0].strip().lower()
     if kind == "text/event-stream" or first.lstrip().startswith(_SSE_PREFIXES):
         return "sse"
@@ -421,28 +511,73 @@ def _chunks(kind: str, lines: Iterable[str]) -> Iterator[tuple[str | None, str]]
 _DONE = object()  # маркер конца потока ``[DONE]``
 
 
-def _decode(data: str, kind: str) -> list[Any]:
+def _decode(body: str, kind: str) -> list[Any]:
     """Объекты из данных куска (``_DONE`` — конец потока).
 
     Строки ``data:`` без пустой строки между событиями (так шлют некоторые серверы) SSE
     склеивает в одно событие — тогда каждая строка разбирается отдельно. Не-JSON в целом
     ответе — ошибка, в потоке — пропускается.
     """
-    text = data.strip()
+    text = body.strip()
     if text == "[DONE]":
         return [_DONE]
     try:
         return [json.loads(text, strict=False)]
-    except json.JSONDecodeError as e:
+    except json.JSONDecodeError as exc:
         if kind == "json":
-            raise ApiError(f"API вернул не-JSON ответ: {text[:ERROR_BODY_CHARS]}") from e
+            shown = text[:ERROR_BODY_CHARS]
+            raise ApiError(f"API вернул не-JSON ответ: {shown}") from exc
         if "\n" not in text:
             return []
-        return [item for line in text.splitlines() for item in _decode(line, "ndjson")]
+        return [decoded for line in text.splitlines() for decoded in _decode(line, "ndjson")]
+
+
+def _read_head(lines: Iterator[str]) -> list[str]:
+    """Строки до первой непустой включительно: по ней виден формат тела."""
+    head: list[str] = []
+    for line in lines:
+        head.append(line)
+        if line.strip():
+            break
+    return head
+
+
+def _check_chunk(chunk: Mapping[str, Any], event: str | None, kind: str) -> None:
+    """Кусок — ошибка API или (в целом ответе) не ответ чата: :class:`ApiError`."""
+    error = _error_text(chunk, event)
+    if error is not None:
+        raise ApiError(f"API вернул ошибку в потоке: {error}")
+    if kind == "json" and not isinstance(chunk.get("choices"), list):
+        shown = str(chunk)[:ERROR_BODY_CHARS]
+        raise ApiError(f"Неожиданный формат ответа API: {shown}")
+
+
+def _feed(
+    builder: ChunkBuilder,
+    event: str | None,
+    body: str,
+    *,
+    kind: str,
+    emit: Callable[[str], None],
+) -> bool:
+    """Учитывает одно событие тела, отдавая текст в ``emit``; True — пришёл ``[DONE]``."""
+    for chunk in _decode(body, kind):
+        if chunk is _DONE:
+            return True
+        if not isinstance(chunk, Mapping):
+            continue
+        _check_chunk(chunk, event, kind)
+        piece = builder.add(chunk)
+        if piece:
+            emit(piece)
+    return False
 
 
 def consume_stream(
-    lines: Iterable[str], emit: Callable[[str], None], *, content_type: str = ""
+    lines: Iterable[str],
+    emit: Callable[[str], None],
+    *,
+    content_type: str = "",
 ) -> AssistantTurn:
     """Разбирает тело ответа (поток или целый ответ), отдавая куски текста в ``emit``.
 
@@ -450,33 +585,15 @@ def consume_stream(
     сервер закрыл соединение посреди ответа. Обрыв соединения уже после окончания
     ответа — не ошибка: ответ получен целиком (не хватать может разве что расхода токенов).
     """
-    lines = iter(lines)
-    head: list[str] = []
-    for line in lines:  # до первой непустой строки: по ней виден формат
-        head.append(line)
-        if line.strip():
-            break
+    remaining = iter(lines)
+    head = _read_head(remaining)  # до первой непустой строки: по ней виден формат
     kind = _stream_kind(content_type, head[-1] if head else "")
     builder = ChunkBuilder()
     done = kind == "json"
     try:
-        for event, data in _chunks(kind, itertools.chain(head, lines)):
-            for chunk in _decode(data, kind):
-                if chunk is _DONE:
-                    done = True
-                    break
-                if not isinstance(chunk, Mapping):
-                    continue
-                error = _error_text(chunk, event)
-                if error is not None:
-                    raise ApiError(f"API вернул ошибку в потоке: {error}")
-                if kind == "json" and not isinstance(chunk.get("choices"), list):
-                    raise ApiError(
-                        f"Неожиданный формат ответа API: {str(chunk)[:ERROR_BODY_CHARS]}"
-                    )
-                piece = builder.add(chunk)
-                if piece:
-                    emit(piece)
+        for event, body in _chunks(kind, itertools.chain(head, remaining)):
+            if _feed(builder, event, body, kind=kind, emit=emit):
+                done = True
             if done and kind != "json":
                 break
     except httpx.TransportError:

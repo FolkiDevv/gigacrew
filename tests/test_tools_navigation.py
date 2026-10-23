@@ -7,15 +7,17 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, NoReturn
 
 import pytest
 
 from gigacrew.project import semantic
 from gigacrew.project.index import RESOLVED_IMPORT, ProjectIndex, RefHit
 from gigacrew.project.lsp import LspError
-from gigacrew.project.semantic import Location, SemanticUnavailable
 from gigacrew.project.workspace import Workspace
-from gigacrew.tools.base import ToolContext, ToolError, build_default_registry
+from gigacrew.tools.base import ToolContext, ToolError, ToolResult, build_default_registry
 from gigacrew.tools.navigation import (
     RESOLVED_TY,
     CallHierarchyParams,
@@ -48,21 +50,21 @@ CLI = (
 )
 
 
-def _make(root, rel, text):
-    p = root / rel
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text, encoding="utf-8")
-    return p
+def _make(root: Path, rel: str, text: str) -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 @pytest.fixture(autouse=True)
-def _stop_servers():
+def _stop_servers() -> Iterator[None]:
     yield
     semantic.shutdown_all()
 
 
 @pytest.fixture
-def root(tmp_path):
+def root(tmp_path: Path) -> Path:
     _make(tmp_path, "app/__init__.py", "")
     _make(tmp_path, "app/agent.py", AGENT)
     _make(tmp_path, "app/cli.py", CLI)
@@ -71,50 +73,52 @@ def root(tmp_path):
 
 
 @pytest.fixture
-def plain(root):
+def plain(root: Path) -> ToolContext:
     """Только индекс: ty выключен."""
     return ToolContext(workspace=Workspace(root), semantic=False)
 
 
 @pytest.fixture
-def typed(root):
+def typed(root: Path) -> ToolContext:
     return ToolContext(workspace=Workspace(root))
 
 
-def _refs(ctx, **kw):
+def _refs(ctx: ToolContext, **kw: Any) -> ToolResult:
     return FindReferencesTool().run(FindReferencesParams(**kw), ctx)
 
 
-def _goto(ctx, path, line, name):
+def _goto(ctx: ToolContext, path: str, line: int, name: str) -> ToolResult:
     return GotoDefinitionTool().run(GotoDefinitionParams(path=path, line=line, name=name), ctx)
 
 
-def _calls(ctx, query, direction="incoming", depth=1):
+def _calls(ctx: ToolContext, query: str, direction: str = "incoming", depth: int = 1) -> ToolResult:
     params = CallHierarchyParams(query=query, direction=direction, depth=depth)
     return CallHierarchyTool().run(params, ctx)
 
 
-def test_registered_in_default_registry():
+def test_registered_in_default_registry() -> None:
     reg = build_default_registry()
     assert all(name in reg for name in ("find_references", "goto_definition", "call_hierarchy"))
 
 
 # ------------------------------ по индексу ------------------------------ #
-def test_find_references_by_index(plain):
-    result = _refs(plain, query="Agent.run_turn")
-    assert result.content.splitlines() == [
-        "определение: app/agent.py:2-4 method Agent.run_turn — "
-        "def run_turn(self, text: str) -> str:  # Ход агента.",
+def test_find_references_by_index(plain: ToolContext) -> None:
+    tool_result = _refs(plain, query="Agent.run_turn")
+    assert tool_result.content.splitlines() == [
+        (
+            "определение: app/agent.py:2-4 method Agent.run_turn — "
+            "def run_turn(self, text: str) -> str:  # Ход агента."
+        ),
         "использования (2):",
         "app/cli.py — импортирует модуль с определением:",
         "  5 [вызов] в main — Agent().run_turn(text)",
         "scripts/x.py — совпадение только по имени — может быть другое определение:",
         "  2 [вызов] в other — bot.run_turn()",
     ]
-    assert result.summary.startswith("найдено использований: 2; индекс обновлён")
+    assert tool_result.summary.startswith("найдено использований: 2; индекс обновлён")
 
 
-def test_find_references_kind_limit_and_errors(plain):
+def test_find_references_kind_limit_and_errors(plain: ToolContext) -> None:
     imports = _refs(plain, query="helper", kind="IMPORT").content.splitlines()
     assert imports[1:] == [
         "использования (1):",
@@ -133,18 +137,18 @@ def test_find_references_kind_limit_and_errors(plain):
         _refs(plain, query=" . ")
 
 
-def test_goto_definition_by_index_follows_import_alias(plain):
-    result = _goto(plain, "app/cli.py", 6, "hp")
-    assert result.content.splitlines() == [
+def test_goto_definition_by_index_follows_import_alias(plain: ToolContext) -> None:
+    tool_result = _goto(plain, "app/cli.py", 6, "hp")
+    assert tool_result.content.splitlines() == [
         "app/agent.py:7-8 function helper — def helper(value: str) -> str:",
         "(по индексу — по имени и импортам файла)",
     ]
-    assert result.summary.startswith("определений: 1 (по индексу)")
+    assert tool_result.summary.startswith("определений: 1 (по индексу)")
     assert _goto(plain, "app/agent.py", 4, "helper").content.startswith("app/agent.py:7-8")
     assert _goto(plain, "app/cli.py", 7, "len").content.startswith("(определение не найдено)")
 
 
-def test_goto_definition_errors(plain):
+def test_goto_definition_errors(plain: ToolContext) -> None:
     with pytest.raises(ToolError, match="Файл не найден"):
         _goto(plain, "app/none.py", 1, "x")
     with pytest.raises(ToolError, match="нет строки 99"):
@@ -161,7 +165,7 @@ def test_goto_definition_errors(plain):
             _goto(plain, rel, 1, "KEY")
 
 
-def test_call_hierarchy_by_index(plain):
+def test_call_hierarchy_by_index(plain: ToolContext) -> None:
     incoming = _calls(plain, "helper", depth=2).content.splitlines()
     assert incoming == [
         "кто вызывает (глубина 2, по индексу):",
@@ -187,17 +191,19 @@ def test_call_hierarchy_by_index(plain):
 
 
 # ------------------------------ через ty ------------------------------ #
-def test_find_references_with_ty_marks_confirmed(typed):
-    result = _refs(typed, query="Agent.run_turn")
-    assert result.content.splitlines()[1:] == [
+def test_find_references_with_ty_marks_confirmed(typed: ToolContext) -> None:
+    tool_result = _refs(typed, query="Agent.run_turn")
+    assert tool_result.content.splitlines()[1:] == [
         "использования (2):",
         "app/cli.py — точно (ty):",
         "  5 [вызов] в main — Agent().run_turn(text)",
-        "scripts/x.py — совпадение только по имени, ty не подтвердил — "
-        "вероятно, другое определение:",
+        (
+            "scripts/x.py — совпадение только по имени, ty не подтвердил — "
+            "вероятно, другое определение:"
+        ),
         "  2 [вызов] в other — bot.run_turn()",
     ]
-    assert "подтверждено ty: 1" in result.summary
+    assert "подтверждено ty: 1" in tool_result.summary
     # псевдоним импорта ty не находит — остаётся найденное индексом
     helper = _refs(typed, query="helper").content.splitlines()
     assert helper[1:] == [
@@ -210,7 +216,7 @@ def test_find_references_with_ty_marks_confirmed(typed):
     ]
 
 
-def test_ty_sees_edits_made_after_start(typed):
+def test_ty_sees_edits_made_after_start(typed: ToolContext) -> None:
     _refs(typed, query="helper")  # сервер запущен
     _make(typed.root, "app/new.py", "from app.agent import helper\n\nhelper('x')\n")
     _make(typed.root, "app/cli.py", CLI.replace("Agent().run_turn(text)", "pass"))
@@ -220,20 +226,23 @@ def test_ty_sees_edits_made_after_start(typed):
     assert "app/new.py — точно (ty):" in new  # новый файл замечен
 
 
-def test_goto_definition_with_ty(typed):
-    result = _goto(typed, "app/cli.py", 5, "Agent().run_turn")
-    assert result.content.splitlines() == [
-        "app/agent.py:2-4 method Agent.run_turn — "
-        "def run_turn(self, text: str) -> str:  # Ход агента.",
+def test_goto_definition_with_ty(typed: ToolContext) -> None:
+    tool_result = _goto(typed, "app/cli.py", 5, "Agent().run_turn")
+    assert tool_result.content.splitlines() == [
+        (
+            "app/agent.py:2-4 method Agent.run_turn — "
+            "def run_turn(self, text: str) -> str:  # Ход агента."
+        ),
         "тип: bound method Agent.run_turn(text: str) -> str",
     ]
-    assert result.summary.startswith("определений: 1 (ty)")
+    assert tool_result.summary.startswith("определений: 1 (ty)")
     builtin = _goto(typed, "app/cli.py", 7, "len").content.splitlines()
-    assert builtin[0].startswith("typeshed/stdlib/builtins.pyi:") and "(вне проекта)" in builtin[0]
+    assert builtin[0].startswith("typeshed/stdlib/builtins.pyi:")
+    assert "(вне проекта)" in builtin[0]
     assert builtin[1] == "тип: def len(obj: Sized, /) -> int"
 
 
-def test_call_hierarchy_with_ty(typed):
+def test_call_hierarchy_with_ty(typed: ToolContext) -> None:
     incoming = _calls(typed, "helper", depth=2).content.splitlines()
     assert incoming == [
         "кто вызывает (глубина 2, ty):",
@@ -254,9 +263,12 @@ def test_call_hierarchy_with_ty(typed):
 
 
 # --------------------------- сбои и откат на индекс --------------------------- #
-def test_missing_ty_falls_back_to_index(typed, monkeypatch):
-    def missing():
-        raise SemanticUnavailable("пакет ty не установлен")
+def test_missing_ty_falls_back_to_index(
+    typed: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing() -> NoReturn:
+        raise semantic.SemanticUnavailableError("пакет ty не установлен")
 
     monkeypatch.setattr(semantic, "find_binary", missing)
     lines = _refs(typed, query="Agent.run_turn").content.splitlines()
@@ -264,8 +276,11 @@ def test_missing_ty_falls_back_to_index(typed, monkeypatch):
     assert lines[-1] == "(ty недоступен: пакет ty не установлен; ответ по индексу — по именам)"
 
 
-def test_failures_restart_once_then_disable_ty(typed, monkeypatch):
-    def broken(self, path, line, col):
+def test_failures_restart_once_then_disable_ty(
+    typed: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(self: semantic.TyServer, path: str, line: int, col: int) -> NoReturn:
         raise LspError("textDocument/references: сбой")
 
     monkeypatch.setattr(semantic.TyServer, "references", broken)
@@ -282,29 +297,36 @@ def test_failures_restart_once_then_disable_ty(typed, monkeypatch):
     assert "ty отключён" in _refs(typed, query="helper").content
 
 
-def test_merge_adds_ty_only_hits_with_kind_and_scope(root):
+def test_merge_adds_ty_only_hits_with_kind_and_scope(root: Path) -> None:
     ws = Workspace(root)
     with ProjectIndex(ws) as index:
         index.refresh()
         definitions = index.definitions("helper")
         hits = index.find_refs("helper").hits
         extra = [
-            Location("app/cli.py", 7, 4),  # строка без использования helper — область по индексу
-            Location("app/agent.py", 7, 4),  # строка определения — не использование
-            Location("/usr/lib/x.py", 1, 0, in_project=False),
+            # строка без использования helper — область по индексу
+            semantic.Location("app/cli.py", 7, 4),
+            # строка определения — не использование
+            semantic.Location("app/agent.py", 7, 4),
+            semantic.Location("/usr/lib/x.py", 1, 0, in_project=False),
         ]
-        merged = FindReferencesTool._merge(index, hits, extra, definitions, None, None)
-        added = [h for h in merged if h not in hits]
+        merged = FindReferencesTool()._merge(index, hits, extra, definitions, None, None)
+        added = [hit for hit in merged if hit not in hits]
         assert added == [RefHit("app/cli.py", 7, 4, "name", "main", RESOLVED_TY)]
-        assert FindReferencesTool._merge(index, hits, extra, definitions, "call", None) == hits
-        assert FindReferencesTool._merge(index, hits, extra, definitions, None, "scripts/**") == [
-            h for h in hits
-        ]
-        assert all(h.resolution == RESOLVED_IMPORT for h in hits if h.path == "app/cli.py")
+        assert FindReferencesTool()._merge(index, hits, extra, definitions, "call", None) == hits
+        assert FindReferencesTool()._merge(
+            index,
+            hits,
+            extra,
+            definitions,
+            None,
+            "scripts/**",
+        ) == list(hits)
+        assert all(hit.resolution == RESOLVED_IMPORT for hit in hits if hit.path == "app/cli.py")
 
 
 @pytest.mark.parametrize(
-    "path, expected",
+    ("path", "expected"),
     [
         (
             "/root/.cache/ty/vendored/typeshed/b932/stdlib/os/__init__.pyi",
@@ -314,56 +336,65 @@ def test_merge_adds_ty_only_hits_with_kind_and_scope(root):
         ("/opt/other.py", "/opt/other.py"),
     ],
 )
-def test_external_path(path, expected):
+def test_external_path(path: str, expected: str) -> None:
     assert external_path(path) == expected
 
 
 @pytest.mark.skipif(os.name == "nt", reason="группы процессов POSIX")
-def test_ty_server_runs_in_own_process_group(typed):
+def test_ty_server_runs_in_own_process_group(typed: ToolContext) -> None:
     _refs(typed, query="helper")
     server = semantic.server_for(typed.workspace)
-    pid = server._client._proc.pid  # noqa: SLF001
+    proc = server._client._proc
+    assert proc is not None
+    pid = proc.pid
     assert os.getpgid(pid) != os.getpgid(0)  # Ctrl+C терминала серверу не достаётся
     assert semantic.status(typed.workspace) == "работает"
 
 
-def test_merge_matches_by_position_not_line(root):
+def test_merge_matches_by_position_not_line(root: Path) -> None:
     line = "    a.run_turn('x'); b.run_turn('y')"
     _make(root, "app/two.py", f"from app.agent import Agent\n\n\ndef both(a: Agent, b):\n{line}\n")
     first, second = line.index("run_turn"), line.rindex("run_turn")
     with ProjectIndex(Workspace(root)) as index:
         index.refresh()
         definitions = index.definitions("Agent.run_turn")
-        hits = [h for h in index.find_refs("Agent.run_turn").hits if h.path == "app/two.py"]
-        assert [h.col for h in hits] == [first, second]
+        hits = [hit for hit in index.find_refs("Agent.run_turn").hits if hit.path == "app/two.py"]
+        assert [hit.col for hit in hits] == [first, second]
         # ty подтвердил только b.run_turn: a.run_turn не помечается
-        merged = FindReferencesTool._merge(
-            index, hits, [Location("app/two.py", 5, second)], definitions, None, None
+        merged = FindReferencesTool()._merge(
+            index,
+            hits,
+            [semantic.Location("app/two.py", 5, second)],
+            definitions,
+            None,
+            None,
         )
-        assert [(h.col, h.resolution) for h in merged] == [
+        assert [(hit.col, hit.resolution) for hit in merged] == [
             (first, RESOLVED_IMPORT),
             (second, RESOLVED_TY),
         ]
 
 
-def test_index_hierarchy_has_one_shared_budget(plain, monkeypatch):
-    from gigacrew.tools import navigation
-
-    monkeypatch.setattr(navigation, "MAX_HIERARCHY_NODES", 2)
+def test_index_hierarchy_has_one_shared_budget(
+    plain: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("gigacrew.tools.navigation.MAX_HIERARCHY_NODES", 2)
     lines = _calls(plain, "helper", depth=3).content.splitlines()
     assert sum(line.lstrip().startswith("←") for line in lines) == 2
     assert lines[-1] == "… дерево обрезано (2 узлов); уменьшите depth"
 
 
-def test_call_hierarchy_with_ty_keeps_other_language_definitions(typed):
+def test_call_hierarchy_with_ty_keeps_other_language_definitions(typed: ToolContext) -> None:
     _make(typed.root, "web/helper.js", "function helper() {}\nfunction use() { helper(); }\n")
     lines = _calls(typed, "helper").content.splitlines()
     assert lines[0] == "кто вызывает (глубина 1, ty + индекс):"
-    assert "helper — web/helper.js:1" in lines and "  ← use — web/helper.js (строка 2)" in lines
+    assert "helper — web/helper.js:1" in lines
+    assert "  ← use — web/helper.js (строка 2)" in lines
 
 
 @pytest.mark.parametrize("path", ["../outside.py", "{outside}"])
-def test_goto_definition_rejects_paths_outside_project(tmp_path, path):
+def test_goto_definition_rejects_paths_outside_project(tmp_path: Path, path: str) -> None:
     # Инструмент «только чтение» не должен открывать файлы вне проекта: его сообщение
     # «В строке N нет имени…» процитировало бы их строку.
     root = tmp_path / "proj"
@@ -377,7 +408,7 @@ def test_goto_definition_rejects_paths_outside_project(tmp_path, path):
     assert "hunter2" not in str(error.value)
 
 
-def test_find_references_orders_files_by_resolution_not_by_path(tmp_path):
+def test_find_references_orders_files_by_resolution_not_by_path(tmp_path: Path) -> None:
     # Алфавитный порядок путей здесь обратен порядку разрешения: сортировка видна.
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
@@ -391,9 +422,10 @@ def test_find_references_orders_files_by_resolution_not_by_path(tmp_path):
     assert heads[-1].startswith("a_other.py — совпадение только по имени")
 
 
-def test_call_hierarchy_depth_is_clamped(tmp_path):
+def test_call_hierarchy_depth_is_clamped(tmp_path: Path) -> None:
     (tmp_path / "m.py").write_text(
-        "def helper(): pass\ndef main():\n    helper()\n", encoding="utf-8"
+        "def helper(): pass\ndef main():\n    helper()\n",
+        encoding="utf-8",
     )
     ctx = ToolContext(workspace=Workspace(tmp_path), semantic=False)
     out = CallHierarchyTool().run(CallHierarchyParams(query="helper", depth=10), ctx)

@@ -8,8 +8,16 @@
 
 Формат секции — как у Claude Code::
 
-    {"hooks": {"PostToolUse": [{"matcher": "write_file|edit_file",
-        "hooks": [{"type": "command", "command": "make fmt", "timeout": 30}]}]}}
+    {
+        "hooks": {
+            "PostToolUse": [
+                {
+                    "matcher": "write_file|edit_file",
+                    "hooks": [{"type": "command", "command": "make fmt", "timeout": 30}],
+                }
+            ]
+        }
+    }
 
 Ошибки в файлах не мешают запуску: запись с ошибкой пропускается, вызывающий получает
 текст предупреждения. Хуки — запуск команд без вопросов, поэтому они работают только после
@@ -42,9 +50,16 @@ MAX_HOOK_TIMEOUT = 600
 
 TRUST_FILE_NAME = "trusted_hooks.json"
 TRUST_FORMAT_VERSION = 1
+_TRUST_USER_KEY = "user"  # отпечаток хуков пользователя в файле доверия
+
+# Нечитаемый файл настроек. RecursionError — глубоко вложенный JSON ([[[…]]]) из репозитория:
+# не повод падать.
+_READ_ERRORS = (OSError, UnicodeDecodeError, ValueError, RecursionError)
 
 
 class HookEvent(StrEnum):
+    """События, на которые вешаются хуки (имена — как в Claude Code)."""
+
     PRE_REQUEST = "PreRequest"  # перед каждым запросом к GigaCode (matcher — вид запроса)
     PRE_TOOL_USE = "PreToolUse"
     POST_TOOL_USE = "PostToolUse"
@@ -58,11 +73,13 @@ class HookEvent(StrEnum):
 
 
 # У этих событий нечего сравнивать с matcher: хуки срабатывают всегда.
-UNMATCHED_EVENTS = frozenset({HookEvent.USER_PROMPT_SUBMIT, HookEvent.STOP})
+UNMATCHED_EVENTS = frozenset((HookEvent.USER_PROMPT_SUBMIT, HookEvent.STOP))
 
 
 @dataclass(frozen=True)
 class HookCommand:
+    """Команда хука и её таймаут."""
+
     command: str
     timeout: int = DEFAULT_HOOK_TIMEOUT  # секунды
 
@@ -82,13 +99,15 @@ class HookGroup:
         Пустой matcher и ``*`` — всё; иначе регулярное выражение целиком
         (``write_file|edit_file``, ``.*_file``).
         """
-        if self.event in UNMATCHED_EVENTS or self.matcher in ("", "*"):
+        if self.event in UNMATCHED_EVENTS or self.matcher in {"", "*"}:
             return True
         return re.fullmatch(self.matcher, target) is not None
 
 
 @dataclass(frozen=True)
 class HookSettings:
+    """Все хуки из файлов настроек и выключатели ``disableAllHooks``."""
+
     groups: tuple[HookGroup, ...] = ()
     disabled: bool = False  # "disableAllHooks": true в файле пользователя — все хуки
     # "disableAllHooks": true в файле проекта: выключены только хуки проекта — файл приходит
@@ -111,10 +130,12 @@ class HookSettings:
         return found
 
     def has(self, event: HookEvent, target: str = "") -> bool:
+        """Есть ли у события команды для ``target``."""
         return bool(self.commands(event, target))
 
     def from_sources(self, *sources: SettingsSource) -> tuple[HookGroup, ...]:
-        return tuple(g for g in self.groups if g.source in sources)
+        """Группы хуков из файлов ``sources``."""
+        return tuple(group for group in self.groups if group.source in sources)
 
     @property
     def project_groups(self) -> tuple[HookGroup, ...]:
@@ -128,7 +149,8 @@ class HookSettings:
 
     def without(self, *sources: SettingsSource) -> HookSettings:
         """Без хуков из ``sources`` (не подтверждены)."""
-        return replace(self, groups=tuple(g for g in self.groups if g.source not in sources))
+        kept = tuple(group for group in self.groups if group.source not in sources)
+        return replace(self, groups=kept)
 
 
 def settings_files(workspace: Workspace) -> list[tuple[Path, SettingsSource]]:
@@ -148,55 +170,78 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
     """
     groups: list[HookGroup] = []
     warnings: list[str] = []
-    disabled = project_disabled = False
+    disabled = False
+    project_disabled = False
     for path, source in settings_files(workspace):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
+        document = _read_settings_file(path, warnings)
+        if document is None:
             continue
-        # RecursionError — глубоко вложенный JSON ([[[…]]]) из репозитория: не повод падать.
-        except (OSError, UnicodeDecodeError, ValueError, RecursionError) as e:
-            warnings.append(f"не удалось прочитать {path}: {e} — файл пропущен")
-            continue
-        if not isinstance(data, dict):
-            warnings.append(f"{path}: ожидается JSON-объект — файл пропущен")
-            continue
-        off = data.get("disableAllHooks")
-        if off is True and source in PROJECT_SOURCES:
+        switch = document.get("disableAllHooks")
+        if switch is True and source in PROJECT_SOURCES:
             project_disabled = True
-        elif off is True:
+        elif switch is True:
             disabled = True
-        elif off not in (None, False):  # "true" или 1 молча не выключили бы ничего
+        elif switch not in {None, False}:  # "true" или 1 молча не выключили бы ничего
             warnings.append(f"{path}: disableAllHooks — ожидается true или false, пропущено")
-        hooks = data.get("hooks")
-        if hooks is None:
-            continue
-        if not isinstance(hooks, dict):
-            warnings.append(f"{path}: hooks — не объект, хуки пропущены")
-            continue
-        for name, entries in hooks.items():
-            where = f"{path}: hooks.{name}"
-            try:
-                event = HookEvent(name)
-            except ValueError:
-                known = ", ".join(e.value for e in HookEvent)
-                warnings.append(f"{where}: неизвестное событие (поддерживаются: {known})")
-                continue
-            if not isinstance(entries, list):
-                warnings.append(f"{where}: ожидается список записей")
-                continue
-            for i, entry in enumerate(entries):
-                group = _parse_group(event, entry, source, f"{where}[{i}]", warnings)
-                if group is not None:
-                    groups.append(group)
+        groups.extend(_parse_hooks(document.get("hooks"), path, source, warnings))
     if project_disabled:
-        groups = [g for g in groups if g.source not in PROJECT_SOURCES]
+        groups = [group for group in groups if group.source not in PROJECT_SOURCES]
     settings = HookSettings(tuple(groups), disabled=disabled, project_disabled=project_disabled)
     return settings, warnings
 
 
+def _read_settings_file(path: Path, warnings: list[str]) -> dict[str, Any] | None:
+    """JSON-объект файла настроек; None — файла нет или он пропущен (с предупреждением)."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except _READ_ERRORS as exc:
+        warnings.append(f"не удалось прочитать {path}: {exc} — файл пропущен")
+        return None
+    if not isinstance(document, dict):
+        warnings.append(f"{path}: ожидается JSON-объект — файл пропущен")
+        return None
+    return document
+
+
+def _parse_hooks(
+    hooks: object,
+    path: Path,
+    source: SettingsSource,
+    warnings: list[str],
+) -> list[HookGroup]:
+    """Секция ``hooks`` одного файла → группы хуков; ошибки — в ``warnings``."""
+    if hooks is None:
+        return []
+    if not isinstance(hooks, dict):
+        warnings.append(f"{path}: hooks — не объект, хуки пропущены")
+        return []
+    groups: list[HookGroup] = []
+    for name, entries in hooks.items():
+        where = f"{path}: hooks.{name}"
+        try:
+            event = HookEvent(name)
+        except ValueError:
+            known = ", ".join(member.value for member in HookEvent)
+            warnings.append(f"{where}: неизвестное событие (поддерживаются: {known})")
+            continue
+        if not isinstance(entries, list):
+            warnings.append(f"{where}: ожидается список записей")
+            continue
+        for index, entry in enumerate(entries):
+            group = _parse_group(event, entry, source, f"{where}[{index}]", warnings)
+            if group is not None:
+                groups.append(group)
+    return groups
+
+
 def _parse_group(
-    event: HookEvent, entry: Any, source: SettingsSource, where: str, warnings: list[str]
+    event: HookEvent,
+    entry: Any,
+    source: SettingsSource,
+    where: str,
+    warnings: list[str],
 ) -> HookGroup | None:
     if not isinstance(entry, dict):
         warnings.append(f"{where}: ожидается объект с полями matcher и hooks — пропущено")
@@ -207,19 +252,19 @@ def _parse_group(
     if not isinstance(matcher, str):
         warnings.append(f"{where}: matcher — не строка, запись пропущена")
         return None
-    if matcher not in ("", "*"):
+    if matcher not in {"", "*"}:
         try:
             re.compile(matcher)
-        except re.error as e:
-            warnings.append(f"{where}: неверное регулярное выражение matcher {matcher!r}: {e}")
+        except re.error as exc:
+            warnings.append(f"{where}: неверное регулярное выражение matcher {matcher!r}: {exc}")
             return None
     raw_hooks = entry.get("hooks")
     if not isinstance(raw_hooks, list) or not raw_hooks:
         warnings.append(f"{where}: hooks — ожидается непустой список команд")
         return None
     hooks: list[HookCommand] = []
-    for j, raw in enumerate(raw_hooks):
-        hook = _parse_command(raw, f"{where}.hooks[{j}]", warnings)
+    for index, raw in enumerate(raw_hooks):
+        hook = _parse_command(raw, f"{where}.hooks[{index}]", warnings)
         if hook is not None:
             hooks.append(hook)
     if not hooks:
@@ -257,7 +302,7 @@ def _parse_command(raw: Any, where: str, warnings: list[str]) -> HookCommand | N
     if not MIN_HOOK_TIMEOUT <= timeout <= MAX_HOOK_TIMEOUT:
         warnings.append(
             f"{where}: timeout {timeout} вне {MIN_HOOK_TIMEOUT}…{MAX_HOOK_TIMEOUT} с, "
-            f"взято {clamped}"
+            f"взято {clamped}",
         )
     return HookCommand(command, clamped)
 
@@ -293,11 +338,16 @@ def hooks_fingerprint(groups: tuple[HookGroup, ...]) -> str:
     if not groups:
         return ""
     canonical = [
-        [g.source, g.event.value, g.matcher, [[h.command, h.timeout] for h in g.hooks]]
-        for g in groups
+        [
+            group.source,
+            group.event.value,
+            group.matcher,
+            [[hook.command, hook.timeout] for hook in group.hooks],
+        ]
+        for group in groups
     ]
-    data = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+    serialized = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 class TrustStore:
@@ -309,11 +359,12 @@ class TrustStore:
     """
 
     def __init__(self, path: Path | None = None):
+        """Хранилище в ``path``; по умолчанию — в каталоге данных пользователя."""
         self.path = user_data_dir() / TRUST_FILE_NAME if path is None else path
 
     def is_trusted(self, root: Path, fingerprint: str) -> bool:
         """Подтверждены ли хуки проекта ``root`` с этим отпечатком."""
-        return bool(fingerprint) and self._read()[1].get(_project_key(root)) == fingerprint
+        return bool(fingerprint) and self._read()[1].get(self._project_key(root)) == fingerprint
 
     def is_user_trusted(self, fingerprint: str) -> bool:
         """Подтверждены ли хуки пользователя с этим отпечатком."""
@@ -322,7 +373,7 @@ class TrustStore:
     def trust(self, root: Path, fingerprint: str) -> None:
         """Запомнить отпечаток проекта. Ошибка записи — ``OSError``."""
         user, projects = self._read()
-        projects[_project_key(root)] = fingerprint
+        projects[self._project_key(root)] = fingerprint
         self._write(user, projects)
 
     def trust_user(self, fingerprint: str) -> None:
@@ -331,38 +382,45 @@ class TrustStore:
 
     def _write(self, user: str, projects: dict[str, str]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        data: dict[str, object] = {"version": TRUST_FORMAT_VERSION}
+        document: dict[str, object] = {"version": TRUST_FORMAT_VERSION}
         if user:
-            data["user"] = user
-        data["projects"] = dict(sorted(projects.items()))
-        fd, tmp = tempfile.mkstemp(
-            prefix=f".{self.path.stem}.", suffix=".tmp", dir=self.path.parent
+            document[_TRUST_USER_KEY] = user
+        document["projects"] = dict(sorted(projects.items()))
+        stem = self.path.stem
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{stem}.",
+            suffix=".tmp",
+            dir=self.path.parent,
         )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.path)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(document, stream, ensure_ascii=False, indent=2)
+            Path(temp_name).replace(self.path)
         except BaseException:
-            Path(tmp).unlink(missing_ok=True)
+            Path(temp_name).unlink(missing_ok=True)
             raise
 
     def _read(self) -> tuple[str, dict[str, str]]:
         """(отпечаток хуков пользователя, отпечатки проектов)."""
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+            document = json.loads(self.path.read_text(encoding="utf-8"))
+        except _READ_ERRORS:
             return "", {}
-        if not isinstance(data, dict) or data.get("version") != TRUST_FORMAT_VERSION:
+        if not isinstance(document, dict) or document.get("version") != TRUST_FORMAT_VERSION:
             return "", {}
-        user = data.get("user")
-        projects = data.get("projects")
+        user = document.get(_TRUST_USER_KEY)
+        projects = document.get("projects")
         if not isinstance(projects, dict):
             projects = {}
         return (
             user if isinstance(user, str) else "",
-            {str(k): v for k, v in projects.items() if isinstance(v, str)},
+            {
+                str(key): fingerprint
+                for key, fingerprint in projects.items()
+                if isinstance(fingerprint, str)
+            },
         )
 
-
-def _project_key(root: Path) -> str:
-    return str(Path(root).resolve())
+    def _project_key(self, root: Path) -> str:
+        """Ключ проекта в файле доверия — абсолютный путь корня без симлинков."""
+        return str(Path(root).resolve())

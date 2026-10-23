@@ -15,23 +15,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import TYPE_CHECKING, override
 
-from gigacrew.agent.events import (
-    AgentEvents,
-    Approval,
-    CompactResult,
-    ConfirmResult,
-    NoticeLevel,
-    Review,
-    SubagentInfo,
-    ToolCallInfo,
-    TurnStats,
-)
+from gigacrew.agent.events import AgentEvents
 from gigacrew.agent.guard import MODEL_STOP_REASONS
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, ToolRegistry, ToolResult
 from gigacrew.tools.process import quote_reminder_tags
 from gigacrew.tools.task import SubagentSpec, allows_tool
+
+if TYPE_CHECKING:
+    # Типы событий нужны только аннотациям.
+    from gigacrew.agent.events import (
+        Approval,
+        CompactResult,
+        ConfirmResult,
+        NoticeLevel,
+        Review,
+        SubagentInfo,
+        ToolCallInfo,
+        TurnStats,
+    )
 
 # Сколько суб-агентов основной агент может запустить за один ход.
 MAX_SUBAGENTS_PER_TURN = 8
@@ -85,7 +90,7 @@ INTERRUPTED_NOTE = "Subagent {name} was interrupted by the user (Ctrl+C). No res
 NO_REPORT_NOTE = "Subagent {name} returned no report."
 
 # Причины остановки — для строки результата task в интерфейсе.
-_STOP_REASONS = {
+_STOP_REASONS = MappingProxyType({
     "max_steps": "исчерпан лимит шагов",
     "context_limit": "контекст заполнен",
     "time_limit": "исчерпан лимит времени",
@@ -93,7 +98,7 @@ _STOP_REASONS = {
     "tool_repeats": "зацикливание (повтор одного вызова)",
     "similar_calls": "зацикливание (похожие вызовы с той же целью)",
     "output_limit": "ответы модели обрывались",
-}
+})
 
 
 @dataclass
@@ -107,85 +112,117 @@ class SubagentTrail:
 
     @property
     def changed(self) -> bool:
+        """Суб-агент что-то изменил: файлы или изменяющие операции."""
         return bool(self.changed_files or self.operations)
 
     def lines(self) -> list[str]:
+        """Строки фактов для отчёта (повторы убраны, порядок сохранён)."""
         out = []
         if self.changed_files:
-            out.append(f"Changed files: {', '.join(dict.fromkeys(self.changed_files))}")
+            files = ", ".join(dict.fromkeys(self.changed_files))
+            out.append(f"Changed files: {files}")
         if self.operations:
-            out.append(f"Changing operations: {'; '.join(dict.fromkeys(self.operations))}")
+            operations = "; ".join(dict.fromkeys(self.operations))
+            out.append(f"Changing operations: {operations}")
         if self.rejected:
-            out.append(f"Rejected by the user: {'; '.join(dict.fromkeys(self.rejected))}")
+            rejected = "; ".join(dict.fromkeys(self.rejected))
+            out.append(f"Rejected by the user: {rejected}")
         return out
 
 
 class SubagentEvents(AgentEvents):
     """События суб-агента → события основного агента (``parent``)."""
 
-    def __init__(self, parent: AgentEvents, info: SubagentInfo):
+    def __init__(self, parent: AgentEvents, subagent: SubagentInfo):
+        """События суб-агента ``subagent`` передаются в события ``parent``."""
         self._parent = parent
-        self._info = info
+        self._subagent = subagent
         self._wrapping = False
         self.trail = SubagentTrail()
 
-    def _activity(self, activity: str) -> None:
-        self._parent.on_subagent_activity(self._info, activity, wrapping_up=self._wrapping)
-
     # Текст суб-агента не печатается: отчёт получит основной агент.
+    @override
     def on_stream_start(self) -> None:
         self._activity("подвожу итог" if self._wrapping else "думаю")
 
+    @override
     def on_tool_call(self, call: ToolCallInfo) -> None:
-        self._parent.on_subagent_tool_call(self._info, call)
+        self._parent.on_subagent_tool_call(self._subagent, call)
 
+    @override
     def confirm(
-        self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
+        self,
+        call: ToolCallInfo,
+        preview: Display | None,
+        *,
+        dangerous: bool,
     ) -> bool | Approval | ConfirmResult:
         return self._parent.confirm(call, preview, dangerous=dangerous)
 
+    @override
     def on_review_start(self, call: ToolCallInfo) -> None:
         self._activity("рецензент проверяет команду")
 
+    @override
     def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
         # Не передаётся как есть: интерфейс остановил бы индикатор суб-агента.
         if review is not None and review.allowed:
-            self._parent.on_notice(f"{self._info.name}: {review.approval}")
+            name = self._subagent.name
+            self._parent.on_notice(f"{name}: {review.approval}")
 
+    @override
     def on_tool_start(self, call: ToolCallInfo) -> None:
         self._activity(call.name)
 
-    def on_tool_result(self, call: ToolCallInfo, result: ToolResult, *, previewed: bool) -> None:
-        if result.ok and result.changed:
+    @override
+    def on_tool_result(
+        self,
+        call: ToolCallInfo,
+        tool_result: ToolResult,
+        *,
+        previewed: bool,
+    ) -> None:
+        if tool_result.ok and tool_result.changed:
             if call.kind is ToolKind.EDIT and call.summary:
                 self.trail.changed_files.append(call.summary)
             else:
                 self.trail.operations.append(f"{call.name} {call.summary}".strip())
-        elif not result.ok and REJECTED_MARK in result.content:
+        elif not tool_result.ok and REJECTED_MARK in tool_result.content:
             self.trail.rejected.append(f"{call.name} {call.summary}".strip())
-        self._parent.on_subagent_tool_result(self._info, call, result, previewed=previewed)
+        self._parent.on_subagent_tool_result(self._subagent, call, tool_result, previewed=previewed)
 
+    @override
     def on_compact_start(self, *, auto: bool) -> None:
         self._activity("сжимаю контекст")
 
-    def on_compact_end(self, result: CompactResult | None) -> None:
+    @override
+    def on_compact_end(self, compacted: CompactResult | None) -> None:
         """Не передаётся: интерфейс остановил бы индикатор суб-агента."""
 
+    @override
     def on_hook_start(self, event: str, command: str) -> None:
         self._activity(f"хук {event}")
 
+    @override
     def on_wrap_up(self, reason: str) -> None:
         self._wrapping = True
         self._activity("подвожу итог")
 
+    @override
     def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:
         # Остановка суб-агента — не остановка хода: основной агент продолжает.
+        name = self._subagent.name
         self._parent.on_notice(
-            f"{self._info.name}: {text}", level="warn" if level == "error" else level
+            f"{name}: {text}",
+            level="warn" if level == "error" else level,
         )
 
+    @override
     def on_turn_end(self, stats: TurnStats) -> None:
         """Итоги суб-агента показываются строкой результата ``task``."""
+
+    def _activity(self, activity: str) -> None:
+        self._parent.on_subagent_activity(self._subagent, activity, wrapping_up=self._wrapping)
 
 
 def subagent_registry(registry: ToolRegistry, spec: SubagentSpec) -> ToolRegistry:
@@ -197,7 +234,8 @@ def _clip(text: str) -> str:
     text = text.strip()
     if len(text) <= MAX_REPORT_CHARS:
         return text
-    return text[:MAX_REPORT_CHARS].rstrip() + "\n…(отчёт обрезан)"
+    head = text[:MAX_REPORT_CHARS].rstrip()
+    return f"{head}\n…(отчёт обрезан)"
 
 
 def _summary(spec: SubagentSpec, stats: TurnStats | None, tail: str = "") -> str:
@@ -212,10 +250,13 @@ def _summary(spec: SubagentSpec, stats: TurnStats | None, tail: str = "") -> str
 
 
 def subagent_report(
-    spec: SubagentSpec, text: str, stats: TurnStats | None, trail: SubagentTrail
+    spec: SubagentSpec,
+    text: str,
+    stats: TurnStats | None,
+    trail: SubagentTrail,
 ) -> ToolResult:
     """Результат ``task`` для основного агента: отчёт суб-агента и факты о сделанном."""
-    stop = stats.stop_reason if stats is not None else None
+    stop = None if stats is None else stats.stop_reason
     parts = []
     tail = ""
     if stop == "user_stop":

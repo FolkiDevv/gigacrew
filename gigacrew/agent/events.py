@@ -20,7 +20,7 @@ from typing import Literal
 
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, ToolResult
-from gigacrew.tools.questions import Answer, Question, QuestionsUnavailable
+from gigacrew.tools.questions import Answer, Question, QuestionsUnavailableError
 
 NoticeLevel = Literal["info", "warn", "error"]
 
@@ -50,7 +50,8 @@ class ToolCallInfo:
 class Approval(Enum):
     """Ответ на подтверждение операции."""
 
-    NO = "no"
+    # Член перечисления рядом с YES и ALWAYS, а не булево значение: не спутать.
+    NO = "no"  # noqa: WPS110
     YES = "yes"
     # Да, и не спрашивать: для команд — сохранённое для проекта разрешение, для прочего —
     # этот же вызов до конца сессии.
@@ -85,7 +86,7 @@ class TurnStats:
     # Почему ход прерван ограничителем (None — модель завершила ход сама).
     stop_reason: str | None = None
     # Длительность хода, секунды.
-    duration_s: float = 0.0
+    duration_s: float = float(0)
     # Успешных изменяющих вызовов за ход (правки, изменяющие команды).
     changes: int = 0
     # Повторов запроса после ответа, оборванного до конца (finish_reason length/incomplete).
@@ -96,6 +97,7 @@ class TurnStats:
 
     @property
     def billed_tokens(self) -> int:
+        """Оплаченные токены хода: промпт и ответ по всем обращениям."""
         return self.prompt_tokens + self.completion_tokens
 
 
@@ -163,7 +165,11 @@ class AgentEvents:
         """Модель вызвала инструмент."""
 
     def confirm(
-        self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
+        self,
+        call: ToolCallInfo,
+        preview: Display | None,
+        *,
+        dangerous: bool,
     ) -> bool | Approval | ConfirmResult:
         """Спросить пользователя, выполнять ли изменяющую/опасную операцию.
 
@@ -179,8 +185,10 @@ class AgentEvents:
         """Модель-рецензент проверяет команду (режим «авто»)."""
 
     def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
-        """Проверка закончилась (вызывается всегда). None — прервана; при отказе или
-        сбое дальше придёт ``confirm`` с ``call.review``."""
+        """Проверка закончилась (вызывается всегда).
+
+        None — прервана; при отказе или сбое дальше придёт ``confirm`` с ``call.review``.
+        """
 
     def on_tool_start(self, call: ToolCallInfo) -> None:
         """Инструмент запущен (после подтверждения, если оно требовалось)."""
@@ -191,7 +199,13 @@ class AgentEvents:
         Парный к ``on_tool_start``, вызывается всегда и раньше ``on_tool_result``.
         """
 
-    def on_tool_result(self, call: ToolCallInfo, result: ToolResult, *, previewed: bool) -> None:
+    def on_tool_result(
+        self,
+        call: ToolCallInfo,
+        tool_result: ToolResult,
+        *,
+        previewed: bool,
+    ) -> None:
         """Результат инструмента. ``previewed`` — превью уже показано при подтверждении."""
 
     def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
@@ -200,13 +214,13 @@ class AgentEvents:
         Интерфейс без поддержки вопросов сообщает, что спросить некого, — модель
         получит ошибку и решит сама, а не примет выдуманный ответ.
         """
-        raise QuestionsUnavailable()
+        raise QuestionsUnavailableError
 
     # --- сжатие контекста ---
     def on_compact_start(self, *, auto: bool) -> None:
         """Началось сжатие истории (``auto`` — по порогу, иначе по команде)."""
 
-    def on_compact_end(self, result: CompactResult | None) -> None:
+    def on_compact_end(self, compacted: CompactResult | None) -> None:
         """Сжатие закончилось (вызывается всегда). None — не удалось или прервано."""
 
     # --- суб-агенты ---
@@ -214,11 +228,15 @@ class AgentEvents:
     # ``on_tool_end``). Его собственные события не приходят как события основного
     # агента: текст суб-агента пользователю не печатается, а инструменты и ожидание
     # сообщаются хуками ниже. Подтверждения суб-агента приходят обычным ``confirm``.
-    def on_subagent_start(self, info: SubagentInfo) -> None:
+    def on_subagent_start(self, subagent: SubagentInfo) -> None:
         """Суб-агент запущен."""
 
     def on_subagent_activity(
-        self, info: SubagentInfo, activity: str, *, wrapping_up: bool = False
+        self,
+        subagent: SubagentInfo,
+        activity: str,
+        *,
+        wrapping_up: bool = False,
     ) -> None:
         """Чем занят суб-агент: «думаю», имя инструмента, «сжимаю контекст».
 
@@ -226,15 +244,20 @@ class AgentEvents:
         оборвёт его без отчёта).
         """
 
-    def on_subagent_tool_call(self, info: SubagentInfo, call: ToolCallInfo) -> None:
+    def on_subagent_tool_call(self, subagent: SubagentInfo, call: ToolCallInfo) -> None:
         """Суб-агент вызвал инструмент."""
 
     def on_subagent_tool_result(
-        self, info: SubagentInfo, call: ToolCallInfo, result: ToolResult, *, previewed: bool
+        self,
+        subagent: SubagentInfo,
+        call: ToolCallInfo,
+        tool_result: ToolResult,
+        *,
+        previewed: bool,
     ) -> None:
         """Результат инструмента суб-агента."""
 
-    def on_subagent_end(self, info: SubagentInfo, stats: TurnStats | None) -> None:
+    def on_subagent_end(self, subagent: SubagentInfo, stats: TurnStats | None) -> None:
         """Суб-агент закончил (вызывается всегда). None — прерван исключением."""
 
     # --- хуки пользователя ---

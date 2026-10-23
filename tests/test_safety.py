@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,7 @@ import pytest
 from gigacrew.project import treesitter
 from gigacrew.safety import CommandLevel, classify
 from gigacrew.safety import bash as shell
+from gigacrew.security import subprocess_env
 
 READ, EXEC, WRITE, DANGER = (
     CommandLevel.READ,
@@ -18,20 +21,41 @@ READ, EXEC, WRITE, DANGER = (
     CommandLevel.WRITE,
     CommandLevel.DANGER,
 )
+# Обратная косая черта в тестовых командах: без неявных raw-строк
+_BACKSLASH = "\\"
+# Пустой набор подписей: сравнение именно с пустым кортежем
+_NO_SIGNATURES: tuple[str, ...] = ()
 
 
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
-    for d in ("src", "tests", "pkg"):
-        (tmp_path / d).mkdir()
-    for f in ("README.md", "a.txt", "b.txt", "src/main.py", "tests/test_a.py", "pyproject.toml"):
-        (tmp_path / f).write_text("hello\n")
+    for dirname in ("src", "tests", "pkg"):
+        (tmp_path / dirname).mkdir()
+    for filename in (
+        "README.md",
+        "a.txt",
+        "b.txt",
+        "src/main.py",
+        "tests/test_a.py",
+        "pyproject.toml",
+    ):
+        (tmp_path / filename).write_text("hello\n")
     (tmp_path / "package.json").write_text('{"scripts": {"test": "jest", "build": "tsc"}}')
     return tmp_path
 
 
-def level(command: str, root: Path, **kw) -> CommandLevel | None:
-    return classify(command, root=root, **kw).level
+def level(
+    command: str,
+    root: Path,
+    *,
+    cwd: str = ".",
+    environ: Mapping[str, str] | None = None,
+) -> CommandLevel | None:
+    return classify(command, root=root, cwd=cwd, environ=environ).level
+
+
+def _not_posix() -> bool:
+    return False
 
 
 # --------------------------- только чтение --------------------------- #
@@ -89,7 +113,7 @@ def level(command: str, root: Path, **kw) -> CommandLevel | None:
         "sleep 1",
     ],
 )
-def test_read_only(root, command):
+def test_read_only(root: Path, command: str) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is READ, verdict.reason
 
@@ -118,7 +142,7 @@ def test_read_only(root, command):
         "ls {a,b}",
         "cat {/etc/passwd,a.txt}",
         # продолжение строки и heredoc: части, спрятанные от разбора
-        "cat .\\\n./.\\\n./outside.txt",
+        f"cat .{_BACKSLASH}\n./.{_BACKSLASH}\n./outside.txt",
         "cat <<'EOF' && rm -rf ~\nhello\nEOF",
         "cat <<EOF\n$(touch pwned)\nEOF",
         # шаблоны, совпадающие с «..» в dash
@@ -146,8 +170,8 @@ def test_read_only(root, command):
         "export PATH=.; ls",
         "x=1; echo $x",
         # опасные флаги «читающих» программ, в том числе сокращённые
-        "find . -exec sh -c 'touch x' \\;",
-        "find . -exec sh -c 'cat \"$1\"' _ {} \\;",
+        r"find . -exec sh -c 'touch x' \;",
+        f"find . -exec sh -c 'cat \"$1\"' _ {{}} {_BACKSLASH};",
         "find . -delete",
         "find . -fprint out.txt",
         "rg --pre ./x hello",
@@ -181,7 +205,7 @@ def test_read_only(root, command):
         "awk 'BEGIN { ARGV[ARGC++] = \"/etc/passwd\" } 1' a.txt",
         "awk -v ARGC=3 '{print}' a.txt",
         "awk '{print}' ARGC=3 a.txt",
-        'awk \'{printf("%s\\n", $1) > "out.txt"}\' a.txt',
+        f'awk \'{{printf("%s{_BACKSLASH}n", $1) > "out.txt"}}\' a.txt',
         "awk '{print $1,\n$2 > \"out.txt\"}' a.txt",
         "awk '$1 > 5 {print $1 > \"out.txt\"}' a.txt",
         "awk '{print $1 | \"sh\"}' a.txt",
@@ -224,18 +248,18 @@ def test_read_only(root, command):
         "python3 <<EOF\nprint($HOME)\nEOF",
     ],
 )
-def test_not_read_only(root, command):
+def test_not_read_only(root: Path, command: str) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is not READ, (command, verdict.reason)
 
 
-def test_glob_expanding_to_option_like_name_is_not_read(root):
+def test_glob_expanding_to_option_like_name_is_not_read(root: Path) -> None:
     (root / "--pre=id").write_text("")
     assert level("rg hello *", root) is not READ
     assert level("wc -l *.txt", root) is READ  # совпадения без «-»
 
 
-def test_program_from_project_path_is_exec(root, monkeypatch):
+def test_program_from_project_path_is_exec(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     bin_dir = root / "bin"
     bin_dir.mkdir()
     fake = bin_dir / "cat"
@@ -246,14 +270,16 @@ def test_program_from_project_path_is_exec(root, monkeypatch):
     assert level("./bin/cat a.txt", root) is EXEC
 
 
-def test_program_path_is_normalized_before_trusting_system_dir(root):
+def test_program_path_is_normalized_before_trusting_system_dir(root: Path) -> None:
     (root / "sub").mkdir()
     fake = root / "sub" / "ls"
     fake.write_text("#!/bin/sh\nid\n")
     fake.chmod(0o755)
     assert level("/usr/bin/cat a.txt", root) is READ
     # путь начинается с системного каталога, но ведёт в файлы проекта
-    climb = "/usr/bin/" + "../" * 2 + str(root).lstrip("/") + "/sub/ls"
+    up_twice = "../" * 2
+    root_without_slash = str(root).lstrip("/")
+    climb = f"/usr/bin/{up_twice}{root_without_slash}/sub/ls"
     assert level(climb, root) is EXEC
     assert level("/usr/bin/../../tmp/x/cat a.txt", root) is None
     assert level("/tmp/x/cat a.txt", root) is None  # программа вне проекта
@@ -261,7 +287,7 @@ def test_program_path_is_normalized_before_trusting_system_dir(root):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         ("env -i ls", READ),
         ("env -u HOME ls", READ),
@@ -288,13 +314,17 @@ def test_program_path_is_normalized_before_trusting_system_dir(root):
         ("env PAGER='sh -c id' git log", DANGER),
     ],
 )
-def test_env_options_and_assignments(root, command, expected):
+def test_env_options_and_assignments(
+    root: Path,
+    command: str,
+    expected: CommandLevel | None,
+) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is expected, (command, verdict.reason)
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         # значение флага в группе коротких (`-uo FILE`) — как в getopt
         ("sort -uo .git/x a.txt", DANGER),
@@ -370,13 +400,17 @@ def test_env_options_and_assignments(root, command, expected):
         ("patch --dry-run -p1 -i a.txt", READ),
     ],
 )
-def test_option_values_are_parsed_like_getopt(root, command, expected):
+def test_option_values_are_parsed_like_getopt(
+    root: Path,
+    command: str,
+    expected: CommandLevel | None,
+) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is expected, (command, verdict.reason)
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         # значения флагов, которые читают файлы, проверяются как пути
         ("date -f ~/.ssh/id_rsa", DANGER),
@@ -403,19 +437,26 @@ def test_option_values_are_parsed_like_getopt(root, command, expected):
         ("bat a.txt", READ),
     ],
 )
-def test_file_reading_flag_values_are_checked(root, command, expected):
+def test_file_reading_flag_values_are_checked(
+    root: Path,
+    command: str,
+    expected: CommandLevel | None,
+) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is expected, (command, verdict.reason)
 
 
-def test_symlink_out_of_project_is_outside(root, tmp_path_factory):
+def test_symlink_out_of_project_is_outside(
+    root: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
     outside = tmp_path_factory.mktemp("outside") / "secret.txt"
     outside.write_text("s")
     (root / "link.txt").symlink_to(outside)
     assert level("cat link.txt", root) is not READ
 
 
-def test_recursive_read_with_secrets_asks(root):
+def test_recursive_read_with_secrets_asks(root: Path) -> None:
     assert level("grep -rn hello .", root) is READ
     assert level("diff -rN src .", root) is READ
     (root / ".env").write_text("TOKEN=1\n")
@@ -431,12 +472,12 @@ def test_recursive_read_with_secrets_asks(root):
 
 # ------------------------------- git -------------------------------- #
 @pytest.fixture
-def repo(root):
+def repo(root: Path) -> Path:
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     return root
 
 
-def test_git_reads_and_changes(repo):
+def test_git_reads_and_changes(repo: Path) -> None:
     assert level("git status", repo) is READ
     assert level("git log --oneline -5", repo) is READ
     assert level("git -C src log -1", repo) is READ
@@ -450,7 +491,7 @@ def test_git_reads_and_changes(repo):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         # настройки, запускающие программы, — на один запуск и постоянно
         ("git -c core.pager='sh -c id' log", DANGER),
@@ -561,30 +602,36 @@ def test_git_reads_and_changes(repo):
         ("git filter-branch --all", DANGER),
     ],
 )
-def test_git_levels(repo, command, expected):
+def test_git_levels(repo: Path, command: str, expected: CommandLevel | None) -> None:
     verdict = classify(command, root=repo)
     assert verdict.level is expected, (command, verdict.reason)
 
 
-def test_git_in_nested_bare_repository_asks(repo):
+def test_git_in_nested_bare_repository_asks(repo: Path) -> None:
     subprocess.run(["git", "init", "-q", "--bare", "pkg.git"], cwd=repo, check=True)
     assert level("git -C pkg.git log", repo) is None
     assert level("git log", repo) is READ
 
 
-def test_git_read_when_repo_config_cannot_be_checked(repo, monkeypatch):
+def test_git_read_when_repo_config_cannot_be_checked(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     assert level("git status", repo) is READ
-    monkeypatch.setattr("gigacrew.safety.gitconfig.repo_config_runs_programs", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "gigacrew.safety.gitconfig.repo_config_runs_programs",
+        lambda *args, **kwargs: None,
+    )
     assert level("git status", repo) is None
 
 
-def test_git_read_with_program_in_repo_config_asks(repo):
+def test_git_read_with_program_in_repo_config_asks(repo: Path) -> None:
     subprocess.run(["git", "config", "diff.evil.textconv", "sh -c id"], cwd=repo, check=True)
     assert level("git diff", repo) is None
     assert level("git log -p", repo) is None
 
 
-def test_git_in_nested_repository_asks(repo):
+def test_git_in_nested_repository_asks(repo: Path) -> None:
     nested = repo / "pkg"
     subprocess.run(["git", "init", "-q"], cwd=nested, check=True)
     assert level("cd pkg && git status", repo) is None
@@ -594,7 +641,7 @@ def test_git_in_nested_repository_asks(repo):
 
 # --------------------------- выполнение кода -------------------------- #
 @pytest.mark.parametrize(
-    "command, signature",
+    ("command", "signature"),
     [
         ("pytest", "pytest"),
         ("pytest -q -x tests/test_a.py", "pytest"),
@@ -610,7 +657,7 @@ def test_git_in_nested_repository_asks(repo):
         ("mypy src", "mypy"),
     ],
 )
-def test_exec_with_signature(root, command, signature):
+def test_exec_with_signature(root: Path, command: str, signature: str) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is EXEC, verdict.reason
     assert verdict.signatures == (signature,)
@@ -627,7 +674,7 @@ def test_exec_with_signature(root, command, signature):
         "PYTHONSTARTUP=x pytest",
     ],
 )
-def test_exec_without_signature_only_exact(root, command):
+def test_exec_without_signature_only_exact(root: Path, command: str) -> None:
     verdict = classify(command, root=root)
     assert not verdict.signatures, (command, verdict)
 
@@ -642,33 +689,34 @@ def test_exec_without_signature_only_exact(root, command):
         "make -C /etc",
     ],
 )
-def test_exec_arguments_out_of_project_ask(root, command):
+def test_exec_arguments_out_of_project_ask(root: Path, command: str) -> None:
     assert level(command, root) is None
 
 
-def test_script_signature_changes_with_content(root):
+def test_script_signature_changes_with_content(root: Path) -> None:
     script = root / "check.sh"
     script.write_text("#!/bin/sh\necho ok\n")
     script.chmod(0o755)
     first = classify("./check.sh", root=root).signatures
     script.write_text("#!/bin/sh\necho changed\n")
     assert classify("./check.sh", root=root).signatures != first
-    assert classify("./check.sh --flag", root=root).signatures == ()  # с аргументами — точно
+    with_args = classify("./check.sh --flag", root=root)
+    assert with_args.signatures == _NO_SIGNATURES  # с аргументами — точно
 
 
-def test_make_dry_run_still_runs_makefile_code(root):
+def test_make_dry_run_still_runs_makefile_code(root: Path) -> None:
     # GNU make разбирает Makefile ($(shell …)) и выполняет «+»-рецепты и при -n/-q, а -p
     # после вывода базы собирает цели как обычно
     (root / "Makefile").write_text("X := $(shell touch pwned)\nall:\n\t+touch built\n")
     for command in ("make -n", "make -p", "make -q", "make --dry-run", "make -n test"):
         verdict = classify(command, root=root)
         assert verdict.level is EXEC, (command, verdict.reason)
-        assert verdict.signatures == (), command  # только точная команда
+        assert verdict.signatures == _NO_SIGNATURES, command  # только точная команда
     assert classify("make test", root=root).signatures == ("make test",)
 
 
 @pytest.mark.parametrize(
-    "command, expected, signatures",
+    ("command", "expected", "signatures"),
     [
         ("make -j 4 test", EXEC, ("make test",)),
         ("make -j8 test", EXEC, ("make test",)),
@@ -684,20 +732,25 @@ def test_make_dry_run_still_runs_makefile_code(root):
         ("make MAKE=./x test", DANGER, ()),
     ],
 )
-def test_make_arguments(root, command, expected, signatures):
+def test_make_arguments(
+    root: Path,
+    command: str,
+    expected: CommandLevel | None,
+    signatures: tuple[str, ...],
+) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is expected, (command, verdict.reason)
     assert verdict.signatures == signatures, command
 
 
-def test_npm_script_must_exist(root):
+def test_npm_script_must_exist(root: Path) -> None:
     assert level("npm run lint", root) is None  # нет в package.json
     assert level("npm run deploy", root) is DANGER
 
 
 # ----------------------- запись, сеть, опасное ------------------------ #
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         ("mkdir -p build", WRITE),
         ("cp a.txt c.txt", WRITE),
@@ -723,12 +776,12 @@ def test_npm_script_must_exist(root):
         ("sed -i 's/a/b/' a.txt", WRITE),
     ],
 )
-def test_levels(root, command, expected):
+def test_levels(root: Path, command: str, expected: CommandLevel | None) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is expected, verdict.reason
 
 
-def test_edits_only(root):
+def test_edits_only(root: Path) -> None:
     assert classify("sed -i 's/a/b/' a.txt", root=root).edits_only
     assert classify("ruff format . && ls", root=root).edits_only
     assert not classify("rm a.txt", root=root).edits_only  # удаление — не правка
@@ -736,20 +789,24 @@ def test_edits_only(root):
 
 
 # ------------------------------ разбор ------------------------------- #
-def test_cd_prefix_becomes_cwd(root):
+def test_cd_prefix_becomes_cwd(root: Path) -> None:
     verdict = classify("cd src && ls -la", root=root)
-    assert verdict.cwd == "src" and verdict.command == "ls -la"
+    assert verdict.cwd == "src"
+    assert verdict.command == "ls -la"
     verdict = classify("ls", root=root, cwd="src")
-    assert verdict.cwd == "src" and verdict.level is READ
+    assert verdict.cwd == "src"
+    assert verdict.level is READ
     mixed = classify("cd src && cd /tmp && ls", root=root)
-    assert mixed.cwd == "src" and mixed.command == "cd /tmp && ls" and mixed.level is None
+    assert mixed.cwd == "src"
+    assert mixed.command == "cd /tmp && ls"
+    assert mixed.level is None
     assert classify("cd src; ls", root=root).level is None  # после «;» cd мог не сработать
     assert classify("cd ../.. && ls", root=root).cwd == "."
 
 
-def test_composable_and_parts(root):
+def test_composable_and_parts(root: Path) -> None:
     verdict = classify("pytest -q 2>&1 | tail -30", root=root)
-    assert [p.level for p in verdict.parts] == [EXEC, READ]
+    assert [part.level for part in verdict.parts] == [EXEC, READ]
     assert classify("pytest > log.txt", root=root).composable is False
 
 
@@ -768,47 +825,50 @@ def test_composable_and_parts(root):
         "ls 2>&1 | tee log | wc -l",
     ],
 )
-def test_every_command_node_is_classified(root, command):
+def test_every_command_node_is_classified(root: Path, command: str) -> None:
     """Каждая простая команда дерева разобрана (ничего не спрятано в heredoc и т.п.)."""
     tree = treesitter.parse_tree("shell", command)
     assert tree is not None
     nodes = 0
     stack = [tree]
     while stack:
-        n = stack.pop()
-        nodes += n.type == "command"
-        stack.extend(n.children)
+        node = stack.pop()
+        nodes += node.type == "command"
+        stack.extend(node.children)
     script = shell.parse(command, root=root)
-    assert script is not None and len(script.commands) + script.consumed == nodes
+    assert script is not None
+    assert len(script.commands) + script.consumed == nodes
 
 
 @pytest.mark.parametrize(
-    "command, value",
+    ("command", "expected"),
     [
         ('echo "a\nb"', "a\nb"),
         ('echo "\n  x = 1\n"', "\n  x = 1\n"),
-        ('echo "a\\"b\nc\\\\d"', 'a"b\nc\\d'),
-        ('echo "a\\\nb"', "ab"),  # перенос строки через \ внутри "…" убирается
+        (f'echo "a{_BACKSLASH}"b\nc{_BACKSLASH}{_BACKSLASH}d"', f'a"b\nc{_BACKSLASH}d'),
+        (f'echo "a{_BACKSLASH}\nb"', "ab"),  # перенос строки через \ внутри "…" убирается
         ("echo 'a\nb'", "a\nb"),
         ('echo x"a\nb"y', "xa\nby"),
     ],
 )
-def test_quoted_word_keeps_newlines(root, command, value):
+def test_quoted_word_keeps_newlines(root: Path, command: str, expected: str) -> None:
     """Значение слова в кавычках — как его получит программа, с переводами строк."""
     script = shell.parse(command, root=root)
     assert script is not None
-    assert script.commands[0].argv[1].value == value
+    first_command = script.commands[0]
+    assert first_command.argv[1].text == expected
 
 
-def test_long_commands_and_other_platforms_ask(root, monkeypatch):
-    assert level("echo " + "x" * 20_000, root) is None
-    monkeypatch.setattr("gigacrew.safety._is_posix", lambda: False)
+def test_long_commands_and_other_platforms_ask(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    long_word = "x" * 20_000
+    assert level(f"echo {long_word}", root) is None
+    monkeypatch.setattr("gigacrew.safety.classifier._is_posix", _not_posix)
     assert level("ls", root) is None
 
 
-def test_child_environment_drops_shell_hooks_and_adds_git_safety(monkeypatch):
-    from gigacrew.tools.process import subprocess_env
-
+def test_child_environment_drops_shell_hooks_and_adds_git_safety(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     env = subprocess_env(
         {
             "CDPATH": "/",
@@ -817,10 +877,13 @@ def test_child_environment_drops_shell_hooks_and_adds_git_safety(monkeypatch):
             "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "user.name",
             "GIT_CONFIG_VALUE_0": "me",
-        }
+        },
     )
-    assert "CDPATH" not in env and "BASH_ENV" not in env and "ENV" not in env
-    assert env["GIT_CONFIG_COUNT"] == "3" and env["GIT_CONFIG_KEY_0"] == "user.name"
+    assert "CDPATH" not in env
+    assert "BASH_ENV" not in env
+    assert "ENV" not in env
+    assert env["GIT_CONFIG_COUNT"] == "3"
+    assert env["GIT_CONFIG_KEY_0"] == "user.name"
     assert env["GIT_CONFIG_KEY_1"] == "safe.bareRepository"
     assert env["GIT_CONFIG_VALUE_2"] == "false"
     # окружение самого процесса не меняется
@@ -843,7 +906,7 @@ def test_child_environment_drops_shell_hooks_and_adds_git_safety(monkeypatch):
         "python3 -c 'x = ().__class__'",
     ],
 )
-def test_hidden_or_dynamic_code_is_marked_dangerous(root, command):
+def test_hidden_or_dynamic_code_is_marked_dangerous(root: Path, command: str) -> None:
     """Спросить И пометить опасным: человек должен посмотреть внимательно."""
     verdict = classify(command, root=root)
     assert verdict.level is DANGER, verdict.reason
@@ -851,7 +914,7 @@ def test_hidden_or_dynamic_code_is_marked_dangerous(root, command):
 
 # ------------------------------ Python ------------------------------- #
 @pytest.fixture
-def venv_site(root):
+def venv_site(root: Path) -> Path:
     venv = root / ".venv"
     site = venv / "lib" / "python3.13" / "site-packages"
     site.mkdir(parents=True)
@@ -867,12 +930,14 @@ def venv_site(root):
         "import _virtualenv",
         "import _distutils_hack",
         "import __editable___pkg_1_0_finder; __editable___pkg_1_0_finder.install()",
-        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') "
-        "== 'local'; enabled and __import__('_distutils_hack').add_shim(); ",
+        (
+            "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') "
+            "== 'local'; enabled and __import__('_distutils_hack').add_shim(); "
+        ),
     ],
 )
-def test_standard_pth_lines_are_trusted(root, venv_site, line):
-    (venv_site / "std.pth").write_text(line + "\n")
+def test_standard_pth_lines_are_trusted(root: Path, venv_site: Path, line: str) -> None:
+    (venv_site / "std.pth").write_text(f"{line}\n")
     assert level(".venv/bin/python -c 'print(1)'", root) is READ
 
 
@@ -889,8 +954,8 @@ def test_standard_pth_lines_are_trusted(root, venv_site, line):
         "import os; os.system('id')",
     ],
 )
-def test_pth_with_appended_code_is_exec(root, venv_site, line):
-    (venv_site / "evil.pth").write_text(line + "\n")
+def test_pth_with_appended_code_is_exec(root: Path, venv_site: Path, line: str) -> None:
+    (venv_site / "evil.pth").write_text(f"{line}\n")
     for command in (
         ".venv/bin/python -c 'print(1)'",
         ".venv/bin/python -m platform",
@@ -900,13 +965,13 @@ def test_pth_with_appended_code_is_exec(root, venv_site, line):
         assert verdict.level is EXEC, (command, verdict.reason)
 
 
-def test_sitecustomize_in_venv_is_exec(root, venv_site):
+def test_sitecustomize_in_venv_is_exec(root: Path, venv_site: Path) -> None:
     assert level(".venv/bin/python -c 'print(1)'", root) is READ
     (venv_site / "sitecustomize.py").write_text("import os; os.system('id')\n")
     assert level(".venv/bin/python -c 'print(1)'", root) is EXEC
 
 
-def test_python_startup_code_on_pythonpath(root):
+def test_python_startup_code_on_pythonpath(root: Path) -> None:
     lib = root / "lib"
     lib.mkdir()
     (lib / "json.py").write_text("print('evil')\n")
@@ -927,7 +992,7 @@ def test_python_startup_code_on_pythonpath(root):
     assert level("python3 -c 'print(1)'", root) is READ  # каталог запуска — не PYTHONPATH
 
 
-def test_stdlib_shadowing_in_run_directory_is_exec(root):
+def test_stdlib_shadowing_in_run_directory_is_exec(root: Path) -> None:
     (root / "json.py").write_text("print('evil')\n")
     assert level("python3 -c 'print(1)'", root) is EXEC
     assert level("python3 -I -c 'print(1)'", root) is READ
@@ -940,7 +1005,7 @@ def test_stdlib_shadowing_in_run_directory_is_exec(root):
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         ("python3 -m json.tool package.json /tmp/o.json", DANGER),
         ("python3 -m json.tool package.json .git/config", DANGER),
@@ -954,14 +1019,16 @@ def test_stdlib_shadowing_in_run_directory_is_exec(root):
         ("python3 /tmp/x.py", None),
     ],
 )
-def test_python_flags_and_module_outputs(root, command, expected):
+def test_python_flags_and_module_outputs(
+    root: Path,
+    command: str,
+    expected: CommandLevel | None,
+) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is expected, (command, verdict.reason)
 
 
-def test_python_script_signature_follows_content(root):
-    import hashlib
-
+def test_python_script_signature_follows_content(root: Path) -> None:
     script = root / "uses_pkg.py"
     script.write_text("import pkg\n")
     first = classify("python3 uses_pkg.py", root=root).parts[0].signature
@@ -984,14 +1051,14 @@ def test_python_script_signature_follows_content(root):
         "uv run --python 3.12 python -c 'print(1)'",
     ],
 )
-def test_flags_before_subcommand_drop_signature(root, command):
+def test_flags_before_subcommand_drop_signature(root: Path, command: str) -> None:
     verdict = classify(command, root=root)
-    assert verdict.signatures == (), (command, verdict.reason)
+    assert verdict.signatures == _NO_SIGNATURES, (command, verdict.reason)
     assert verdict.level is not READ, command
 
 
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         ("uv --directory=/tmp/other run pytest", None),
         ("uv run --python /tmp/x/python python -c 'print(1)'", None),
@@ -1048,21 +1115,23 @@ def test_flags_before_subcommand_drop_signature(root, command):
         ("find -files0-from a.txt -exec cat {} +", None),
     ],
 )
-def test_tool_levels(root, command, expected):
+def test_tool_levels(root: Path, command: str, expected: CommandLevel | None) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is expected, (command, verdict.reason)
 
 
-def test_npm_format_script_edits_files(root):
+def test_npm_format_script_edits_files(root: Path) -> None:
     (root / "package.json").write_text('{"scripts": {"format": "prettier -w .", "lint": "x"}}')
     verdict = classify("npm run format", root=root)
-    assert verdict.level is WRITE and verdict.edits_only and verdict.signatures == ()
+    assert verdict.level is WRITE
+    assert verdict.edits_only
+    assert verdict.signatures == _NO_SIGNATURES
     assert classify("npm run lint", root=root).signatures == ("npm run lint",)
 
 
 # ------------- точные уровни правил (обе стороны каждого) ------------- #
 @pytest.mark.parametrize(
-    "command, expected",
+    ("command", "expected"),
     [
         # sed: правка на месте и в группе флагов, запуск команд
         ("sed -Ei 's/a/b/' a.txt", WRITE),
@@ -1098,7 +1167,7 @@ def test_npm_format_script_edits_files(root):
         ("grep -f a.txt ~/.ssh/id_rsa", DANGER),
         ("rg --hostname-bin=./x hello", None),
         ("rg -z hello", None),
-        # tar: программы
+        # tar: внешние программы сжатия
         ("tar -I ./x -tf a.tar", DANGER),
         ("tar --use-compress-program=./x -xf a.tar", DANGER),
         # служебная папка gigacrew и устройства
@@ -1149,28 +1218,33 @@ def test_npm_format_script_edits_files(root):
         ("aws s3 ls", None),
     ],
 )
-def test_rule_levels(root, command, expected):
+def test_rule_levels(root: Path, command: str, expected: CommandLevel | None) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is expected, (command, verdict.reason)
 
 
-def test_fd_search_paths_are_relative_to_base_directory(root):
-    """Относительные пути поиска fd отсчитывает от -C/--base-directory, а не от каталога
-    команды: из src/a `fd y ../x -C ../..` ищет в <проект>/../x — за пределами проекта."""
+def test_fd_search_paths_are_relative_to_base_directory(root: Path) -> None:
+    """Относительные пути поиска fd отсчитывает от -C/--base-directory, не от каталога команды.
+
+    Из src/a `fd y ../x -C ../..` ищет в <проект>/../x — за пределами проекта.
+    """
     (root / "src" / "a").mkdir()
-    sub = {"cwd": "src/a"}
-    assert level("fd y ../x -x cat", root, **sub) is READ  # src/x — внутри
-    assert level("fd y ../x -C ../.. -x cat", root, **sub) is None
-    assert level("fd y ../x --base-directory=../.. -x cat", root, **sub) is None
-    assert level("fd y --search-path ../x -C ../.. -X cat", root, **sub) is None
-    assert level("fd y ../x -C ../..", root, **sub) is None
-    assert level("fd y src -C ../.. -x cat", root, **sub) is READ  # <проект>/src
-    assert level(f"fd y {root}/src -C .. -x cat", root, **sub) is READ  # абсолютный — как есть
-    assert level("fd y '*' -C ../.. -x cat", root, **sub) is READ  # шаблон fd в кавычках
-    assert level("fd y * -C ../.. -x cat", root, **sub) is None  # имена раскроет оболочка
+    sub = "src/a"
+    assert level("fd y ../x -x cat", root, cwd=sub) is READ  # src/x — внутри
+    assert level("fd y ../x -C ../.. -x cat", root, cwd=sub) is None
+    assert level("fd y ../x --base-directory=../.. -x cat", root, cwd=sub) is None
+    assert level("fd y --search-path ../x -C ../.. -X cat", root, cwd=sub) is None
+    assert level("fd y ../x -C ../..", root, cwd=sub) is None
+    assert level("fd y src -C ../.. -x cat", root, cwd=sub) is READ  # <проект>/src
+    assert level(f"fd y {root}/src -C .. -x cat", root, cwd=sub) is READ  # абсолютный — как есть
+    assert level("fd y '*' -C ../.. -x cat", root, cwd=sub) is READ  # шаблон fd в кавычках
+    assert level("fd y * -C ../.. -x cat", root, cwd=sub) is None  # имена раскроет оболочка
 
 
-def test_recursive_reads_follow_secrets_and_links(root, tmp_path_factory):
+def test_recursive_reads_follow_secrets_and_links(
+    root: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
     outside = tmp_path_factory.mktemp("outside") / "secret.txt"
     outside.write_text("s")
     assert level("grep -R hello .", root) is READ
@@ -1192,7 +1266,7 @@ def test_recursive_reads_follow_secrets_and_links(root, tmp_path_factory):
     assert level("grep -e TOKEN .env", root) is None
 
 
-def test_source_project_venv_activate_is_prelude(root):
+def test_source_project_venv_activate_is_prelude(root: Path) -> None:
     venv = root / ".venv"
     (venv / "bin").mkdir(parents=True)
     (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
@@ -1200,6 +1274,8 @@ def test_source_project_venv_activate_is_prelude(root):
     (root / "scripts").mkdir()
     (root / "scripts" / "activate").write_text("echo hi\n")
     real = classify("source .venv/bin/activate && pytest", root=root)
-    assert real.parts[0].prelude and real.parts[0].signature == "venv-activate"
+    assert real.parts[0].prelude
+    assert real.parts[0].signature == "venv-activate"
     fake = classify("source scripts/activate && pytest", root=root)
-    assert not fake.parts[0].prelude and fake.parts[0].signature is None
+    assert not fake.parts[0].prelude
+    assert fake.parts[0].signature is None

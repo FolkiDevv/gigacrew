@@ -1,0 +1,51 @@
+# Архитектурные контракты: https://import-linter.readthedocs.io
+# Запуск: `make lint` (lint-imports). Динамические проверки импорта — tests/test_layering.py.
+
+[importlinter]
+root_package = gigacrew
+include_external_packages = True
+exclude_type_checking_imports = True
+
+
+[importlinter:contract:layers]
+name = Слои gigacrew: верхний слой импортирует нижние, но не наоборот
+type = layers
+layers =
+  gigacrew.__main__
+  gigacrew.cli
+  gigacrew.ui
+  gigacrew.agent
+  gigacrew.tools
+  gigacrew.llm | gigacrew.safety
+  gigacrew.config
+  gigacrew.project
+  gigacrew.permissions
+  gigacrew.security
+  gigacrew.errors
+
+
+[importlinter:contract:core-without-ui]
+name = Ядро агента не зависит от интерфейса (rich, prompt_toolkit)
+type = forbidden
+source_modules =
+  gigacrew.agent
+  gigacrew.config
+  gigacrew.errors
+  gigacrew.llm
+  gigacrew.permissions
+  gigacrew.project
+  gigacrew.safety
+  gigacrew.security
+  gigacrew.tools
+forbidden_modules =
+  prompt_toolkit
+  rich
+
+
+[importlinter:contract:tree-sitter-in-one-place]
+name = API tree-sitter ломается между версиями: его загружает только project.treesitter
+type = protected
+protected_modules =
+  tree_sitter
+allowed_importers =
+  gigacrew.project.treesitter

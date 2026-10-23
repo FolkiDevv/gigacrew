@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,11 +24,13 @@ INTERRUPTED_NOTE = "Execution was interrupted by the user (Ctrl+C). No result."
 # пользователя: по ней блок отрезается при показе запроса (заголовок чата, продолжение).
 HOOK_CONTEXT_HEADER = "Context from the user's UserPromptSubmit hooks:"
 _HOOK_CONTEXT_TAIL = f"\n\n<system-reminder>\n{HOOK_CONTEXT_HEADER}\n"
+# Версии формата, которые читает :meth:`Conversation.from_dict`.
+_READABLE_VERSIONS = (1, 2)
 
 
 # Одиночные суррогаты: в Python так декодируются байты не в UTF-8 в именах файлов
 # (архив из cp1251: «\udcee…»), а из JSON приходят экранированные «\ud800».
-_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
 
 def clean_text(text: str) -> str:
@@ -40,15 +42,15 @@ def clean_text(text: str) -> str:
     return _SURROGATE_RE.sub("\ufffd", text) if _SURROGATE_RE.search(text) else text
 
 
-def _clean_value(value: Any) -> Any:
+def _clean_value(argument: Any) -> Any:
     """Аргументы вызова инструмента — без одиночных суррогатов (вложенно)."""
-    if isinstance(value, str):
-        return clean_text(value)
-    if isinstance(value, dict):
-        return {clean_text(str(k)): _clean_value(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_clean_value(v) for v in value]
-    return value
+    if isinstance(argument, str):
+        return clean_text(argument)
+    if isinstance(argument, dict):
+        return {clean_text(str(key)): _clean_value(nested) for key, nested in argument.items()}
+    if isinstance(argument, list):
+        return [_clean_value(element) for element in argument]
+    return argument
 
 
 def _clean_message(message: Message) -> Message:
@@ -85,13 +87,26 @@ class Summary:
     upto: int
 
 
+def _check_summary(summary: Summary, messages: Sequence[Message]) -> None:
+    """Проверить краткое содержание: текст не пуст, граница — внутри диалога ``messages``."""
+    if not summary.text.strip():
+        raise ValueError("пустое краткое содержание")
+    if not 0 < summary.upto <= len(messages):
+        raise ValueError(f"граница сжатия вне диалога: {summary.upto}")
+    if summary.upto < len(messages) and messages[summary.upto].role == "function":
+        # Результат без своего вызова — некорректный запрос к API.
+        raise ValueError("граница сжатия не может приходиться на результат инструмента")
+
+
+# Версия 2 — несколько вызовов инструментов в сообщении (``function_calls``, API v2).
+# Версия 1 читается: её единственный ``function_call`` приводит :class:`Message`.
+# Ключ ``summary`` необязателен: версия gigacrew без сжатия его не видит и
+# отправляет журнал целиком, как раньше.
+FORMAT_VERSION = 2
+
+
 class Conversation:
-    # Версия 2 — несколько вызовов инструментов в сообщении (``function_calls``, API v2).
-    # Версия 1 читается: её единственный ``function_call`` приводит :class:`Message`.
-    # Ключ ``summary`` необязателен: версия gigacrew без сжатия его не видит и
-    # отправляет журнал целиком, как раньше.
-    FORMAT_VERSION = 2
-    _READABLE_VERSIONS = (1, 2)
+    """История диалога: сообщения, расход токенов и граница сжатия контекста."""
 
     def __init__(
         self,
@@ -100,16 +115,18 @@ class Conversation:
         last_usage: Usage | None = None,
         summary: Summary | None = None,
     ):
+        """Диалог из ``messages``; ``summary`` проверяется на соответствие сообщениям."""
         self._messages: list[Message] = list(messages)
         self._last_usage = last_usage
         self._summary: Summary | None = None
         if summary is not None:
-            self._check_summary(summary)
+            _check_summary(summary, self._messages)
             self._summary = summary
 
     # ------------------------------------------------------------------ #
     @property
     def messages(self) -> tuple[Message, ...]:
+        """Полный журнал диалога (включая свёрнутое в краткое содержание)."""
         return tuple(self._messages)
 
     @property
@@ -123,6 +140,7 @@ class Conversation:
         return self._summary
 
     def __len__(self) -> int:
+        """Число сообщений в полном журнале."""
         return len(self._messages)
 
     def context_messages(self) -> list[Message]:
@@ -135,33 +153,29 @@ class Conversation:
         if self._summary is None:
             return list(self._messages)
         tail = self._messages[self._summary.upto :]
-        if not tail or any(m.is_request for m in tail):
+        if not tail or any(message.is_request for message in tail):
             return tail
         task = next(
-            (m for m in reversed(self._messages[: self._summary.upto]) if m.is_request),
+            (
+                message
+                for message in reversed(self._messages[: self._summary.upto])
+                if message.is_request
+            ),
             None,
         )
         return tail if task is None else [task, *tail]
 
-    def set_summary(self, summary: Summary) -> None:
+    # Не сеттер свойства: проверяет границу и сбрасывает last_usage — побочный эффект явный.
+    def set_summary(self, summary: Summary) -> None:  # noqa: WPS615
         """Заменить начало диалога кратким содержанием (сжатие контекста).
 
         ``last_usage`` сбрасывается: он описывал контекст до сжатия.
         """
-        self._check_summary(summary)
+        _check_summary(summary, self._messages)
         if self._summary is not None and summary.upto < self._summary.upto:
             raise ValueError("граница сжатия не может сдвигаться назад")
         self._summary = summary
         self._last_usage = None
-
-    def _check_summary(self, summary: Summary) -> None:
-        if not summary.text.strip():
-            raise ValueError("пустое краткое содержание")
-        if not 0 < summary.upto <= len(self._messages):
-            raise ValueError(f"граница сжатия вне диалога: {summary.upto}")
-        if summary.upto < len(self._messages) and self._messages[summary.upto].role == "function":
-            # Результат без своего вызова — некорректный запрос к API.
-            raise ValueError("граница сжатия не может приходиться на результат инструмента")
 
     # ------------------------------------------------------------------ #
     # Всё, что попадает в историю, — без одиночных суррогатов (:func:`clean_text`):
@@ -171,18 +185,22 @@ class Conversation:
         self._messages.append(Message(role="user", content=clean_text(text), meta=meta))
 
     def add_assistant(self, message: Message, usage: Usage | None = None) -> None:
+        """Ответ модели; ``usage`` — расход токенов этого обращения (если известен)."""
         self._messages.append(_clean_message(message))
         if usage is not None:
             self._last_usage = usage
 
     def add_function_result(self, name: str, content: str, call_id: str | None = None) -> None:
-        """Результат вызова инструмента. Результаты идут по порядку вызовов, поэтому
-        без ``call_id`` берётся id первого вызова, на который ещё нет ответа."""
+        """Результат вызова инструмента.
+
+        Результаты идут по порядку вызовов, поэтому без ``call_id`` берётся id первого
+        вызова, на который ещё нет ответа.
+        """
         if call_id is None:
             pending = self.pending_calls()
             call_id = pending[0].id if pending else None
         self._messages.append(
-            Message(role="function", name=name, content=clean_text(content), call_id=call_id)
+            Message(role="function", name=name, content=clean_text(content), call_id=call_id),
         )
 
     # ------------------------------------------------------------------ #
@@ -215,7 +233,8 @@ class Conversation:
     def forget_reasoning(self) -> None:
         """Убрать рассуждения модели из истории: они нужны ей только в пределах хода."""
         self._messages = [
-            m.model_copy(update={"reasoning": ""}) if m.reasoning else m for m in self._messages
+            message.model_copy(update={"reasoning": ""}) if message.reasoning else message
+            for message in self._messages
         ]
 
     def truncate(self, length: int) -> None:
@@ -227,28 +246,32 @@ class Conversation:
             raise ValueError(f"длина вне диалога: {length}")
         if self._summary is not None and self._summary.upto > length:
             raise ValueError("нельзя убрать сообщения, свёрнутые в краткое содержание")
-        del self._messages[length:]
+        self._messages = self._messages[:length]
 
     # ------------------------------------------------------------------ #
     def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
-            "version": self.FORMAT_VERSION,
-            "messages": [m.model_dump(exclude_defaults=True) for m in self._messages],
+        """Диалог версионированным словарём для сохранения чата (см. :meth:`from_dict`)."""
+        serialized: dict[str, Any] = {
+            "version": FORMAT_VERSION,
+            "messages": [message.model_dump(exclude_defaults=True) for message in self._messages],
             "last_usage": self._last_usage.model_dump() if self._last_usage else None,
         }
         if self._summary is not None:
-            data["summary"] = {"text": self._summary.text, "upto": self._summary.upto}
-        return data
+            serialized["summary"] = {"text": self._summary.text, "upto": self._summary.upto}
+        return serialized
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> Conversation:
-        version = data.get("version")
-        if version not in cls._READABLE_VERSIONS:
+    def from_dict(cls, payload: Mapping[str, Any]) -> Conversation:
+        """Диалог из словаря :meth:`to_dict`; неверный формат — :class:`ValueError`."""
+        version = payload.get("version")
+        if version not in _READABLE_VERSIONS:
             raise ValueError(f"Неподдерживаемая версия формата диалога: {version!r}")
         # Файл чата — тоже вход истории: «\udcee» в JSON читается одиночным суррогатом.
-        messages = [_clean_message(Message.model_validate(m)) for m in data.get("messages") or []]
-        usage = data.get("last_usage")
-        raw = data.get("summary")
+        messages = [
+            _clean_message(Message.model_validate(entry)) for entry in payload.get("messages") or []
+        ]
+        usage = payload.get("last_usage")
+        raw = payload.get("summary")
         summary = None
         if raw is not None:
             if not isinstance(raw, Mapping):
