@@ -1340,12 +1340,15 @@ def test_plan_revised_many_times_is_not_a_loop(tmp_path: Path) -> None:
         ],
     )
     remarks = [Answer((), custom=f"замечание {number}") for number in range(4)]
-    events = _PlanAnswers(*remarks, None)
+    events = _PlanAnswers(*([remark] for remark in remarks), None)
     agent = _planning_agent(provider, tmp_path, events)
     assert agent.run_turn("спланируй") == "жду"
     assert len(events.questions) == 5
     assert events.stats[-1].stop_reason is None
-    assert not any("WARNING" in output for output in _function_results(agent))
+    outputs = _function_results(agent)
+    assert not any("WARNING" in output for output in outputs)
+    # Каждое замечание дошло до модели: план доработан четыре раза, а не отклонён.
+    assert sum("просит доработать" in output for output in outputs) == len(remarks)
 
 
 def test_unchanged_plan_shown_again_and_again_is_a_loop(tmp_path: Path) -> None:
