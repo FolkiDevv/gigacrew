@@ -7,25 +7,39 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar, override
 
 from rich.console import Console, ConsoleOptions, RenderResult
-from rich.markdown import Heading
+from rich.markdown import Heading, MarkdownElement
 from rich.markdown import Markdown as RichMarkdown
 
 CODE_THEME = "ansi_dark"
 
+# Таблица rich: тег разметки -> класс элемента Markdown.
+type _Elements = dict[str, type[MarkdownElement]]
+
 
 class _LeftHeading(Heading):
-    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+    @override
+    def __rich_console__(
+        self,
+        console: Console,
+        options: ConsoleOptions,
+    ) -> RenderResult:
         text = self.text.copy()
         text.justify = "left"
         yield text
 
 
 class Markdown(RichMarkdown):
-    elements = {**RichMarkdown.elements, "heading_open": _LeftHeading}
+    """Markdown rich с заголовками слева и ANSI-темой подсветки кода."""
+
+    elements: ClassVar[_Elements] = {
+        **RichMarkdown.elements,
+        "heading_open": _LeftHeading,
+    }
 
     def __init__(self, markup: str, **kwargs: Any) -> None:
+        """Создаёт Markdown; тема кода по умолчанию — ``CODE_THEME``."""
         kwargs.setdefault("code_theme", CODE_THEME)
         super().__init__(markup, **kwargs)

@@ -175,17 +175,17 @@ class _Node(Protocol):
 class Word:
     """Слово команды.
 
-    ``value`` — значение после снятия кавычек (у нестатичного слова — исходный текст);
-    ``vars`` — раскрываемые переменные; ``glob`` — оболочка раскроет шаблон имён файлов
-    (``*``, ``?``, ``[`` вне кавычек); ``plain`` — те из ``vars``, что только
+    ``text`` — значение после снятия кавычек (у нестатичного слова — исходный текст);
+    ``variables`` — раскрываемые переменные; ``glob`` — оболочка раскроет шаблон имён
+    файлов (``*``, ``?``, ``[`` вне кавычек); ``plain`` — те из ``variables``, что только
     подставляются как есть (``$X``, ``${X}``).
     """
 
-    value: str
+    text: str
     raw: str = ""
     static: bool = True
     glob: bool = False
-    vars: tuple[str, ...] = ()
+    variables: tuple[str, ...] = ()
     plain: tuple[str, ...] = ()
 
 
@@ -423,7 +423,7 @@ class _Walker:
         raw = _text(node)
         dynamic, names = self.scan(node)
         if dynamic:
-            return Word(raw, raw, static=False, vars=tuple(names), plain=_plain_vars(node))
+            return Word(raw, raw, static=False, variables=tuple(names), plain=_plain_vars(node))
         if _has_brace(node):
             return Word(raw, raw, static=False)
         return Word(_static_value(node), raw, glob=_has_glob(node))
@@ -510,10 +510,10 @@ class _Walker:
                 self.script.assigns.append(self.assignment(child))
             elif child.type in _WORD_NODES:
                 word = self.word(child)
-                if word.value.startswith("-") or keyword != "export":
-                    self.problem(f"{keyword} {word.value}".strip())
+                if word.text.startswith("-") or keyword != "export":
+                    self.problem(f"{keyword} {word.text}".strip())
                 else:  # export NAME — значение берётся из присваивания раньше
-                    self.script.assigns.append((word.value, Word("", static=False)))
+                    self.script.assigns.append((word.text, Word("", static=False)))
 
     def redirected(
         self,
@@ -572,13 +572,13 @@ class _Walker:
         if node.type == "herestring_redirect":
             redirect = Redirect(
                 op,
-                body=first.value,
+                body=first.text,
                 body_static=first.static,
-                body_vars=first.vars,
+                body_vars=first.variables,
                 body_plain=first.plain,
             )
             return redirect, words[1:]
-        if op in {">&", "<&"} and first.static and (first.value.isdigit() or first.value == "-"):
+        if op in {">&", "<&"} and first.static and (first.text.isdigit() or first.text == "-"):
             return Redirect(op, first, fd_dup=True), words[1:]
         if op == "<>":
             self.problem("перенаправление <>")
@@ -631,7 +631,7 @@ class _Walker:
         # встроенные read, printf -v, eval… присваивают сами: значение больше не известно.
         for name, _ in cmd.assigns:
             self._assigned.discard(name)
-        if cmd.name is None or not cmd.name.static or cmd.name.value in _SETS_VARS:
+        if cmd.name is None or not cmd.name.static or cmd.name.text in _SETS_VARS:
             self._assigned.clear()
         return cmd
 
@@ -669,7 +669,7 @@ class _Walker:
     def _track_assigned(self, assigns: Iterable[tuple[str, Word]], *, certain: bool) -> None:
         """Запомнить постоянные значения присваиваний (см. Command.assigned) или забыть их."""
         for name, word in assigns:
-            if certain and word.static and _PLAIN_VALUE.fullmatch(word.value):
+            if certain and word.static and _PLAIN_VALUE.fullmatch(word.text):
                 self._assigned.add(name)
             else:
                 self._assigned.discard(name)
@@ -695,9 +695,9 @@ class _Walker:
         if len(parts) != 1 or parts[0].type not in _WORD_NODES:
             return None
         word = self.word(parts[0])
-        if not word.static or word.glob or not word.value or word.value.startswith(("~", "-")):
+        if not word.static or word.glob or not word.text or word.text.startswith(("~", "-")):
             return None
-        target = (self.root / cwd / word.value).resolve()
+        target = (self.root / cwd / word.text).resolve()
         try:
             rel = target.relative_to(self.root)
         except ValueError:

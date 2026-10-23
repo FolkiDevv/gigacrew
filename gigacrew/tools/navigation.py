@@ -272,8 +272,8 @@ class FindReferencesTool(Tool[FindReferencesParams]):
             summary=self._summary(len(hits), confirmed, refreshed),
         )
 
-    @staticmethod
     def _merge(
+        self,
         index: ProjectIndex,
         hits: list[RefHit],
         locations: list[semantic.Location],

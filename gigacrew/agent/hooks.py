@@ -202,7 +202,7 @@ def _run_hook(
             cwd=cwd,
             timeout=hook.timeout,
             shell=True,
-            input=stdin_text,
+            stdin_text=stdin_text,
             extra_env=env,
         )
     except (OSError, ValueError) as error:  # ValueError: NUL или суррогат в команде

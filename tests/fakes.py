@@ -2,17 +2,31 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
+from contextlib import ExitStack
 from itertools import starmap
-from typing import Any
+from typing import Any, override
 
 from pydantic import BaseModel
 
-from gigacrew.agent.events import AgentEvents, ToolCallInfo, TurnStats
+from gigacrew.agent import AgentEvents, ToolCallInfo, TurnStats
+from gigacrew.agent.events import (
+    Approval,
+    CompactResult,
+    ConfirmResult,
+    NoticeLevel,
+    Review,
+    SubagentInfo,
+)
 from gigacrew.llm.base import LLMProvider, ModelInfo, PromptTooLongError
-from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, Usage
+from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec, Usage
 from gigacrew.permissions import ToolKind
+from gigacrew.security import RiskLevel
 from gigacrew.tools.base import Display, Tool, ToolContext, ToolResult
+from gigacrew.tools.questions import Answer, Question
+
+# Аргументы вызова инструмента — как их присылает модель.
+type _Arguments = dict[str, Any]
 
 
 class ScriptedProvider(LLMProvider):
@@ -32,23 +46,29 @@ class ScriptedProvider(LLMProvider):
         turns: Iterable[AssistantTurn | BaseException] = (),
         *,
         summaries: Iterable[AssistantTurn | BaseException] = (),
-    ):
+    ) -> None:
         self._turns = list(turns)
         self.summaries = list(summaries)
         self.requests: list[dict[str, Any]] = []
         self.summary_requests: list[dict[str, Any]] = []
+        self._streaming = False  # идёт stream(): запрос пишется с ``streamed=True``
 
     @property
     def calls(self) -> int:
         return len(self.requests)
 
     @property
+    @override
     def model(self) -> str:
         return "scripted"
 
-    _streaming = False  # идёт stream(): запрос пишется с ``streamed=True``
-
-    def complete(self, messages, tools=None, **kwargs) -> AssistantTurn:
+    @override
+    def complete(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None = None,
+        **kwargs: Any,
+    ) -> AssistantTurn:
         request = {"messages": list(messages), **kwargs, "streamed": self._streaming}
         if tools is None:
             self.summary_requests.append(request)
@@ -56,25 +76,36 @@ class ScriptedProvider(LLMProvider):
         self.requests.append({**request, "tools": tools})
         return _next(self._turns, "конец")
 
-    def stream(self, messages, tools=None, *, on_delta=None, **kwargs) -> AssistantTurn:
+    @override
+    def stream(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None = None,
+        *,
+        on_delta: Callable[[str], None] | None = None,
+        **kwargs: Any,
+    ) -> AssistantTurn:
         # через complete(): подклассы тестов переопределяют только его
         self._streaming = True
-        try:
+        with ExitStack() as cleanup:
+            # флаг снимается и тогда, когда complete() бросает исключение
+            cleanup.callback(self._stop_streaming)
             turn = self.complete(messages, tools, **kwargs)
-        finally:
-            self._streaming = False
         if on_delta and turn.message.content:
             on_delta(turn.message.content)
         return turn
 
+    def _stop_streaming(self) -> None:
+        self._streaming = False
 
-def _next(queue: list, default: str) -> AssistantTurn:
+
+def _next(queue: list[AssistantTurn | BaseException], default: str) -> AssistantTurn:
     if not queue:
         return text_turn(default)
-    item = queue.pop(0)
-    if isinstance(item, BaseException):
-        raise item
-    return item
+    scripted = queue.pop(0)
+    if isinstance(scripted, BaseException):
+        raise scripted
+    return scripted
 
 
 class WindowProvider(ScriptedProvider):
@@ -86,7 +117,8 @@ class WindowProvider(ScriptedProvider):
 
     supports_measure = True
 
-    def __init__(
+    # Двойник настраивается именованными параметрами — по одному на каждый режим сервера.
+    def __init__(  # noqa: WPS211
         self,
         window: int,
         turns: Iterable[AssistantTurn | BaseException] = (),
@@ -98,44 +130,49 @@ class WindowProvider(ScriptedProvider):
         overhead: int = 5,
         truncate: bool = False,
         max_chars: int | None = None,
-    ):
+    ) -> None:
         super().__init__(turns)
-        self.window = window
-        self.chars_per_token = chars_per_token
-        self.hint = hint
-        self.status = status
-        self.error = error
-        self.overhead = overhead  # служебные токены сообщения
-        self.truncate = truncate  # сервер молча обрезает запрос до окна, а не отказывает
+        self._window = window
+        self._chars_per_token = chars_per_token
+        self._hint = hint
+        self._status = status
+        self._error = error
+        self._overhead = overhead  # служебные токены сообщения
+        self._truncate = truncate  # сервер молча обрезает запрос до окна, а не отказывает
         self.measured: list[tuple[str | None, int]] = []
         self.sent_chars: list[int] = []  # длина текста каждой пробы
-        self.max_chars = max_chars  # проба длиннее — AssertionError
+        self._max_chars = max_chars  # проба длиннее — AssertionError
 
+    @override
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
-        if self.error is not None:
-            raise self.error
-        self.sent_chars.append(len(text))
-        if self.max_chars is not None and len(text) > self.max_chars:
+        if self._error is not None:
+            raise self._error
+        length = len(text)
+        self.sent_chars.append(length)
+        if self._max_chars is not None and length > self._max_chars:
             # тест падает сразу, а не на таймауте, пока замер строит гигабайтные пробы
-            raise AssertionError(f"проба в {len(text)} символов — замер пошёл вразнос")
-        tokens = int(len(text) / self.chars_per_token) + self.overhead
-        if self.truncate:
-            tokens = min(tokens, self.window - 1)
+            raise AssertionError(f"проба в {length} символов — замер пошёл вразнос")
+        tokens = int(length / self._chars_per_token) + self._overhead
+        if self._truncate:
+            tokens = min(tokens, self._window - 1)
         self.measured.append((model, tokens))
-        if tokens + 1 > self.window:
+        requested = tokens + 1
+        if requested > self._window:
             detail = (
-                f"This model's maximum context length is {self.window} tokens. "
-                f"However, you requested {tokens + 1} tokens"
-                if self.hint
+                f"This model's maximum context length is {self._window} tokens. "
+                f"However, you requested {requested} tokens"
+                if self._hint
                 else "Request too large"
             )
-            raise PromptTooLongError(self.status, detail)
+            raise PromptTooLongError(self._status, detail)
         return tokens
 
 
 class CatalogueProvider(WindowProvider):
-    """Провайдер с каталогом моделей, как бэкенд GigaCode: ``connect()`` (токен и каталог)
-    считается и может бросать заготовленные ошибки, модель по умолчанию — первая в каталоге.
+    """Провайдер с каталогом моделей, как бэкенд GigaCode.
+
+    ``connect()`` (токен и каталог) считается и может бросать заготовленные ошибки,
+    модель по умолчанию — первая в каталоге.
     """
 
     def __init__(
@@ -144,33 +181,37 @@ class CatalogueProvider(WindowProvider):
         *,
         models: Iterable[tuple[str, int]] = (("cat-a", 64_000), ("cat-b", 32_000)),
         connect_errors: Iterable[BaseException] = (),
-    ):
+    ) -> None:
         super().__init__(16_384, turns)
-        self.catalogue = list(starmap(ModelInfo, models))
-        self.connect_errors = list(connect_errors)
+        self._catalogue = list(starmap(ModelInfo, models))
+        self._connect_errors = list(connect_errors)
         self.connects = 0
 
     @property
+    @override
     def model(self) -> str:
-        return self.catalogue[0].id
+        return self._catalogue[0].id
 
+    @override
     def connect(self) -> None:
         self.connects += 1
-        if self.connect_errors:
-            raise self.connect_errors.pop(0)
+        if self._connect_errors:
+            raise self._connect_errors.pop(0)
 
+    @override
     def list_models(self) -> list[str]:
-        return [m.id for m in self.catalogue]
+        return [model_info.id for model_info in self._catalogue]
 
+    @override
     def known_models(self) -> list[ModelInfo]:
-        return list(self.catalogue)
+        return list(self._catalogue)
 
 
 def text_turn(text: str, usage: Usage | None = None) -> AssistantTurn:
     return AssistantTurn(message=Message(role="assistant", content=text), usage=usage or Usage())
 
 
-def tool_turn(name: str, args: dict, usage: Usage | None = None) -> AssistantTurn:
+def tool_turn(name: str, args: _Arguments, usage: Usage | None = None) -> AssistantTurn:
     return AssistantTurn(
         message=Message(
             role="assistant",
@@ -191,15 +232,15 @@ def cut_turn(text: str = "", reason: str = "length", usage: Usage | None = None)
     )
 
 
-def tools_turn(calls: list[tuple[str, dict]], text: str = "") -> AssistantTurn:
+def tools_turn(calls: Sequence[tuple[str, _Arguments]], text: str = "") -> AssistantTurn:
     """Ход с несколькими вызовами сразу (id — c1, c2, …)."""
     return AssistantTurn(
         message=Message(
             role="assistant",
             content=text,
             function_calls=[
-                FunctionCall(name=name, arguments=args, id=f"c{i}")
-                for i, (name, args) in enumerate(calls, 1)
+                FunctionCall(name=name, arguments=args, id=f"c{index}")
+                for index, (name, args) in enumerate(calls, 1)
             ],
             state_id="S",
         ),
@@ -207,96 +248,151 @@ def tools_turn(calls: list[tuple[str, dict]], text: str = "") -> AssistantTurn:
     )
 
 
-class RecordingEvents(AgentEvents):
+# Двойник реализует весь интерфейс AgentEvents, а журналы событий — его API для тестов.
+class RecordingEvents(AgentEvents):  # noqa: WPS214, WPS230
     """UI-двойник: запоминает события, на подтверждение отвечает ``confirm_answer``."""
 
-    def __init__(self, confirm_answer: bool = True, answers: list | None = None):
-        self.confirm_answer = confirm_answer
-        self.answers = answers  # ответы на ask_user (None — отказ)
-        self.questions: list = []
+    def __init__(
+        self,
+        *,
+        confirm_answer: bool | Approval | ConfirmResult = True,
+        answers: list[Answer] | None = None,
+    ) -> None:
+        self._confirm_answer = confirm_answer
+        self._user_answers = answers  # ответы на ask_user (None — отказ)
+        self.questions: list[list[Question]] = []
         self.events: list[tuple[str, Any]] = []
         self.confirms: list[tuple[ToolCallInfo, Display | None, bool]] = []
-        self.results: list[tuple[ToolCallInfo, ToolResult, bool]] = []
+        self.tool_results: list[tuple[ToolCallInfo, ToolResult, bool]] = []
         self.stats: list[TurnStats] = []
         self.notices: list[tuple[str, str]] = []
-        self.compactions: list = []  # CompactResult | None по каждому сжатию
-        self.reviews: list = []  # Review | None по каждой проверке рецензента
+        self.compactions: list[CompactResult | None] = []  # по каждому сжатию
+        self.reviews: list[Review | None] = []  # по каждой проверке рецензента
 
+    @override
     def on_stream_start(self) -> None:
         self.events.append(("stream_start", None))
 
+    @override
     def on_stream_delta(self, text: str) -> None:
         self.events.append(("delta", text))
 
+    @override
     def on_stream_end(self) -> None:
         self.events.append(("stream_end", None))
 
+    @override
     def on_assistant_text(self, text: str) -> None:
         self.events.append(("text", text))
 
+    @override
     def on_tool_call(self, call: ToolCallInfo) -> None:
         self.events.append(("tool_call", call))
 
-    def confirm(self, call, preview, *, dangerous):
+    @override
+    def confirm(
+        self,
+        call: ToolCallInfo,
+        preview: Display | None,
+        *,
+        dangerous: bool,
+    ) -> bool | Approval | ConfirmResult:
         self.confirms.append((call, preview, dangerous))
-        return self.confirm_answer
+        return self._confirm_answer
 
+    @override
     def on_review_start(self, call: ToolCallInfo) -> None:
         self.events.append(("review_start", call))
 
-    def on_review_end(self, call, review) -> None:
+    @override
+    def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
         self.events.append(("review_end", review))
         self.reviews.append(review)
 
+    @override
     def on_tool_start(self, call: ToolCallInfo) -> None:
         self.events.append(("tool_start", call))
 
+    @override
     def on_tool_end(self, call: ToolCallInfo) -> None:
         self.events.append(("tool_end", call))
 
-    def on_tool_result(self, call, result, *, previewed):
+    @override
+    def on_tool_result(
+        self,
+        call: ToolCallInfo,
+        tool_result: ToolResult,
+        *,
+        previewed: bool,
+    ) -> None:
         self.events.append(("tool_result", call))
-        self.results.append((call, result, previewed))
+        self.tool_results.append((call, tool_result, previewed))
 
-    def ask_user(self, questions):
+    @override
+    def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
         self.questions.append(list(questions))
-        return self.answers
+        return self._user_answers
 
-    def on_notice(self, text, *, level="info"):
+    @override
+    def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:
         self.notices.append((level, text))
 
-    def on_compact_start(self, *, auto):
+    @override
+    def on_compact_start(self, *, auto: bool) -> None:
         self.events.append(("compact_start", auto))
 
-    def on_compact_end(self, result):
-        self.events.append(("compact_end", result))
-        self.compactions.append(result)
+    @override
+    def on_compact_end(self, compacted: CompactResult | None) -> None:
+        self.events.append(("compact_end", compacted))
+        self.compactions.append(compacted)
 
+    @override
     def on_turn_end(self, stats: TurnStats) -> None:
         self.stats.append(stats)
 
-    def on_wrap_up(self, reason):
+    @override
+    def on_wrap_up(self, reason: str) -> None:
         self.events.append(("wrap_up", reason))
 
-    def on_hook_start(self, event, command):
+    @override
+    def on_hook_start(self, event: str, command: str) -> None:
         self.events.append(("hook_start", (event, command)))
 
-    def on_hook_end(self):
+    @override
+    def on_hook_end(self) -> None:
         self.events.append(("hook_end", None))
 
-    def on_subagent_start(self, info):
-        self.events.append(("subagent_start", info))
+    @override
+    def on_subagent_start(self, subagent: SubagentInfo) -> None:
+        self.events.append(("subagent_start", subagent))
 
-    def on_subagent_activity(self, info, activity, *, wrapping_up=False):
+    @override
+    def on_subagent_activity(
+        self,
+        subagent: SubagentInfo,
+        activity: str,
+        *,
+        wrapping_up: bool = False,
+    ) -> None:
         self.events.append(("subagent_activity", (activity, wrapping_up)))
 
-    def on_subagent_tool_call(self, info, call):
+    @override
+    def on_subagent_tool_call(self, subagent: SubagentInfo, call: ToolCallInfo) -> None:
         self.events.append(("subagent_tool_call", call))
 
-    def on_subagent_tool_result(self, info, call, result, *, previewed):
-        self.events.append(("subagent_tool_result", (call, result)))
+    @override
+    def on_subagent_tool_result(
+        self,
+        subagent: SubagentInfo,
+        call: ToolCallInfo,
+        tool_result: ToolResult,
+        *,
+        previewed: bool,
+    ) -> None:
+        self.events.append(("subagent_tool_result", (call, tool_result)))
 
-    def on_subagent_end(self, info, stats):
+    @override
+    def on_subagent_end(self, subagent: SubagentInfo, stats: TurnStats | None) -> None:
         self.events.append(("subagent_end", stats))
 
 
@@ -305,13 +401,15 @@ class FakeParams(BaseModel):
 
 
 class FakeTool(Tool[FakeParams]):
-    """Настраиваемый WRITE-инструмент для тестов агентного цикла (``kind`` — вид для
-    режимов разрешений).
+    """Настраиваемый WRITE-инструмент для тестов агентного цикла.
+
+    ``kind`` — вид для режимов разрешений.
     """
 
     name = "fake_write"
     description = "тестовый инструмент"
-    Params = FakeParams
+    # Имя схемы параметров задано базовым классом Tool.
+    Params = FakeParams  # noqa: WPS115
 
     def __init__(
         self,
@@ -319,20 +417,21 @@ class FakeTool(Tool[FakeParams]):
         preview: Callable[[], Display | None] | None = None,
         run: Callable[[], ToolResult] | None = None,
         kind: ToolKind = ToolKind.OTHER,
-    ):
+    ) -> None:
         self.kind = kind
         self._preview = preview or (lambda: Display("+x", kind="diff", title="x"))
         self._run = run or (lambda: ToolResult(content="ok", summary="ok"))
         self.runs = 0
 
-    def risk(self, params, ctx: ToolContext):
-        from gigacrew.security import RiskLevel
-
+    @override
+    def risk(self, params: FakeParams, ctx: ToolContext) -> RiskLevel:
         return RiskLevel.WRITE
 
-    def preview(self, params, ctx):
+    @override
+    def preview(self, params: FakeParams, ctx: ToolContext) -> Display | None:
         return self._preview()
 
-    def run(self, params, ctx):
+    @override
+    def run(self, params: FakeParams, ctx: ToolContext) -> ToolResult:
         self.runs += 1
         return self._run()

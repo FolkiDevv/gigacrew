@@ -912,19 +912,19 @@ class Console(events.AgentEvents):  # noqa: WPS338
     def on_tool_result(
         self,
         call: events.ToolCallInfo,
-        result: ToolResult,
+        tool_result: ToolResult,
         *,
         previewed: bool,
     ) -> None:
         step = self._find(call)
         if step is None:  # результат без on_tool_call — строкой сразу
             step = _Step(call)
-        step.outcome = result
+        step.outcome = tool_result
         if self._in_group(step):
             return  # итог группы — когда она закончится
         if step is self._step:
             self._step = None
-        if call.name in _SELF_REPORTING and result.ok:
+        if call.name in _SELF_REPORTING and tool_result.ok:
             return
         for line in self._step_lines(step):
             self._emit(line)
@@ -1198,9 +1198,9 @@ class Console(events.AgentEvents):  # noqa: WPS338
 
     # ---------------------------- суб-агенты ----------------------------- #
     @override
-    def on_subagent_start(self, info: events.SubagentInfo) -> None:
+    def on_subagent_start(self, subagent: events.SubagentInfo) -> None:
         self._flush_group()
-        self._sub = info
+        self._sub = subagent
         self._sub_started = time.monotonic()
         self._sub_activity = "думаю"
         self._sub_wrapping = False
@@ -1221,7 +1221,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
     @override
     def on_subagent_activity(
         self,
-        info: events.SubagentInfo,
+        subagent: events.SubagentInfo,
         activity: str,
         *,
         wrapping_up: bool = False,
@@ -1232,15 +1232,19 @@ class Console(events.AgentEvents):  # noqa: WPS338
             self._start_subagent_live()
 
     @override
-    def on_subagent_tool_call(self, info: events.SubagentInfo, call: events.ToolCallInfo) -> None:
+    def on_subagent_tool_call(
+        self,
+        subagent: events.SubagentInfo,
+        call: events.ToolCallInfo,
+    ) -> None:
         self._sub_steps.append(_Step(call))
 
     @override
     def on_subagent_tool_result(
         self,
-        info: events.SubagentInfo,
+        subagent: events.SubagentInfo,
         call: events.ToolCallInfo,
-        result: ToolResult,
+        tool_result: ToolResult,
         *,
         previewed: bool,
     ) -> None:
@@ -1248,10 +1252,14 @@ class Console(events.AgentEvents):  # noqa: WPS338
         if step is None:
             step = _Step(call)
             self._sub_steps.append(step)
-        step.outcome = result
+        step.outcome = tool_result
 
     @override
-    def on_subagent_end(self, info: events.SubagentInfo, stats: events.TurnStats | None) -> None:
+    def on_subagent_end(
+        self,
+        subagent: events.SubagentInfo,
+        stats: events.TurnStats | None,
+    ) -> None:
         self.stop_live()  # до сброса: последняя отрисовка ещё читает метку
         self._sub = None
         self._sub_wrapping = False
@@ -1277,13 +1285,13 @@ class Console(events.AgentEvents):  # noqa: WPS338
         self._start_live(self._view(title))
 
     @override
-    def on_compact_end(self, result: events.CompactResult | None) -> None:
+    def on_compact_end(self, compacted: events.CompactResult | None) -> None:
         self.stop_live()
-        if result is None:
+        if compacted is None:
             return
-        before = format_tokens(result.before_tokens)
-        after = format_tokens(result.after_tokens)
-        folded = _counted(result.messages, "сообщение", "сообщения", "сообщений")
+        before = format_tokens(compacted.before_tokens)
+        after = format_tokens(compacted.after_tokens)
+        folded = _counted(compacted.messages, "сообщение", "сообщения", "сообщений")
         self.system(
             f"✂ контекст сжат: ~{before} → ~{after} ток. · в краткое содержание свёрнуто {folded}",
         )

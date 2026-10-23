@@ -273,7 +273,8 @@ def _continuation(width: int, line_number: int, wrap_count: int) -> StyleAndText
 
 
 # --------------------------------- сборка ---------------------------------- #
-def create_prompt_session(
+# Параметры — только по имени: источники автодополнения и подмены ввода для тестов.
+def create_prompt_session(  # noqa: WPS211
     *,
     commands: CommandRegistry,
     workspace: Workspace,
@@ -301,7 +302,7 @@ def create_prompt_session(
         prompt_continuation=_continuation,
         placeholder=[("class:placeholder", PLACEHOLDER)],
         style=prompt_style(),
-        color_depth=prompt_color_depth(no_color),
+        color_depth=prompt_color_depth(no_color=no_color),
         **kwargs,
     )
 

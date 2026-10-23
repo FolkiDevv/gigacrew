@@ -3,7 +3,7 @@
 Гарантии:
   * stdin — /dev/null: процесс не читает терминал пользователя и не зависает
     в ожидании ввода (``cat``, интерактивные утилиты, редактор git); хуку вместо
-    него подаётся готовый текст (``input``) — из временного файла, не из канала;
+    него подаётся готовый текст (``stdin_text``) — из временного файла, не из канала;
   * окружение без настроек и секретов gigacrew (``GIGACREW_*``) и без интерактива git;
   * процесс и его потомки живут в отдельной группе и убиваются целиком — по
     таймауту, по Ctrl+C и если после выхода команды в группе остались фоновые
@@ -290,19 +290,19 @@ def run_process(
     timeout: float,
     shell: bool = False,
     environ: Mapping[str, str] | None = None,
-    input: str | None = None,
+    stdin_text: str | None = None,
     extra_env: Mapping[str, str] | None = None,
 ) -> ProcessResult:
     """Запускает команду и собирает вывод. FileNotFoundError — если нет программы.
 
-    ``input`` — текст на stdin (UTF-8). Он пишется во временный файл, а не в канал:
+    ``stdin_text`` — текст на stdin (UTF-8). Он пишется во временный файл, а не в канал:
     без потока-писателя, который мог бы заблокироваться на процессе, не читающем
     stdin. ``extra_env`` добавляется к окружению после фильтра секретов.
     """
     env = subprocess_env(environ)
     if extra_env:
         env.update(extra_env)
-    proc = _spawn(cmd, cwd=cwd, shell=shell, env=env, stdin_text=input)
+    proc = _spawn(cmd, cwd=cwd, shell=shell, env=env, stdin_text=stdin_text)
     out, err = _Capture(), _Capture()
     readers: list[threading.Thread] = []
     # Защищённый блок начинается сразу после Popen: прерывание в любой момент

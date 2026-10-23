@@ -6,6 +6,9 @@ R — только чтение; X — исполняет код проекта 
 прототипа, около двух третей программ в нём новые.
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
+
 CORPUS = r"""
 R	ls
 R	ls -la
@@ -780,7 +783,7 @@ D	mongo --eval "db.dropDatabase()"
 D	sqlite3 app.db "DROP TABLE users"
 """
 
-LEVELS = {"R": 0, "X": 1, "W": 2, "D": 3}
+LEVELS: Mapping[str, int] = MappingProxyType({"R": 0, "X": 1, "W": 2, "D": 3})
 
 # Исправленные метки: исходная разметка выше не меняется, поправка и её причина — здесь.
 # Метка правится, только если она расходится с определением уровней (levels.py,
@@ -791,7 +794,7 @@ _GIT_REMOTE = (
     "(tests/test_safety.py::test_git_reads_and_changes, README)"
 )
 _LINTER = "линтер или анализатор исполняет код инструмента — EXEC по определению уровней"
-RELABELED: dict[str, tuple[str, str]] = {
+RELABELED: Mapping[str, tuple[str, str]] = MappingProxyType({
     # D → W: сеть и сторонний код при установке — по замыслу «меняет окружение»
     "go mod tidy": ("W", _INSTALL),
     "uv lock": ("W", _INSTALL),
@@ -838,26 +841,34 @@ RELABELED: dict[str, tuple[str, str]] = {
     "ruff check . --diff": ("X", f"{_LINTER}; `ruff check .` в корпусе — X"),
     "go vet ./...": ("X", f"{_LINTER}; go vet собирает пакеты"),
     "dart analyze": ("X", f"{_LINTER}; как mypy в корпусе"),
-}
+})
 
 
 def load(raw: str) -> list[tuple[str, int]]:
     """Команды с метками (с поправками RELABELED)."""
-    return [(c, LEVELS[RELABELED[c][0]] if c in RELABELED else label) for c, label in parse(raw)]
+    return [(command, _relabeled(command, label)) for command, label in parse(raw)]
+
+
+def _relabeled(command: str, label: int) -> int:
+    """Метка команды с учётом поправки из RELABELED."""
+    relabel = RELABELED.get(command)
+    if relabel is None:
+        return label
+    return LEVELS[relabel[0]]
 
 
 def parse(raw: str) -> list[tuple[str, int]]:
     """Команды с исходными метками разметки."""
-    items: list[tuple[str, int]] = []
+    commands: list[tuple[str, int]] = []
     current: list[str] | None = None
     for line in raw.strip("\n").split("\n"):
         if len(line) > 2 and line[0] in LEVELS and line[1] == "\t":
             if current:
-                items.append(("\n".join(current[1:]), LEVELS[current[0]]))
+                commands.append(("\n".join(current[1:]), LEVELS[current[0]]))
             current = [line[0], line[2:]]
         else:  # продолжение многострочной команды (heredoc)
             assert current is not None
             current.append(line)
     if current:
-        items.append(("\n".join(current[1:]), LEVELS[current[0]]))
-    return items
+        commands.append(("\n".join(current[1:]), LEVELS[current[0]]))
+    return commands

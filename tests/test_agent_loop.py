@@ -282,7 +282,7 @@ def test_preview_failure_never_runs_tool(tmp_path: Path, exc: Exception) -> None
     agent.run_turn("x")
     assert tool.runs == 0
     assert events.confirms == []
-    assert events.results[-1][1].ok is False
+    assert events.tool_results[-1][1].ok is False
 
 
 def test_rejection_does_not_run_and_tells_model(tmp_path: Path) -> None:
@@ -330,7 +330,7 @@ def test_custom_tool_display_reaches_ui(tmp_path: Path) -> None:
         auto_approve=False,
     )
     agent.run_turn("x")
-    _call, tool_result, previewed = events.results[-1]
+    _call, tool_result, previewed = events.tool_results[-1]
     assert tool_result.display == display
     assert previewed is True
 
@@ -341,7 +341,7 @@ def test_disallowed_git_subcommand_is_not_confirmed(tmp_path: Path) -> None:
     agent = _agent(provider, tmp_path, events=events, auto_approve=False)
     agent.run_turn("запушь")
     assert events.confirms == []
-    assert events.results[-1][1].ok is False
+    assert events.tool_results[-1][1].ok is False
 
 
 def test_turn_stats_split_billed_and_context(tmp_path: Path) -> None:
@@ -863,7 +863,7 @@ def test_plan_mode_blocks_edits_without_asking(tmp_path: Path) -> None:
     agent.run_turn("поправь")
     assert tool.runs == 0
     assert events.confirms == []
-    assert events.results[-1][1].summary == "заблокировано: режим планирования"
+    assert events.tool_results[-1][1].summary == "заблокировано: режим планирования"
     assert _function_results(agent)[-1] == PLAN_BLOCKED_NOTE.format(path=agent._plan_display())
 
 
@@ -1758,6 +1758,7 @@ def test_auto_compaction_summarizes_old_steps_and_keeps_task(tmp_path: Path) -> 
     assert "ЗАДАЧА" in user.content
     assert len(events.compactions) == 1
     compaction = events.compactions[0]
+    assert compaction is not None
     assert compaction.auto
     assert compaction.after_tokens < compaction.before_tokens
     assert ("compact_start", True) in events.events
@@ -2084,7 +2085,7 @@ def test_nonzero_exit_codes_do_not_stop_the_turn(tmp_path: Path) -> None:
     assert agent.run_turn("x") == "ок"
     assert events.stats[-1].stop_reason is None
     # в UI — по-прежнему неуспех
-    assert all(not tool_result.ok for _, tool_result, _ in events.results)
+    assert all(not tool_result.ok for _, tool_result, _ in events.tool_results)
     # и не пугают модель: «ещё одна неудача остановит работу» не появляется
     assert not any("tool calls failed" in tail for tail in _tails(provider))
 
@@ -2384,7 +2385,7 @@ def test_ui_learns_whether_a_preview_was_shown(tmp_path: Path) -> None:
     agent.run_turn("x")
     tool._preview = lambda: Display("+x", kind="diff", title="x")
     agent.run_turn("ещё")
-    assert [previewed for _, _, previewed in events.results] == [False, False, True, True]
+    assert [previewed for _, _, previewed in events.tool_results] == [False, False, True, True]
 
 
 def test_failed_changing_call_is_not_marked_changed(tmp_path: Path) -> None:
@@ -2392,7 +2393,7 @@ def test_failed_changing_call_is_not_marked_changed(tmp_path: Path) -> None:
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents()
     _agent(provider, tmp_path, events=events, registry=_registry_with(tool)).run_turn("x")
-    assert [tool_result.changed for _, tool_result, _ in events.results] == [False]
+    assert [tool_result.changed for _, tool_result, _ in events.tool_results] == [False]
 
 
 def test_auto_mode_runs_commands_that_only_edit_files(tmp_path: Path) -> None:

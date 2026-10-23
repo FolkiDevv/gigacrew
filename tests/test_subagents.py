@@ -108,7 +108,7 @@ def _first_payload(events: RecordingEvents, kind: str) -> Any:
 
 def _last_result(events: RecordingEvents) -> ToolResult:
     """Результат последнего инструмента основного агента."""
-    return events.results[-1][1]
+    return events.tool_results[-1][1]
 
 
 def _sent_messages(provider: ScriptedProvider, index: int) -> list[Message]:
@@ -353,7 +353,7 @@ def test_general_edits_without_asking_in_auto_mode(tmp_path: Path) -> None:
     report = _function_outputs(agent.conversation.messages)[0]
     assert "создал b.txt" in report
     assert "Changed files: b.txt" in report
-    assert events.results[-1][1].changed
+    assert events.tool_results[-1][1].changed
 
 
 def test_delegation_rules_only_for_main_agent() -> None:
@@ -699,7 +699,7 @@ def test_llm_error_after_changes_keeps_trail(tmp_path: Path) -> None:
     report = _function_outputs(agent.conversation.messages)[0]
     assert "model error: сбой сети" in report
     assert "Changed files: b.txt" in report
-    task_result = events.results[-1][1]
+    task_result = events.tool_results[-1][1]
     assert not task_result.ok
     assert task_result.changed
 
@@ -907,7 +907,7 @@ def test_subagent_without_wrap_up_text_reports_no_report(tmp_path: Path) -> None
     assert agent.run_turn("x") == "ок"
     report = _function_outputs(agent.conversation.messages)[0]
     assert NO_REPORT_NOTE.format(name="explore") in report
-    task_result = next(outcome for call, outcome, _ in events.results if call.name == "task")
+    task_result = next(outcome for call, outcome, _ in events.tool_results if call.name == "task")
     assert not task_result.ok
 
 
@@ -1203,7 +1203,7 @@ def test_explore_run_is_read_only_and_not_a_change(tmp_path: Path) -> None:
     changing = {"write_file", "edit_file", "task", "explore", "ask_user", "exit_plan_mode"}
     assert names
     assert not names & changing
-    assert events.results[-1][1].changed is False
+    assert events.tool_results[-1][1].changed is False
 
 
 def test_successful_output_mentioning_rejection_is_not_a_rejection() -> None:

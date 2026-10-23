@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from importlib import metadata
 
 from gigacrew.agent.chat_store import ChatInfo, ChatRecorder
@@ -84,7 +85,8 @@ def esc_interrupt_for(
     return interrupt
 
 
-def run_repl(
+# Публичная точка входа: параметры передаются по имени из app.py и тестов.
+def run_repl(  # noqa: WPS211
     agent: Agent,
     ui: Console,
     commands: CommandRegistry,
@@ -98,7 +100,9 @@ def run_repl(
     skills: SkillCatalog | None = None,
     trust_hooks: bool = False,
 ) -> int:
-    """``interrupt`` подменяется в тестах; по умолчанию Esc слушается только вместе с
+    """Запустить интерактивный режим и вернуть код выхода.
+
+    ``interrupt`` подменяется в тестах; по умолчанию Esc слушается только вместе с
     настоящей строкой ввода (``read_input is None``). ``index_on_start`` — до первого
     ввода построить индекс проекта, если его нет (:func:`~gigacrew.cli.indexing.ensure_index`).
 
@@ -121,30 +125,9 @@ def run_repl(
     esc = esc_interrupt_for(ui, interrupt, agent)
     if models is None and read_input is None:
         models = ModelCatalog(agent.provider)
-    catalog = models
     skills = SkillCatalog(agent.workspace) if skills is None else skills
-    arg_choices: dict[str, ArgChoices] = {"/mode": lambda: mode_choices(agent.mode)}
-    if catalog is not None:
-        arg_choices["/model"] = lambda: catalog.choices(agent.windows, agent.model)
-    read = read_input or make_input_reader(
-        commands=commands,
-        workspace=agent.workspace,
-        status=lambda: status_of(agent),
-        no_color=ui.no_color,
-        arg_choices=arg_choices,
-        on_cycle_mode=agent.cycle_mode,
-        skills=lambda: [(skill.command, skill.description) for skill in skills],
-    )
-    ui.banner(
-        version=metadata.version("gigacrew"),
-        model=agent.model,
-        root=str(agent.workspace.root),
-        hints=[(name, desc) for name, desc in BANNER_HINTS if commands.get(name) is not None],
-        auto_approve=agent.config.auto_approve,
-        mode=agent.mode,
-    )
-    if resumed is not None:
-        ui.chat_resumed(resumed, agent.conversation.messages, agent.call_info)
+    read = read_input or _make_reader(agent, ui, commands, models, skills)
+    _show_banner(agent, ui, commands, resumed)
     # Ввод не принимается, пока строится индекс (Esc/Ctrl+C — отменить построение).
     if index_on_start:
         ensure_index(agent.workspace, ui, esc)
@@ -163,78 +146,159 @@ def run_repl(
         skills=skills,
         trust_hooks=trust_hooks,
     )
-    source = "resume" if resumed is not None else "startup"
+    repl = _Repl(
+        agent=agent,
+        ui=ui,
+        commands=commands,
+        ctx=ctx,
+        read=read,
+        esc=esc,
+        skills=skills,
+        chats=chats,
+    )
+    source = "startup" if resumed is None else "resume"
     with hook_session(agent, ui, source=source, end_reason="prompt_input_exit"):
-        return _loop(agent, ui, commands, ctx, read, esc, skills, chats)
+        return repl.loop()
 
 
-def _loop(
+def _make_reader(
     agent: Agent,
     ui: Console,
     commands: CommandRegistry,
-    ctx: CommandContext,
-    read: InputReader,
-    esc: EscInterrupt,
+    catalog: ModelCatalog | None,
     skills: SkillCatalog,
-    chats: ChatRecorder | None,
-) -> int:
-    """Цикл ввода REPL до выхода."""
-    typeahead = esc.take_typeahead()  # набранное во время хода — в следующую строку ввода
+) -> InputReader:
+    """Настоящая строка ввода: автодополнение команд, аргументов и скиллов, статус-строка."""
+    arg_choices: dict[str, ArgChoices] = {"/mode": lambda: mode_choices(agent.mode)}
+    if catalog is not None:
+        arg_choices["/model"] = lambda: catalog.choices(agent.windows, agent.model)
+    return make_input_reader(
+        commands=commands,
+        workspace=agent.workspace,
+        status=lambda: status_of(agent),
+        no_color=ui.no_color,
+        arg_choices=arg_choices,
+        on_cycle_mode=agent.cycle_mode,
+        skills=lambda: [(skill.command, skill.description) for skill in skills],
+    )
 
-    while True:
-        skills.refresh()  # для автодополнения: скиллы могли поменяться за ход
+
+def _show_banner(
+    agent: Agent,
+    ui: Console,
+    commands: CommandRegistry,
+    resumed: ChatInfo | None,
+) -> None:
+    """Стартовый экран; для продолженного чата — его последние обмены."""
+    ui.banner(
+        version=metadata.version("gigacrew"),
+        model=agent.model,
+        root=str(agent.workspace.root),
+        hints=[(name, desc) for name, desc in BANNER_HINTS if commands.get(name) is not None],
+        auto_approve=agent.config.auto_approve,
+        mode=agent.mode,
+    )
+    if resumed is not None:
+        ui.chat_resumed(resumed, agent.conversation.messages, agent.call_info)
+
+
+def _report_turn_error(ui: Console, error: PromptBlockedError | LLMError) -> None:
+    """Сообщить об ожидаемой ошибке хода: отказ хука или ошибка модели."""
+    if isinstance(error, PromptBlockedError):
+        ui.warn(f"запрос отклонён хуком UserPromptSubmit: {error.reason}")
+    else:
+        ui.error(str(error))
+
+
+@dataclass
+class _Repl:
+    """Состояние цикла ввода REPL."""
+
+    agent: Agent
+    ui: Console
+    commands: CommandRegistry
+    ctx: CommandContext
+    read: InputReader
+    esc: EscInterrupt
+    skills: SkillCatalog
+    chats: ChatRecorder | None
+    typeahead: str = ""
+
+    def loop(self) -> int:
+        """Цикл ввода REPL до выхода."""
+        # Набранное во время хода — в следующую строку ввода.
+        self.typeahead = self.esc.take_typeahead()
+
+        while True:
+            self.skills.refresh()  # для автодополнения: скиллы могли поменяться за ход
+            line = self._read_line()
+            if line is None:
+                return 0
+            if line and not self._execute(line):
+                return 0
+
+    def _read_line(self) -> str | None:
+        """Прочитать строку ввода; None — выход (EOF), пустая строка — ввод сброшен."""
         try:
             # Набранное во время хода подставляется один раз: Ctrl+C его сбрасывает.
-            default, typeahead = typeahead, ""
-            line = (read(default=default) if default else read()).strip()
+            default = self.typeahead
+            self.typeahead = ""
+            return (self.read(default=default) if default else self.read()).strip()
         except EOFError:
-            ui.system("\nдо встречи!")
-            return 0
+            self.ui.system("\nдо встречи!")
+            return None
         except KeyboardInterrupt:
-            ui.system("(Ctrl+D или /exit — выход)")
-            continue
-        if not line:
-            continue
+            self.ui.system("(Ctrl+D или /exit — выход)")
+            return ""
 
+    def _execute(self, line: str) -> bool:
+        """Выполнить строку: скилл, слеш-команду или ход агента. False — выход из REPL."""
         if is_repl_command(line):
-            skills.refresh()  # скилл могли установить, пока открыто приглашение
+            self.skills.refresh()  # скилл могли установить, пока открыто приглашение
         try:
-            request = expand_skill(line, commands, skills)
-        except OSError as e:
-            ui.error(str(e))
-            continue
-        if request is not None:
-            line = request
-        elif is_repl_command(line):
-            try:
-                if not commands.dispatch(line, ctx):
-                    return 0
-            except Exception as e:  # как и ошибка в ходе: сбой команды не закрывает REPL
-                ui.stop_live()
-                name = line.split(maxsplit=1)[0]
-                ui.error(f"внутренняя ошибка в {name}: {type(e).__name__}: {e}")
-            typeahead = esc.take_typeahead()
-            continue
+            request = expand_skill(line, self.commands, self.skills)
+        except OSError as exc:
+            self.ui.error(str(exc))
+            return True
+        if request is None and is_repl_command(line):
+            return self._dispatch(line)
+        self._run_turn(line if request is None else request)
+        return True
 
+    def _dispatch(self, line: str) -> bool:
+        """Выполнить слеш-команду. False — выход из REPL."""
         try:
-            ui.print()
-            # Токен бэкенда — до индикатора хода: истёк — ошибка с просьбой пройти
-            # авторизацию в GigaCode, а не сбой посреди хода.
-            agent.provider.connect()
-            with esc:
-                agent.run_turn(line)
-            ui.print()
-        except PromptBlockedError as e:
-            ui.stop_live()
-            ui.warn(f"запрос отклонён хуком UserPromptSubmit: {e.reason}")
-        except LLMError as e:
-            ui.stop_live()
-            ui.error(str(e))
+            if not self.commands.dispatch(line, self.ctx):
+                return False
+        except Exception as exc:  # как и ошибка в ходе: сбой команды не закрывает REPL
+            self.ui.stop_live()
+            name = line.split(maxsplit=1)[0]
+            self.ui.error(f"внутренняя ошибка в {name}: {type(exc).__name__}: {exc}")
+        self.typeahead = self.esc.take_typeahead()
+        return True
+
+    def _run_turn(self, line: str) -> None:
+        """Ход агента с обработкой ошибок, затем автосохранение чата."""
+        try:
+            self._turn(line)
+        except (PromptBlockedError, LLMError) as error:
+            self.ui.stop_live()
+            _report_turn_error(self.ui, error)
         except KeyboardInterrupt:
-            ui.stop_live()
-            ui.system("\n(прервано)")
-        except Exception as e:  # ошибка внутри хода не должна закрывать REPL
-            ui.stop_live()
-            ui.error(f"внутренняя ошибка: {type(e).__name__}: {e}")
-        autosave(chats, agent, ui)
-        typeahead = esc.take_typeahead()
+            self.ui.stop_live()
+            self.ui.system("\n(прервано)")
+        except Exception as exc:  # ошибка внутри хода не должна закрывать REPL
+            self.ui.stop_live()
+            self.ui.error(f"внутренняя ошибка: {type(exc).__name__}: {exc}")
+        autosave(self.chats, self.agent, self.ui)
+        self.typeahead = self.esc.take_typeahead()
+
+    def _turn(self, line: str) -> None:
+        """Ход агента: подключение к бэкенду и обработка запроса."""
+        self.ui.print()
+        # Токен бэкенда — до индикатора хода: истёк — ошибка с просьбой пройти
+        # авторизацию в GigaCode, а не сбой посреди хода.
+        self.agent.provider.connect()
+        with self.esc:
+            self.agent.run_turn(line)
+        self.ui.print()

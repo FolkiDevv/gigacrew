@@ -1,5 +1,4 @@
-"""Режимы разрешений: что агенту можно делать без вопроса, что — с подтверждением,
-а что запрещено.
+"""Режимы разрешений: что агенту можно без вопроса, что — с подтверждением, что запрещено.
 
 Режим выбирает пользователь (Shift+Tab, ``/mode``, ``--mode``, ``GIGACREW_MODE``):
 
@@ -27,37 +26,46 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum, StrEnum
+from types import MappingProxyType
 from typing import Literal
 
 from gigacrew.security import RiskLevel
 
 
 class PermissionMode(StrEnum):
+    """Режим разрешений, который выбирает пользователь."""
+
     AUTO = "auto"
     PLAN = "plan"
 
     @property
     def label(self) -> str:
+        """Короткое русское название режима."""
         return _LABELS[self]
 
     @property
     def description(self) -> str:
+        """Описание режима для пользователя."""
         return _DESCRIPTIONS[self]
 
 
-_LABELS = {
+_LABELS: Mapping[PermissionMode, str] = MappingProxyType({
     PermissionMode.AUTO: "авто",
     PermissionMode.PLAN: "план",
-}
-_DESCRIPTIONS = {
+})
+_DESCRIPTIONS: Mapping[PermissionMode, str] = MappingProxyType({
     PermissionMode.AUTO: "правки файлов без вопросов; команды проверяет модель-рецензент, "
     "сомнительные и опасные — с подтверждением",
     PermissionMode.PLAN: "только исследование и план: правки и изменяющие команды "
     "заблокированы, проверки — с подтверждением",
-}
+})
 # Прежние режимы «ручной» и «авто-правки» заменены режимом «авто».
-_ALIASES = {"manual": PermissionMode.AUTO, "edits": PermissionMode.AUTO}
+_ALIASES: Mapping[str, PermissionMode] = MappingProxyType({
+    "manual": PermissionMode.AUTO,
+    "edits": PermissionMode.AUTO,
+})
 
 # Порядок переключения по Shift+Tab.
 MODE_CYCLE: tuple[PermissionMode, ...] = (PermissionMode.AUTO, PermissionMode.PLAN)
@@ -69,16 +77,18 @@ def next_mode(mode: PermissionMode) -> PermissionMode:
 
 
 def parse_mode(text: str) -> PermissionMode:
-    """Режим по имени (``auto``/``plan``, без учёта регистра; ``manual``/``edits`` —
-    прежние имена ``auto``).
+    """Режим по имени (``auto``/``plan``, без учёта регистра).
+
+    ``manual``/``edits`` — прежние имена ``auto``.
     """
-    value = text.strip().lower()
+    mode_name = text.strip().lower()
     for mode in PermissionMode:
-        if value == mode.value:
+        if mode_name == mode.value:
             return mode
-    if value in _ALIASES:
-        return _ALIASES[value]
-    names = ", ".join(mode.value for mode in PermissionMode)
+    alias = _ALIASES.get(mode_name)
+    if alias is not None:
+        return alias
+    names = ", ".join(known.value for known in PermissionMode)
     raise ValueError(f"неизвестный режим {text.strip()!r}; допустимые: {names}")
 
 
@@ -91,6 +101,8 @@ class ToolKind(StrEnum):
 
 
 class Decision(Enum):
+    """Как поступить с вызовом инструмента."""
+
     ALLOW = "allow"  # выполнить без вопроса
     REVIEW = "review"  # спросить модель-рецензента (она разрешит или спросит пользователя)
     ASK = "ask"  # спросить пользователя
@@ -139,11 +151,12 @@ def apply_hook(
     risk: RiskLevel,
     hook: Literal["allow", "ask"] | None,
 ) -> Decision:
-    """Решение с учётом хука PreToolUse (см. :func:`decide`). Отдельно — для агента: он
-    сначала уточняет решение по вердикту классификатора (изменяющая команда в режиме
-    плана — запрет; за команду, которую классификатор не проверил, ``-y`` не ручается),
-    и только потом применяет хук, чтобы ``allow`` не снял запрет. За непроверенную
-    команду не ручается и ``allow``.
+    """Решение с учётом хука PreToolUse (см. :func:`decide`).
+
+    Отдельно — для агента: он сначала уточняет решение по вердикту классификатора
+    (изменяющая команда в режиме плана — запрет; за команду, которую классификатор не
+    проверил, ``-y`` не ручается), и только потом применяет хук, чтобы ``allow`` не снял
+    запрет. За непроверенную команду не ручается и ``allow``.
     """
     if hook == "ask" and decision in {Decision.ALLOW, Decision.REVIEW}:
         return Decision.ASK

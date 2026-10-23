@@ -916,8 +916,8 @@ def _merge_paths(found: list[_Path]) -> _Path:
         return _UNKNOWN_PATH
     if len(found) == 1:
         return found[0]
-    statics = {candidate.static for candidate in found}
-    if all(candidate.static is not None for candidate in found) and len(statics) == 1:
+    static_values = {candidate.static for candidate in found}
+    if all(candidate.static is not None for candidate in found) and len(static_values) == 1:
         return found[0]
     unders = []
     for candidate in found:

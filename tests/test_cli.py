@@ -721,8 +721,8 @@ def test_compact_command_summarizes_and_saves(
     chats = _chats(ctx)
     saved = chats.store.load(chats.chat_id)
     assert saved.conversation.summary is not None
-    assert saved.info.title.startswith("старый вопрос")
-    saved_id = saved.info.id
+    assert saved.meta.title.startswith("старый вопрос")
+    saved_id = saved.meta.id
     commands.dispatch("/clear", ctx)
     commands.dispatch(f"/resume {saved_id}", ctx)
     assert "старый вопрос" in _out(capsys)  # показ последнего обмена — из полного журнала
@@ -983,13 +983,6 @@ def _models_json(home: Path) -> dict[str, Any]:
     models = json.loads(path.read_text(encoding="utf-8"))["models"]
     assert isinstance(models, dict)
     return models
-
-
-@pytest.fixture
-def user_home(request: pytest.FixtureRequest) -> Path:
-    """Временный домашний каталог из автоматической фикстуры _isolated_home (conftest.py)."""
-    home: Path = request.getfixturevalue("_isolated_home")
-    return home
 
 
 def test_test_context_measures_and_saves(

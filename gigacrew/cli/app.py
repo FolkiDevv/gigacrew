@@ -404,7 +404,7 @@ def _run_session(args: argparse.Namespace, agent: Agent, config: Config, ui: Con
             return EXIT_ERROR
         ensure_context_window(agent, ui, interactive=False)
         return run_oneshot(agent, ui, prompt, chats, resumed=saved is not None)
-    resumed = None if saved is None else saved.info
+    resumed = None if saved is None else saved.meta
     return run_repl(
         agent,
         ui,

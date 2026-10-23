@@ -492,8 +492,8 @@ def test_gigacode_verifies_tls_by_default(tmp_path: Path) -> None:
 
 
 @pytest.mark.usefixtures("_certifi_roots")
-def test_gigacode_trusts_official_cli_certificates(tmp_path: Path, _isolated_home: Path) -> None:
-    certs = _isolated_home / ".gigacode" / "certs"
+def test_gigacode_trusts_official_cli_certificates(tmp_path: Path, user_home: Path) -> None:
+    certs = user_home / ".gigacode" / "certs"
     certs.mkdir(parents=True)
     _self_signed(tmp_path / "a", "bundled")[0].rename(certs / "gigacode-bundled-1.pem")
     _self_signed(tmp_path / "b", "extra")[0].rename(certs / "extra.crt")
@@ -526,8 +526,8 @@ def test_gigacode_trusts_official_cli_certificates(tmp_path: Path, _isolated_hom
     assert "bundled" not in names
 
 
-def test_gigacode_broken_certificate_is_an_error(tmp_path: Path, _isolated_home: Path) -> None:
-    certs = _isolated_home / ".gigacode" / "certs"
+def test_gigacode_broken_certificate_is_an_error(tmp_path: Path, user_home: Path) -> None:
+    certs = user_home / ".gigacode" / "certs"
     certs.mkdir(parents=True)
     (certs / "broken.pem").write_text("-----BEGIN CERTIFICATE-----\nмусор\n")
     cfg = Config.load(
@@ -653,7 +653,7 @@ def test_project_dotenv_cannot_set_security_settings(tmp_path: Path) -> None:
     assert "~/.gigacode/.env" in text
 
 
-def test_user_dotenv_and_environment_are_trusted(tmp_path: Path, _isolated_home: Path) -> None:
+def test_user_dotenv_and_environment_are_trusted(tmp_path: Path, user_home: Path) -> None:
     """Настройки безопасности задаются окружением или ~/.gigacode/.env.
 
     Файл пользователя важнее .env проекта, окружение — важнее всего.
@@ -661,7 +661,7 @@ def test_user_dotenv_and_environment_are_trusted(tmp_path: Path, _isolated_home:
     root = tmp_path / "repo"
     _env_file(root, "GIGACREW_AUTH_URL=https://collector.test/oauth\nGIGACREW_MODEL=repo-M\n")
     _env_file(
-        _isolated_home / ".gigacode",
+        user_home / ".gigacode",
         "GIGACREW_AUTH_URL=https://auth.mine/oauth\nGIGACREW_VERIFY_SSL=0\n"
         "GIGACREW_MODEL=user-M\nGIGACREW_API_URL=https://api.mine/v1\n",
     )

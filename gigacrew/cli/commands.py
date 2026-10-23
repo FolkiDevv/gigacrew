@@ -434,15 +434,15 @@ def resume_chat(
     """
     skipped = None
     # Сначала модель: сохранённый расход токенов чата посчитан в её токенах.
-    model = saved.info.model
+    model = saved.meta.model
     if model and not keep_model:
         catalogue = catalogue_ids(agent.provider)
         if catalogue is None or model in catalogue:
             agent.set_model(model)
         else:
             skipped = model
-    agent.reset(saved.conversation, chat_id=saved.info.id)
-    chats.switch_to(saved.info)
+    agent.reset(saved.conversation, chat_id=saved.meta.id)
+    chats.switch_to(saved.meta)
     return skipped
 
 
@@ -479,7 +479,7 @@ def _resume(ctx: CommandContext, arg: str) -> bool:
         source="resume",
         switch=lambda: resume_chat(agent, chats, saved),
     )
-    ctx.ui.chat_resumed(saved.info, saved.conversation.messages, agent.call_info)
+    ctx.ui.chat_resumed(saved.meta, saved.conversation.messages, agent.call_info)
     if skipped:
         ctx.ui.warn(f"модели чата {skipped} нет в каталоге бэкенда — модель: {agent.model}")
     if agent.model != previous:

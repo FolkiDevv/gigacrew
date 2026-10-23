@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import re
 import ssl
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,6 +32,22 @@ import httpx
 
 from gigacrew.permissions import PermissionMode, parse_mode
 from gigacrew.project.workspace import user_data_dir
+
+# Значения по умолчанию и границы числовых настроек (время — в секундах, доли — в процентах).
+_DEFAULT_TIMEOUT = 120
+_DEFAULT_READ_TIMEOUT = 600
+_DEFAULT_RATE_LIMIT_WAIT = 120
+_DEFAULT_TEMPERATURE = 0.2
+_MIN_TEMPERATURE = float(0)
+_MAX_TEMPERATURE = 2.0
+_MIN_CONTEXT_TOKENS = 4_000
+_DEFAULT_SHARE_PERCENT = 80
+_MIN_SHARE_PERCENT = 10
+_MAX_SHARE_PERCENT = 95
+_PERCENT = 100
+_DEFAULT_SUBAGENT_MAX_STEPS = 25
+_DEFAULT_SUBAGENT_TIMEOUT = 600
+_MIN_SUBAGENT_TIMEOUT = 10
 
 
 class ConfigError(ValueError):
@@ -43,40 +59,42 @@ def read_dotenv(path: Path) -> dict[str, str]:
 
     Возвращает словарь; глобальное окружение процесса не изменяется.
     """
-    values: dict[str, str] = {}
+    settings: dict[str, str] = {}
     if not path.is_file():
-        return values
+        return settings
     try:
         # utf-8-sig: BOM (PowerShell 5, старый Блокнот) иначе приклеился бы к первому ключу,
         # и первая настройка — например, GIGACREW_VERIFY_SSL=1 — молча пропала бы.
         text = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError) as e:
-        raise ConfigError(f"Не удалось прочитать {path}: {e}") from e
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"Не удалось прочитать {path}: {exc}") from exc
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, _, value = line.partition("=")
+        key, _, raw_setting = line.partition("=")
         key = key.strip()
         if key.startswith("export "):
             key = key[len("export ") :].strip()
         if key:
-            values[key] = _dotenv_value(value)
-    return values
+            settings[key] = _dotenv_value(raw_setting)
+    return settings
 
 
 _INLINE_COMMENT_RE = re.compile(r"\s#")
 
 
 def _dotenv_value(raw: str) -> str:
-    """Значение из .env: в кавычках — до парной закрывающей (остальное — комментарий),
-    без кавычек — до « #» (``MODEL=model-large # быстрая``).
+    """Значение из .env без кавычек и комментария в конце строки.
+
+    В кавычках — до парной закрывающей (остальное — комментарий), без кавычек — до « #»
+    (``MODEL=model-large # быстрая``).
     """
-    value = raw.strip()
-    if value[:1] in {"'", '"'}:
-        end = value.find(value[0], 1)
-        return value[1:end] if end != -1 else value
-    return _INLINE_COMMENT_RE.split(value, maxsplit=1)[0].rstrip()
+    setting = raw.strip()
+    if setting[:1] in {"'", '"'}:
+        end = setting.find(setting[0], 1)
+        return setting if end == -1 else setting[1:end]
+    return _INLINE_COMMENT_RE.split(setting, maxsplit=1)[0].rstrip()
 
 
 # Настройки безопасности: их задают только окружение и ~/.gigacode/.env, но не .env проекта
@@ -112,7 +130,7 @@ def user_env_file() -> Path:
 class Environment:
     """Сводное окружение и настройки безопасности, пропущенные в .env проекта."""
 
-    values: dict[str, str]
+    variables: dict[str, str]
     ignored: tuple[tuple[str, str], ...] = ()  # (ключ, файл .env)
 
 
@@ -130,28 +148,35 @@ def collect_environment(
     live-тестов). Пропущенные возвращаются, только если итоговое значение другое.
     Порядок детерминирован; одинаковые пути читаются один раз.
     """
-    environ = os.environ if environ is None else environ
     cwd = (cwd or Path.cwd()).resolve()
     root = root.resolve()
     user_file = user_env_file()
     merged: dict[str, str] = {}
+    # Пропущенные настройки безопасности: (ключ, файл .env, значение).
     skipped: list[tuple[str, str, str]] = []
     # От младшего источника к старшему: каждый следующий перекрывает предыдущий.
-    sources = [cwd / ".env"] if cwd != root else []
-    sources.append(root / ".env")
-    for path in sources:
+    for path in (root / ".env",) if cwd == root else (cwd / ".env", root / ".env"):
         if path == user_file:
             continue  # проект — сам ~/.gigacode: файл прочитается ниже, как доверенный
-        for key, value in read_dotenv(path).items():
-            if key in SECURITY_KEYS and not trusted_dotenv:
-                if value.strip():
-                    skipped.append((key, str(path), value))
-                continue
-            merged[key] = value
+        project_settings = read_dotenv(path)
+        if not trusted_dotenv:
+            skipped.extend(
+                (key, str(path), setting)
+                for key, setting in project_settings.items()
+                if key in SECURITY_KEYS and setting.strip()
+            )
+            project_settings = {
+                key: setting
+                for key, setting in project_settings.items()
+                if key not in SECURITY_KEYS
+            }
+        merged.update(project_settings)
     merged.update(read_dotenv(user_file))
-    merged.update(environ)
-    ignored = tuple((key, path) for key, path, value in skipped if merged.get(key) != value)
-    return Environment(merged, ignored)
+    merged.update(os.environ if environ is None else environ)
+    return Environment(
+        merged,
+        tuple((key, source) for key, source, setting in skipped if merged.get(key) != setting),
+    )
 
 
 def load_environment(
@@ -162,20 +187,21 @@ def load_environment(
     trusted_dotenv: bool = False,
 ) -> dict[str, str]:
     """Сводное окружение (см. :func:`collect_environment`)."""
-    return collect_environment(root, environ=environ, cwd=cwd, trusted_dotenv=trusted_dotenv).values
+    collected = collect_environment(root, environ=environ, cwd=cwd, trusted_dotenv=trusted_dotenv)
+    return collected.variables
 
 
-def _env_bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
-    val = env.get(name)
-    if val is None or not val.strip():
+def _env_bool(env: Mapping[str, str], name: str, *, default: bool = False) -> bool:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
         return default
-    norm = val.strip().lower()
+    norm = raw.strip().lower()
     if norm in {"1", "true", "yes", "on"}:
         return True
     if norm in {"0", "false", "no", "off"}:
         return False
     # Опечатка не должна молча выключать настройку — например, проверку TLS у GigaCode.
-    raise ConfigError(f"{name}: ожидается 1/0, true/false, yes/no или on/off, получено {val!r}")
+    raise ConfigError(f"{name}: ожидается 1/0, true/false, yes/no или on/off, получено {raw!r}")
 
 
 def _env_int(
@@ -190,14 +216,14 @@ def _env_int(
     if raw is None or not raw.strip():
         return default
     try:
-        value = int(raw.strip())
-    except ValueError as e:
-        raise ConfigError(f"{name}: ожидается целое число, получено {raw!r}") from e
-    if value < minimum:
-        raise ConfigError(f"{name}: значение должно быть не меньше {minimum}, получено {value}")
-    if maximum is not None and value > maximum:
-        raise ConfigError(f"{name}: значение должно быть не больше {maximum}, получено {value}")
-    return value
+        number = int(raw.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name}: ожидается целое число, получено {raw!r}") from exc
+    if number < minimum:
+        raise ConfigError(f"{name}: значение должно быть не меньше {minimum}, получено {number}")
+    if maximum is not None and number > maximum:
+        raise ConfigError(f"{name}: значение должно быть не больше {maximum}, получено {number}")
+    return number
 
 
 def _env_optional_int(env: Mapping[str, str], name: str, *, minimum: int = 1) -> int | None:
@@ -213,8 +239,8 @@ def _env_mode(env: Mapping[str, str], name: str) -> PermissionMode:
         return PermissionMode.AUTO
     try:
         return parse_mode(raw)
-    except ValueError as e:
-        raise ConfigError(f"{name}: {e}") from e
+    except ValueError as exc:
+        raise ConfigError(f"{name}: {exc}") from exc
 
 
 def _env_choice(env: Mapping[str, str], name: str, choices: tuple[str, ...]) -> str:
@@ -223,7 +249,8 @@ def _env_choice(env: Mapping[str, str], name: str, choices: tuple[str, ...]) -> 
     if not raw:
         return choices[0]
     if raw not in choices:
-        raise ConfigError(f"{name}: ожидается одно из {', '.join(choices)}, получено {raw!r}")
+        allowed = ", ".join(choices)
+        raise ConfigError(f"{name}: ожидается одно из {allowed}, получено {raw!r}")
     return raw
 
 
@@ -235,12 +262,12 @@ def _env_header(env: Mapping[str, str], name: str) -> str | None:
 
     Иначе запрос не собрать — ошибка при запуске, а не на первом запросе.
     """
-    value = (env.get(name) or "").strip()
-    if not value:
+    header = (env.get(name) or "").strip()
+    if not header:
         return None
-    if not _HEADER_VALUE_RE.fullmatch(value):
-        raise ConfigError(f"{name}: допустимы только печатные ASCII-символы, получено {value!r}")
-    return value
+    if not _HEADER_VALUE_RE.fullmatch(header):
+        raise ConfigError(f"{name}: допустимы только печатные ASCII-символы, получено {header!r}")
+    return header
 
 
 def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, hi: float) -> float:
@@ -248,14 +275,14 @@ def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, 
     if raw is None or not raw.strip():
         return default
     try:
-        value = float(raw.strip())
-    except ValueError as e:
-        raise ConfigError(f"{name}: ожидается число, получено {raw!r}") from e
-    if not lo <= value <= hi:
+        number = float(raw.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name}: ожидается число, получено {raw!r}") from exc
+    if not lo <= number <= hi:
         raise ConfigError(
-            f"{name}: значение должно быть в диапазоне [{lo}; {hi}], получено {value}",
+            f"{name}: значение должно быть в диапазоне [{lo}; {hi}], получено {number}",
         )
-    return value
+    return number
 
 
 @dataclass(frozen=True)
@@ -285,8 +312,8 @@ class Config:
     auth_url: str | None = None
     base_url: str = ""
     # Проверка TLS-сертификата сервера: включена по умолчанию у всех провайдеров — без неё
-    # ключ, токен и сам код ушли бы любому, кто подменит сервер. Выключает только явный
-    # GIGACREW_VERIFY_SSL=0.
+    # ключ, токен и сам код ушли бы любому, кто подменит сервер. Выключает её только
+    # явный GIGACREW_VERIFY_SSL=0.
     verify_ssl: bool = True
     # Корневой сертификат для проверки сервера, чей корень не в стандартном хранилище.
     # У API v2 — вместо стандартных корней, у бэкенда GigaCode — в дополнение к ним.
@@ -296,13 +323,13 @@ class Config:
     # Каталог официального CLI GigaCode (GIGACODE_HOME, иначе ~/.gigacode): оттуда
     # читается токен бэкенда (gigacode_token.json).
     gigacode_home: str | None = None
-    timeout: int = 120
+    timeout: int = _DEFAULT_TIMEOUT
     # Ожидание ответа модели в запросах чата, с (не меньше timeout): вызовы инструментов
     # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план, файл),
     # байты не идут — обычный timeout оборвал бы такой ответ.
-    read_timeout: int = 600
+    read_timeout: int = _DEFAULT_READ_TIMEOUT
     # Сколько ждать при 429 (лимит запросов шлюза) на один запрос, с; 0 — не ждать.
-    rate_limit_wait: int = 120
+    rate_limit_wait: int = _DEFAULT_RATE_LIMIT_WAIT
 
     # --- Агент / окружение ---
     project_root: Path = field(default_factory=Path.cwd)
@@ -325,7 +352,7 @@ class Config:
     # Одинаковый вызов без изменений между повторами: на N-м — предупреждение
     # модели, следующий не выполняется и ход останавливается (анти-зацикливание).
     max_tool_repeats: int = 3
-    temperature: float = 0.2
+    temperature: float = _DEFAULT_TEMPERATURE
     stream: bool = True  # потоковый (посимвольный) вывод ответа модели
     # Возвращать ли модели её рассуждения: "turn" — в пределах хода (до следующего
     # запроса пользователя), как советуют вендоры моделей с рассуждениями; "off" — нет.
@@ -350,15 +377,16 @@ class Config:
     # Ограничители одного запуска суб-агента (инструмент task): шаги, доля окна
     # контекста модели, которую может занять его контекст, и время, с. На исчерпании
     # суб-агент подводит итог.
-    subagent_max_steps: int = 25
+    subagent_max_steps: int = _DEFAULT_SUBAGENT_MAX_STEPS
     subagent_context_share: float = 0.8
-    subagent_timeout: int = 600
+    subagent_timeout: int = _DEFAULT_SUBAGENT_TIMEOUT
     # Настройки безопасности, которые .env проекта задавал, но они пропущены:
     # (ключ, файл) — для предупреждения при запуске (:attr:`ignored_env_warning`).
     ignored_env: tuple[tuple[str, str], ...] = ()
 
     @classmethod
-    def load(
+    # Параметры — только по имени: флаги командной строки поверх окружения и .env.
+    def load(  # noqa: WPS211
         cls,
         *,
         project_root: Path | None = None,
@@ -385,7 +413,7 @@ class Config:
             cwd=cwd,
             trusted_dotenv=trusted_dotenv,
         )
-        env = collected.values
+        env = collected.variables
 
         access_key = env.get("GIGACREW_ACCESS_KEY") or None
         cert = env.get("GIGACREW_CERT") or None
@@ -406,46 +434,70 @@ class Config:
             model=model or env.get("GIGACREW_MODEL") or "",
             auth_url=env.get("GIGACREW_AUTH_URL") or None,
             base_url=base_url.rstrip("/"),
-            verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", True),
+            verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", default=True),
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             user_agent=_env_header(env, "GIGACREW_USER_AGENT"),
             gigacode_home=env.get("GIGACODE_HOME") or None,
-            timeout=_env_int(env, "GIGACREW_TIMEOUT", 120),
-            read_timeout=_env_int(env, "GIGACREW_READ_TIMEOUT", 600),
-            rate_limit_wait=_env_int(env, "GIGACREW_RATE_LIMIT_WAIT", 120, minimum=0),
+            timeout=_env_int(env, "GIGACREW_TIMEOUT", _DEFAULT_TIMEOUT),
+            read_timeout=_env_int(env, "GIGACREW_READ_TIMEOUT", _DEFAULT_READ_TIMEOUT),
+            rate_limit_wait=_env_int(
+                env,
+                "GIGACREW_RATE_LIMIT_WAIT",
+                _DEFAULT_RATE_LIMIT_WAIT,
+                minimum=0,
+            ),
             project_root=root,
             auto_approve=auto_approve or yes_all,
             yes_all=yes_all,
             mode=mode or _env_mode(env, "GIGACREW_MODE"),
             stream=stream,
-            temperature=_env_float(env, "GIGACREW_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
+            temperature=_env_float(
+                env,
+                "GIGACREW_TEMPERATURE",
+                _DEFAULT_TEMPERATURE,
+                lo=_MIN_TEMPERATURE,
+                hi=_MAX_TEMPERATURE,
+            ),
             reasoning=_env_choice(env, "GIGACREW_REASONING", ("turn", "off")),
-            context_budget_tokens=_env_optional_int(env, "GIGACREW_CONTEXT_TOKENS", minimum=4_000),
-            auto_compact=_env_bool(env, "GIGACREW_AUTO_COMPACT", True),
+            context_budget_tokens=_env_optional_int(
+                env,
+                "GIGACREW_CONTEXT_TOKENS",
+                minimum=_MIN_CONTEXT_TOKENS,
+            ),
+            auto_compact=_env_bool(env, "GIGACREW_AUTO_COMPACT", default=True),
             compact_threshold=_env_int(
                 env,
                 "GIGACREW_COMPACT_THRESHOLD",
-                80,
-                minimum=10,
-                maximum=95,
+                _DEFAULT_SHARE_PERCENT,
+                minimum=_MIN_SHARE_PERCENT,
+                maximum=_MAX_SHARE_PERCENT,
             )
-            / 100,
-            save_chats=save_chats and _env_bool(env, "GIGACREW_SAVE_CHATS", True),
-            auto_measure=_env_bool(env, "GIGACREW_AUTO_MEASURE", True),
-            ty=_env_bool(env, "GIGACREW_TY", True),
-            safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", True),
-            remember_approvals=_env_bool(env, "GIGACREW_REMEMBER_APPROVALS", True),
+            / _PERCENT,
+            save_chats=save_chats and _env_bool(env, "GIGACREW_SAVE_CHATS", default=True),
+            auto_measure=_env_bool(env, "GIGACREW_AUTO_MEASURE", default=True),
+            ty=_env_bool(env, "GIGACREW_TY", default=True),
+            safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", default=True),
+            remember_approvals=_env_bool(env, "GIGACREW_REMEMBER_APPROVALS", default=True),
             reviewer_model=(env.get("GIGACREW_REVIEWER_MODEL") or "").strip() or None,
-            subagent_max_steps=_env_int(env, "GIGACREW_SUBAGENT_MAX_STEPS", 25),
+            subagent_max_steps=_env_int(
+                env,
+                "GIGACREW_SUBAGENT_MAX_STEPS",
+                _DEFAULT_SUBAGENT_MAX_STEPS,
+            ),
             subagent_context_share=_env_int(
                 env,
                 "GIGACREW_SUBAGENT_CONTEXT",
-                80,
-                minimum=10,
-                maximum=95,
+                _DEFAULT_SHARE_PERCENT,
+                minimum=_MIN_SHARE_PERCENT,
+                maximum=_MAX_SHARE_PERCENT,
             )
-            / 100,
-            subagent_timeout=_env_int(env, "GIGACREW_SUBAGENT_TIMEOUT", 600, minimum=10),
+            / _PERCENT,
+            subagent_timeout=_env_int(
+                env,
+                "GIGACREW_SUBAGENT_TIMEOUT",
+                _DEFAULT_SUBAGENT_TIMEOUT,
+                minimum=_MIN_SUBAGENT_TIMEOUT,
+            ),
             ignored_env=collected.ignored,
         )
 
@@ -454,10 +506,10 @@ class Config:
         """Предупреждение о пропущенных настройках безопасности из .env проекта."""
         if not self.ignored_env:
             return None
-        keys = list(dict.fromkeys(key for key, _ in self.ignored_env))
-        files = list(dict.fromkeys(path for _, path in self.ignored_env))
+        keys = ", ".join(dict.fromkeys(key for key, _ in self.ignored_env))
+        files = ", ".join(dict.fromkeys(path for _, path in self.ignored_env))
         return (
-            f"в {', '.join(files)} не действуют настройки безопасности: {', '.join(keys)} — "
+            f"в {files} не действуют настройки безопасности: {keys} — "
             "их может прислать репозиторий. Задайте их в переменных окружения или в "
             f"{USER_ENV_HINT} (файл пользователя, общий для всех проектов)"
         )
@@ -515,61 +567,14 @@ class Config:
             context.verify_mode = ssl.CERT_NONE
         try:
             context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
-        except ssl.SSLError as e:
-            raise RuntimeError(f"Не удалось загрузить клиентский сертификат: {e}") from e
-        return context
-
-    def _server_ssl_context(self) -> ssl.SSLContext:
-        """Проверка сервера API v2: корни из ``ca_bundle``, если он задан, иначе
-        стандартные — как у httpx (certifi или SSL_CERT_FILE/SSL_CERT_DIR) и системное
-        хранилище (туда ставят корпоративные корни).
-        """
-        if self.ca_bundle:
-            try:
-                return ssl.create_default_context(cafile=self.ca_bundle)
-            except (OSError, ssl.SSLError) as e:
-                raise RuntimeError(
-                    f"не удалось загрузить GIGACREW_CA_BUNDLE {self.ca_bundle}: {e}",
-                ) from e
-        context = httpx.create_ssl_context()
-        context.load_default_certs()
-        return context
-
-    def _gigacode_ssl_context(self) -> ssl.SSLContext:
-        """Проверка сервера GigaCode с теми же корнями, что у официального CLI: стандартные
-        (как у httpx), его сертификаты — ``certs/*.pem`` и ``*.crt`` в
-        :attr:`gigacode_dir` (туда CLI кладёт свой корпоративный корень) — и ``ca_bundle``.
-        Файл, который не читается как сертификат, — ошибка, а не тихий пропуск.
-        """
-        context = httpx.create_ssl_context()
-        certs = self.gigacode_dir / "certs"
-        files = sorted(
-            path
-            for path in (certs.iterdir() if certs.is_dir() else ())
-            if path.suffix.lower() in {".pem", ".crt"} and path.is_file()
-        )
-        if self.ca_bundle:
-            files.append(Path(self.ca_bundle))
-        for path in files:
-            try:
-                context.load_verify_locations(cafile=str(path))
-            except (OSError, ssl.SSLError) as e:
-                raise RuntimeError(f"не удалось загрузить корневой сертификат {path}: {e}") from e
+        except ssl.SSLError as exc:
+            raise RuntimeError(f"Не удалось загрузить клиентский сертификат: {exc}") from exc
         return context
 
     def require_credentials(self) -> None:
         """Проверяет, что заданы реквизиты и адреса API (значений по умолчанию нет)."""
         if self.provider == "gigacode":
-            if not self.base_url:
-                raise RuntimeError(
-                    "Не задан адрес бэкенда GigaCode. Укажите GIGACREW_API_URL в переменных "
-                    "окружения или ~/.gigacode/.env (не в .env проекта). См. .env.example.",
-                )
-            if not self.user_agent:
-                raise RuntimeError(
-                    "Не задан User-Agent для запросов к GigaCode. Укажите GIGACREW_USER_AGENT "
-                    "в .env или переменных окружения. См. .env.example.",
-                )
+            self._require_gigacode_settings()
             return
         if self.auth_mode == "none":
             raise RuntimeError(
@@ -587,4 +592,60 @@ class Config:
                 "Не задан адрес выдачи токена. Для схемы OAuth укажите GIGACREW_AUTH_URL "
                 "в переменных окружения или ~/.gigacode/.env (не в .env проекта). "
                 "См. .env.example.",
+            )
+
+    def _server_ssl_context(self) -> ssl.SSLContext:
+        """Проверка сервера API v2: корни из ``ca_bundle``, если он задан, иначе стандартные.
+
+        Стандартные — как у httpx (certifi или SSL_CERT_FILE/SSL_CERT_DIR) и системное
+        хранилище (туда ставят корпоративные корни).
+        """
+        if self.ca_bundle:
+            try:
+                return ssl.create_default_context(cafile=self.ca_bundle)
+            except (OSError, ssl.SSLError) as exc:
+                raise RuntimeError(
+                    f"не удалось загрузить GIGACREW_CA_BUNDLE {self.ca_bundle}: {exc}",
+                ) from exc
+        context = httpx.create_ssl_context()
+        context.load_default_certs()
+        return context
+
+    def _gigacode_ssl_context(self) -> ssl.SSLContext:
+        """Проверка сервера GigaCode с теми же корнями, что у официального CLI.
+
+        Корни: стандартные (как у httpx), его сертификаты — ``certs/*.pem`` и ``*.crt`` в
+        :attr:`gigacode_dir` (туда CLI кладёт свой корпоративный корень) — и ``ca_bundle``.
+        Файл, который не читается как сертификат, — ошибка, а не тихий пропуск.
+        """
+        context = httpx.create_ssl_context()
+        certs = self.gigacode_dir / "certs"
+        candidates: Iterable[Path] = certs.iterdir() if certs.is_dir() else ()
+        files = sorted(
+            path
+            for path in candidates
+            if path.suffix.lower() in {".pem", ".crt"} and path.is_file()
+        )
+        if self.ca_bundle:
+            files.append(Path(self.ca_bundle))
+        for path in files:
+            try:
+                context.load_verify_locations(cafile=str(path))
+            except (OSError, ssl.SSLError) as exc:
+                raise RuntimeError(
+                    f"не удалось загрузить корневой сертификат {path}: {exc}",
+                ) from exc
+        return context
+
+    def _require_gigacode_settings(self) -> None:
+        """Проверяет адрес бэкенда GigaCode и User-Agent (значений по умолчанию нет)."""
+        if not self.base_url:
+            raise RuntimeError(
+                "Не задан адрес бэкенда GigaCode. Укажите GIGACREW_API_URL в переменных "
+                "окружения или ~/.gigacode/.env (не в .env проекта). См. .env.example.",
+            )
+        if not self.user_agent:
+            raise RuntimeError(
+                "Не задан User-Agent для запросов к GigaCode. Укажите GIGACREW_USER_AGENT "
+                "в .env или переменных окружения. См. .env.example.",
             )

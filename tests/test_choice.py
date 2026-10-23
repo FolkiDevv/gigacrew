@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
@@ -43,25 +45,25 @@ def _choose(question: Question, *chunks: str) -> Answer | None:
         (("2",), Answer(("SQLite",))),  # цифра — сразу
     ],
 )
-def test_single_choice(keys, expected):
+def test_single_choice(keys: tuple[str, ...], expected: Answer) -> None:
     assert _choose(DB, *keys) == expected
 
 
-def test_custom_answer():
+def test_custom_answer() -> None:
     assert _choose(DB, "3", "  Mongo 2\x7fDB \r") == Answer(custom="Mongo DB")
     assert _choose(DB, UP, "x", "\x15", "Redis\r") == Answer(custom="Redis")  # Ctrl+U
 
 
-def test_empty_custom_answer_is_not_accepted():
+def test_empty_custom_answer_is_not_accepted() -> None:
     assert _choose(DB, "3", "\r", DOWN, "\r") == Answer(("PostgreSQL",))
 
 
-def test_escape_declines():
+def test_escape_declines() -> None:
     assert _choose(DB, ESC) is None
     assert _choose(DB, "\x03") is None  # Ctrl+C
 
 
-def test_multi_select():
+def test_multi_select() -> None:
     assert _choose(PARTS, " ", DOWN, DOWN, " ", "\r") == Answer(("Логи", "Трейсы"))
     assert _choose(PARTS, "2", "3", "2", "\r") == Answer(("Трейсы",))  # цифры переключают
     assert _choose(PARTS, DOWN, "\r") == Answer(("Метрики",))  # ничего не отмечено — текущий
@@ -73,7 +75,7 @@ def _text(state: ChoiceState, width: int = 80) -> str:
     return "".join(text for _, text in render(state, width))
 
 
-def test_render_shows_counter_options_descriptions_and_custom():
+def test_render_shows_counter_options_descriptions_and_custom() -> None:
     text = _text(ChoiceState(DB, 1, 2))
     assert "▌ ? Какую БД использовать?   База данных · 1 из 2" in text
     assert "❯ 1. PostgreSQL" in text
@@ -85,9 +87,7 @@ def test_render_shows_counter_options_descriptions_and_custom():
     assert "1 из 1" not in _text(ChoiceState(DB, 1, 1))  # один вопрос — без номера
 
 
-def test_render_custom_label_of_question():
-    from dataclasses import replace
-
+def test_render_custom_label_of_question() -> None:
     plan = replace(DB, custom_label="Замечания…", custom_hint="что поправить")
     assert "3. Замечания…" in _text(ChoiceState(plan, 1, 1))
     assert "что поправить" in _text(
@@ -98,13 +98,13 @@ def test_render_custom_label_of_question():
     )
 
 
-def test_render_custom_text():
+def test_render_custom_text() -> None:
     text = _text(ChoiceState(DB, 1, 1, cursor=2, custom="MongoDB"))
     assert "❯ 3. Свой ответ: MongoDB" in text
     assert "Начните печатать" not in text
 
 
-def test_render_multi_select_and_wrapping():
+def test_render_multi_select_and_wrapping() -> None:
     state = ChoiceState(PARTS, 2, 2, cursor=1, checked={0})
     text = _text(state)
     assert "[✔] Логи" in text

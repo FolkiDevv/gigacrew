@@ -26,25 +26,13 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
+import sys
+from collections.abc import Iterator
+from pathlib import Path
 
+import behavior
 import pytest
-from behavior import (
-    DEFAULT_RUNS,
-    DEFAULT_TIMEOUT,
-    EVAL_LABEL_ENV,
-    EVAL_RUNS_ENV,
-    EVAL_TIMEOUT_ENV,
-    REPO_ROOT,
-    SCENARIOS,
-    EvalSession,
-    env_int,
-    eval_models,
-    invariant_errors,
-    make_project,
-    report_dir,
-    run_scenario,
-    summary_table,
-)
 
 from gigacrew.config import Config, load_environment
 from gigacrew.llm.api import ApiProvider
@@ -52,17 +40,15 @@ from gigacrew.llm.model_windows import ModelWindows
 
 pytestmark = [pytest.mark.live, pytest.mark.eval]
 
-ENV = load_environment(REPO_ROOT)
-MODELS = eval_models(ENV)
-RUNS = env_int(ENV, EVAL_RUNS_ENV, DEFAULT_RUNS)
-TIMEOUT = env_int(ENV, EVAL_TIMEOUT_ENV, DEFAULT_TIMEOUT)
+ENV = load_environment(behavior.REPO_ROOT)
+MODELS = behavior.eval_models(ENV)
+RUNS = behavior.env_int(ENV, behavior.EVAL_RUNS_ENV, behavior.DEFAULT_RUNS)
+TIMEOUT = behavior.env_int(ENV, behavior.EVAL_TIMEOUT_ENV, behavior.DEFAULT_TIMEOUT)
 
-CASES = [
+CASES = tuple(
     pytest.param(model, scenario, run, id=f"{model}-{scenario.id}-r{run}")
-    for model in MODELS
-    for scenario in SCENARIOS
-    for run in range(1, RUNS + 1)
-] or [
+    for model, scenario, run in itertools.product(MODELS, behavior.SCENARIOS, range(1, RUNS + 1))
+) or (
     pytest.param(
         None,
         None,
@@ -70,67 +56,75 @@ CASES = [
         id="no-models",
         marks=pytest.mark.skip(reason="не заданы GIGACREW_EVAL_MODELS и GIGACREW_TEST_MODEL"),
     ),
-]
+)
 
-_SESSIONS: list[EvalSession] = []
+# Сессия eval (одна на прогон pytest) — для таблицы итогов в конце модуля.
+_SESSION_KEY = pytest.StashKey[behavior.EvalSession]()
 
 
 @pytest.fixture(scope="session")
-def eval_session():
+def eval_session(request: pytest.FixtureRequest) -> Iterator[behavior.EvalSession]:
     """Конфиг, провайдер и окна моделей — общие для всех прогонов.
 
     Окна читаются до того, как фикстура ``_isolated_home`` подменит домашнюю папку
     (фикстуры сессии создаются раньше фикстур теста).
     """
-    config = Config.load(project_root=REPO_ROOT, trusted_dotenv=True, model=MODELS[0])
+    config = Config.load(project_root=behavior.REPO_ROOT, trusted_dotenv=True, model=MODELS[0])
     if config.provider != "api":
         pytest.skip("eval — для API v2 (GIGACREW_PROVIDER=api)")
     try:
         config.require_credentials()
-    except RuntimeError as e:
-        pytest.skip(f"{e} — eval пропущен")
+    except RuntimeError as error:
+        pytest.skip(f"{error} — eval пропущен")
     windows, _ = ModelWindows.load(base_url=config.base_url)
     provider = ApiProvider(config)
-    session = EvalSession(
+    session = behavior.EvalSession(
         config=config,
         provider=provider,
         windows=windows,
-        directory=report_dir(ENV),
+        directory=behavior.report_dir(ENV),
         models=MODELS,
         runs=RUNS,
-        label=(ENV.get(EVAL_LABEL_ENV) or "").strip(),
+        label=(ENV.get(behavior.EVAL_LABEL_ENV) or "").strip(),
     )
-    _SESSIONS.append(session)
+    request.config.stash.setdefault(_SESSION_KEY, session)
     yield session
     provider.close()
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _summary(request):
+def _summary(request: pytest.FixtureRequest) -> Iterator[None]:
     """После всех прогонов — таблица итогов (вне перехвата вывода pytest)."""
     yield
-    if not _SESSIONS or not _SESSIONS[0].records:
+    session = request.config.stash.get(_SESSION_KEY, None)
+    if session is None or not session.records:
         return
-    session = _SESSIONS[0]
-    lines = ["", f"Отчёт eval: {session.path}", *summary_table(session.records)]
+    lines = ["", f"Отчёт eval: {session.path}", *behavior.summary_table(session.records)]
+    report = "\n".join(lines)
     capture = request.config.pluginmanager.getplugin("capturemanager")
     guard = capture.global_and_fixture_disabled() if capture else contextlib.nullcontext()
     with guard:
-        print("\n".join(lines))
+        sys.stdout.write(f"{report}\n")
 
 
 @pytest.mark.timeout(TIMEOUT)
 @pytest.mark.parametrize(("model", "scenario", "run"), CASES)
-def test_scenario(model, scenario, run, eval_session, tmp_path):
-    root = make_project(tmp_path / "shop")
-    result = run_scenario(
+def test_scenario(
+    model: str,
+    scenario: behavior.Scenario,
+    run: int,
+    eval_session: behavior.EvalSession,
+    tmp_path: Path,
+) -> None:
+    root = behavior.make_project(tmp_path / "shop")
+    outcome = behavior.run_scenario(
         scenario,
         provider=eval_session.provider,
         config=eval_session.config_for(model, scenario, root),
         windows=eval_session.windows,
     )
-    record = eval_session.add(result, run=run)
-    if result.error is not None:
-        raise result.error
-    problems = invariant_errors(scenario, record)
+    record = eval_session.add(outcome, run=run)
+    if outcome.error is not None:
+        raise outcome.error
+    problems = behavior.invariant_errors(scenario, record)
     assert not problems, "; ".join(problems)

@@ -335,7 +335,7 @@ def choose(
         layout=Layout(Window(control, wrap_lines=True, dont_extend_height=True)),
         key_bindings=kb,
         style=prompt_style(),
-        color_depth=prompt_color_depth(no_color),
+        color_depth=prompt_color_depth(no_color=no_color),
         full_screen=False,
         erase_when_done=True,
         **io,

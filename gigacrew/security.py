@@ -32,6 +32,8 @@ __all__ = [
 
 
 class RiskLevel(IntEnum):
+    """Уровень риска операции: от неё зависит, нужно ли подтверждение."""
+
     SAFE = 0  # чтение, поиск — без подтверждения
     WRITE = 1  # изменение ФС (запись/редактирование/коммит)
     DANGEROUS = 2  # потенциально разрушительные команды
@@ -43,11 +45,11 @@ def resolve_in_root(root: Path, path: str | Path) -> Path:
     Возвращает разрешённый Path. Бросает SandboxError, если путь ведёт наружу.
     """
     root = root.resolve()
-    p = Path(path)
-    if not p.is_absolute():
-        p = root / p
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
     # resolve() раскрывает .. и симлинки; strict=False — файла может ещё не быть.
-    resolved = p.resolve()
+    resolved = candidate.resolve()
     if resolved != root and root not in resolved.parents:
         raise SandboxError(
             f"Путь '{path}' выходит за пределы корня проекта ({root}). Операция запрещена.",
@@ -56,7 +58,7 @@ def resolve_in_root(root: Path, path: str | Path) -> Path:
 
 
 # Шаблоны заведомо опасных shell-конструкций.
-_DANGEROUS_PATTERNS = [
+_DANGEROUS_PATTERNS = (
     # rm с флагом -r/-R/-f (в любой позиции и комбинации) или --recursive/--force
     r"\brm\s+(?:\S+\s+)*?-(?:[a-zA-Z]*[rRf][a-zA-Z]*|-recursive|-force)\b",
     r"\bsudo\b",
@@ -77,7 +79,7 @@ _DANGEROUS_PATTERNS = [
     r"\bshutdown\b|\breboot\b",
     r"\bcurl\b|\bwget\b",  # сетевые загрузки запрещены политикой
     r"\bnc\b|\bnetcat\b",
-]
+)
 _DANGEROUS_RE = re.compile("|".join(_DANGEROUS_PATTERNS), re.IGNORECASE)
 
 
@@ -103,9 +105,9 @@ def subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """Окружение для дочернего процесса: без секретов и без интерактива."""
     source = os.environ if environ is None else environ
     env = {
-        k: v
-        for k, v in source.items()
-        if not k.upper().startswith(SECRET_ENV_PREFIXES) and k not in SHELL_ENV_DROP
+        name: setting
+        for name, setting in source.items()
+        if not name.upper().startswith(SECRET_ENV_PREFIXES) and name not in SHELL_ENV_DROP
     }
     env["GIT_TERMINAL_PROMPT"] = "0"  # не спрашивать логин/пароль
     env["GIT_EDITOR"] = "true"  # не открывать редактор (commit без -m)
@@ -115,9 +117,9 @@ def subprocess_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
         count = int(env.get("GIT_CONFIG_COUNT", "0"))
     except ValueError:
         count = 0
-    for key, value in GIT_SAFE_CONFIG:
-        env[f"GIT_CONFIG_KEY_{count}"] = key
-        env[f"GIT_CONFIG_VALUE_{count}"] = value
+    for config_key, config_setting in GIT_SAFE_CONFIG:
+        env[f"GIT_CONFIG_KEY_{count}"] = config_key
+        env[f"GIT_CONFIG_VALUE_{count}"] = config_setting
         count += 1
     env["GIT_CONFIG_COUNT"] = str(count)
     return env

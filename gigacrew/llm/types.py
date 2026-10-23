@@ -61,20 +61,22 @@ class Message(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _legacy_fields(cls, data: Any) -> Any:
-        """Чаты, сохранённые до перехода на API v2: один ``function_call`` и
-        ``functions_state_id`` (состояние старого API в новом не действует).
+    def _legacy_fields(cls, raw: Any) -> Any:
+        """Чаты, сохранённые до перехода на API v2.
+
+        В них один ``function_call`` и ``functions_state_id`` (состояние старого API
+        в новом не действует).
         """
-        if not isinstance(data, Mapping) or (
-            "function_call" not in data and "functions_state_id" not in data
+        if not isinstance(raw, Mapping) or (
+            "function_call" not in raw and "functions_state_id" not in raw
         ):
-            return data
-        data = dict(data)
-        call = data.pop("function_call", None)
-        data.pop("functions_state_id", None)
-        if call is not None and not data.get("function_calls"):
-            data["function_calls"] = [call]
-        return data
+            return raw
+        fields = dict(raw)
+        call = fields.pop("function_call", None)
+        fields.pop("functions_state_id", None)
+        if call is not None and not fields.get("function_calls"):
+            fields["function_calls"] = [call]
+        return fields
 
 
 class ToolSpec(BaseModel):
@@ -82,7 +84,8 @@ class ToolSpec(BaseModel):
 
     name: str
     description: str
-    parameters: dict[str, Any]
+    # Имя поля — термин JSON-schema функции и часть API модуля (``spec.parameters``).
+    parameters: dict[str, Any]  # noqa: WPS110
 
 
 # Имена полей ``usage`` в ответе API v2.
@@ -120,18 +123,18 @@ class Usage(BaseModel):
             if isinstance(details, Mapping) and details.get("cached_tokens") is not None:
                 cached = details["cached_tokens"]
                 break
-        values: dict[str, int] = {}
+        counts: dict[str, int] = {}
         for name in cls.model_fields:
-            value = raw.get(name)
-            if value is None and name in _USAGE_V2_KEYS:
-                value = raw.get(_USAGE_V2_KEYS[name])
-            if value is None and name == "precached_prompt_tokens":
-                value = cached
+            count = raw.get(name)
+            if count is None and name in _USAGE_V2_KEYS:
+                count = raw.get(_USAGE_V2_KEYS[name])
+            if count is None and name == "precached_prompt_tokens":
+                count = cached
             try:
-                values[name] = max(int(value or 0), 0)
+                counts[name] = max(int(count or 0), 0)
             except (TypeError, ValueError):
-                values[name] = 0
-        return cls(**values)
+                counts[name] = 0
+        return cls(**counts)
 
 
 class AssistantTurn(BaseModel):
@@ -143,4 +146,5 @@ class AssistantTurn(BaseModel):
 
     @property
     def wants_tool(self) -> bool:
+        """Модель просит вызвать инструменты."""
         return bool(self.message.function_calls)

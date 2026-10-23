@@ -175,22 +175,28 @@ class SubagentEvents(AgentEvents):
         self._activity(call.name)
 
     @override
-    def on_tool_result(self, call: ToolCallInfo, result: ToolResult, *, previewed: bool) -> None:
-        if result.ok and result.changed:
+    def on_tool_result(
+        self,
+        call: ToolCallInfo,
+        tool_result: ToolResult,
+        *,
+        previewed: bool,
+    ) -> None:
+        if tool_result.ok and tool_result.changed:
             if call.kind is ToolKind.EDIT and call.summary:
                 self.trail.changed_files.append(call.summary)
             else:
                 self.trail.operations.append(f"{call.name} {call.summary}".strip())
-        elif not result.ok and REJECTED_MARK in result.content:
+        elif not tool_result.ok and REJECTED_MARK in tool_result.content:
             self.trail.rejected.append(f"{call.name} {call.summary}".strip())
-        self._parent.on_subagent_tool_result(self._subagent, call, result, previewed=previewed)
+        self._parent.on_subagent_tool_result(self._subagent, call, tool_result, previewed=previewed)
 
     @override
     def on_compact_start(self, *, auto: bool) -> None:
         self._activity("сжимаю контекст")
 
     @override
-    def on_compact_end(self, result: CompactResult | None) -> None:
+    def on_compact_end(self, compacted: CompactResult | None) -> None:
         """Не передаётся: интерфейс остановил бы индикатор суб-агента."""
 
     @override

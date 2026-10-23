@@ -13,10 +13,10 @@ import fnmatch
 import glob
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 from gigacrew.project import files
-from gigacrew.project.files import is_secret_path
 from gigacrew.project.secret_paths import (
     SECRET_DIRS,
     SINKS,
@@ -53,13 +53,15 @@ def is_data_path(path: Path, root: Path) -> bool:
     return Workspace(root).is_data_path(path)
 
 
-def _resolve(root: Path, cwd: str, value: str) -> Scope:
-    if value.startswith("~"):
-        lexical = Path(os.path.expanduser(value))
+def _resolve(root: Path, cwd: str, path_text: str) -> Scope:
+    if path_text.startswith("~"):
+        # Path.expanduser падает на «~неизвестный», os.path.expanduser оставляет как есть.
+        lexical = Path(os.path.expanduser(path_text))  # noqa: PTH111
         return Scope.SECRET_OUTSIDE if is_secret_location(lexical) else Scope.OUTSIDE
-    if value in SINKS:
+    if path_text in SINKS:
         return Scope.SINK
-    return scope_of_path(Path(value) if value.startswith("/") else root / cwd / value, root)
+    lexical_path = Path(path_text) if path_text.startswith("/") else root / cwd / path_text
+    return scope_of_path(lexical_path, root)
 
 
 def _worst(scopes: list[Scope]) -> Scope:
@@ -71,41 +73,45 @@ def _worst(scopes: list[Scope]) -> Scope:
         Scope.SINK,
         Scope.INSIDE,
     ]
-    for s in order:
-        if s in scopes:
-            return s
+    for candidate in order:
+        if candidate in scopes:
+            return candidate
     return Scope.INSIDE
 
 
-def scope(word: Word, *, root: Path, cwd: str = ".") -> Scope:
+# Проверки пути идут подряд, от простых к раскрытию шаблона: так их легче сверять с оболочкой.
+def scope(word: Word, *, root: Path, cwd: str = ".") -> Scope:  # noqa: WPS212
     """Область пути ``word`` для команды, запущенной в ``root/cwd``."""
     if not word.static:
         return Scope.DYNAMIC
-    value = word.value
+    pattern = word.text
     if not word.glob:
-        return _resolve(root, cwd, value)
+        return _resolve(root, cwd, pattern)
     # Шаблон: сегмент, начинающийся с точки, в dash совпадает с «..».
-    if any(seg.startswith(".") and re.search(r"[*?\[]", seg) for seg in value.split("/")):
+    if any(seg.startswith(".") and re.search(r"[*?\[]", seg) for seg in pattern.split("/")):
         return Scope.OUTSIDE
-    if value.startswith(("~", "/")):
-        base_scope = _resolve(root, cwd, value.split("*")[0].rsplit("/", 1)[0] or "/")
+    if pattern.startswith(("~", "/")):
+        base_scope = _resolve(root, cwd, pattern.split("*")[0].rsplit("/", 1)[0] or "/")
         if base_scope != Scope.INSIDE:
-            return Scope.OUTSIDE if base_scope != Scope.SECRET_OUTSIDE else base_scope
+            return base_scope if base_scope == Scope.SECRET_OUTSIDE else Scope.OUTSIDE
     try:
-        matches = glob.glob(value, root_dir=root / cwd)
+        # glob.glob, как оболочка, не находит скрытые файлы по «*», а Path.glob находит.
+        matches = glob.glob(pattern, root_dir=root / cwd)  # noqa: PTH207
     except (OSError, ValueError):
         return Scope.DYNAMIC
     if len(matches) > MAX_GLOB_MATCHES:
         return Scope.DYNAMIC
     if not matches:  # без совпадений шаблон остаётся словом как есть
-        return _resolve(root, cwd, value)
-    return _worst([_resolve(root, cwd, m) for m in matches])
+        return _resolve(root, cwd, pattern)
+    return _worst([_resolve(root, cwd, match) for match in matches])
 
 
-def _walk(directory: Path, limit: int):
-    """Обход дерева целиком, как у ``grep -r`` и ``find``: служебные каталоги (build,
-    node_modules, .venv…) они не пропускают, значит, и проверка не пропускает. Отдаёт
-    (каталог, подкаталоги, файлы); None — дерево больше ``limit`` записей.
+def _walk(directory: Path, limit: int) -> Iterator[tuple[Path, list[str], list[str]] | None]:
+    """Обход дерева целиком, как у ``grep -r`` и ``find``.
+
+    Служебные каталоги (build, node_modules, .venv…) они не пропускают, значит, и проверка
+    не пропускает. Отдаёт (каталог, подкаталоги, файлы); None — дерево больше ``limit``
+    записей.
     """
     seen = 0
     for current, dirs, names in os.walk(directory):
@@ -116,7 +122,8 @@ def _walk(directory: Path, limit: int):
         yield Path(current), dirs, names
 
 
-def has_secrets_under(
+# Обход дерева и проверки найденных файлов — одним циклом, как идёт сама рекурсивная команда.
+def has_secrets_under(  # noqa: WPS231
     directory: Path,
     root: Path,
     *,
@@ -134,14 +141,14 @@ def has_secrets_under(
         if entry is None:
             return True
         current, dirs, names = entry
-        if any(d in SECRET_DIRS for d in dirs):
+        if any(dirname in SECRET_DIRS for dirname in dirs):
             return True
         if ".git" in dirs and _git_config_has_credentials(current / ".git" / "config"):
             return True
         for name in names:
             if name_pattern is not None and not fnmatch.fnmatch(name, name_pattern):
                 continue
-            if is_secret_name(name) or is_secret_path(current / name):
+            if is_secret_name(name) or files.is_secret_path(current / name):
                 return True
     return False
 
@@ -157,7 +164,8 @@ def _git_config_has_credentials(path: Path) -> bool:
         return False
 
 
-def has_escaping_links(
+# Обход дерева и проверки ссылок — одним циклом, как идёт сама рекурсивная команда.
+def has_escaping_links(  # noqa: WPS231
     directory: Path,
     root: Path,
     *,

@@ -47,7 +47,7 @@ READ, EXEC, WRITE, DANGER = (
     CommandLevel.DANGER,
 )
 
-__all__ = ["Env", "classify_simple"]
+__all__ = ["Env", "check_env", "check_read", "check_vars", "check_write", "classify_simple"]
 
 
 @dataclass
@@ -125,9 +125,9 @@ def _split(args: list[Word]) -> tuple[list[Word], list[Word]]:
     for arg in args:
         if rest:
             pos.append(arg)
-        elif arg.static and arg.value == "--":
+        elif arg.static and arg.text == "--":
             rest = True
-        elif arg.static and arg.value.startswith("-") and arg.value != "-":
+        elif arg.static and arg.text.startswith("-") and arg.text != "-":
             flags.append(arg)
         else:
             pos.append(arg)
@@ -138,7 +138,7 @@ def _flagset(flags: list[Word]) -> set[str]:
     """Имена флагов: ``--name`` (без ``=значения``) и буквы сгруппированных ``-abc``."""
     out: set[str] = set()
     for flag in flags:
-        text = flag.value
+        text = flag.text
         if text.startswith("--"):
             out.add(text.split("=", 1)[0])
         else:
@@ -172,7 +172,7 @@ def _options(
     idx = 0
     while idx < len(args):
         arg = args[idx]
-        text = arg.value
+        text = arg.text
         nxt = args[idx + 1] if idx + 1 < len(args) else None
         if not arg.static or not text.startswith("-") or text == "-":
             kept.append(arg)
@@ -232,15 +232,15 @@ def _subcommand(args: list[Word]) -> tuple[str, list[Word]]:
     for idx, arg in enumerate(args):
         if not arg.static:
             return "", args
-        if arg.value.startswith("-") or arg.value.startswith("+"):
+        if arg.text.startswith("-") or arg.text.startswith("+"):
             continue
-        return arg.value, args[idx + 1 :]
+        return arg.text, args[idx + 1 :]
     return "", []
 
 
 def _word_after(args: list[Word], idx: int) -> str:
     """Текст слова после ``args[idx]`` (значение флага); пустая строка — слов больше нет."""
-    return args[idx + 1].value if idx + 1 < len(args) else ""
+    return args[idx + 1].text if idx + 1 < len(args) else ""
 
 
 def _static_next(args: list[Word], idx: int) -> bool:
@@ -264,9 +264,9 @@ def _abbrev(args: list[Word], *names: str, allow: tuple[str, ...] = ()) -> Word 
     """
     flags, _ = _split(args)
     for arg in flags:
-        if not arg.value.startswith("--"):
+        if not arg.text.startswith("--"):
             continue
-        opt = arg.value[2:].split("=", 1)[0]
+        opt = arg.text[2:].split("=", 1)[0]
         if not opt or f"--{opt}" in allow:  # полное имя другого флага (grep --include)
             continue
         for name in names:
@@ -280,7 +280,7 @@ def _abbrev_only(args: list[Word], *names: str, allow: tuple[str, ...] = ()) -> 
     hit = _abbrev(args, *names, allow=allow)
     if hit is None:
         return None
-    return None if hit.value.split("=", 1)[0] in names else hit
+    return None if hit.text.split("=", 1)[0] in names else hit
 
 
 # --------------------------------------------------------------------------- #
@@ -306,7 +306,7 @@ _SYSTEM_INFO = frozenset((
 ))
 
 
-def _check_read(env: Env, words: list[Word], what: str, *, content: bool = True) -> Part | None:
+def check_read(env: Env, words: list[Word], what: str, *, content: bool = True) -> Part | None:
     """Чтение файлов: None — все пути внутри проекта и не секреты.
 
     ``content=False`` — читаются только имена и размеры (ls, du): секретный каталог
@@ -314,7 +314,7 @@ def _check_read(env: Env, words: list[Word], what: str, *, content: bool = True)
     """
     found: list[Part] = []
     for word in words:
-        if word.static and not word.glob and word.value in _SYSTEM_INFO:
+        if word.static and not word.glob and word.text in _SYSTEM_INFO:
             continue
         where = scope(word, root=env.root, cwd=env.cwd)
         if where is Scope.SECRET_OUTSIDE:
@@ -331,7 +331,7 @@ def _check_read(env: Env, words: list[Word], what: str, *, content: bool = True)
     return found[0] if found else None
 
 
-def _check_write(env: Env, words: list[Word], what: str, *, edits: bool = True) -> Part:
+def check_write(env: Env, words: list[Word], what: str, *, edits: bool = True) -> Part:
     """Запись в файлы: WRITE внутри проекта, DANGER — снаружи или в служебные каталоги."""
     parts: list[Part] = []
     for word in words:
@@ -339,13 +339,13 @@ def _check_write(env: Env, words: list[Word], what: str, *, edits: bool = True) 
         if where in {Scope.OUTSIDE, Scope.SECRET_OUTSIDE}:
             return _danger(f"{what}: запись вне проекта ({word.raw})")
         if where is Scope.SINK:
-            if word.value == "/dev/null" and what == "перенаправление":
+            if word.text == "/dev/null" and what == "перенаправление":
                 continue
             return _danger(f"{what}: {word.raw}")
         if where is Scope.DYNAMIC:
             parts.append(_unknown(f"{what}: путь известен только при выполнении ({word.raw})"))
             continue
-        target = Path(word.value) if word.value.startswith("/") else (env.dir / word.value)
+        target = Path(word.text) if word.text.startswith("/") else (env.dir / word.text)
         if is_git_internal(target.resolve(), env.root) or is_git_internal(target, env.root):
             return _danger(
                 f"{what}: служебные файлы git ({word.raw}) — оттуда запускаются программы",
@@ -373,11 +373,11 @@ def _check_recursive(
     pattern: str | None = None,
 ) -> Part | None:
     """Рекурсивное чтение каталогов: секреты и ссылки наружу в дереве — «не знаю»."""
-    bad = _check_read(env, dirs, what)
+    bad = check_read(env, dirs, what)
     if bad is not None:
         return bad
     for word in dirs or [Word(".")]:
-        folder = env.dir if word.glob else (env.dir / word.value).resolve()
+        folder = env.dir if word.glob else (env.dir / word.text).resolve()
         if hidden and has_secrets_under(folder, env.root, name_pattern=pattern):
             return _unknown(f"{what}: в каталоге есть файлы с секретами")
         if has_escaping_links(folder, env.root, name_pattern=pattern) and (follow or hidden):
@@ -390,7 +390,7 @@ def _check_exec_args(env: Env, args: list[Word], what: str) -> Part | None:
     for arg in args:
         if not arg.static:
             return _unknown(f"{what}: аргумент известен только при выполнении ({arg.raw})")
-        text = arg.value
+        text = arg.text
         if text.startswith("--basetemp"):
             return _unknown(f"{what}: --basetemp очищает каталог")
         candidates = [text]
@@ -675,7 +675,7 @@ def _signature_args_ok(signature: str, args: list[Word], env: Env) -> bool:
         arg = args[idx]
         if not arg.static:
             return False
-        text = arg.value
+        text = arg.text
         if rest:
             if after is None or not (
                 text in after or text.split("=", 1)[0] in after or not text.startswith("-")
@@ -774,9 +774,14 @@ _PAGERS = frozenset(("cat", "less", "more", ""))
 _SECRETISH = re.compile(r"KEY|TOKEN|SECRET|PASS|CRED|AUTH|COOKIE|SESSION|PRIVATE", re.IGNORECASE)
 
 
+def _is_assignment(word: Word) -> bool:
+    """Статичное слово ``NAME=value`` (не флаг): присваивание перед программой у ``env``."""
+    return word.static and "=" in word.text and not word.text.startswith("-")
+
+
 def check_env(name: str, word: Word, *, reading: bool) -> Part | None:
     """Префиксное присваивание ``NAME=value cmd`` (или ``export``): None — безвредно."""
-    if name in {"GIT_PAGER", "PAGER"} and word.static and word.value in _PAGERS:
+    if name in {"GIT_PAGER", "PAGER"} and word.static and word.text in _PAGERS:
         return None
     if name == "PYTHONPATH":
         return None  # проверяется у интерпретатора Python
@@ -787,14 +792,14 @@ def check_env(name: str, word: Word, *, reading: bool) -> Part | None:
     return None
 
 
-def _check_vars(env: Env, args: list[Word], what: str) -> Part | None:
+def check_vars(env: Env, args: list[Word], what: str) -> Part | None:
     """Раскрытие переменных в аргументах, которые выводятся (``echo $X``): только известные."""
     for arg in args:
         if arg.static:
             continue
-        if not arg.vars:
+        if not arg.variables:
             return _unknown(f"{what}: аргумент известен только при выполнении ({arg.raw})")
-        for name in arg.vars:
+        for name in arg.variables:
             if name not in SAFE_VARS and not (name in env.assigned and name in arg.plain):
                 return _unknown(f"{what}: переменная ${name} (может быть секретом)")
     return None
@@ -1017,13 +1022,13 @@ def _simple_read(env: Env, name: str, args: list[Word]) -> Part:
         # tree берёт значения букв группы из следующих слов по порядку (`-Lo 2 out`), а не
         # из остатка слова: совпадает с getopt, только если буква со значением — последняя.
         for flag in flags:
-            text = flag.value
+            text = flag.text
             if text.startswith("--"):
                 continue
             if any(f"-{ch}" in _TREE_VALUED for ch in text[1:-1]):
                 return _unknown(f"tree {text}: значения флагов в группе не разобрать")
         if _has(fl, "-o"):
-            return _check_write(env, _flag_values(args, "-o", valued=_TREE_VALUED), "tree -o")
+            return check_write(env, _flag_values(args, "-o", valued=_TREE_VALUED), "tree -o")
         pos = _split(_without_values(args, *_TREE_VALUED))[1]
     if name == "file" and _has(fl, "-C", "--compile"):
         return _unknown("file -C пишет файл")
@@ -1040,9 +1045,7 @@ def _simple_read(env: Env, name: str, args: list[Word]) -> Part:
                 "-s",
                 "--sleep-interval",
             )
-            if not (
-                word.static and (word.value.startswith("-") or word.value.lstrip("+-").isdigit())
-            )
+            if not (word.static and (word.text.startswith("-") or word.text.lstrip("+-").isdigit()))
         ]
         flags = []
     if name == "cut":
@@ -1081,7 +1084,7 @@ def _simple_read(env: Env, name: str, args: list[Word]) -> Part:
             if opt in {"--from-file", "--to-file", "-X", "--exclude-from"}
         ]
         if _has(_flagset(flags), "-r", "-R", "--recursive"):  # содержимое всех файлов дерева
-            bad = _check_read(env, read_values, name) or _check_recursive(env, pos, "diff -r")
+            bad = check_read(env, read_values, name) or _check_recursive(env, pos, "diff -r")
             return _read("diff -r: сравнение каталогов") if bad is None else bad
     if name == "file":
         rest, found = _options(args, ("-m", "--magic-file", "-f", "--files-from", "-F"))
@@ -1093,9 +1096,9 @@ def _simple_read(env: Env, name: str, args: list[Word]) -> Part:
         return _unknown(f"{name} --pager: запускает программу")
     listing = name in {"ls", "dir", "vdir", "du", "stat", "tree", "exa", "eza", "lsd"}
     bad = (
-        _check_read(env, read_values, name)
-        or _check_read(env, pos, name, content=not listing)
-        or _check_vars(env, args, name)
+        check_read(env, read_values, name)
+        or check_read(env, pos, name, content=not listing)
+        or check_vars(env, args, name)
     )
     if bad is not None:
         return bad
@@ -1113,30 +1116,30 @@ def _no_files(env: Env, name: str, args: list[Word]) -> Part:
         if (
             any(opt in {"-s", "--set"} for opt, _ in found)
             or _abbrev(args, "--set", "--file")
-            or any(word.static and word.value[:1].isdigit() for word in _split(rest)[1])
+            or any(word.static and word.text[:1].isdigit() for word in _split(rest)[1])
         ):
             return _unknown("date может установить системное время")
         # date -f ФАЙЛ печатает строки, которые не разобрала, — содержимое файла
-        bad = _check_read(env, [word for opt, word in found if opt in {"-f", "--file"}], "date -f")
+        bad = check_read(env, [word for opt, word in found if opt in {"-f", "--file"}], "date -f")
         if bad is not None:
             return bad
     if name == "dmesg":  # -F ФАЙЛ: вывод файла вместо буфера ядра
-        bad = _check_read(env, _flag_values(args, "-F", "--file"), "dmesg -F")
+        bad = check_read(env, _flag_values(args, "-F", "--file"), "dmesg -F")
         if bad is not None:
             return bad
     if name == "dircolors":  # печатает разобранный файл (и его строки в ошибках)
-        bad = _check_read(env, pos, name)
+        bad = check_read(env, pos, name)
         if bad is not None:
             return bad
     if name == "printenv" and not pos:
         return _unknown("printenv без аргументов выводит всё окружение (там бывают секреты)")
     if name == "printenv":
         for word in pos:
-            if word.value not in SAFE_VARS and _SECRETISH.search(word.value):
-                return _unknown(f"printenv {word.value}: возможно, секрет")
+            if word.text not in SAFE_VARS and _SECRETISH.search(word.text):
+                return _unknown(f"printenv {word.text}: возможно, секрет")
     if name == "kill":
         return _write("kill: завершение процессов")
-    if name == "hostname" and any(arg.static and not arg.value.startswith("-") for arg in pos):
+    if name == "hostname" and any(arg.static and not arg.text.startswith("-") for arg in pos):
         return _unknown("hostname с аргументом меняет имя машины")
     if name == "dmesg" and _has(
         fl,
@@ -1150,7 +1153,7 @@ def _no_files(env: Env, name: str, args: list[Word]) -> Part:
         "-E",
     ):
         return _unknown("dmesg: изменение буфера ядра")
-    bad = _check_vars(env, args, name)
+    bad = check_vars(env, args, name)
     return _read(f"{name}: без побочных эффектов") if bad is None else bad
 
 
@@ -1199,7 +1202,7 @@ def _ps(args: list[Word]) -> Part:
     for arg in args:
         if not arg.static:
             return _unknown("ps: аргумент известен только при выполнении")
-        text = arg.value
+        text = arg.text
         if expect_value:
             expect_value = False
             if re.search(r"env|environ", text, re.IGNORECASE):
@@ -1282,7 +1285,7 @@ def _grep(env: Env, name: str, args: list[Word]) -> Part:
         ),
     )
     if hit is not None:
-        return _unknown(f"{name} {hit.value}: сокращённый флаг")
+        return _unknown(f"{name} {hit.text}: сокращённый флаг")
     rest, found = _options(args, _GREP_VALUED)
     flags, pos = _split(rest)
     fl = _flagset(flags)
@@ -1291,11 +1294,11 @@ def _grep(env: Env, name: str, args: list[Word]) -> Part:
     lists = [
         word for opt, word in found if opt in {"-f", "--file", "--exclude-from", "--include-from"}
     ]
-    bad = _check_read(env, lists, name)
+    bad = check_read(env, lists, name)
     if bad is not None:
         return bad
     recursive = _has(fl, "-r", "-R", "--recursive", "--dereference-recursive") or any(
-        opt in {"-d", "--directories"} and word.value == "recurse" for opt, word in found
+        opt in {"-d", "--directories"} and word.text == "recurse" for opt, word in found
     )
     if recursive:
         bad = _check_recursive(
@@ -1305,20 +1308,20 @@ def _grep(env: Env, name: str, args: list[Word]) -> Part:
             follow=_has(fl, "-R", "--dereference-recursive"),
         )
     else:
-        bad = _check_read(env, paths, name)
+        bad = check_read(env, paths, name)
     return _read(f"{name}: поиск в файлах проекта") if bad is None else bad
 
 
 def _rg(env: Env, name: str, args: list[Word]) -> Part:
     for arg in args:
-        if arg.static and arg.value.split("=", 1)[0] in {
+        if arg.static and arg.text.split("=", 1)[0] in {
             "--pre",
             "--pre-glob",
             "--search-zip",
             "-z",
             "--hostname-bin",
         }:
-            return _unknown(f"{name} {arg.value}: запускает внешние программы")
+            return _unknown(f"{name} {arg.text}: запускает внешние программы")
     value_flags = (
         "-e",
         "--regexp",
@@ -1369,16 +1372,16 @@ def _rg(env: Env, name: str, args: list[Word]) -> Part:
     listing = _has(fl, "--files", "--type-list")
     paths = pos if (has_pattern or listing) else pos[1:]
     files_from = [word for opt, word in found if opt in {"-f", "--file", "--ignore-file"}]
-    bad = _check_read(env, files_from, name)
+    bad = check_read(env, files_from, name)
     if bad is not None:
         return bad
     unrestricted = sum(
-        flag.value.count("u") for flag in flags if re.fullmatch(r"-[a-zA-Z.]+", flag.value)
+        flag.text.count("u") for flag in flags if re.fullmatch(r"-[a-zA-Z.]+", flag.text)
     )
     hidden = _has(fl, "--hidden", "-.") or unrestricted >= 2
     follow = _has(fl, "-L", "--follow")
     if listing:
-        bad = _check_read(env, paths, name)
+        bad = check_read(env, paths, name)
     else:
         bad = _check_recursive(env, paths, name, hidden=hidden, follow=follow)
     return _read(f"{name}: поиск в файлах проекта") if bad is None else bad
@@ -1390,16 +1393,16 @@ _FIND_WRITES = frozenset(("-fprint", "-fprint0", "-fprintf", "-fls"))
 
 def _find_expr_word(word: Word) -> bool:
     """С этого слова начинается выражение find: предикат, скобка, «!» или «,»."""
-    return word.static and (word.value.startswith("-") or word.value in {"(", ")", "!", ","})
+    return word.static and (word.text.startswith("-") or word.text in {"(", ")", "!", ","})
 
 
 def _find_exec_end(word: Word) -> bool:
     """Конец команды -exec/-ok: «;» или «+»."""
-    return word.static and word.value in {";", "+"}
+    return word.static and word.text in {";", "+"}
 
 
 def _find(env: Env, name: str, args: list[Word], classify: Callable[[Command], Part]) -> Part:
-    if any(arg.static and arg.value == "-files0-from" for arg in args):
+    if any(arg.static and arg.text == "-files0-from" for arg in args):
         return _unknown("find -files0-from: каталоги поиска по списку из файла")
     starts: list[Word] = []
     idx = 0
@@ -1415,12 +1418,12 @@ def _find(env: Env, name: str, args: list[Word], classify: Callable[[Command], P
         if not word.static:
             cursor += 1
             continue
-        text = word.value
+        text = word.text
         if text == "-delete":
             return _danger("find -delete: удаление файлов")
         if text in _FIND_WRITES:
             target = expr[cursor + 1 : cursor + 2]
-            parts.append(_check_write(env, target, f"find {text}"))
+            parts.append(check_write(env, target, f"find {text}"))
             cursor += 2
             continue
         if text in _FIND_ACTIONS:
@@ -1428,7 +1431,7 @@ def _find(env: Env, name: str, args: list[Word], classify: Callable[[Command], P
             end = cursor + 1
             while end < len(expr) and not _find_exec_end(expr[end]):
                 # {} — найденный путь: внутри каталогов поиска (они проверены ниже)
-                inner.append(_FOUND if expr[end].value == "{}" else expr[end])
+                inner.append(_FOUND if expr[end].text == "{}" else expr[end])
                 end += 1
             if not inner:
                 return _unknown("find -exec без команды")
@@ -1436,16 +1439,16 @@ def _find(env: Env, name: str, args: list[Word], classify: Callable[[Command], P
             if sub.level is CommandLevel.READ:
                 reads_contents = True
             elif (
-                inner[0].value == "rm"
+                inner[0].text == "rm"
                 and sub.level is not CommandLevel.DANGER
-                and all(not arg.value.startswith("-") for arg in inner[1:] if arg.static)
+                and all(not arg.text.startswith("-") for arg in inner[1:] if arg.static)
             ):
                 sub = _write("find -exec rm: удаление найденных файлов")
             parts.append(sub)
             cursor = end + 1
             continue
         cursor += 1
-    bad = _check_read(env, starts, name)
+    bad = check_read(env, starts, name)
     if bad is not None:
         return bad
     if reads_contents:
@@ -1486,7 +1489,7 @@ def _fd_exec(args: list[Word]) -> int | None:
     idx = 0
     while idx < len(args):
         arg = args[idx]
-        text = arg.value
+        text = arg.text
         if not arg.static or not text.startswith("-") or text == "-":
             idx += 1
             continue
@@ -1519,9 +1522,9 @@ def _under(base: Word, path: Word) -> Word:
     Относительный — от ``base``. Шаблон имён оболочка раскроет от каталога команды — такой
     путь «не знаю».
     """
-    if path.static and not path.glob and path.value.startswith(("/", "~")):
+    if path.static and not path.glob and path.text.startswith(("/", "~")):
         return path
-    joined = posixpath.join(base.value, path.value)
+    joined = posixpath.join(base.text, path.text)
     return Word(joined, joined, static=base.static and path.static and not path.glob)
 
 
@@ -1546,13 +1549,13 @@ def _fd(env: Env, name: str, args: list[Word], classify: Callable[[Command], Par
     if at is not None:
         # Каталоги поиска — до -x/-X: найденные там файлы и прочитает команда.
         dirs = _fd_dirs(args[:at])
-        bad = _check_read(env, dirs, name)
+        bad = check_read(env, dirs, name)
         if bad is not None:
             return bad
         inner = [
-            _FOUND if word.value == "{}" else word
+            _FOUND if word.text == "{}" else word
             for word in args[at + 1 :]
-            if not (word.static and word.value == ";")
+            if not (word.static and word.text == ";")
         ]
         if not inner:
             return _unknown("fd --exec без команды")
@@ -1561,7 +1564,7 @@ def _fd(env: Env, name: str, args: list[Word], classify: Callable[[Command], Par
             return _unknown(f"fd --exec: {sub.reason}") if sub.level is None else sub
         rec = _check_recursive(env, dirs, "fd --exec")
         return _read("fd --exec: чтение найденных файлов") if rec is None else rec
-    bad = _check_read(env, _fd_dirs(args), name)
+    bad = check_read(env, _fd_dirs(args), name)
     return _read(f"{name}: поиск файлов") if bad is None else bad
 
 
@@ -1586,14 +1589,14 @@ def _finder_source(cmd: Command) -> Command | None:
     source = cmd.stdin
     if source is None or source.name is None:
         return None
-    return source if source.name.value in {"find", "fd", "fdfind"} else None
+    return source if source.name.text in {"find", "fd", "fdfind"} else None
 
 
 def _xargs(env: Env, cmd: Command, args: list[Word], classify: Callable[[Command], Part]) -> Part:
     idx = 0
     lists: list[Word] = []  # -a ФАЙЛ: аргументы из файла, а не со stdin
-    while idx < len(args) and args[idx].static and args[idx].value.startswith("-"):
-        text = args[idx].value
+    while idx < len(args) and args[idx].static and args[idx].text.startswith("-"):
+        text = args[idx].text
         name = text.split("=", 1)[0]
         if text in {"-a", "--arg-file"} and idx + 1 < len(args):
             lists.append(args[idx + 1])
@@ -1616,10 +1619,10 @@ def _xargs(env: Env, cmd: Command, args: list[Word], classify: Callable[[Command
             continue
         return _unknown(f"xargs {text}: флаг не проверен")
     inner = args[idx:] or [Word("echo")]
-    bad = _check_read(env, lists, "xargs -a")
+    bad = check_read(env, lists, "xargs -a")
     if bad is not None:
         return bad
-    if inner[0].value in {"echo", "printf"} and len(inner) == 1:
+    if inner[0].text in {"echo", "printf"} and len(inner) == 1:
         return _read("xargs echo")
     # Аргументы приходят со stdin. Если это пути из find/fd по проекту — они начинаются с
     # каталога поиска и не похожи на флаги; иначе известны только при выполнении.
@@ -1627,7 +1630,7 @@ def _xargs(env: Env, cmd: Command, args: list[Word], classify: Callable[[Command
     from_find = finder is not None and classify(finder).level is CommandLevel.READ
     placeholder = _FOUND if from_find else Word("{}", "{}", static=False)
     sub = classify(Command(argv=[*inner, placeholder], cwd=env.cwd))
-    if not from_find and inner[0].static and inner[0].value == "rm":
+    if not from_find and inner[0].static and inner[0].text == "rm":
         # имена известны только при выполнении — как rm по шаблону
         return _danger("xargs rm: удаление файлов по списку, известному при выполнении")
     if sub.level is CommandLevel.READ:
@@ -1674,8 +1677,8 @@ def _sed(env: Env, args: list[Word]) -> Part:
         or _abbrev_only(args, "--expression", "--in-place")
         or any(
             arg.static
-            and re.fullmatch(r"-[a-zA-Z]*f.*", arg.value)
-            and not arg.value.startswith("--")
+            and re.fullmatch(r"-[a-zA-Z]*f.*", arg.text)
+            and not arg.text.startswith("--")
             for arg in args
         )
     ):
@@ -1684,7 +1687,7 @@ def _sed(env: Env, args: list[Word]) -> Part:
     scripts = [word for opt, word in found if opt in {"-e", "--expression"}]
     flags, pos = _split(rest)
     in_place = any(
-        flag.value.startswith(("-i", "--in-place")) or re.match(r"^-[a-zA-Z]*i", flag.value)
+        flag.text.startswith(("-i", "--in-place")) or re.match(r"^-[a-zA-Z]*i", flag.text)
         for flag in flags
     )
     if not scripts:
@@ -1692,13 +1695,13 @@ def _sed(env: Env, args: list[Word]) -> Part:
             return _unknown("sed без скрипта")
         scripts, pos = [pos[0]], pos[1:]
     for script in scripts:
-        if script.static and _sed_runs_commands(script.value):
+        if script.static and _sed_runs_commands(script.text):
             return _danger("sed e: скрипт запускает команды оболочки")
-        if not script.static or not _sed_script_safe(script.value):
+        if not script.static or not _sed_script_safe(script.text):
             return _unknown("sed: скрипт с командами, которые не проверены (w, e, r…)")
     if in_place:  # в том числе -i.bak — с суффиксом резервной копии
-        return _check_write(env, pos, "sed -i")
-    bad = _check_read(env, pos, "sed")
+        return check_write(env, pos, "sed -i")
+    bad = check_read(env, pos, "sed")
     return _read("sed: вывод с заменами") if bad is None else bad
 
 
@@ -1775,35 +1778,35 @@ def _awk(env: Env, args: list[Word]) -> Part:
     given = [word for opt, word in found if opt in {"-v", "--assign"}]
     flags, pos = _split(rest)
     for flag in flags:
-        if not _AWK_OPTION.fullmatch(flag.value):
+        if not _AWK_OPTION.fullmatch(flag.text):
             return _unknown(
-                f"awk: опция {flag.value} — программа или расширения из файла, запись файлов",
+                f"awk: опция {flag.text} — программа или расширения из файла, запись файлов",
             )
     if not pos:
         return _unknown("awk без программы")
     program = pos[0]
-    if program.static and _AWK_COMMANDS.search(program.value):
+    if program.static and _AWK_COMMANDS.search(program.text):
         return _danger("awk: программа запускает команды оболочки")
-    if not program.static or _AWK_UNSAFE.search(program.value) or _awk_redirects(program.value):
+    if not program.static or _AWK_UNSAFE.search(program.text) or _awk_redirects(program.text):
         return _unknown("awk: программа с вызовом команд, записью или окружением")
-    operands = [word for word in pos[1:] if word.static and "=" in word.value]  # var=значение
+    operands = [word for word in pos[1:] if word.static and "=" in word.text]  # var=значение
     assigns = [*given, *operands]
     if any(
-        _AWK_UNSAFE.search(assign.value.partition("=")[0]) for assign in assigns if assign.static
+        _AWK_UNSAFE.search(assign.text.partition("=")[0]) for assign in assigns if assign.static
     ):
         return _unknown("awk: присваивание ARGV, ARGC или переменным окружения")
     files = [word for word in pos[1:] if word not in operands]
-    bad = _check_read(env, files, "awk") or _check_vars(env, given, "awk")
+    bad = check_read(env, files, "awk") or check_vars(env, given, "awk")
     return _read("awk: обработка текста") if bad is None else bad
 
 
 def _jq(env: Env, name: str, args: list[Word]) -> Part:
     if name == "yq" and (
         _has(_flagset(_split(args)[0]), "-i", "--inplace")
-        or any(arg.static and arg.value.startswith("--inplace") for arg in args)
+        or any(arg.static and arg.text.startswith("--inplace") for arg in args)
     ):
         _, pos = _split(args)
-        return _check_write(env, pos[1:], "yq -i")
+        return check_write(env, pos[1:], "yq -i")
     # --arg/--argjson/--rawfile/--slurpfile берут два слова (имя и значение или файл):
     # иначе значение приняли бы за выражение, а настоящее выражение — за файл.
     kept: list[Word] = []
@@ -1811,11 +1814,11 @@ def _jq(env: Env, name: str, args: list[Word]) -> Part:
     idx = 0
     while idx < len(args):
         arg = args[idx]
-        if arg.static and arg.value == "--":
+        if arg.static and arg.text == "--":
             kept.extend(args[idx:])
             break
-        if arg.static and arg.value in {"--arg", "--argjson", "--rawfile", "--slurpfile"}:
-            if arg.value in {"--rawfile", "--slurpfile"}:
+        if arg.static and arg.text in {"--arg", "--argjson", "--rawfile", "--slurpfile"}:
+            if arg.text in {"--rawfile", "--slurpfile"}:
                 files.extend(args[idx + 2 : idx + 3])
             idx += 3
             continue
@@ -1833,12 +1836,12 @@ def _jq(env: Env, name: str, args: list[Word]) -> Part:
         or re.search(
             r"\$ENV|\benv\b|input_filename|\$__loc__|\bload\b|@sh|getpath|\binclude\b|"
             r"\bimport\b",
-            program.value,
+            program.text,
         )
     ):
         return _unknown(f"{name}: выражение читает окружение или файлы")
     paths = pos if has_file_program else pos[1:]
-    bad = _check_read(env, files + paths, name)
+    bad = check_read(env, files + paths, name)
     return _read(f"{name}: обработка JSON") if bad is None else bad
 
 
@@ -1868,22 +1871,22 @@ def _sort(env: Env, args: list[Word]) -> Part:
     )
     out = [word for opt, word in found if opt in {"-o", "--output"}]
     _, pos = _split(rest)
-    bad = _check_read(env, pos, "sort")
+    bad = check_read(env, pos, "sort")
     if bad is not None:
         return bad
     if out:
-        return _check_write(env, out, "sort -o")
+        return check_write(env, out, "sort -o")
     return _read("sort: сортировка")
 
 
 def _uniq(env: Env, args: list[Word]) -> Part:
     rest = _without_values(args, "-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars")
     _, pos = _split(rest)
-    bad = _check_read(env, pos[:1], "uniq")
+    bad = check_read(env, pos[:1], "uniq")
     if bad is not None:
         return bad
     if len(pos) > 1:
-        return _check_write(env, pos[1:2], "uniq: файл вывода")
+        return check_write(env, pos[1:2], "uniq: файл вывода")
     return _read("uniq")
 
 
@@ -1905,11 +1908,11 @@ def _xxd(env: Env, args: list[Word]) -> Part:
         clusters=False,
     )
     _, pos = _split(rest)
-    bad = _check_read(env, pos[:1], "xxd")
+    bad = check_read(env, pos[:1], "xxd")
     if bad is not None:
         return bad
     if len(pos) > 1:
-        return _check_write(env, pos[1:2], "xxd: файл вывода")
+        return check_write(env, pos[1:2], "xxd: файл вывода")
     return _read("xxd")
 
 
@@ -1923,26 +1926,26 @@ def _base64(env: Env, args: list[Word]) -> Part:
     out = [word for opt, word in found if opt in {"-o", "--output"}]
     _, pos = _split(rest)
     inputs = [word for opt, word in found if opt in {"-i", "--input"}]
-    bad = _check_read(env, pos + inputs, "base64")
+    bad = check_read(env, pos + inputs, "base64")
     if bad is not None:
         return bad
-    return _check_write(env, out, "base64 -o") if out else _read("base64")
+    return check_write(env, out, "base64 -o") if out else _read("base64")
 
 
 def _tee(env: Env, args: list[Word]) -> Part:
     _, pos = _split(args)
     if not pos:
         return _read("tee: только вывод")
-    return _check_write(env, pos, "tee")
+    return check_write(env, pos, "tee")
 
 
 def _less(env: Env, name: str, args: list[Word]) -> Part:
     for arg in args:
         if not arg.static:
             continue
-        if arg.value.startswith("+") and ("!" in arg.value or "|" in arg.value):
-            return _danger(f"{name} {arg.value}: запуск команды оболочки")
-        if arg.value.startswith("+") or arg.value.split("=", 1)[0] in {
+        if arg.text.startswith("+") and ("!" in arg.text or "|" in arg.text):
+            return _danger(f"{name} {arg.text}: запуск команды оболочки")
+        if arg.text.startswith("+") or arg.text.split("=", 1)[0] in {
             "-o",
             "-O",
             "--log-file",
@@ -1951,9 +1954,9 @@ def _less(env: Env, name: str, args: list[Word]) -> Part:
             "--lesskey-file",
             "--lesskey-src",
         }:
-            return _unknown(f"{name} {arg.value}: команда или запись файла")
+            return _unknown(f"{name} {arg.text}: команда или запись файла")
     _, pos = _split(args)
-    bad = _check_read(env, pos, name)
+    bad = check_read(env, pos, name)
     return _read(f"{name}: просмотр") if bad is None else bad
 
 
@@ -1970,7 +1973,7 @@ def _rm(env: Env, args: list[Word]) -> Part:
     for word in pos:
         if word.glob:
             return _danger(f"rm {word.raw}: удаление по шаблону")
-    return _check_write(env, pos, "rm: удаление файла", edits=False)
+    return check_write(env, pos, "rm: удаление файла", edits=False)
 
 
 def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
@@ -1981,7 +1984,7 @@ def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
         return _unknown(f"{name} без файлов")
     sources, dest = (pos, target_dir) if target_dir else (pos[:-1], pos[-1:])
     if name == "cp":
-        bad = _check_read(env, sources, name)
+        bad = check_read(env, sources, name)
         if bad is not None:
             return (
                 _unknown(
@@ -1991,10 +1994,10 @@ def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
                 else bad
             )
     else:
-        moved = _check_write(env, sources, name)
+        moved = check_write(env, sources, name)
         if moved.level is not CommandLevel.WRITE:
             return moved
-    return _check_write(env, dest, name)
+    return check_write(env, dest, name)
 
 
 # Флаги со значением у каждой программы: общий список сдвигал бы позиционные (у touch
@@ -2049,11 +2052,11 @@ def _simple_write(env: Env, name: str, args: list[Word]) -> Part:
     edits = name in {"mkdir", "touch", "ln", "install", "dos2unix", "unix2dos", "truncate"}
     target_dir = [word for opt, word in found if opt in {"-t", "--target-directory"}]
     if name == "install" and target_dir:  # install -t КАТАЛОГ файлы… — копирование, как cp -t
-        bad = _check_read(env, pos, name)
+        bad = check_read(env, pos, name)
         if bad is not None:
             return _unknown(f"install: {bad.reason}") if bad.level is None else bad
-        return _check_write(env, target_dir, name, edits=edits)
-    return _check_write(env, pos, name, edits=edits)
+        return check_write(env, target_dir, name, edits=edits)
+    return check_write(env, pos, name, edits=edits)
 
 
 def _ln(env: Env, args: list[Word]) -> Part:
@@ -2068,9 +2071,9 @@ def _ln(env: Env, args: list[Word]) -> Part:
         if where != Scope.INSIDE:
             return _danger(f"ln: ссылка на {target.raw} — вне проекта или секреты")
     if target_dir:  # ln -t КАТАЛОГ цели… — ссылки создаются в КАТАЛОГЕ
-        return _check_write(env, target_dir, "ln", edits=True)
-    links = pos[1:] or [Word(Path(pos[0].value).name)]  # `ln цель` — ссылка в каталоге команды
-    return _check_write(env, links, "ln", edits=True)
+        return check_write(env, target_dir, "ln", edits=True)
+    links = pos[1:] or [Word(Path(pos[0].text).name)]  # `ln цель` — ссылка в каталоге команды
+    return check_write(env, links, "ln", edits=True)
 
 
 def _chmod(env: Env, args: list[Word]) -> Part:
@@ -2080,14 +2083,14 @@ def _chmod(env: Env, args: list[Word]) -> Part:
         return _danger("chmod -R")
     if not pos:
         return _unknown("chmod без аргументов")
-    mode = pos[0].value if pos[0].static else ""
+    mode = pos[0].text if pos[0].static else ""
     if (
         not mode
         or re.search(r"[st]|777|[0-7]?[0-7][0-7][2367]$|^[1-7][0-7]{3}$", mode)
         or _chmod_world_writable(mode)
     ):
         return _danger(f"chmod {mode}: права для всех или setuid")
-    return _check_write(env, pos[1:], "chmod")
+    return check_write(env, pos[1:], "chmod")
 
 
 def _chmod_world_writable(mode: str) -> bool:
@@ -2167,11 +2170,11 @@ def _tar_old_style(args: list[Word]) -> list[Word]:
     Буквы первого слова — флаги без «-»; значения букв со значением — следующие слова по
     порядку (``tar xfC a.tar dir``).
     """
-    if not args or not args[0].static or not args[0].value.isalpha():
+    if not args or not args[0].static or not args[0].text.isalpha():
         return args
     out: list[Word] = []
     rest = list(args[1:])
-    for ch in args[0].value:
+    for ch in args[0].text:
         flag = f"-{ch}"
         out.append(Word(flag, args[0].raw))
         if flag in _TAR_VALUED and rest:
@@ -2195,16 +2198,16 @@ def _tar(env: Env, args: list[Word]) -> Part:
         "--exclude-from",
     )
     if hit is not None:
-        return _danger(f"tar {hit.value}: запуск программы или файлы вне проекта")
+        return _danger(f"tar {hit.text}: запуск программы или файлы вне проекта")
     if _abbrev_only(args, "--file", "--directory", "--extract", "--create", "--list"):
         return _unknown("tar: сокращённый флаг")
     for arg in args:
         if arg.static and re.match(
             r"^--(to-command|use-compress-program|checkpoint-action|"
             r"info-script|new-volume-script|rsh-command|rmt-command)",
-            arg.value,
+            arg.text,
         ):
-            return _danger(f"tar {arg.value}: запуск программы")
+            return _danger(f"tar {arg.text}: запуск программы")
     rest, found = _options(_tar_old_style(args), _TAR_VALUED)
     flags, pos = _split(rest)
     fl = _flagset(flags)
@@ -2216,25 +2219,25 @@ def _tar(env: Env, args: list[Word]) -> Part:
     archive = [word for opt, word in found if opt in {"-f", "--file"}]
     directory = [word for opt, word in found if opt in {"-C", "--directory"}]
     if _has(fl, "-t", "--list"):
-        bad = _check_read(env, archive, "tar -t")
+        bad = check_read(env, archive, "tar -t")
         return _read("tar: список файлов архива") if bad is None else bad
     if _has(fl, "-x", "--extract", "--get"):
-        bad = _check_read(env, archive, "tar -x")
+        bad = check_read(env, archive, "tar -x")
         if bad is not None:
             return bad
-        return _check_write(env, directory or [Word(".")], "tar -x: распаковка", edits=False)
+        return check_write(env, directory or [Word(".")], "tar -x: распаковка", edits=False)
     if _has(fl, "-c", "-r", "-u", "-A", "--create", "--append", "--update", "--concatenate"):
         # Каталоги читаются целиком (как grep -r), файлы после -C — от его каталога.
-        bad = _check_read(env, directory, "tar -C")
+        bad = check_read(env, directory, "tar -C")
         if bad is not None:
             return bad
         for base in (Word("."), *directory):
-            rel = os.path.relpath((env.dir / base.value).resolve(), env.root)
+            rel = os.path.relpath((env.dir / base.text).resolve(), env.root)
             bad = _check_recursive(replace(env, cwd=rel), pos, "tar -c")
             if bad is not None:
                 return bad
-        target = [word for word in archive if word.value != "-"]
-        return _check_write(env, target, "tar -c: архив") if target else _read("tar -c в stdout")
+        target = [word for word in archive if word.text != "-"]
+        return check_write(env, target, "tar -c: архив") if target else _read("tar -c в stdout")
     return _unknown("tar: режим не распознан")
 
 
@@ -2243,12 +2246,12 @@ def _zip_family(env: Env, name: str, args: list[Word]) -> Part:
     fl = _flagset(flags)
     if name == "unzip":
         if _has(fl, "-l", "-v", "-Z", "-t", "-z", "-p"):
-            bad = _check_read(env, pos[:1], name)
+            bad = check_read(env, pos[:1], name)
             return _read("unzip: просмотр архива") if bad is None else bad
-        bad = _check_read(env, pos[:1], name)
+        bad = check_read(env, pos[:1], name)
         if bad is not None:
             return bad
-        return _check_write(
+        return check_write(
             env,
             _flag_values(args, "-d", valued=("-P",)) or [Word(".")],
             "unzip: распаковка",
@@ -2259,10 +2262,10 @@ def _zip_family(env: Env, name: str, args: list[Word]) -> Part:
             return _danger("zip -T/-TT: запуск программы")
         if not pos:
             return _unknown("zip без архива")
-        bad = _check_read(env, pos[1:], name)
+        bad = check_read(env, pos[1:], name)
         if bad is not None:
             return bad
-        return _check_write(env, pos[:1], "zip: архив")
+        return check_write(env, pos[:1], "zip: архив")
     # gzip, bzip2, xz, zstd и обратные
     if _has(fl, "-c", "--stdout", "-l", "--list", "-t", "--test", "-k", "--keep") and _has(
         fl,
@@ -2273,11 +2276,11 @@ def _zip_family(env: Env, name: str, args: list[Word]) -> Part:
         "-t",
         "--test",
     ):
-        bad = _check_read(env, pos, name)
+        bad = check_read(env, pos, name)
         return _read(f"{name}: в stdout") if bad is None else bad
     if not pos:
         return _read(f"{name}: stdin → stdout")
-    return _check_write(env, pos, f"{name}: сжатие на месте", edits=False)
+    return check_write(env, pos, f"{name}: сжатие на месте", edits=False)
 
 
 _PATCH_VALUED = (
@@ -2315,7 +2318,7 @@ def _patch(env: Env, args: list[Word]) -> Part:
     flags, pos = _split(rest)
     fl = _flagset(flags)
     inputs = [word for opt, word in found if opt in {"-i", "--input"}]
-    bad = _check_read(env, inputs + pos[1:], "patch")
+    bad = check_read(env, inputs + pos[1:], "patch")
     if bad is not None:
         return bad
     if any(opt in {"-B", "--prefix", "-Y", "--basename-prefix"} for opt, _ in found):
@@ -2325,27 +2328,27 @@ def _patch(env: Env, args: list[Word]) -> Part:
     outputs = [
         word
         for opt, word in found
-        if opt in {"-o", "--output", "-r", "--reject-file"} and word.value != "-"
+        if opt in {"-o", "--output", "-r", "--reject-file"} and word.text != "-"
     ]
     dirs = [word for opt, word in found if opt in {"-d", "--directory"}]
     written = [*(dirs or [Word(".")]), *outputs, *pos[:1]]
-    return _check_write(env, written, "patch: правка файлов", edits=True)
+    return check_write(env, written, "patch: правка файлов", edits=True)
 
 
 def _dd_operands(args: list[Word], key: str) -> list[Word]:
     """Пути из операндов dd ``key=ПУТЬ`` (``if=``, ``of=``)."""
-    given = [arg for arg in args if arg.value.startswith(key)]
-    return [Word(arg.value[len(key) :], arg.raw, arg.static, arg.glob) for arg in given]
+    given = [arg for arg in args if arg.text.startswith(key)]
+    return [Word(arg.text[len(key) :], arg.raw, arg.static, arg.glob) for arg in given]
 
 
 def _dd(env: Env, args: list[Word]) -> Part:
     src = _dd_operands(args, "if=")
     dst = _dd_operands(args, "of=")
     # Запись — первой: `dd if=/dev/zero of=/dev/sda` опасна, каким бы ни был источник.
-    written = _check_write(env, dst, "dd of=", edits=False) if dst else None
+    written = check_write(env, dst, "dd of=", edits=False) if dst else None
     if written is not None and written.level is CommandLevel.DANGER:
         return written
-    bad = _check_read(env, src, "dd")
+    bad = check_read(env, src, "dd")
     if bad is not None:
         return bad
     return _read("dd: в stdout") if written is None else written
@@ -2476,8 +2479,8 @@ _DEPLOY = re.compile(r"deploy|publish|release|upload|prod\b|production", re.IGNO
 
 def _formatter(env: Env, name: str, args: list[Word]) -> Part:
     flags, pos = _split(args)
-    names = {flag.value.split("=", 1)[0] for flag in flags}
-    names.update(word.value for word in pos[:1])  # подкоманда: `biome check`
+    names = {flag.text.split("=", 1)[0] for flag in flags}
+    names.update(word.text for word in pos[:1])  # подкоманда: `biome check`
     write_flags = _FORMATTER_WRITE_FLAGS.get(name)
     if write_flags is not None:
         if not any(option in write_flags for option in names):
@@ -2608,7 +2611,7 @@ def _npm(env: Env, name: str, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
     pre = _before_sub(args, rest)
     if not sub:
-        if args and args[0].static and args[0].value in {"-v", "--version"}:
+        if args and args[0].static and args[0].text in {"-v", "--version"}:
             return _read(f"{name} --version")
         return _unknown(f"{name}: подкоманда не распознана")
     if sub in _NPM_DANGER:
@@ -2669,13 +2672,13 @@ def _local_bin(env: Env, tool: str) -> bool:
 
 def _npx(env: Env, args: list[Word], classify: Callable[[Command], Part]) -> Part:
     rest = list(args)
-    while rest and rest[0].static and rest[0].value.startswith("-"):
-        if rest[0].value in {"-p", "--package", "-c", "--call"}:
+    while rest and rest[0].static and rest[0].text.startswith("-"):
+        if rest[0].text in {"-p", "--package", "-c", "--call"}:
             return _unknown("npx с пакетом или командой")
         rest = rest[1:]
     if not rest or not rest[0].static:
         return _unknown("npx без команды")
-    tool = rest[0].value
+    tool = rest[0].text
     if not _local_bin(env, tool):
         return _net(f"npx {tool}: пакет не установлен в проекте — будет загружен")
     sub = classify(Command(argv=rest, cwd=env.cwd))
@@ -2727,7 +2730,7 @@ _CARGO_DANGER = frozenset(("publish", "yank", "login", "logout", "owner"))
 def _cargo(env: Env, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
     pre = _before_sub(args, rest)  # `cargo --config=build.rustc-wrapper=… test`
-    if not sub and args and args[0].static and args[0].value in {"--version", "-V"}:
+    if not sub and args and args[0].static and args[0].text in {"--version", "-V"}:
         return _read("cargo --version")
     if sub in _CARGO_DANGER:
         return _danger(f"cargo {sub}: публикация")
@@ -2758,7 +2761,7 @@ def _cargo(env: Env, args: list[Word]) -> Part:
 def _go(env: Env, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
     if sub in {"version", "env", "list", "doc", "help"}:
-        if sub == "env" and any(arg.static and arg.value == "-w" for arg in rest):
+        if sub == "env" and any(arg.static and arg.text == "-w" for arg in rest):
             return _write("go env -w: изменение настроек")
         return _read(f"go {sub}: сведения")
     if sub in {"build", "test", "run", "vet", "tool"}:
@@ -2787,9 +2790,9 @@ def _make_jobs(args: list[Word]) -> list[Word]:
     while idx < len(args):
         arg = args[idx]
         nxt = args[idx + 1] if idx + 1 < len(args) else None
-        if nxt is not None and arg.static and nxt.static and _jobs_value(arg.value, nxt.value):
-            sep = "=" if arg.value.startswith("--") else ""
-            out.append(Word(f"{arg.value}{sep}{nxt.value}", arg.raw))
+        if nxt is not None and arg.static and nxt.static and _jobs_value(arg.text, nxt.text):
+            sep = "=" if arg.text.startswith("--") else ""
+            out.append(Word(f"{arg.text}{sep}{nxt.text}", arg.raw))
             idx += 2
             continue
         out.append(arg)
@@ -2814,16 +2817,16 @@ def _make(env: Env, args: list[Word]) -> Part:
     )
     dirs = [word for opt, word in found if opt in {"-C", "--directory"}]
     makefiles = [word for opt, word in found if opt in {"-f", "--file", "--makefile"}]
-    bad = _check_read(env, dirs + makefiles, "make")
+    bad = check_read(env, dirs + makefiles, "make")
     if bad is not None:
         return bad
     _flags, pos = _split(rest)
-    targets = [word.value for word in pos if word.static and "=" not in word.value]
+    targets = [word.text for word in pos if word.static and "=" not in word.text]
     if any(not word.static for word in pos):
         return _unknown("make: цель известна только при выполнении")
-    assigned = [word for word in pos if "=" in word.value]
+    assigned = [word for word in pos if "=" in word.text]
     for assign in assigned:
-        var_name = assign.value.split("=", 1)[0]
+        var_name = assign.text.split("=", 1)[0]
         if _DANGER_ENV.match(var_name) or var_name in {"SHELL", "MAKE"}:
             return _danger(f"make {var_name}=…: подмена программ")
     bad = _check_exec_args(env, assigned, "make")  # `make test PYTHON=/tmp/x/python`
@@ -2845,7 +2848,7 @@ def _make(env: Env, args: list[Word]) -> Part:
     if (
         not _signature_args_ok(
             "make",
-            [arg for arg in rest if not (arg.static and arg.value in targets)],
+            [arg for arg in rest if not (arg.static and arg.text in targets)],
             env,
         )
         or dirs
@@ -2886,7 +2889,7 @@ _JVM_EXEC = frozenset((
 
 def _jvm(env: Env, name: str, args: list[Word]) -> Part:
     flags, pos = _split(args)
-    goals = [word.value for word in pos if word.static and not word.value.startswith("-D")]
+    goals = [word.text for word in pos if word.static and not word.text.startswith("-D")]
     if not goals:
         if _has(_flagset(flags), "-v", "--version", "-version"):
             return _read(f"{name} --version")
@@ -2907,7 +2910,7 @@ def _jvm(env: Env, name: str, args: list[Word]) -> Part:
 def _dotnet(env: Env, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
     if sub in {"--version", "--info", "--list-sdks", "--list-runtimes"} or (
-        not sub and args and args[0].value in {"--version", "--info"}
+        not sub and args and args[0].text in {"--version", "--info"}
     ):
         return _read("dotnet: сведения")
     if sub in {"build", "test", "run", "publish", "pack", "msbuild", "vstest"}:
@@ -2929,7 +2932,7 @@ _PY_TOOLS_NET = frozenset(("install", "uninstall", "download", "wheel"))
 def _pip(env: Env, name: str, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
     if not sub:
-        if args and args[0].static and args[0].value in {"--version", "-V"}:
+        if args and args[0].static and args[0].text in {"--version", "-V"}:
             return _read(f"{name} --version")
         return _unknown(f"{name}: подкоманда не распознана")
     if sub in {"list", "show", "freeze", "check", "inspect", "help", "debug"}:
@@ -2975,7 +2978,7 @@ def _py_project_tool(
     sub, rest = _subcommand(args)
     pre = _before_sub(args, rest)  # `uv --directory=/другой/проект run pytest`
     if not sub:
-        if args and args[0].static and args[0].value in {"--version", "-V", "version"}:
+        if args and args[0].static and args[0].text in {"--version", "-V", "version"}:
             return _read(f"{name} --version")
         return _unknown(f"{name}: подкоманда не распознана")
     if sub == "run":  # uv/poetry/pdm/hatch run, conda/mamba/micromamba run
@@ -2996,7 +2999,7 @@ def _py_project_tool(
             "--group",
             "--package",
         )
-        while inner and inner[0].static and inner[0].value.startswith("-"):
+        while inner and inner[0].static and inner[0].text.startswith("-"):
             inner = inner[1:]
         if not inner:
             return _unknown(f"{name} run без команды")
@@ -3008,7 +3011,7 @@ def _py_project_tool(
         flagged = bool(pre) or len(inner) != len(rest)
         if any(
             arg.static
-            and arg.value.split("=", 1)[0]
+            and arg.text.split("=", 1)[0]
             in {"--with", "--with-requirements", "--with-editable", "--from"}
             for arg in rest
         ):
@@ -3093,14 +3096,14 @@ def _py_tool_config(name: str, rest: list[Word]) -> Part:
         "--delete",
         "--edit",
         "-e",
-    ) or (pos[:1] and pos[0].value in {"set", "unset", "update", "restore", "edit", "init"})
+    ) or (pos[:1] and pos[0].text in {"set", "unset", "update", "restore", "edit", "init"})
     if writes or len(pos) > 1:  # `poetry config ключ значение`
         return _write(f"{name} config: изменение настроек")
     return _read(f"{name} config: просмотр настроек")
 
 
 def _first(words: list[Word]) -> str | None:
-    return words[0].value.rsplit("/", 1)[-1] if words and words[0].static else None
+    return words[0].text.rsplit("/", 1)[-1] if words and words[0].static else None
 
 
 # --------------------------------------------------------------------------- #
@@ -3229,11 +3232,11 @@ def _git(env: Env, args: list[Word]) -> Part:
         arg = args[cursor]
         if not arg.static:
             return _unknown("git: аргумент известен только при выполнении")
-        text = arg.value
+        text = arg.text
         if not text.startswith("-"):
             break
         if text == "-c" and cursor + 1 < len(args):
-            key = args[cursor + 1].value.split("=", 1)[0]
+            key = args[cursor + 1].text.split("=", 1)[0]
             if not args[cursor + 1].static or _GIT_DANGER_CFG.match(key):
                 return _danger(f"git -c {key}: настройка запускает программы")
             return _unknown(f"git -c {key}: настройка на один запуск не проверена")
@@ -3241,7 +3244,7 @@ def _git(env: Env, args: list[Word]) -> Part:
             target = args[cursor + 1]
             if scope(target, root=env.root, cwd=env.cwd) is not Scope.INSIDE:
                 return _unknown(f"git -C {target.raw}: каталог вне проекта")
-            env = replace(env, cwd=os.path.relpath((env.dir / target.value).resolve(), env.root))
+            env = replace(env, cwd=os.path.relpath((env.dir / target.text).resolve(), env.root))
             cursor += 2
             continue
         if text in {"--no-pager", "-P", "--no-optional-locks", "--version"}:
@@ -3252,15 +3255,15 @@ def _git(env: Env, args: list[Word]) -> Part:
         return _unknown(f"git {text}: глобальный флаг не проверен")
     if cursor >= len(args):
         return _read("git: справка")
-    sub, rest = args[cursor].value, args[cursor + 1 :]
+    sub, rest = args[cursor].text, args[cursor + 1 :]
     if any(not word.static for word in rest):
         dynamic_ok = sub in _GIT_READ and all(
             word.static or not _looks_like_path(word.raw) for word in rest
         )
         if not dynamic_ok:
             return _unknown(f"git {sub}: аргумент известен только при выполнении")
-    static_args = [word.value for word in rest if word.static]
-    fl = _flagset([word for word in rest if word.static and word.value.startswith("-")])
+    static_args = [word.text for word in rest if word.static]
+    fl = _flagset([word for word in rest if word.static and word.text.startswith("-")])
     hit = _abbrev(
         rest,
         "--output",
@@ -3277,10 +3280,10 @@ def _git(env: Env, args: list[Word]) -> Part:
         "--config-env",
         "--template",
     )
-    if hit is not None and hit.value.split("=", 1)[0] not in {"--output", "--output-directory"}:
-        return _unknown(f"git {sub} {hit.value}: запуск программ или чужие каталоги")
-    if hit is not None and hit.value.split("=", 1)[0] != "--output" and sub != "format-patch":
-        return _unknown(f"git {sub} {hit.value}: сокращённый флаг")
+    if hit is not None and hit.text.split("=", 1)[0] not in {"--output", "--output-directory"}:
+        return _unknown(f"git {sub} {hit.text}: запуск программ или чужие каталоги")
+    if hit is not None and hit.text.split("=", 1)[0] != "--output" and sub != "format-patch":
+        return _unknown(f"git {sub} {hit.text}: сокращённый флаг")
     for token in static_args:
         name = token.split("=", 1)[0]
         if (
@@ -3293,7 +3296,7 @@ def _git(env: Env, args: list[Word]) -> Part:
             if not written:
                 idx = static_args.index(token)
                 written = [Word(static_args[idx + 1])] if idx + 1 < len(static_args) else []
-            return _check_write(env, written, f"git {sub} --output", edits=False)
+            return check_write(env, written, f"git {sub} --output", edits=False)
         if name in {
             "--ext-diff",
             "--exec",
@@ -3316,7 +3319,7 @@ def _git(env: Env, args: list[Word]) -> Part:
             if sub == "grep"
             else _flag_values(rest, "--contents", valued=("-L", "-S"))
         )
-        bad = _check_read(env, files, f"git {sub}")
+        bad = check_read(env, files, f"git {sub}")
         if bad is not None:
             return bad
     if sub in _GIT_READ:
@@ -3324,7 +3327,7 @@ def _git(env: Env, args: list[Word]) -> Part:
         # ~/.ssh/id_rsa /dev/null`), поэтому пути проверяются и без флага.
         if sub == "diff" or (sub == "grep" and "--no-index" in fl):
             paths = [Word(arg_text) for arg_text in static_args if not arg_text.startswith("-")]
-            bad = _check_read(env, paths if sub == "diff" else paths[1:], f"git {sub}")
+            bad = check_read(env, paths if sub == "diff" else paths[1:], f"git {sub}")
             if bad is not None:
                 return bad
         if sub == "fsck" and any(arg_text.startswith("--lost-found") for arg_text in static_args):
@@ -3532,7 +3535,7 @@ def _git_change(env: Env, sub: str, rest: list[Word], static_args: list[str], fl
             return _danger(f"git worktree {action}")
         targets = [Word(arg_text) for arg_text in positional[1:2]]
         return (
-            _check_write(env, targets, f"git worktree {action}", edits=False)
+            check_write(env, targets, f"git worktree {action}", edits=False)
             if targets
             else _write(f"git worktree {action}")
         )
@@ -3554,12 +3557,12 @@ def _git_change(env: Env, sub: str, rest: list[Word], static_args: list[str], fl
         return _danger("git switch -f/-C: незакоммиченные правки или ветка будут потеряны")
     if sub == "bundle" and positional[:1] == ["create"]:
         bundle = [Word(arg_text) for arg_text in positional[1:2]]
-        return _check_write(env, bundle, "git bundle create")
+        return check_write(env, bundle, "git bundle create")
     if sub in {"fetch", "pull", "clone", "submodule", "lfs", "ls-remote"}:
         if sub == "clone":
             dest = [Word(arg_text) for arg_text in positional[1:2]]
             if dest:
-                bad = _check_write(env, dest, "git clone")
+                bad = check_write(env, dest, "git clone")
                 if bad.level is CommandLevel.DANGER:
                     return bad
         return _write(f"git {sub}: обращение к удалённому репозиторию")
@@ -3765,7 +3768,7 @@ def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
         arg = args[idx]
         if not arg.static:
             return _unknown(f"{prog}: аргумент известен только при выполнении")
-        text = arg.value
+        text = arg.text
         if text in {"--version", "-V", "-VV", "--help", "-h"}:
             return _read(f"{prog} --version")
         if text == "-":
@@ -3840,8 +3843,8 @@ def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
             if level is CommandLevel.EXEC:
                 return _exec_tool(env, module_args, f"python -m {module}", signature)
             if level is CommandLevel.READ:
-                operands = [word for word in module_args if not word.value.startswith("-")]
-                bad = _check_read(env, operands, f"python -m {module}") if module_args else None
+                operands = [word for word in module_args if not word.text.startswith("-")]
+                bad = check_read(env, operands, f"python -m {module}") if module_args else None
                 if bad is not None:
                     return bad
                 return _combine(_read(f"python -m {module}"), trust)
@@ -3849,12 +3852,12 @@ def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
                 return _unknown(f"python -m {module}")
             return Part(level, f"python -m {module}")
         if module == "json.tool":
-            files = [word for word in module_args if not word.value.startswith("-")]
-            bad = _check_read(env, files[:1], "python -m json.tool")
+            files = [word for word in module_args if not word.text.startswith("-")]
+            bad = check_read(env, files[:1], "python -m json.tool")
             if bad is not None:
                 return bad
             if len(files) > 1:
-                return _check_write(env, files[1:2], "python -m json.tool: файл вывода")
+                return check_write(env, files[1:2], "python -m json.tool: файл вывода")
             return _combine(_read("python -m json.tool"), trust)
         if (env.dir / Path(*module.split("."))).with_suffix(".py").exists() or (
             env.dir / Path(*module.split(".")) / "__main__.py"
@@ -3917,7 +3920,7 @@ def _pythonpath_dirs(env: Env, cmd: Command) -> tuple[tuple[Path, ...], Part | N
         if name == "PYTHONPATH":
             if not word.static:
                 return (), _unknown("PYTHONPATH известен только при выполнении")
-            sources.append(word.value)
+            sources.append(word.text)
     dirs: list[Path] = []
     for source in sources:
         for entry in source.split(os.pathsep):
@@ -3939,17 +3942,17 @@ def _stdin_code(cmd: Command) -> str | None:
     src = cmd.stdin
     if src is None or src.name is None or not src.name.static:
         return None
-    name = src.name.value
+    name = src.name.text
     if (
         name == "echo"
         and all(arg.static for arg in src.args)
-        and not any(arg.value.startswith("-") for arg in src.args)
+        and not any(arg.text.startswith("-") for arg in src.args)
     ):
-        return " ".join(arg.value for arg in src.args)
+        return " ".join(arg.text for arg in src.args)
     if name == "printf" and len(src.args) == 1:
         template = src.args[0]
-        if template.static and "%" not in template.value and "\\" not in template.value:
-            return template.value
+        if template.static and "%" not in template.text and "\\" not in template.text:
+            return template.text
     if name == "cat" and not src.args and src.heredoc is not None and src.heredoc.body_static:
         return src.heredoc.body
     return None
@@ -3961,9 +3964,9 @@ _SHELLS = frozenset(("sh", "bash", "zsh", "dash", "ksh", "ash", "fish", "mksh", 
 def _shell(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
     flags = []
     idx = 0
-    while idx < len(args) and args[idx].static and args[idx].value.startswith(("-", "+")):
-        flags.append(args[idx].value)
-        if args[idx].value in {"-o", "+o", "-O", "+O"}:
+    while idx < len(args) and args[idx].static and args[idx].text.startswith(("-", "+")):
+        flags.append(args[idx].text)
+        if args[idx].text in {"-o", "+o", "-O", "+O"}:
             idx += 1
         idx += 1
     rest = args[idx:]
@@ -3977,18 +3980,18 @@ def _shell(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
             return _danger(f"{prog} -c: команда известна только при выполнении")
         if env.nested is None or env.depth >= 3:
             return _unknown(f"{prog} -c: слишком глубокая вложенность")
-        return env.nested(rest[0].value, replace(env, depth=env.depth + 1))
+        return env.nested(rest[0].text, replace(env, depth=env.depth + 1))
     if rest:
         script = rest[0]
         if scope(script, root=env.root, cwd=env.cwd) is not Scope.INSIDE:
             return _unknown(f"{prog} {script.raw}: скрипт вне проекта")
-        if _DEPLOY.search(script.value):
+        if _DEPLOY.search(script.text):
             return _danger(f"{prog} {script.raw}: похоже на развёртывание или публикацию")
         return _exec_tool(
             env,
             rest[1:],
             f"{prog} {script.raw}: скрипт проекта",
-            f"{prog} {script.value}",
+            f"{prog} {script.text}",
         )
     # Команды со stdin: heredoc или конвейер.
     doc = cmd.heredoc
@@ -4003,7 +4006,7 @@ def _shell(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
 def _source(env: Env, args: list[Word]) -> Part:
     if not args or not args[0].static:
         return _unknown("source: файл известен только при выполнении")
-    target = env.dir / args[0].value
+    target = env.dir / args[0].text
     if scope(args[0], root=env.root, cwd=env.cwd) is not Scope.INSIDE:
         return _unknown(f"source {args[0].raw}: файл вне проекта")
     if target.name in {"activate", "activate.sh"} and _venv_root(target) is not None:
@@ -4158,7 +4161,7 @@ def _remote_cli(env: Env, name: str, args: list[Word]) -> Part:
 
     Чтение — обращение к сети («не знаю»), изменение — опасно.
     """
-    words = [arg.value for arg in args if arg.static and not arg.value.startswith("-")]
+    words = [arg.text for arg in args if arg.static and not arg.text.startswith("-")]
     if name in {"gh", "glab", "hub"}:
         return _gh(name, args, words)
     # У kubectl/helm/terraform глагол — первое слово; у облаков — после сервиса и ресурса.
@@ -4172,7 +4175,7 @@ def _remote_cli(env: Env, name: str, args: list[Word]) -> Part:
                     else (_unknown("terraform plan: обращение к облаку"))
                 )
             return _danger(f"{name} {verb}: изменение удалённой инфраструктуры")
-    if args and args[0].static and args[0].value in {"--version", "version", "-v"}:
+    if args and args[0].static and args[0].text in {"--version", "version", "-v"}:
         return _read(f"{name} --version")
     return _unknown(f"{name}: обращение к удалённому сервису")
 
@@ -4195,12 +4198,12 @@ def _gh(name: str, args: list[Word], words: list[str]) -> Part:
     """gh/glab: просмотр — обращение к сети («не знаю»), изменение — опасно."""
     group = words[0] if words else ""
     action = words[1] if len(words) > 1 else ""
-    if group in {"--version", "version"} or (args and args[0].value == "--version"):
+    if group in {"--version", "version"} or (args and args[0].text == "--version"):
         return _read(f"{name} --version")
     if group == "api":
         writes = any(
             arg.static
-            and arg.value.split("=", 1)[0]
+            and arg.text.split("=", 1)[0]
             in {"-X", "--method", "-f", "-F", "--field", "--raw-field", "--input"}
             for arg in args
         )
@@ -4237,7 +4240,7 @@ def _docker(env: Env, name: str, args: list[Word]) -> Part:
             return _read(f"{name} compose {action}")
         if action == "logs":
             return _read(f"{name} compose logs")
-        if action == "down" and any(arg.value in {"-v", "--volumes", "--rmi"} for arg in more):
+        if action == "down" and any(arg.text in {"-v", "--volumes", "--rmi"} for arg in more):
             return _danger("docker compose down -v: удаление томов")
         if action == "config":
             return _unknown("docker compose config: выводит переменные (секреты)")
@@ -4260,7 +4263,7 @@ def _docker(env: Env, name: str, args: list[Word]) -> Part:
         "stats",
         "search",
     }:
-        if sub == "stats" and not any(arg.value == "--no-stream" for arg in rest):
+        if sub == "stats" and not any(arg.text == "--no-stream" for arg in rest):
             return _read(f"{name} stats")
         return _read(f"{name} {sub}: сведения")
     if sub in {
@@ -4285,11 +4288,11 @@ def _docker(env: Env, name: str, args: list[Word]) -> Part:
         return _danger(f"{name} {sub}: удаление, публикация или настройка")
     if sub in {"run", "exec", "create"}:
         risky = [
-            arg.value
+            arg.text
             for arg in rest
             if arg.static
             and (
-                arg.value.startswith((
+                arg.text.startswith((
                     "--privileged",
                     "--pid=host",
                     "--network=host",
@@ -4302,12 +4305,12 @@ def _docker(env: Env, name: str, args: list[Word]) -> Part:
                     "--volume=/",
                     "--mount",
                 ))
-                or arg.value.startswith("/:")
+                or arg.text.startswith("/:")
             )
         ]
         vols = _flag_values(rest, "-v", "--volume", valued=_DOCKER_VALUED)
         if risky or any(
-            vol.value.startswith(("/", "~")) and not vol.value.startswith(str(env.root))
+            vol.text.startswith(("/", "~")) and not vol.text.startswith(str(env.root))
             for vol in vols
         ):
             return _danger(f"{name} {sub}: доступ к хосту из контейнера")
@@ -4327,7 +4330,7 @@ _DB_DANGER = re.compile(
 
 
 def _db(env: Env, name: str, args: list[Word]) -> Part:
-    text = " ".join(arg.value for arg in args)
+    text = " ".join(arg.text for arg in args)
     if _DB_DANGER.search(text):
         return _danger(f"{name}: изменение данных базы")
     return _unknown(f"{name}: обращение к базе данных")
@@ -4387,7 +4390,7 @@ def _program(env: Env, word: Word) -> tuple[str, Part | None]:
 
     Вторая часть — оценка, если путь к программе особый (файл проекта, неизвестный каталог).
     """
-    text = word.value
+    text = word.text
     if "/" not in text:
         return text, None
     if text.startswith("~"):  # оболочка раскроет в домашний каталог — вне проекта
@@ -4429,23 +4432,23 @@ def _unwrap(name: str, args: list[Word]) -> list[Word] | None:
     """Аргументы-команда обёртки (``timeout 10 pytest`` → ``pytest``); None — не обёртка."""
     rest = list(args)
     if name == "timeout":
-        while rest and rest[0].static and rest[0].value.startswith("-"):
-            if rest[0].value in {"-s", "--signal", "-k", "--kill-after"} and len(rest) > 1:
+        while rest and rest[0].static and rest[0].text.startswith("-"):
+            if rest[0].text in {"-s", "--signal", "-k", "--kill-after"} and len(rest) > 1:
                 rest = rest[2:]
             else:
                 rest = rest[1:]
         return rest[1:]  # длительность
     if name == "nice":
-        while rest and rest[0].static and rest[0].value.startswith("-"):
-            rest = rest[2:] if rest[0].value in {"-n", "--adjustment"} else rest[1:]
+        while rest and rest[0].static and rest[0].text.startswith("-"):
+            rest = rest[2:] if rest[0].text in {"-n", "--adjustment"} else rest[1:]
         return rest
     if name == "stdbuf":
-        while rest and rest[0].static and rest[0].value.startswith("-"):
-            rest = rest[1:] if len(rest[0].value) > 2 else rest[2:]
+        while rest and rest[0].static and rest[0].text.startswith("-"):
+            rest = rest[1:] if len(rest[0].text) > 2 else rest[2:]
         return rest
     if name == "time":
-        while rest and rest[0].static and rest[0].value.startswith("-"):
-            rest = rest[2:] if rest[0].value in {"-o", "-f"} else rest[1:]
+        while rest and rest[0].static and rest[0].text.startswith("-"):
+            rest = rest[2:] if rest[0].text in {"-o", "-f"} else rest[1:]
         return rest
     return rest
 
@@ -4459,8 +4462,8 @@ def _env_options(args: list[Word]) -> list[Word] | None:
     (подмена argv[0]), BSD ``-P`` (свой PATH) и незнакомые опции — «не знаю».
     """
     rest = list(args)
-    while rest and rest[0].static and rest[0].value.startswith("-"):
-        text = rest[0].value
+    while rest and rest[0].static and rest[0].text.startswith("-"):
+        text = rest[0].text
         rest = rest[1:]
         if text == "--":
             break
@@ -4498,8 +4501,8 @@ def classify_simple(cmd: Command, env: Env) -> Part:
     if not name_word.static:
         return _danger("имя программы получается при выполнении — разбор не видит, что запустится")
     prog, special = _program(env, name_word)
-    if "/" in name_word.value and special is None:
-        env = replace(env, program_path=str(Path(os.path.normpath(env.dir / name_word.value))))
+    if "/" in name_word.text and special is None:
+        env = replace(env, program_path=str(Path(os.path.normpath(env.dir / name_word.text))))
     args = cmd.argv[1:]
     classify = partial(_classify_nested, cmd, env)
     if special is None:
@@ -4558,7 +4561,7 @@ def _glob_injection(env: Env, args: list[Word]) -> str | None:
         try:
             # Шаблон бывает абсолютным, а совпадения нужны строками, как раскроет оболочка:
             # Path.glob не принимает абсолютных шаблонов.
-            matches = glob.glob(arg.value, root_dir=env.dir)  # noqa: PTH207
+            matches = glob.glob(arg.text, root_dir=env.dir)  # noqa: PTH207
         except (OSError, ValueError):
             return arg.raw
         if any(
@@ -4576,7 +4579,7 @@ def _dispatch(
     classify: Callable[[Command], Part],
 ) -> Part:
     if prog in _WRAPPERS:
-        if prog == "command" and args and args[0].static and args[0].value in {"-v", "-V"}:
+        if prog == "command" and args and args[0].static and args[0].text in {"-v", "-V"}:
             return _read("command -v")
         if prog == "exec" and not args:
             return _unknown("exec без команды")
@@ -4589,10 +4592,8 @@ def _dispatch(
         if rest is None:
             return _unknown("env: опция меняет каталог, программу или разбор команды")
         assigns: list[tuple[str, Word]] = []
-        while (
-            rest and rest[0].static and "=" in rest[0].value and not rest[0].value.startswith("-")
-        ):
-            var_name, _, var_value = rest[0].value.partition("=")
+        while rest and _is_assignment(rest[0]):
+            var_name, _, var_value = rest[0].text.partition("=")
             assigns.append((var_name, Word(var_value)))
             rest = rest[1:]
         if not rest:
@@ -4611,7 +4612,7 @@ def _dispatch(
             and re.fullmatch(
                 r"[-+][euxvfCnhbmBHPo]+|pipefail|errexit|nounset|"
                 r"xtrace|noclobber|--",
-                arg.value,
+                arg.text,
             )
             for arg in args
         ):
@@ -4694,13 +4695,13 @@ def _dispatch(
         "fzf",
     }:
         if prog == "top" and any(
-            arg.static and re.match(r"^-[a-zA-Z]*b", arg.value) for arg in args
+            arg.static and re.match(r"^-[a-zA-Z]*b", arg.text) for arg in args
         ):
             return _read("top -b")
         if prog == "ulimit" and (
             not args
             or all(
-                arg.static and arg.value in {"-a", "-n", "-s", "-u", "-v", "-H", "-S"}
+                arg.static and arg.text in {"-a", "-n", "-s", "-u", "-v", "-H", "-S"}
                 for arg in args
             )
         ):
@@ -4745,7 +4746,7 @@ def _dispatch(
     if prog == "ps":
         return _ps(args)
     if prog == "tr":
-        bad = _check_vars(env, args, "tr")
+        bad = check_vars(env, args, "tr")
         return _read("tr") if bad is None else bad
     if prog == "tee":
         return _tee(env, args)
@@ -4779,25 +4780,25 @@ def _dispatch(
             rest, found = _options(args, ("-f", "-t", "--from-code", "--to-code", "-o", "--output"))
             out = [word for opt, word in found if opt in {"-o", "--output"}]
             _, pos = _split(rest)
-            bad = _check_read(env, pos, "iconv")
+            bad = check_read(env, pos, "iconv")
             if bad is not None:
                 return bad
-            return _check_write(env, out, "iconv -o") if out else _read("iconv")
+            return check_write(env, out, "iconv -o") if out else _read("iconv")
         if prog in {"rmdir", "unlink", "trash", "trash-put"}:
             _, pos = _split(args)
             if not pos:
                 return _unknown(f"{prog} без аргументов")
-            return _check_write(env, pos, f"{prog}: удаление", edits=False)
+            return check_write(env, pos, f"{prog}: удаление", edits=False)
         return _simple_write(env, prog, args)
     if prog == "ln":
         return _ln(env, args)
     if prog == "chmod":
         return _chmod(env, args)
     if prog in {"chown", "chgrp"}:
-        if any(arg.static and arg.value in {"-R", "--recursive"} for arg in args):
+        if any(arg.static and arg.text in {"-R", "--recursive"} for arg in args):
             return _danger(f"{prog} -R")
         _, pos = _split(args)
-        return _check_write(env, pos[1:], prog, edits=False) if len(pos) > 1 else _unknown(prog)
+        return check_write(env, pos[1:], prog, edits=False) if len(pos) > 1 else _unknown(prog)
     if prog == "tar":
         return _tar(env, args)
     if prog in {
@@ -4825,7 +4826,7 @@ def _dispatch(
         return _dd(env, args)
     if prog in {"kill", "pkill"}:
         if prog == "pkill" or any(
-            arg.static and arg.value in {"-9", "-KILL", "-SIGKILL", "-1", "1", "0", "-0"}
+            arg.static and arg.text in {"-9", "-KILL", "-SIGKILL", "-1", "1", "0", "-0"}
             for arg in args
         ):
             return _danger(f"{prog}: принудительное завершение процессов")
@@ -4835,7 +4836,7 @@ def _dispatch(
     if prog in _NETWORK_READ:
         return _unknown(f"{prog}: сетевая диагностика")
     if prog in {"systemctl", "service", "journalctl", "crontab", "launchctl"}:
-        words = [arg.value for arg in args if arg.static]
+        words = [arg.text for arg in args if arg.static]
         if (
             prog == "journalctl"
             or (
@@ -4855,20 +4856,18 @@ def _dispatch(
         return _unknown(f"openssl {sub}: ключи, сертификаты или сеть")
     if prog == "rsync":
         _, pos = _split(args)
-        if any(":" in word.value for word in pos if word.static) or any(
-            arg.value.startswith(("--rsh", "-e", "--rsync-path")) for arg in args if arg.static
+        if any(":" in word.text for word in pos if word.static) or any(
+            arg.text.startswith(("--rsh", "-e", "--rsync-path")) for arg in args if arg.static
         ):
             return _danger("rsync на удалённый хост")
         if any(
-            arg.value.startswith(("--delete", "--remove-source-files"))
-            for arg in args
-            if arg.static
+            arg.text.startswith(("--delete", "--remove-source-files")) for arg in args if arg.static
         ):
             return _danger("rsync --delete: удаление файлов")
-        bad = _check_read(env, pos[:-1], "rsync")
+        bad = check_read(env, pos[:-1], "rsync")
         if bad is not None:
             return bad
-        return _check_write(env, pos[-1:], "rsync", edits=False)
+        return check_write(env, pos[-1:], "rsync", edits=False)
     if prog == "git":
         return _git(env, args)
     if prog in {"python", "python3", "python2", "pypy", "pypy3", "ipython", "py"} or re.fullmatch(
@@ -4968,12 +4967,12 @@ def _dispatch(
     }:
         return _build_cli(env, prog, args)
     if prog == "cmake":
-        if any(arg.static and arg.value in {"--install", "-P"} for arg in args):
+        if any(arg.static and arg.text in {"--install", "-P"} for arg in args):
             return _unknown("cmake --install/-P")
-        if any(arg.static and arg.value == "--build" for arg in args):
+        if any(arg.static and arg.text == "--build" for arg in args):
             return _exec_tool(env, args, "cmake --build", "cmake --build")
-        if any(arg.static and arg.value in {"--version", "--help", "-E"} for arg in args):
-            if any(arg.value == "-E" for arg in args if arg.static):
+        if any(arg.static and arg.text in {"--version", "--help", "-E"} for arg in args):
+            if any(arg.text == "-E" for arg in args if arg.static):
                 return _unknown("cmake -E: команды файловой системы")
             return _read("cmake --version")
         return _exec_tool(env, args, "cmake: настройка сборки", "cmake")
@@ -4981,14 +4980,14 @@ def _dispatch(
         if (
             args
             and args[0].static
-            and args[0].value in {"--version", "-V", "-v", "version"}
+            and args[0].text in {"--version", "-V", "-v", "version"}
             and len(args) == 1
         ):
             return _read(f"{prog} --version")
         if prog in {"eslint", "stylelint", "rubocop", "standardrb", "swiftlint", "ktlint"} and any(
             arg.static
-            and arg.value in {"--fix", "-a", "-A", "--autocorrect", "-F", "--format"}
-            and arg.value != "--format"
+            and arg.text in {"--fix", "-a", "-A", "--autocorrect", "-F", "--format"}
+            and arg.text != "--format"
             for arg in args
         ):
             return _write(f"{prog} --fix: правка файлов", edits=True)
@@ -4999,7 +4998,7 @@ def _dispatch(
             if sub in {"erase", "html", "xml", "json", "lcov", "combine", "annotate"}:
                 return _write(f"coverage {sub}: файлы отчёта", edits=True)
         if prog in {"tox", "nox"} and any(
-            arg.static and arg.value in {"-l", "--list", "--listenvs"} for arg in args
+            arg.static and arg.text in {"-l", "--list", "--listenvs"} for arg in args
         ):
             return _read(f"{prog} --list")
         if prog == "deno":
@@ -5072,7 +5071,7 @@ def _dispatch(
             _, pos = _split(args)
             database = pos[0] if pos and pos[0].static else None
             if database is not None and scope(database, root=env.root, cwd=env.cwd) is Scope.INSIDE:
-                sql = " ".join(word.value for word in pos[1:])
+                sql = " ".join(word.text for word in pos[1:])
                 if (
                     sql
                     and not _DB_DANGER.search(sql)
@@ -5100,10 +5099,10 @@ def _editor_shell_command(args: list[Word]) -> bool:
         if not arg.static:
             continue
         command = None
-        if arg.value.startswith("+"):
-            command = arg.value[1:]
-        elif arg.value in {"-c", "--cmd"} and idx + 1 < len(args):
-            command = args[idx + 1].value
+        if arg.text.startswith("+"):
+            command = arg.text[1:]
+        elif arg.text in {"-c", "--cmd"} and idx + 1 < len(args):
+            command = args[idx + 1].text
         if command is not None and re.search(r"!|\bsystem\s*\(|\bterm", command):
             return True
     return False
@@ -5112,13 +5111,13 @@ def _editor_shell_command(args: list[Word]) -> bool:
 def _deno(env: Env, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
     if not sub:
-        if args and args[0].static and args[0].value in {"--version", "-V", "-v"}:
+        if args and args[0].static and args[0].text in {"--version", "-V", "-v"}:
             return _read("deno --version")
         return _unknown("deno без подкоманды")
     if sub in {"test", "lint", "check", "bench", "doc", "info", "coverage"}:
         return _exec_tool(env, rest, f"deno {sub}", f"deno {sub}")
     if sub == "fmt":
-        if any(arg.static and arg.value == "--check" for arg in rest):
+        if any(arg.static and arg.text == "--check" for arg in rest):
             return _exec_tool(env, rest, "deno fmt --check", "deno fmt --check")
         return _write("deno fmt: форматирование", edits=True)
     if sub in {"run", "task", "serve"}:
@@ -5148,15 +5147,11 @@ def _script_runner(
     args: list[Word],
     classify: Callable[[Command], Part],
 ) -> Part:
-    if (
-        args
-        and args[0].static
-        and args[0].value in {"--version", "-v", "-V", "-version", "version"}
-    ):
+    if args and args[0].static and args[0].text in {"--version", "-v", "-V", "-version", "version"}:
         return _read(f"{prog} --version")
     flags, pos = _split(args)
     for flag in flags:
-        if flag.value in {
+        if flag.text in {
             "-e",
             "-E",
             "--eval",
@@ -5172,18 +5167,18 @@ def _script_runner(
             "-n",
             "--command",
             "-Command",
-        } or flag.value.startswith(("-e", "--eval", "-pi", "-r")):
-            return _unknown(f"{prog} {flag.value}: код в командной строке не проверяется")
+        } or flag.text.startswith(("-e", "--eval", "-pi", "-r")):
+            return _unknown(f"{prog} {flag.text}: код в командной строке не проверяется")
     if not pos:
         return _unknown(f"{prog}: код со stdin")
     script = pos[0]
-    if prog == "java" and any(arg.value == "-jar" for arg in flags):
+    if prog == "java" and any(arg.text == "-jar" for arg in flags):
         script = _flag_values(args, "-jar")[0] if _flag_values(args, "-jar") else script
     if scope(script, root=env.root, cwd=env.cwd) is not Scope.INSIDE:
         return _unknown(f"{prog} {script.raw}: скрипт вне проекта или неизвестен")
-    if _DEPLOY.search(script.value):
+    if _DEPLOY.search(script.text):
         return _danger(f"{prog} {script.raw}: похоже на развёртывание")
-    return _exec_tool(env, pos[1:], f"{prog} {script.raw}: код проекта", f"{prog} {script.value}")
+    return _exec_tool(env, pos[1:], f"{prog} {script.raw}: код проекта", f"{prog} {script.text}")
 
 
 _BUILD_CLI_EXEC = frozenset((
@@ -5209,7 +5204,7 @@ _BUILD_CLI_EXEC = frozenset((
 def _build_cli(env: Env, prog: str, args: list[Word]) -> Part:
     sub, rest = _subcommand(args)
     if not sub:
-        if args and args[0].static and args[0].value in {"--version", "-v", "-V", "version"}:
+        if args and args[0].static and args[0].text in {"--version", "-v", "-V", "version"}:
             return _read(f"{prog} --version")
         return _unknown(f"{prog}: без подкоманды")
     if sub in {

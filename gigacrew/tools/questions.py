@@ -15,12 +15,16 @@ from gigacrew.errors import ToolError
 
 @dataclass(frozen=True)
 class QuestionOption:
+    """Вариант ответа: короткая метка и пояснение."""
+
     label: str  # короткий вариант
     description: str = ""  # что означает выбор, последствия
 
 
 @dataclass(frozen=True)
 class Question:
+    """Вопрос пользователю с вариантами ответа и пунктом «свой ответ»."""
+
     text: str
     options: tuple[QuestionOption, ...]
     header: str = ""  # короткая метка темы («База данных»)
@@ -48,7 +52,8 @@ AskUser = Callable[[Sequence[Question]], "list[Answer] | None"]
 class QuestionsUnavailableError(ToolError):
     """Спросить некого: одноразовый режим без терминала, ввод не с клавиатуры."""
 
-    def __init__(self, reason: str = "нет интерактивного пользователя"):
+    def __init__(self, reason: str = "нет интерактивного пользователя") -> None:
+        """Сообщение для модели: почему спросить нельзя и что делать вместо этого."""
         super().__init__(
             f"Нельзя задать вопрос: {reason}. Прими разумное решение сам и перечисли "
             "сделанные допущения в ответе.",

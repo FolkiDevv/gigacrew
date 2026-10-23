@@ -90,7 +90,7 @@ class ChatInfo:
 class SavedChat:
     """Сохранённый чат: метаданные и диалог."""
 
-    info: ChatInfo
+    meta: ChatInfo
     conversation: Conversation
 
 
@@ -294,8 +294,8 @@ class ChatStore:
         return self._migration_notices(legacy, report)
 
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def new_id(now: datetime | None = None) -> str:
+    @classmethod
+    def new_id(cls, now: datetime | None = None) -> str:
         """Id сортируется по времени создания; суффикс — от коллизий чатов одной секунды."""
         stamp = (now or _now()).strftime(_ID_TIME_FORMAT)
         suffix = secrets.token_hex(4)
@@ -411,14 +411,14 @@ class ChatStore:
             raise ChatStoreError("не указан id чата")
         ids = [path.stem for path in self._files()]
         if ref in ids:
-            return self.load(ref).info
+            return self.load(ref).meta
         matches = [chat_id for chat_id in ids if chat_id.startswith(ref)]
         if not matches:
             raise ChatStoreError(f"чат {ref} не найден")
         if len(matches) > 1:
             shown = ", ".join(matches[:5])
             raise ChatStoreError(f"под «{ref}» подходит несколько чатов: {shown}")
-        return self.load(matches[0]).info
+        return self.load(matches[0]).meta
 
     # ------------------------------------------------------------------ #
     def _path(self, chat_id: str) -> Path:
