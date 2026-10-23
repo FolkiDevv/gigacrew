@@ -266,7 +266,7 @@ class GigaCodeProvider(HttpProvider):
         if self._catalogue is None:
             self._load_config()
         elif self.request_hook is None:
-            self._token = load_token(self._token_file, self._config_url)
+            self._token = load_token(self._token_file)
 
     @override
     def list_models(self) -> list[str]:
@@ -345,7 +345,7 @@ class GigaCodeProvider(HttpProvider):
     def _current_token(self) -> Token:
         """Действующий токен: в памяти, а истёк или его нет — заново из файла."""
         if self._token is None or self._token.expired():
-            self._token = load_token(self._token_file, self._config_url)
+            self._token = load_token(self._token_file)
         return self._token
 
     def _reload_rejected(self, rejected: Token) -> Token:
@@ -354,7 +354,7 @@ class GigaCodeProvider(HttpProvider):
         Там тот же токен — :class:`ApiError` с просьбой пройти авторизацию заново.
         """
         self._token = None
-        token = load_token(self._token_file, self._config_url)
+        token = load_token(self._token_file)
         if token.access_token == rejected.access_token:
             raise ApiError(f"GigaCode не принял токен (401): {login_hint(self._token_file)}")
         self._token = token

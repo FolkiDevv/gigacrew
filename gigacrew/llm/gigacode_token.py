@@ -9,13 +9,10 @@ gigacrew сам не входит в бэкенд: токен выдаёт оф�
 
 Формат файла::
 
-    {"version": 1, "token": {"accessToken": "…", "expiresAtUnixMs": 1.7e12,
-        "configEndpoint": "https://…/api/v2/config", "authBundle": …, "resourceUrl": …}}
+    {"token": "…", "expiryDate": 1792744173568}
 
-Нужны ``accessToken`` и срок ``expiresAtUnixMs`` (unix-время в миллисекундах; нет —
-токен действует, пока бэкенд не ответит 401). ``configEndpoint`` — адрес конфигурации
-бэкенда, для которого выдан токен: не совпадает с адресом из ``GIGACREW_API_URL`` —
-ошибка, токен на чужой бэкенд не уходит. ``authBundle`` и ``resourceUrl`` не нужны.
+Нужен ``token``; ``expiryDate`` — срок (unix-время в миллисекундах; нет — токен
+действует, пока бэкенд не ответит 401). Прочие поля игнорируются.
 """
 
 from __future__ import annotations
@@ -33,7 +30,6 @@ from gigacrew.llm.transport import ApiError
 
 # Имя файла с токеном, а не сам пароль.
 TOKEN_FILE = "gigacode_token.json"  # noqa: S105
-FORMAT_VERSION = 1
 EXPIRY_MARGIN = 60.0  # с: токен считается истёкшим заранее
 _TOKEN = re.compile(r"[\x21-\x7e]+")  # печатный ASCII без пробелов
 
@@ -44,7 +40,6 @@ class Token:
 
     access_token: str
     expires_at: float | None = None
-    config_endpoint: str | None = None  # для какого бэкенда выдан (None — не указано)
 
     def expired(self, now: float | None = None) -> bool:
         """Истёк ли (за :data:`EXPIRY_MARGIN` до срока — уже да)."""
@@ -70,53 +65,28 @@ def login_hint(path: Path) -> str:
     return f"пройдите авторизацию в GigaCode — gigacrew возьмёт новый токен из {path}"
 
 
-def _token_entry(document: Any) -> Mapping[str, Any]:
-    """Запись ``token`` из содержимого файла; некорректное — ``ValueError`` с причиной."""
-    if not isinstance(document, Mapping):
-        # ValueError, а не TypeError: load_token превращает его в просьбу авторизоваться.
-        raise ValueError("не JSON-объект")  # noqa: TRY004
-    if document.get("version") != FORMAT_VERSION:
-        raise ValueError(f"неизвестная версия формата: {document.get('version')!r}")
-    entry = document.get("token")
-    if not isinstance(entry, Mapping):
-        # ValueError, а не TypeError: load_token превращает его в просьбу авторизоваться.
-        raise ValueError("нет записи token")  # noqa: TRY004
-    return entry
-
-
-def _expires_ms(entry: Mapping[str, Any]) -> float | None:
-    """Срок ``expiresAtUnixMs`` записи (None — не указан); некорректный — ``ValueError``."""
-    expires_ms = entry.get("expiresAtUnixMs")
+def _expires_ms(document: Mapping[str, Any]) -> float | None:
+    """Срок ``expiryDate`` (None — не указан); некорректный — ``ValueError``."""
+    expires_ms = document.get("expiryDate")
     if expires_ms is not None and (
         isinstance(expires_ms, bool)
         or not isinstance(expires_ms, int | float)
         or not math.isfinite(expires_ms)
     ):
-        raise ValueError(f"некорректный expiresAtUnixMs: {expires_ms!r}")
+        raise ValueError(f"некорректный expiryDate: {expires_ms!r}")
     return expires_ms
-
-
-def _config_endpoint(entry: Mapping[str, Any]) -> str | None:
-    """``configEndpoint`` записи (None — не указан); некорректный — ``ValueError``."""
-    endpoint = entry.get("configEndpoint")
-    if endpoint is not None and (not isinstance(endpoint, str) or not endpoint.strip()):
-        raise ValueError(f"некорректный configEndpoint: {endpoint!r}")
-    return endpoint
 
 
 def parse_token(document: Any) -> Token:
     """Токен из содержимого файла; некорректный — ``ValueError`` с причиной."""
-    entry = _token_entry(document)
-    token = entry.get("accessToken")
+    if not isinstance(document, Mapping):
+        # ValueError, а не TypeError: load_token превращает его в просьбу авторизоваться.
+        raise ValueError("не JSON-объект")  # noqa: TRY004
+    token = document.get("token")
     if not isinstance(token, str) or not _TOKEN.fullmatch(token):
-        raise ValueError("нет корректного accessToken")
-    expires_ms = _expires_ms(entry)
-    endpoint = _config_endpoint(entry)
-    return Token(
-        token,
-        None if expires_ms is None else expires_ms / 1000,
-        None if endpoint is None else endpoint.strip(),
-    )
+        raise ValueError("нет корректного token")
+    expires_ms = _expires_ms(document)
+    return Token(token, None if expires_ms is None else expires_ms / 1000)
 
 
 def _read_token(path: Path) -> Token:
@@ -133,20 +103,9 @@ def _read_token(path: Path) -> Token:
         raise ApiError(f"{path}: {exc} — {login_hint(path)}") from None
 
 
-def load_token(path: Path, config_url: str) -> Token:
-    """Действующий токен из файла CLI для бэкенда ``config_url``.
-
-    Нет, не читается, истёк или выдан другому бэкенду — :class:`ApiError`.
-    """
+def load_token(path: Path) -> Token:
+    """Действующий токен из файла CLI; нет, не читается или истёк — :class:`ApiError`."""
     token = _read_token(path)
-    if token.config_endpoint is not None and (
-        token.config_endpoint.rstrip("/") != config_url.rstrip("/")
-    ):
-        raise ApiError(
-            f"токен GigaCode в {path} выдан для {token.config_endpoint}, а GIGACREW_API_URL "
-            f"указывает на {config_url} — исправьте GIGACREW_API_URL или пройдите авторизацию "
-            "в GigaCode на нужном бэкенде",
-        )
     if token.expired():
         raise ApiError(f"токен GigaCode истёк: {login_hint(path)}")
     return token
