@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import codecs
+import contextlib
 import os
 import re
 import signal
@@ -29,6 +30,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO, Any
 
 from gigacrew.security import subprocess_env
 
@@ -37,8 +39,14 @@ from gigacrew.security import subprocess_env
 _PIPE_GRACE_SECONDS = 1.0
 # Сколько ждать, пока опустеет группа команды (зомби уже завершившихся потомков).
 _GROUP_SETTLE_SECONDS = 0.2
+# Пауза между проверками, опустела ли группа команды.
+_GROUP_POLL_SECONDS = 0.01
 # Сколько символов каждого потока держим в памяти (начало и конец).
 _CAPTURE_LIMIT = 200_000
+# Сколько байт канала читать за раз.
+_READ_CHUNK_BYTES = 65536
+# Состояния процесса в /proc/<pid>/stat, которые не считаются живыми: зомби и мёртвый.
+_DEAD_STATES = frozenset((b"Z", b"X"))
 
 
 # Тег заметок harness'а: системный промпт велит модели выполнять такие блоки и считать
@@ -63,7 +71,9 @@ def truncate_middle(text: str, limit: int = 30_000, head: int = 10_000) -> str:
     head = min(head, limit)
     tail = limit - head
     dropped = len(text) - head - tail
-    return f"{text[:head]}\n...(пропущено {dropped} символов)...\n{text[len(text) - tail :]}"
+    head_text = text[:head]
+    tail_text = text[len(text) - tail :]
+    return f"{head_text}\n...(пропущено {dropped} символов)...\n{tail_text}"
 
 
 class _Capture:
@@ -101,6 +111,8 @@ class _Capture:
 
 @dataclass(frozen=True)
 class ProcessResult:
+    """Итог запуска процесса: код возврата, вывод и судьба фоновых потомков."""
+
     returncode: int | None  # None — процесс убит по таймауту
     stdout: str
     stderr: str
@@ -110,9 +122,9 @@ class ProcessResult:
     escaped_output: bool = False
 
 
-def _kill_group(proc: subprocess.Popen) -> None:
+def _kill_group(proc: subprocess.Popen[bytes]) -> None:
     """Убивает процесс вместе со всеми потомками."""
-    try:
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
         if os.name == "posix":
             os.killpg(proc.pid, signal.SIGKILL)
             return
@@ -126,16 +138,12 @@ def _kill_group(proc: subprocess.Popen) -> None:
             timeout=10,
             check=False,
         )
-    except (ProcessLookupError, PermissionError, OSError, subprocess.TimeoutExpired):
-        pass
     if os.name != "posix":
-        try:
+        with contextlib.suppress(OSError):
             proc.kill()  # на случай, если taskkill недоступен
-        except OSError:
-            pass
 
 
-def _group_alive(proc: subprocess.Popen) -> bool:
+def _group_alive(proc: subprocess.Popen[bytes]) -> bool:
     """Остались ли живые процессы в группе команды (её фоновые потомки). Только POSIX.
 
     Сигнал 0 доходит и до зомби: уже завершившийся фоновый потомок (``(true &)``) ждёт,
@@ -157,28 +165,28 @@ def _group_alive(proc: subprocess.Popen) -> bool:
             return members
         if time.monotonic() >= deadline:
             return True
-        time.sleep(0.01)
+        time.sleep(_GROUP_POLL_SECONDS)
 
 
 def _live_members(pgid: int) -> bool | None:
     """Есть ли в группе ``pgid`` процессы, кроме зомби (по /proc); None — /proc нет."""
     try:
-        pids = [name for name in os.listdir("/proc") if name.isdecimal()]
+        entries = [entry for entry in Path("/proc").iterdir() if entry.name.isdecimal()]
     except OSError:
         return None
-    for pid in pids:
+    for entry in entries:
         try:
-            with Path(f"/proc/{pid}/stat").open("rb") as f:
-                fields = f.read().rsplit(b")", 1)[1].split()
+            stat = (entry / "stat").read_bytes()
+            fields = stat.rsplit(b")", 1)[1].split()
         except (OSError, IndexError):
             continue  # процесс уже завершился
         # после имени: состояние, родитель, группа
-        if len(fields) > 2 and int(fields[2]) == pgid and fields[0] not in {b"Z", b"X"}:
+        if len(fields) > 2 and int(fields[2]) == pgid and fields[0] not in _DEAD_STATES:
             return True
     return False
 
 
-def _pump(stream, capture: _Capture) -> None:
+def _pump(stream: IO[bytes], capture: _Capture) -> None:
     """Читает канал по мере поступления данных (os.read не ждёт заполнения буфера).
 
     Поэтому вывод сохраняется, даже если канал так и не закрылся (его держит
@@ -186,12 +194,93 @@ def _pump(stream, capture: _Capture) -> None:
     """
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     fd = stream.fileno()
-    try:
-        while chunk := os.read(fd, 65536):
+    with contextlib.suppress(OSError, ValueError):
+        while chunk := os.read(fd, _READ_CHUNK_BYTES):
             capture.add(decoder.decode(chunk))
-    except (OSError, ValueError):
-        pass
     capture.add(decoder.decode(b"", final=True))
+
+
+def _spawn(
+    cmd: str | Sequence[str],
+    *,
+    cwd: Path,
+    shell: bool,
+    env: dict[str, str],
+    stdin_text: str | None,
+) -> subprocess.Popen[bytes]:
+    """Запускает команду в своей группе процессов; stdin — ``stdin_text`` или /dev/null.
+
+    Текст для stdin пишется во временный файл, который закрывается сразу после запуска:
+    у процесса своя копия дескриптора.
+    """
+    kwargs: dict[str, Any] = {
+        "shell": shell,
+        "cwd": str(cwd),
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "posix":
+        kwargs["start_new_session"] = True  # своя группа процессов — убиваем целиком
+    else:
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    if stdin_text is None:
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, **kwargs)
+    with tempfile.TemporaryFile() as stdin_file:
+        stdin_file.write(stdin_text.encode("utf-8"))
+        stdin_file.seek(0)
+        return subprocess.Popen(cmd, stdin=stdin_file, **kwargs)
+
+
+def _join_readers(readers: list[threading.Thread]) -> bool:
+    """Даёт читателям дочитать вывод; True — кто-то из них всё ещё ждёт данных."""
+    for reader in readers:
+        reader.join(timeout=_PIPE_GRACE_SECONDS)
+    return any(thread.is_alive() for thread in readers)
+
+
+def _supervise(
+    proc: subprocess.Popen[bytes],
+    readers: list[threading.Thread],
+    timeout: float,
+) -> tuple[bool, bool, bool]:
+    """Ждёт завершения команды и её вывода, убивает оставшихся в группе потомков.
+
+    Возвращает флаги: таймаут, убиты фоновые потомки, вывод держит процесс вне группы.
+    """
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_group(proc)
+        proc.wait()
+    # Команда завершилась, но вывод может держать фоновый потомок (`cmd &`).
+    alive = _join_readers(readers)
+    # Потомки в группе команды убиваются, даже если вывод они не держат
+    # (`server >/dev/null 2>&1 &`): иначе пережили бы и команду, и gigacrew.
+    killed_background = _group_alive(proc) or (alive and os.name != "posix")
+    if killed_background:
+        _kill_group(proc)
+    escaped = False
+    if alive:
+        # Вывод всё ещё держит процесс вне группы (setsid) — его не достать.
+        escaped = _join_readers(readers)
+    return timed_out, killed_background, escaped
+
+
+def _close_streams(proc: subprocess.Popen[bytes], readers: list[threading.Thread]) -> None:
+    """Закрывает каналы вывода команды, кроме тех, на которых заблокирован читатель."""
+    for stream_index, stream in enumerate((proc.stdout, proc.stderr)):
+        reader = readers[stream_index] if stream_index < len(readers) else None
+        # Если вывод держит потомок, сбежавший из группы (setsid), поток-читатель
+        # всё ещё заблокирован в read(), и close() ждал бы ту же блокировку
+        # бесконечно. Такой поток не закрываем: читатель — daemon, канал
+        # закроется, когда потомок завершится.
+        if reader is not None and reader.is_alive():
+            continue
+        with contextlib.suppress(OSError):
+            stream.close()  # type: ignore[union-attr]
 
 
 def run_process(
@@ -210,37 +299,12 @@ def run_process(
     без потока-писателя, который мог бы заблокироваться на процессе, не читающем
     stdin. ``extra_env`` добавляется к окружению после фильтра секретов.
     """
-    kwargs: dict = {}
-    if os.name == "posix":
-        kwargs["start_new_session"] = True  # своя группа процессов — убиваем целиком
-    else:
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-
     env = subprocess_env(environ)
     if extra_env:
         env.update(extra_env)
-    stdin = None
-    if input is not None:
-        stdin = tempfile.TemporaryFile()
-        stdin.write(input.encode("utf-8"))
-        stdin.seek(0)
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            shell=shell,
-            cwd=str(cwd),
-            env=env,
-            stdin=subprocess.DEVNULL if stdin is None else stdin,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **kwargs,
-        )
-    finally:
-        if stdin is not None:
-            stdin.close()  # у процесса своя копия дескриптора
+    proc = _spawn(cmd, cwd=cwd, shell=shell, env=env, stdin_text=input)
     out, err = _Capture(), _Capture()
     readers: list[threading.Thread] = []
-    timed_out = killed_background = escaped = False
     # Защищённый блок начинается сразу после Popen: прерывание в любой момент
     # (в том числе при запуске читателей) не оставит команду работать.
     try:
@@ -248,45 +312,15 @@ def run_process(
             threading.Thread(target=_pump, args=(proc.stdout, out), daemon=True),
             threading.Thread(target=_pump, args=(proc.stderr, err), daemon=True),
         ]
-        for t in readers:
-            t.start()
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_group(proc)
-            proc.wait()
-        # Команда завершилась, но вывод может держать фоновый потомок (`cmd &`).
-        for t in readers:
-            t.join(timeout=_PIPE_GRACE_SECONDS)
-        # Потомки в группе команды убиваются, даже если вывод они не держат
-        # (`server >/dev/null 2>&1 &`): иначе пережили бы и команду, и gigacrew.
-        alive = any(t.is_alive() for t in readers)
-        if _group_alive(proc) or (alive and os.name != "posix"):
-            killed_background = True
-            _kill_group(proc)
-        if alive:
-            for t in readers:
-                t.join(timeout=_PIPE_GRACE_SECONDS)
-            # Вывод всё ещё держит процесс вне группы (setsid) — его не достать.
-            escaped = any(t.is_alive() for t in readers)
+        for reader in readers:
+            reader.start()
+        timed_out, killed_background, escaped = _supervise(proc, readers, timeout)
     except BaseException:  # Ctrl+C или сбой запуска читателей
         _kill_group(proc)
         proc.wait()
         raise
     finally:
-        for i, stream in enumerate((proc.stdout, proc.stderr)):
-            reader = readers[i] if i < len(readers) else None
-            # Если вывод держит потомок, сбежавший из группы (setsid), поток-читатель
-            # всё ещё заблокирован в read(), и close() ждал бы ту же блокировку
-            # бесконечно. Такой поток не закрываем: читатель — daemon, канал
-            # закроется, когда потомок завершится.
-            if reader is not None and reader.is_alive():
-                continue
-            try:
-                stream.close()  # type: ignore[union-attr]
-            except OSError:
-                pass
+        _close_streams(proc, readers)
 
     return ProcessResult(
         returncode=None if timed_out else proc.returncode,

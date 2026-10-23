@@ -15,7 +15,7 @@ from pathlib import Path
 from gigacrew.project.gitignore import IgnoreStack, compile_glob, root_stack, stack_for
 from gigacrew.project.workspace import DATA_DIR_NAME
 
-IGNORE_DIRS: frozenset[str] = frozenset({
+IGNORE_DIRS: frozenset[str] = frozenset((
     ".git",
     ".hg",
     ".svn",
@@ -32,11 +32,19 @@ IGNORE_DIRS: frozenset[str] = frozenset({
     "build",
     ".idea",
     DATA_DIR_NAME,
-})
+))
 
 
 TREE_TRUNCATED = "... (tree truncated)"
 GIT_DIR_NAME = ".git"
+
+# Раскладка каталога git: обязательная запись и признак «это каталог».
+_GIT_LAYOUT = (("HEAD", False), ("objects", True), ("refs", True))
+
+# Запись дерева проекта: имя и признак «настоящий каталог» (не симлинк).
+_Entry = tuple[str, bool]
+# Каталоги одного уровня дерева: путь, путь от корня и правила .gitignore в каталоге.
+_Level = list[tuple[Path, str, IgnoreStack]]
 
 
 def is_ignored_dir(name: str) -> bool:
@@ -63,8 +71,10 @@ def is_secret_path(path: Path) -> bool:
 
 
 def git_dirs(root: Path) -> list[Path]:
-    """Каталоги git проекта: ``<root>/.git`` (раскрытый) или цель ``gitdir:`` из
-    ``.git``-файла (рабочие деревья, сабмодули, раскладка с ``.bare``).
+    """Каталоги git проекта: ``<root>/.git`` или цель ``gitdir:`` из ``.git``-файла.
+
+    ``<root>/.git`` возвращается раскрытым; ``.git``-файл с ``gitdir:`` бывает у рабочих
+    деревьев, сабмодулей и в раскладке с ``.bare``.
     """
     dot_git = root / GIT_DIR_NAME
     try:
@@ -77,29 +87,31 @@ def git_dirs(root: Path) -> list[Path]:
                 target = Path(line[len("gitdir:") :].strip())
                 return [(target if target.is_absolute() else root / target).resolve()]
     except OSError:
-        pass
+        return []
     return []
 
 
 def looks_like_git_dir(directory: Path, adding: Path | None = None) -> bool:
-    """Каталог устроен как каталог git (обычный ``.git``, bare-репозиторий или цель
-    ``gitdir:``/симлинка вложенного репозитория): ``HEAD``, ``objects/``, ``refs/``.
+    """Каталог устроен как каталог git: в нём есть ``HEAD``, ``objects/`` и ``refs/``.
+
+    Так устроены обычный ``.git``, bare-репозиторий и цель ``gitdir:``/симлинка
+    вложенного репозитория.
 
     ``adding`` — путь, который сейчас будет записан: каталог проверяется таким, каким
     станет после записи. Иначе раскладку можно было бы собрать по файлу — ``config``
     первым, ``HEAD`` последним, — и каждая запись по отдельности прошла бы проверку.
     """
-
-    def present(name: str, is_dir: bool) -> bool:
-        entry = directory / name
-        if adding is not None and (adding == entry or (is_dir and entry in adding.parents)):
-            return True
-        return entry.is_dir() if is_dir else entry.is_file()
-
     try:
-        return present("HEAD", False) and present("objects", True) and present("refs", True)
+        for name, is_dir in _GIT_LAYOUT:
+            entry = directory / name
+            if adding is not None and (adding == entry or (is_dir and entry in adding.parents)):
+                continue  # запись появится вместе с ``adding``
+            exists = entry.is_dir() if is_dir else entry.is_file()
+            if not exists:
+                return False
     except OSError:
         return False
+    return True
 
 
 def is_git_internal(root: Path, path: Path, raw: str = "") -> bool:
@@ -119,11 +131,13 @@ def is_git_internal(root: Path, path: Path, raw: str = "") -> bool:
     raw_parts = Path(raw).parts if raw else ()
     if any(part.casefold() == GIT_DIR_NAME for part in (*parts, *raw_parts)):
         return True
-    if any(path == d or d in path.parents for d in git_dirs(root)):
+    if any(path == git_dir or git_dir in path.parents for git_dir in git_dirs(root)):
         return True
     candidates = [path, *path.parents] if path.is_dir() else list(path.parents)
     return any(
-        looks_like_git_dir(d, adding=path) for d in candidates if d != root and root in d.parents
+        looks_like_git_dir(candidate, adding=path)
+        for candidate in candidates
+        if candidate != root and root in candidate.parents
     )
 
 
@@ -156,20 +170,69 @@ def is_excluded(root: Path, path: Path) -> bool:
     if is_last_dir and is_ignored_dir(parts[-1]):
         return True
     stack = root_stack(root)
-    for i in range(len(parts)):
-        sub = "/".join(parts[: i + 1])
-        is_dir = i < len(parts) - 1 or is_last_dir
+    last = len(parts) - 1
+    sub = ""
+    for index, part in enumerate(parts):
+        sub = f"{sub}/{part}" if index else part  # первые index + 1 компонентов пути
+        is_dir = index < last or is_last_dir
         if stack.is_ignored(sub, is_dir):
             return True
-        if i < len(parts) - 1:
+        if index < last:
             stack = stack.enter(root, sub)
     return False
 
 
-def _rel_dir(root: Path, directory: Path) -> str:
-    """Каталог относительно корня в POSIX-виде; сам корень — пустая строка."""
-    rel = directory.relative_to(root).as_posix()
-    return "" if rel == "." else rel
+def _join_rel(rel_dir: str, name: str) -> str:
+    """Путь от корня для записи ``name`` каталога ``rel_dir`` (корень — пустая строка)."""
+    return f"{rel_dir}/{name}" if rel_dir else name
+
+
+class _Walk:
+    """Состояние обхода :func:`walk_files`: правила ``.gitignore`` каталогов впереди."""
+
+    def __init__(self, root: Path, start: Path, *, gitignore: bool) -> None:
+        self._root = root
+        self._gitignore = gitignore
+        self._stacks: dict[str, IgnoreStack] = {}
+        if gitignore:
+            start_rel = self._rel_dir(start)
+            self._stacks[start_rel] = stack_for(root, start_rel)
+
+    def files(self, current: Path, dirnames: list[str], filenames: list[str]) -> Iterator[Path]:
+        """Файлы каталога ``current``, которые не исключены.
+
+        В ``dirnames`` (на месте — для os.walk) остаются каталоги, в которые спускаться.
+        """
+        rel_dir = self._rel_dir(current) if self._gitignore else ""
+        stack = self._stacks.pop(rel_dir, None) if self._gitignore else None
+        self._prune(rel_dir, dirnames, stack)
+        for name in sorted(filenames):
+            if stack is not None and stack.is_ignored(_join_rel(rel_dir, name), is_dir=False):
+                continue
+            path = current / name
+            if path.is_symlink() and not is_within(self._root, path):
+                continue
+            yield path
+
+    def _prune(self, rel_dir: str, dirnames: list[str], stack: IgnoreStack | None) -> None:
+        """Оставляет в ``dirnames`` каталоги, в которые спускаться, и запоминает их правила."""
+        kept = []
+        for dirname in sorted(dirnames):
+            if is_ignored_dir(dirname):
+                continue
+            if stack is not None:
+                rel = _join_rel(rel_dir, dirname)
+                if stack.is_ignored(rel, is_dir=True):
+                    continue
+                self._stacks[rel] = stack.enter(self._root, rel)
+            kept.append(dirname)
+        dirnames.clear()
+        dirnames.extend(kept)
+
+    def _rel_dir(self, directory: Path) -> str:
+        """Каталог относительно корня в POSIX-виде; сам корень — пустая строка."""
+        rel = directory.relative_to(self._root).as_posix()
+        return "" if rel == "." else rel
 
 
 def walk_files(root: Path, base: Path | None = None, *, gitignore: bool = True) -> Iterator[Path]:
@@ -182,39 +245,14 @@ def walk_files(root: Path, base: Path | None = None, *, gitignore: bool = True) 
     ``root`` пропускаются.
     """
     root = root.resolve()
-    start = base if base is not None else root
-    if not is_within(root, start):
-        gitignore = False  # путь вне корня: правилам проекта не к чему относиться
-    elif gitignore:
-        start = start.resolve()  # пути от корня считаются по раскрытому пути
-    stacks: dict[str, IgnoreStack] = {}
+    start = root if base is None else base
+    # путь вне корня: правилам проекта не к чему относиться
+    gitignore = is_within(root, start) and gitignore
     if gitignore:
-        stacks[_rel_dir(root, start)] = stack_for(root, _rel_dir(root, start))
+        start = start.resolve()  # пути от корня считаются по раскрытому пути
+    walk = _Walk(root, start, gitignore=gitignore)
     for dirpath, dirnames, filenames in os.walk(start, followlinks=False):
-        current = Path(dirpath)
-        rel_dir = _rel_dir(root, current) if gitignore else ""
-        stack = stacks.pop(rel_dir, None) if gitignore else None
-
-        def rel(name: str, rel_dir: str = rel_dir) -> str:
-            return f"{rel_dir}/{name}" if rel_dir else name
-
-        kept = []
-        for d in sorted(dirnames):
-            if is_ignored_dir(d):
-                continue
-            if stack is not None:
-                if stack.is_ignored(rel(d), is_dir=True):
-                    continue
-                stacks[rel(d)] = stack.enter(root, rel(d))
-            kept.append(d)
-        dirnames[:] = kept
-        for name in sorted(filenames):
-            if stack is not None and stack.is_ignored(rel(name), is_dir=False):
-                continue
-            path = current / name
-            if path.is_symlink() and not is_within(root, path):
-                continue
-            yield path
+        yield from walk.files(Path(dirpath), dirnames, filenames)
 
 
 def glob_match(rel_posix: str, pattern: str) -> bool:
@@ -233,21 +271,121 @@ def glob_match(rel_posix: str, pattern: str) -> bool:
 TREE_DIR_CAP = 30  # записей одного каталога ниже корня (корень — без ограничения)
 
 
-def _shares(sizes: list[int], budget: int) -> list[int]:
-    """Делит ``budget`` между каталогами поровну, отдавая недобранное остальным."""
-    shares = [0] * len(sizes)
-    pending = [i for i, size in enumerate(sizes) if size]
-    while pending and budget > 0:
-        fair = max(budget // len(pending), 1)
-        still = []
-        for i in pending:
-            take = min(sizes[i] - shares[i], fair, budget)
-            shares[i] += take
-            budget -= take
-            if shares[i] < sizes[i]:
-                still.append(i)
-        pending = still
-    return shares
+class _FileTree:
+    """Сборка дерева для :func:`build_file_tree`: отбор записей по уровням и вывод."""
+
+    def __init__(self, root: Path, max_entries: int) -> None:
+        self._root = root
+        self._budget = max_entries
+        self._shown: dict[str, list[_Entry]] = {}  # каталог → показанные записи
+        self._hidden: dict[str, int] = {}  # каталог → сколько записей не показано
+        self._lines: list[str] = []
+        self._truncated = False
+
+    def render(self) -> str:
+        """Отбирает записи и выводит дерево строками с отступами."""
+        self._select()
+        self._truncated = bool(self._hidden)
+        self._render_dir("", "")
+        if self._truncated:
+            self._lines.append(TREE_TRUNCATED)
+        return "\n".join(self._lines)
+
+    def _select(self) -> None:
+        """Отбирает показываемые записи уровень за уровнем, пока не кончится лимит."""
+        level: _Level = [(self._root, "", root_stack(self._root))]
+        depth = 0
+        while level and self._budget > 0:
+            listed = self._list_level(level)
+            level = level[: len(listed)]
+            cap = self._budget if depth == 0 else TREE_DIR_CAP
+            shares = self._shares([min(len(entries), cap) for entries in listed], self._budget)
+            level = self._take(level, listed, shares)
+            self._budget -= sum(shares)
+            depth += 1
+
+    def _list_level(self, level: _Level) -> list[list[_Entry]]:
+        """Читает каталоги уровня по порядку, пока их ещё можно раскрыть."""
+        # Непустых каталогов сверх лимита не раскрыть всё равно — дальше не читаем
+        # (пустые и целиком исключённые лимит не тратят и не обрывают перебор).
+        listed: list[list[_Entry]] = []
+        nonempty = 0
+        for directory, rel_dir, stack in level:
+            if nonempty >= self._budget:
+                break
+            listed.append(self._listing(directory, rel_dir, stack))
+            nonempty += bool(listed[-1])
+        return listed
+
+    def _take(self, level: _Level, listed: list[list[_Entry]], shares: list[int]) -> _Level:
+        """Запоминает показанные и скрытые записи уровня; возвращает следующий уровень."""
+        next_level: _Level = []
+        for (directory, rel_dir, stack), entries, share in zip(level, listed, shares, strict=True):
+            self._shown[rel_dir] = entries[:share]
+            if len(entries) > share:
+                self._hidden[rel_dir] = len(entries) - share
+            for name, is_dir in self._shown[rel_dir]:
+                if is_dir:
+                    rel = _join_rel(rel_dir, name)
+                    next_level.append((directory / name, rel, stack.enter(self._root, rel)))
+        return next_level
+
+    def _shares(self, sizes: list[int], budget: int) -> list[int]:
+        """Делит ``budget`` между каталогами поровну, отдавая недобранное остальным."""
+        shares = [0 for _ in sizes]
+        pending = [index for index, size in enumerate(sizes) if size]
+        while pending and budget > 0:
+            fair = max(budget // len(pending), 1)
+            still = []
+            for index in pending:
+                take = min(sizes[index] - shares[index], fair, budget)
+                shares[index] += take
+                budget -= take
+                if shares[index] < sizes[index]:
+                    still.append(index)
+            pending = still
+        return shares
+
+    def _listing(self, directory: Path, rel_dir: str, stack: IgnoreStack) -> list[_Entry]:
+        """Записи каталога для дерева: каталоги первыми, затем по имени."""
+        try:
+            entries = sorted(
+                directory.iterdir(),
+                key=lambda entry: (not self._is_real_dir(entry), entry.name.lower()),
+            )
+        except OSError:
+            return []
+        kept: list[_Entry] = []
+        for entry in entries:
+            is_dir = self._is_real_dir(entry)
+            rel = _join_rel(rel_dir, entry.name)
+            if is_dir and is_ignored_dir(entry.name):
+                continue
+            if stack.is_ignored(rel, is_dir=is_dir):
+                continue
+            kept.append((entry.name, is_dir))
+        return kept
+
+    def _is_real_dir(self, path: Path) -> bool:
+        # симлинки на каталоги не раскрываем (возможны циклы и выход из корня)
+        return path.is_dir() and not path.is_symlink()
+
+    def _render_dir(self, rel_dir: str, prefix: str) -> None:
+        """Выводит записи каталога ``rel_dir`` и, вглубь, раскрытых подкаталогов."""
+        for name, is_dir in self._shown.get(rel_dir, []):
+            if not is_dir:
+                self._lines.append(f"{prefix}{name}")
+                continue
+            rel = _join_rel(rel_dir, name)
+            if rel in self._shown:
+                self._lines.append(f"{prefix}{name}/")
+                self._render_dir(rel, f"{prefix}  ")
+            else:
+                self._truncated = True
+                self._lines.append(f"{prefix}{name}/ …")
+        hidden = self._hidden.get(rel_dir)
+        if hidden:
+            self._lines.append(f"{prefix}… {hidden} more")
 
 
 def build_file_tree(root: Path, max_entries: int = 200) -> str:
@@ -262,82 +400,4 @@ def build_file_tree(root: Path, max_entries: int = 200) -> str:
     Скрытые файлы и каталоги (``.github``, ``.gitignore``) показываются,
     служебные каталоги (``.git``, ``node_modules``…) и исключённое ``.gitignore`` — нет.
     """
-    root = root.resolve()
-
-    def is_real_dir(p: Path) -> bool:
-        # симлинки на каталоги не раскрываем (возможны циклы и выход из корня)
-        return p.is_dir() and not p.is_symlink()
-
-    def listing(directory: Path, rel_dir: str, stack: IgnoreStack) -> list[tuple[str, bool]]:
-        try:
-            entries = sorted(
-                directory.iterdir(),
-                key=lambda e: (not is_real_dir(e), e.name.lower()),
-            )
-        except OSError:
-            return []
-        kept = []
-        for e in entries:
-            is_dir = is_real_dir(e)
-            rel = f"{rel_dir}/{e.name}" if rel_dir else e.name
-            if is_dir and is_ignored_dir(e.name):
-                continue
-            if stack.is_ignored(rel, is_dir=is_dir):
-                continue
-            kept.append((e.name, is_dir))
-        return kept
-
-    shown: dict[str, list[tuple[str, bool]]] = {}  # каталог → показанные записи
-    hidden: dict[str, int] = {}  # каталог → сколько записей не показано
-    budget = max_entries
-    level = [(root, "", root_stack(root))]
-    depth = 0
-    while level and budget > 0:
-        # Непустых каталогов сверх лимита не раскрыть всё равно — дальше не читаем
-        # (пустые и целиком исключённые лимит не тратят и не обрывают перебор).
-        listed: list[list[tuple[str, bool]]] = []
-        nonempty = 0
-        for d, rel, stack in level:
-            if nonempty >= budget:
-                break
-            listed.append(listing(d, rel, stack))
-            nonempty += bool(listed[-1])
-        level = level[: len(listed)]
-        cap = budget if depth == 0 else TREE_DIR_CAP
-        shares = _shares([min(len(entries), cap) for entries in listed], budget)
-        next_level = []
-        for (directory, rel_dir, stack), entries, share in zip(level, listed, shares, strict=True):
-            shown[rel_dir] = entries[:share]
-            if len(entries) > share:
-                hidden[rel_dir] = len(entries) - share
-            for name, is_dir in shown[rel_dir]:
-                if is_dir:
-                    rel = f"{rel_dir}/{name}" if rel_dir else name
-                    next_level.append((directory / name, rel, stack.enter(root, rel)))
-        budget -= sum(shares)
-        level = next_level
-        depth += 1
-
-    lines: list[str] = []
-    truncated = bool(hidden)
-
-    def render(rel_dir: str, prefix: str) -> None:
-        nonlocal truncated
-        for name, is_dir in shown.get(rel_dir, []):
-            if not is_dir:
-                lines.append(f"{prefix}{name}")
-                continue
-            rel = f"{rel_dir}/{name}" if rel_dir else name
-            if rel in shown:
-                lines.append(f"{prefix}{name}/")
-                render(rel, prefix + "  ")
-            else:
-                truncated = True
-                lines.append(f"{prefix}{name}/ …")
-        if hidden.get(rel_dir):
-            lines.append(f"{prefix}… {hidden[rel_dir]} more")
-
-    render("", "")
-    if truncated:
-        lines.append(TREE_TRUNCATED)
-    return "\n".join(lines)
+    return _FileTree(root.resolve(), max_entries).render()

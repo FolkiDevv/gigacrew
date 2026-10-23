@@ -6,14 +6,14 @@ import json
 import os
 import shlex
 import sys
-from collections.abc import Callable
 from pathlib import Path
+from typing import Any, Literal, NoReturn, Protocol, override
 
 import pytest
 from fakes import FakeTool, RecordingEvents, ScriptedProvider, text_turn, tool_turn
 
 from gigacrew.agent.chat_store import chat_title
-from gigacrew.agent.events import Approval
+from gigacrew.agent.events import AgentEvents, Approval
 from gigacrew.agent.hooks import HookResult, HookRunner, PromptBlockedError
 from gigacrew.agent.loop import (
     HOOK_BLOCKED_NOTE,
@@ -26,52 +26,86 @@ from gigacrew.config import Config
 from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide
 from gigacrew.project.settings import HookCommand, HookEvent, HookGroup, HookSettings
 from gigacrew.security import RiskLevel
-from gigacrew.tools.base import ToolRegistry, ToolResult, build_default_registry
+from gigacrew.tools.base import Tool, ToolRegistry, ToolResult, build_default_registry
 from gigacrew.tools.questions import Question, QuestionOption
 from gigacrew.tools.task import EXPLORE
 
-Answer = HookResult | Callable[[dict], HookResult] | list[HookResult]
+_Payload = dict[str, Any]
+
+
+class _Handler(Protocol):
+    """Ответ хука, вычисляемый по payload события."""
+
+    def __call__(self, payload: _Payload, /) -> HookResult: ...
+
+
+Answer = HookResult | _Handler | list[HookResult]
 
 
 class FakeHooks(HookRunner):
     """Раннер без процессов: на событие — заготовленный ответ (или функция от payload)."""
 
-    def __init__(self, answers: dict[HookEvent, Answer]):
+    def __init__(self, answers: dict[HookEvent, Answer]) -> None:
         super().__init__()
         self.answers = answers
-        self.calls: list[tuple[HookEvent, str, dict]] = []
+        self.calls: list[tuple[HookEvent, str, _Payload]] = []
 
-    def has(self, event, target=""):
+    @override
+    def has(self, event: HookEvent, target: str = "") -> bool:
         return event in self.answers
 
-    def run(self, event, payload, *, cwd, events, target=""):
+    @override
+    def run(
+        self,
+        event: HookEvent,
+        payload: _Payload,
+        *,
+        cwd: Path,
+        events: AgentEvents,
+        target: str = "",
+    ) -> HookResult:
         self.calls.append((event, target, payload))
         answer = self.answers[event]
         if isinstance(answer, list):
             return answer.pop(0) if answer else HookResult()
         return answer(payload) if callable(answer) else answer
 
-    def of(self, event: HookEvent) -> list[dict]:
-        return [payload for e, _, payload in self.calls if e is event]
+    def of(self, event: HookEvent) -> list[_Payload]:
+        return [payload for called, _, payload in self.calls if called is event]
 
 
-def _agent(provider, tmp_path: Path, hooks: HookRunner, *, events=None, tool=None, **cfg_kw):
+def _agent(
+    provider: ScriptedProvider,
+    tmp_path: Path,
+    hooks: HookRunner,
+    *,
+    events: AgentEvents | None = None,
+    tool: Tool[Any] | None = None,
+    **cfg_kw: Any,
+) -> Agent:
     cfg_kw.setdefault("auto_approve", True)
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, **cfg_kw)
-    if tool is not None:
+    if tool is None:
+        registry = build_default_registry()
+    else:
         registry = ToolRegistry()
         registry.register(tool)
-    else:
-        registry = build_default_registry()
     return Agent(provider, registry, cfg, events or RecordingEvents(), hooks=hooks)
 
 
 def _function_results(agent: Agent) -> list[str]:
-    return [m.content for m in agent.conversation.messages if m.role == "function"]
+    return [
+        message.content for message in agent.conversation.messages if message.role == "function"
+    ]
+
+
+def _single[Entry](entries: list[Entry]) -> Entry:
+    assert len(entries) == 1
+    return entries[0]
 
 
 # --------------------------------------------------------------------------- #
-# decide(hook=...)
+# decide с параметром hook
 
 
 @pytest.mark.parametrize(
@@ -100,11 +134,19 @@ def _function_results(agent: Agent) -> list[str]:
         (PermissionMode.AUTO, RiskLevel.WRITE, ToolKind.COMMAND, False, None, Decision.REVIEW),
     ],
 )
-def test_decide_with_hook(mode, risk, kind, auto, hook, expected):
+def test_decide_with_hook(
+    mode: PermissionMode,
+    risk: RiskLevel,
+    kind: ToolKind,
+    *,
+    auto: bool,
+    hook: Literal["allow", "ask"] | None,
+    expected: Decision,
+) -> None:
     assert decide(mode, risk, kind, auto_approve=auto, hook=hook) is expected
 
 
-def test_decide_hook_keeps_read_only_block():
+def test_decide_hook_keeps_read_only_block() -> None:
     assert (
         decide(
             PermissionMode.AUTO,
@@ -122,7 +164,7 @@ def test_decide_hook_keeps_read_only_block():
 # PreToolUse
 
 
-def test_pre_tool_use_deny_blocks_call(tmp_path):
+def test_pre_tool_use_deny_blocks_call(tmp_path: Path) -> None:
     tool = FakeTool()
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(blocked=True, reason="только чтение")})
     provider = ScriptedProvider([tool_turn("fake_write", {"path": "a"}), text_turn("понял")])
@@ -132,7 +174,7 @@ def test_pre_tool_use_deny_blocks_call(tmp_path):
     assert tool.runs == 0
     assert events.confirms == []
     assert _function_results(agent) == [HOOK_BLOCKED_NOTE.format(reason="только чтение")]
-    (payload,) = hooks.of(HookEvent.PRE_TOOL_USE)
+    payload = _single(hooks.of(HookEvent.PRE_TOOL_USE))
     assert payload["tool_name"] == "fake_write"
     assert payload["tool_input"] == {"path": "a"}
     assert payload["session_id"] == agent.chat_id
@@ -141,17 +183,18 @@ def test_pre_tool_use_deny_blocks_call(tmp_path):
     assert payload["cwd"] == str(tmp_path.resolve())
 
 
-def test_pre_tool_use_denials_are_not_a_failure_series(tmp_path):
+def test_pre_tool_use_denials_are_not_a_failure_series(tmp_path: Path) -> None:
     tool = FakeTool()
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(blocked=True, reason="нет")})
-    turns = [tool_turn("fake_write", {"path": f"f{i}"}) for i in range(4)] + [text_turn("всё")]
+    denied = [tool_turn("fake_write", {"path": f"f{index}"}) for index in range(4)]
+    turns = [*denied, text_turn("всё")]
     agent = _agent(ScriptedProvider(turns), tmp_path, hooks, tool=tool, max_tool_failures=2)
     assert agent.run_turn("пиши") == "всё"
     assert agent.last_turn is not None
     assert not agent.last_turn.stop_reason
 
 
-def test_pre_tool_use_allow_skips_confirmation(tmp_path):
+def test_pre_tool_use_allow_skips_confirmation(tmp_path: Path) -> None:
     tool = FakeTool()  # не правка и не команда: в режиме «авто» спрашивается
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="allow")})
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
@@ -162,7 +205,7 @@ def test_pre_tool_use_allow_skips_confirmation(tmp_path):
     assert events.confirms == []
 
 
-def test_pre_tool_use_ask_confirms_every_time(tmp_path):
+def test_pre_tool_use_ask_confirms_every_time(tmp_path: Path) -> None:
     tool = FakeTool()
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="ask")})
     calls = [tool_turn("fake_write", {"path": "a"}), tool_turn("fake_write", {"path": "a"})]
@@ -185,7 +228,14 @@ shell_only = pytest.mark.skipif(os.name != "posix", reason="классифика
 REVIEWER_DENY = '{"allow": false, "reason": "об этом не просили"}'
 
 
-def _shell_agent(provider, tmp_path: Path, hooks: HookRunner, *, events, mode=PermissionMode.AUTO):
+def _shell_agent(
+    provider: ScriptedProvider,
+    tmp_path: Path,
+    hooks: HookRunner,
+    *,
+    events: AgentEvents,
+    mode: PermissionMode = PermissionMode.AUTO,
+) -> Agent:
     script = tmp_path / "build.sh"
     script.write_text("#!/bin/sh\necho built\n")
     script.chmod(0o755)
@@ -194,7 +244,7 @@ def _shell_agent(provider, tmp_path: Path, hooks: HookRunner, *, events, mode=Pe
 
 
 @shell_only
-def test_pre_tool_use_allow_skips_reviewer(tmp_path):
+def test_pre_tool_use_allow_skips_reviewer(tmp_path: Path) -> None:
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="allow")})
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "./build.sh"}), text_turn("ок")],
@@ -209,7 +259,7 @@ def test_pre_tool_use_allow_skips_reviewer(tmp_path):
 
 
 @shell_only
-def test_pre_tool_use_ask_goes_to_user_not_reviewer(tmp_path):
+def test_pre_tool_use_ask_goes_to_user_not_reviewer(tmp_path: Path) -> None:
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="ask")})
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "./build.sh"}), text_turn("ок")],
@@ -219,12 +269,12 @@ def test_pre_tool_use_ask_goes_to_user_not_reviewer(tmp_path):
     agent = _shell_agent(provider, tmp_path, hooks, events=events)
     agent.run_turn("собери")
     assert provider.summary_requests == []
-    ((call, _, _),) = events.confirms
+    call = _single(events.confirms)[0]
     assert "хук PreToolUse требует подтверждения" in call.reason
 
 
 @shell_only
-def test_pre_tool_use_allow_keeps_plan_mode_block(tmp_path):
+def test_pre_tool_use_allow_keeps_plan_mode_block(tmp_path: Path) -> None:
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="allow")})
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "mkdir newdir"}), text_turn("ок")],
@@ -237,11 +287,11 @@ def test_pre_tool_use_allow_keeps_plan_mode_block(tmp_path):
     assert _function_results(agent)[0] == PLAN_BLOCKED_NOTE.format(path=agent._plan_display())
 
 
-def test_notification_before_confirmation(tmp_path):
+def test_notification_before_confirmation(tmp_path: Path) -> None:
     tool = FakeTool()
     events = RecordingEvents()
 
-    def notify(payload: dict) -> HookResult:
+    def notify(payload: _Payload) -> HookResult:
         assert events.confirms == []  # хук — до вопроса
         return HookResult()
 
@@ -249,14 +299,14 @@ def test_notification_before_confirmation(tmp_path):
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     agent = _agent(provider, tmp_path, hooks, events=events, tool=tool, auto_approve=False)
     agent.run_turn("пиши")
-    (payload,) = hooks.of(HookEvent.NOTIFICATION)
+    payload = _single(hooks.of(HookEvent.NOTIFICATION))
     assert payload["notification_type"] == "permission_prompt"
     assert "fake_write" in payload["message"]
     assert hooks.calls[0][1] == "permission_prompt"  # matcher — по типу
     assert len(events.confirms) == 1
 
 
-def test_notification_on_question(tmp_path):
+def test_notification_on_question(tmp_path: Path) -> None:
     hooks = FakeHooks({HookEvent.NOTIFICATION: HookResult()})
     events = RecordingEvents(answers=[])
     agent = _agent(ScriptedProvider(), tmp_path, hooks, events=events)
@@ -265,8 +315,10 @@ def test_notification_on_question(tmp_path):
         (QuestionOption("pg"), QuestionOption("sqlite")),
         header="База",
     )
-    agent._ctx.ask_user([question])
-    (payload,) = hooks.of(HookEvent.NOTIFICATION)
+    ask_user = agent._ctx.ask_user
+    assert ask_user is not None
+    ask_user([question])
+    payload = _single(hooks.of(HookEvent.NOTIFICATION))
     assert payload["notification_type"] == "question"
     assert "База" in payload["message"]
     assert events.questions
@@ -276,7 +328,7 @@ def test_notification_on_question(tmp_path):
 # PostToolUse
 
 
-def test_post_tool_use_feedback_goes_to_model(tmp_path):
+def test_post_tool_use_feedback_goes_to_model(tmp_path: Path) -> None:
     tool = FakeTool(run=lambda: ToolResult(content="записано", summary="ok"))
     hooks = FakeHooks(
         {HookEvent.POST_TOOL_USE: HookResult(blocked=True, reason="ruff: E501", context=["лог"])},
@@ -285,21 +337,21 @@ def test_post_tool_use_feedback_goes_to_model(tmp_path):
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, hooks, events=events, tool=tool)
     agent.run_turn("пиши")
-    (result,) = _function_results(agent)
-    assert result.startswith("записано")
-    assert "ruff: E501" in result
-    assert "лог" in result
-    assert "<system-reminder>" in result
-    assert "PostToolUse" in result
-    (payload,) = hooks.of(HookEvent.POST_TOOL_USE)
+    output = _single(_function_results(agent))
+    assert output.startswith("записано")
+    assert "ruff: E501" in output
+    assert "лог" in output
+    assert "<system-reminder>" in output
+    assert "PostToolUse" in output
+    payload = _single(hooks.of(HookEvent.POST_TOOL_USE))
     assert payload["tool_response"] == {"ok": True, "content": "записано"}
     assert any("ruff: E501" in text for _, text in events.notices)
 
 
-def test_post_tool_use_interrupt_keeps_tool_result(tmp_path):
+def test_post_tool_use_interrupt_keeps_tool_result(tmp_path: Path) -> None:
     tool = FakeTool(run=lambda: ToolResult(content="записано", summary="ok"))
 
-    def interrupt(payload):
+    def interrupt(payload: _Payload) -> NoReturn:
         raise KeyboardInterrupt
 
     hooks = FakeHooks({HookEvent.POST_TOOL_USE: interrupt})
@@ -309,7 +361,7 @@ def test_post_tool_use_interrupt_keeps_tool_result(tmp_path):
     assert _function_results(agent) == ["записано"]  # а не «No result» от repair()
 
 
-def test_post_tool_use_without_output_changes_nothing(tmp_path):
+def test_post_tool_use_without_output_changes_nothing(tmp_path: Path) -> None:
     tool = FakeTool(run=lambda: ToolResult(content="записано", summary="ok"))
     hooks = FakeHooks({HookEvent.POST_TOOL_USE: HookResult()})
     agent = _agent(ScriptedProvider([tool_turn("fake_write", {})]), tmp_path, hooks, tool=tool)
@@ -321,7 +373,7 @@ def test_post_tool_use_without_output_changes_nothing(tmp_path):
 # UserPromptSubmit
 
 
-def test_prompt_blocked_leaves_history_untouched(tmp_path):
+def test_prompt_blocked_leaves_history_untouched(tmp_path: Path) -> None:
     hooks = FakeHooks({HookEvent.USER_PROMPT_SUBMIT: HookResult(blocked=True, reason="секрет")})
     provider = ScriptedProvider()
     agent = _agent(provider, tmp_path, hooks)
@@ -332,13 +384,14 @@ def test_prompt_blocked_leaves_history_untouched(tmp_path):
     assert provider.calls == 0
 
 
-def test_prompt_context_is_appended_but_title_is_clean(tmp_path):
+def test_prompt_context_is_appended_but_title_is_clean(tmp_path: Path) -> None:
     hooks = FakeHooks({HookEvent.USER_PROMPT_SUBMIT: HookResult(context=["ветка feature/x"])})
     provider = ScriptedProvider([text_turn("ок")])
     agent = _agent(provider, tmp_path, hooks)
     agent.run_turn("почини тесты")
     assert hooks.of(HookEvent.USER_PROMPT_SUBMIT)[0]["prompt"] == "почини тесты"
-    sent = provider.requests[0]["messages"][-1].content
+    first_request = provider.requests[0]
+    sent = first_request["messages"][-1].content
     assert sent.startswith("почини тесты")
     assert "ветка feature/x" in sent
     assert chat_title(agent.conversation.messages) == "почини тесты"
@@ -348,7 +401,7 @@ def test_prompt_context_is_appended_but_title_is_clean(tmp_path):
 # Stop / SubagentStop
 
 
-def test_stop_hook_returns_model_to_work(tmp_path):
+def test_stop_hook_returns_model_to_work(tmp_path: Path) -> None:
     hooks = FakeHooks(
         {HookEvent.STOP: [HookResult(blocked=True, reason="тесты падают"), HookResult()]},
     )
@@ -366,7 +419,7 @@ def test_stop_hook_returns_model_to_work(tmp_path):
     assert len(events.stats) == 1  # один ход
 
 
-def test_stop_hook_limit(tmp_path):
+def test_stop_hook_limit(tmp_path: Path) -> None:
     hooks = FakeHooks({HookEvent.STOP: lambda payload: HookResult(blocked=True, reason="ещё")})
     provider = ScriptedProvider()  # отвечает «конец» сколько угодно раз
     events = RecordingEvents()
@@ -376,8 +429,8 @@ def test_stop_hook_limit(tmp_path):
     assert any(level == "warn" and "не дал закончить" in text for level, text in events.notices)
 
 
-def test_stop_hook_interrupt_finishes_with_answer(tmp_path):
-    def interrupt(payload):
+def test_stop_hook_interrupt_finishes_with_answer(tmp_path: Path) -> None:
+    def interrupt(payload: _Payload) -> NoReturn:
         raise KeyboardInterrupt
 
     hooks = FakeHooks({HookEvent.STOP: interrupt})
@@ -385,7 +438,7 @@ def test_stop_hook_interrupt_finishes_with_answer(tmp_path):
     assert agent.run_turn("сделай") == "готово"
 
 
-def test_subagent_stop(tmp_path):
+def test_subagent_stop(tmp_path: Path) -> None:
     hooks = FakeHooks(
         {
             HookEvent.SUBAGENT_STOP: [HookResult(blocked=True, reason="мало"), HookResult()],
@@ -418,7 +471,7 @@ def test_subagent_stop(tmp_path):
 # SessionStart / SessionEnd / PreCompact
 
 
-def test_session_context_in_system_message_until_reset(tmp_path):
+def test_session_context_in_system_message_until_reset(tmp_path: Path) -> None:
     hooks = FakeHooks(
         {
             HookEvent.SESSION_START: HookResult(context=["задача JIRA-1"]),
@@ -429,26 +482,28 @@ def test_session_context_in_system_message_until_reset(tmp_path):
     agent = _agent(provider, tmp_path, hooks)
     agent.start_session("startup")
     agent.run_turn("привет")
-    assert "задача JIRA-1" in provider.requests[0]["messages"][0].content
+    system_before = provider.requests[0]["messages"][0]
+    assert "задача JIRA-1" in system_before.content
     assert hooks.of(HookEvent.SESSION_START)[0]["source"] == "startup"
     agent.end_session("clear")
     agent.reset()
     agent.run_turn("снова")
-    assert "задача JIRA-1" not in provider.requests[1]["messages"][0].content
+    system_after = provider.requests[1]["messages"][0]
+    assert "задача JIRA-1" not in system_after.content
     assert hooks.of(HookEvent.SESSION_END)[0]["reason"] == "clear"
 
 
-def test_pre_compact(tmp_path):
+def test_pre_compact(tmp_path: Path) -> None:
     hooks = FakeHooks({HookEvent.PRE_COMPACT: HookResult()})
     agent = _agent(ScriptedProvider([text_turn("ответ " * 50)]), tmp_path, hooks)
     agent.run_turn("вопрос " * 50)
     assert agent.compact("покороче") is not None
-    (payload,) = hooks.of(HookEvent.PRE_COMPACT)
+    payload = _single(hooks.of(HookEvent.PRE_COMPACT))
     assert payload["trigger"] == "manual"
     assert payload["custom_instructions"] == "покороче"
 
 
-def test_no_hooks_no_overhead(tmp_path):
+def test_no_hooks_no_overhead(tmp_path: Path) -> None:
     tool = FakeTool()
     hooks = FakeHooks({})
     agent = _agent(
@@ -466,7 +521,7 @@ def test_no_hooks_no_overhead(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="команды хуков — через /bin/sh")
-def test_end_to_end_with_real_commands(tmp_path):
+def test_end_to_end_with_real_commands(tmp_path: Path) -> None:
     log = tmp_path / "events.log"
     script = tmp_path / "hook.py"
     script.write_text(

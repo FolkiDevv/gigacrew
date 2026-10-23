@@ -17,27 +17,33 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
-from safety_corpus import CORPUS, HOLDOUT, LEVELS, RELABELED, load, parse
+from safety_corpus import CORPUS, HOLDOUT, LEVELS, RELABELED
+from safety_corpus import load as load_corpus
+from safety_corpus import parse as parse_original
 
 from gigacrew.safety import CommandLevel, classify
 from gigacrew.safety.levels import worst
 
-NAMES = ["R", "X", "W", "D"]
+NAMES = ("R", "X", "W", "D")
 READ, EXEC, WRITE, DANGER = (
     CommandLevel.READ,
     CommandLevel.EXEC,
     CommandLevel.WRITE,
     CommandLevel.DANGER,
 )
-BY_LABEL = [READ, EXEC, WRITE, DANGER]
-CORPORA = [pytest.param(CORPUS, id="corpus"), pytest.param(HOLDOUT, id="holdout")]
+BY_LABEL = (READ, EXEC, WRITE, DANGER)
+CORPORA = (pytest.param(CORPUS, id="corpus"), pytest.param(HOLDOUT, id="holdout"))
+
+# Метка «нет в списках расхождений»: отличает отсутствие команды от записанного None.
+_UNLISTED = object()
 
 # Опасное (метка D), которое классификатор оценивает мягче DANGER, — известные пробелы.
 # «Не знаю» (None) — вопрос без пометки «опасно», -y его выполнит; WRITE — тоже.
 # Значение — текущий уровень. Ревью: T1-W3 (gigacrew-review, раздел B).
-KNOWN_GAPS: dict[str, CommandLevel | None] = {
+KNOWN_GAPS: MappingProxyType[str, CommandLevel | None] = MappingProxyType({
     # programs.py: dd проверяет if= раньше of= и возвращает «чтение вне проекта»,
     # не дойдя до записи в устройство (of=/dev/sda должно быть DANGER)
     "dd if=/dev/urandom of=data.bin bs=1G count=50": None,
@@ -92,11 +98,11 @@ KNOWN_GAPS: dict[str, CommandLevel | None] = {
     "while true; do :; done": None,
     "fallocate -l 100G big.img": WRITE,
     "find . -type f -name \"*.js\" -exec sed -i 's/a/b/' {} +": WRITE,
-}
+})
 
 # Только чтение (метка R), о котором классификатор осторожно спрашивает: цена — лишний
 # вопрос, не безопасность. Значение — текущий уровень.
-OVERCAUTIOUS: dict[str, CommandLevel | None] = {
+OVERCAUTIOUS: MappingProxyType[str, CommandLevel | None] = MappingProxyType({
     # окружение целиком может содержать секреты
     "printenv | grep -i python": None,
     "env | sort": None,
@@ -135,16 +141,16 @@ OVERCAUTIOUS: dict[str, CommandLevel | None] = {
     "pipdeptree": None,
     "gpg --list-keys": None,
     "mktemp -d": None,
-}
+})
 
 
 @pytest.fixture(scope="module")
-def project(tmp_path_factory) -> Path:
+def project(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Проект с файлами, о которых говорят команды корпуса."""
     root = tmp_path_factory.mktemp("corpus")
-    for d in ("src", "tests", "gigacrew", "docs", "build", "logs", "scripts"):
-        (root / d).mkdir()
-    for f in (
+    for directory in ("src", "tests", "gigacrew", "docs", "build", "logs", "scripts"):
+        (root / directory).mkdir()
+    for relative in (
         "README.md",
         "pyproject.toml",
         "data.csv",
@@ -160,7 +166,7 @@ def project(tmp_path_factory) -> Path:
         "data.tsv",
         "tools.py",
     ):
-        (root / f).write_text("x = 1\n")
+        (root / relative).write_text("x = 1\n")
     (root / "main.py").write_text("import gigacrew\nprint(gigacrew)\n")  # код проекта
     (root / "package.json").write_text(
         json.dumps(
@@ -180,64 +186,71 @@ def project(tmp_path_factory) -> Path:
 
 
 @pytest.mark.parametrize("raw", CORPORA)
-def test_changing_commands_are_never_read_only(project, raw):
+def test_changing_commands_are_never_read_only(project: Path, raw: str) -> None:
     wrong = []
-    for command, label in load(raw):
+    for command, label in load_corpus(raw):
         verdict = classify(command, root=project)
         if label > 0 and verdict.level is CommandLevel.READ:
             wrong.append((NAMES[label], command, verdict.reason))
-    assert wrong == []
+    assert not wrong
 
 
 @pytest.mark.parametrize("raw", CORPORA)
-def test_dangerous_commands_are_not_exec(project, raw):
+def test_dangerous_commands_are_not_exec(project: Path, raw: str) -> None:
     """Опасное не попадает в «выполняет код проекта» (его разрешают «всегда»)."""
     wrong = []
-    for command, label in load(raw):
+    for command, label in load_corpus(raw):
         verdict = classify(command, root=project)
         if label == 3 and verdict.level in {CommandLevel.READ, CommandLevel.EXEC}:
             wrong.append((command, verdict.reason))
-    assert wrong == []
+    assert not wrong
 
 
 @pytest.mark.parametrize(
     ("name", "raw", "minimum"),
     [("corpus", CORPUS, 0.85), ("holdout", HOLDOUT, 0.6)],
 )
-def test_read_only_recall(project, name, raw, minimum):
+def test_read_only_recall(project: Path, name: str, raw: str, minimum: float) -> None:
     """Читающие команды в основном проходят без вопроса (иначе классификатор бесполезен)."""
-    reads = [c for c, label in load(raw) if label == 0]
-    passed = [c for c in reads if classify(c, root=project).level is CommandLevel.READ]
+    reads = [command for command, label in load_corpus(raw) if label == 0]
+    passed = [
+        command for command in reads if classify(command, root=project).level is CommandLevel.READ
+    ]
     assert len(passed) / len(reads) >= minimum
 
 
 @pytest.mark.parametrize("raw", CORPORA)
-def test_levels_match_labels(project, raw):
-    """D — ровно DANGER, R — ровно READ, X и W — не мягче метки; известные расхождения —
-    ровно с записанным уровнем.
+def test_levels_match_labels(project: Path, raw: str) -> None:
+    """D — ровно DANGER, R — ровно READ, X и W — не мягче метки.
+
+    Известные расхождения — ровно с записанным уровнем.
     """
     known = {**KNOWN_GAPS, **OVERCAUTIOUS}
     wrong = []
-    for command, label in load(raw):
+    for command, label in load_corpus(raw):
         verdict = classify(command, root=project)
         got = verdict.level
-        if command in known:
-            if got is not known[command]:
+        recorded = known.get(command, _UNLISTED)
+        if recorded is not _UNLISTED:
+            if got is not recorded:
                 wrong.append(("расхождение изменилось", command, got, verdict.reason))
             continue
         want = BY_LABEL[label]
         ok = got is want if label in {0, 3} else worst(got, want) is got
         if not ok:
             wrong.append((NAMES[label], command, got, verdict.reason))
-    assert wrong == []
+    assert not wrong
 
 
-def test_known_mismatches_and_relabels_are_real():
+def test_known_mismatches_and_relabels_are_real() -> None:
     """Списки расхождений и поправок меток говорят о строках корпусов, какие они есть."""
-    labels = dict(load(CORPUS) + load(HOLDOUT))
-    original = dict(parse(CORPUS) + parse(HOLDOUT))
-    assert sorted(c for c in KNOWN_GAPS if labels.get(c) != 3) == []
-    assert sorted(c for c in OVERCAUTIOUS if labels.get(c) != 0) == []
+    labels = dict(load_corpus(CORPUS) + load_corpus(HOLDOUT))
+    original = dict(parse_original(CORPUS) + parse_original(HOLDOUT))
+    not_dangerous = sorted(command for command in KNOWN_GAPS if labels.get(command) != 3)
+    assert not not_dangerous
+    not_read_only = sorted(command for command in OVERCAUTIOUS if labels.get(command) != 0)
+    assert not not_read_only
     for command, (label, why) in RELABELED.items():
-        assert command in original and why, command
+        assert command in original, command
+        assert why, command
         assert original[command] != LEVELS[label], command

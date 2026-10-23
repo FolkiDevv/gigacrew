@@ -51,6 +51,8 @@ _GITIGNORE_BODY = (
     "# скиллы (skills/) и settings.json — коммитятся.\n"
     + "".join(f"{pattern}\n" for pattern in GITIGNORED_DATA)
 )
+_GITIGNORE_MODE = 0o644
+_PROJECT_KEY_LENGTH = 16  # символов hex-дайджеста sha256
 
 
 def user_data_dir() -> Path:
@@ -65,7 +67,8 @@ def user_settings_file() -> Path:
 
 def project_key(root: Path) -> str:
     """Ключ проекта: путь корня; рабочее дерево git — путь основного репозитория."""
-    return hashlib.sha256(str(project_key_root(root)).encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(str(project_key_root(root)).encode("utf-8")).hexdigest()
+    return digest[:_PROJECT_KEY_LENGTH]
 
 
 def project_key_root(root: Path) -> Path:
@@ -83,24 +86,33 @@ def _main_worktree(root: Path) -> Path | None:
     """
     dot_git = root / ".git"
     try:
-        if not dot_git.is_file():
-            return None
-        for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
-            if not line.startswith("gitdir:"):
-                continue
-            target = Path(line[len("gitdir:") :].strip())
-            gitdir = (target if target.is_absolute() else root / target).resolve()
-            # <основной>/.git/worktrees/<имя>
-            if gitdir.parent.name != "worktrees" or gitdir.parent.parent.name != ".git":
-                return None
-            back = Path((gitdir / "gitdir").read_text(encoding="utf-8").strip())
-            back = (back if back.is_absolute() else gitdir / back).resolve()
-            if os.path.normcase(str(back)) != os.path.normcase(str(dot_git.resolve())):
-                return None
-            return gitdir.parent.parent.parent
+        return _read_main_worktree(root, dot_git)
     except (OSError, ValueError):
         return None
+
+
+def _read_main_worktree(root: Path, dot_git: Path) -> Path | None:
+    """Тело :func:`_main_worktree`: ошибки ФС и путей (OSError, ValueError) не перехватывает."""
+    if not dot_git.is_file():
+        return None
+    for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("gitdir:"):
+            return _confirmed_main_worktree(root, dot_git, line)
     return None
+
+
+def _confirmed_main_worktree(root: Path, dot_git: Path, line: str) -> Path | None:
+    """Основной репозиторий по строке ``gitdir:`` из ``root/.git``, если git её подтверждает."""
+    target = Path(line[len("gitdir:") :].strip())
+    gitdir = (target if target.is_absolute() else root / target).resolve()
+    # <основной>/.git/worktrees/<имя>
+    if gitdir.parent.name != "worktrees" or gitdir.parent.parent.name != ".git":
+        return None
+    back = Path((gitdir / "gitdir").read_text(encoding="utf-8").strip())
+    back = (back if back.is_absolute() else gitdir / back).resolve()
+    if os.path.normcase(str(back)) != os.path.normcase(str(dot_git.resolve())):
+        return None
+    return gitdir.parent.parent.parent
 
 
 @dataclass(frozen=True)
@@ -110,6 +122,7 @@ class Workspace:
     root: Path
 
     def __post_init__(self) -> None:
+        """Приводит корень к абсолютному пути без симлинков."""
         object.__setattr__(self, "root", Path(self.root).resolve())
 
     @property
@@ -174,10 +187,11 @@ class Workspace:
         return bool(parts) and parts[0].casefold() == DATA_DIR_NAME.casefold()
 
     def in_git_repo(self) -> bool:
-        """Проект внутри git-репозитория: ``.git`` (каталог или файл рабочего дерева)
-        в корне или выше. Только проверка ФС — git не запускается.
+        """Проект внутри git-репозитория: ``.git`` в корне или выше.
+
+        ``.git`` — каталог или файл рабочего дерева. Только проверка ФС — git не запускается.
         """
-        return any((d / ".git").exists() for d in (self.root, *self.root.parents))
+        return any((directory / ".git").exists() for directory in (self.root, *self.root.parents))
 
     def ensure_data_dir(self) -> Path:
         """Создаёт ``.gigacode/`` с ``.gitignore`` (идемпотентно) и возвращает путь.
@@ -194,12 +208,14 @@ class Workspace:
             raise OSError(f"{data_dir} — симлинк: gigacrew не пишет по нему")
         data_dir.mkdir(parents=True, exist_ok=True)
         for name in _OWN_ENTRIES:
-            if (data_dir / name).is_symlink():
-                raise OSError(f"{data_dir / name} — симлинк: gigacrew не пишет по нему")
+            entry = data_dir / name
+            if entry.is_symlink():
+                raise OSError(f"{entry} — симлинк: gigacrew не пишет по нему")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         try:
-            fd = os.open(data_dir / ".gitignore", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            fd = os.open(data_dir / ".gitignore", flags, _GITIGNORE_MODE)
         except FileExistsError:
             return data_dir
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(_GITIGNORE_BODY)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(_GITIGNORE_BODY)
         return data_dir

@@ -48,16 +48,19 @@ def root(tmp_path: Path) -> Path:
         ),
         "import importlib.metadata as m; print(m.version('pytest'))",
         "import os; print(os.getcwd(), os.listdir('.'))",
-        "import re\nprint(re.findall(r'def (\\w+)', open('pkg/mod.py').read()))",
+        (
+            "import re\n"
+            r"print(re.findall(r'def (\w+)', open('pkg/mod.py').read()))"
+        ),
         "x = [1, 2]; x.remove(1); print('a'.replace('a', 'b'))",
         "print('{} {}'.format(1, 2))",
         "def f(n):\n    return n * 2\nprint(f(2))",
         "class A:\n    def go(self):\n        return 1\nprint(A().go())",
     ],
 )
-def test_read_only_code(root, code):
-    result = analyze(code, root=root)
-    assert result.level is READ, result.reason
+def test_read_only_code(root: Path, code: str) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is READ, analysis.reason
 
 
 @pytest.mark.parametrize(
@@ -110,9 +113,9 @@ def test_read_only_code(root, code):
         ("print('a b'.replace('a', 'b'))", READ),
     ],
 )
-def test_risky_code(root, code, expected):
-    result = analyze(code, root=root)
-    assert result.level is expected, result.reason
+def test_risky_code(root: Path, code: str, expected: CommandLevel | None) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is expected, analysis.reason
 
 
 @pytest.mark.parametrize(
@@ -148,9 +151,13 @@ def test_risky_code(root, code, expected):
         ("from math import *\nprint(pi)", None),
     ],
 )
-def test_modules_reached_through_other_modules(root, code, expected):
-    result = analyze(code, root=root)
-    assert result.level is expected, result.reason
+def test_modules_reached_through_other_modules(
+    root: Path,
+    code: str,
+    expected: CommandLevel | None,
+) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is expected, analysis.reason
 
 
 @pytest.mark.parametrize(
@@ -198,9 +205,9 @@ def test_modules_reached_through_other_modules(root, code, expected):
         ("import json; print(json.dumps({}, default=str))", READ),
     ],
 )
-def test_callables_as_values(root, code, expected):
-    result = analyze(code, root=root)
-    assert result.level is expected, result.reason
+def test_callables_as_values(root: Path, code: str, expected: CommandLevel | None) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is expected, analysis.reason
 
 
 @pytest.mark.parametrize(
@@ -232,9 +239,9 @@ def test_callables_as_values(root, code, expected):
         ("d = {}; e = d.copy(); print(e)", READ),
     ],
 )
-def test_move_and_copy_destination(root, code, expected):
-    result = analyze(code, root=root)
-    assert result.level is expected, result.reason
+def test_move_and_copy_destination(root: Path, code: str, expected: CommandLevel | None) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is expected, analysis.reason
 
 
 @pytest.mark.parametrize(
@@ -255,9 +262,9 @@ def test_move_and_copy_destination(root, code, expected):
         ("import shutil; kw = {'dst': '/tmp/x'}; shutil.copy('a.txt', **kw)", None),
     ],
 )
-def test_os_writers_keyword_arguments(root, code, expected):
-    result = analyze(code, root=root)
-    assert result.level is expected, result.reason
+def test_os_writers_keyword_arguments(root: Path, code: str, expected: CommandLevel | None) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is expected, analysis.reason
 
 
 @pytest.mark.parametrize(
@@ -272,11 +279,11 @@ def test_os_writers_keyword_arguments(root, code, expected):
         ("print(open('.gigacode/plans/p.md').read())", READ),
     ],
 )
-def test_writes_into_gigacode_data(root, code, expected):
+def test_writes_into_gigacode_data(root: Path, code: str, expected: CommandLevel | None) -> None:
     (root / ".gigacode" / "plans").mkdir(parents=True)
     (root / ".gigacode" / "plans" / "p.md").write_text("plan")
-    result = analyze(code, root=root)
-    assert result.level is expected, result.reason
+    analysis = analyze(code, root=root)
+    assert analysis.level is expected, analysis.reason
 
 
 @pytest.mark.parametrize(
@@ -291,19 +298,19 @@ def test_writes_into_gigacode_data(root, code, expected):
         ("import random, sys; random.shuffle(sys.path)", None),
         # читать sys.path — можно
         ("import sys; print(sys.path)", READ),
-        ("import sys; print('\\n'.join(sys.path), len(sys.path), '/tmp' in sys.path)", READ),
+        (r"import sys; print('\n'.join(sys.path), len(sys.path), '/tmp' in sys.path)", READ),
         ("import sys\nfor p in sys.path:\n    print(p)", READ),
         ("from sys import path; print(path)", READ),
     ],
 )
-def test_sys_path_changes(root, code, expected):
-    result = analyze(code, root=root)
-    assert result.level is expected, result.reason
+def test_sys_path_changes(root: Path, code: str, expected: CommandLevel | None) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is expected, analysis.reason
 
 
 # Каждую строку ловит одно правило: в test_risky_code уровень часто даёт другое, раньше
 # (rmtree, os.system, __builtins__), и само правило там не проверяется.
-_DANGER_METHOD_NAMES = [
+_DANGER_METHOD_NAMES = (
     "system",
     "popen",
     "spawnl",
@@ -337,7 +344,7 @@ _DANGER_METHOD_NAMES = [
     "startfile",
     "run_module",
     "run_path",
-]
+)
 
 
 @pytest.mark.parametrize(
@@ -408,7 +415,10 @@ _DANGER_METHOD_NAMES = [
         ("from pathlib import Path; (Path.cwd() / '..' / 'x').write_text('a')", DANGER),
         ("from pathlib import Path\np = Path('/tmp/x')\np.write_text('x')", DANGER),
         (
-            "from pathlib import Path\nfor p in Path('pkg').iterdir():\n    print(list(p.glob('../*')))",
+            (
+                "from pathlib import Path\nfor p in Path('pkg').iterdir():\n"
+                "    print(list(p.glob('../*')))"
+            ),
             None,
         ),
         (
@@ -424,17 +434,17 @@ _DANGER_METHOD_NAMES = [
         ),
     ],
 )
-def test_each_guard_alone(root, code, expected):
-    result = analyze(code, root=root)
-    assert result.level is expected, result.reason
+def test_each_guard_alone(root: Path, code: str, expected: CommandLevel | None) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is expected, analysis.reason
 
 
-def test_source_limits(root):
+def test_source_limits(root: Path) -> None:
     assert analyze("#" * (256 * 1024 + 1), root=root).level is None
     assert analyze("print(1)\x00", root=root).level is None
 
 
-def test_walks_see_links_and_secrets(root, tmp_path_factory):
+def test_walks_see_links_and_secrets(root: Path, tmp_path_factory: pytest.TempPathFactory) -> None:
     outside = tmp_path_factory.mktemp("outside")
     (outside / "secret.txt").write_text("s")
     # запись через ссылку наружу — запись вне проекта
@@ -453,7 +463,7 @@ def test_walks_see_links_and_secrets(root, tmp_path_factory):
     assert analyze(code, root=root).level is None
 
 
-def test_secret_files_ask(root):
+def test_secret_files_ask(root: Path) -> None:
     (root / ".env").write_text("TOKEN=1\n")
     assert analyze("print(open('.env').read())", root=root).level is None
     # обход каталога, где есть секрет, читает и его
@@ -464,7 +474,7 @@ def test_secret_files_ask(root):
     assert analyze(code, root=root).level is READ
 
 
-def test_stdlib_shadowing_in_run_directory(root):
+def test_stdlib_shadowing_in_run_directory(root: Path) -> None:
     assert shadowed_stdlib(root) is None
     (root / "json.py").write_text("print('evil')")
     assert shadowed_stdlib(root) == "json.py"
@@ -473,7 +483,7 @@ def test_stdlib_shadowing_in_run_directory(root):
     assert classify("python3 -I -c 'print(1)'", root=root).level is READ
 
 
-def test_stdlib_shadowing_by_packages_script_dir_and_pythonpath(root):
+def test_stdlib_shadowing_by_packages_script_dir_and_pythonpath(root: Path) -> None:
     (root / "json").mkdir()
     assert shadowed_stdlib(root) is None  # каталог без __init__.py — не пакет
     (root / "json" / "__init__.py").write_text("")
@@ -508,9 +518,22 @@ def test_stdlib_shadowing_by_packages_script_dir_and_pythonpath(root):
         ("python3 -i", None),
         ('python3 -c "$CODE"', None),
         # многострочный код в кавычках: переводы строк — часть кода
-        ('python3 -c "\nimport ast\nprint(ast.dump(ast.parse(\\"x\\")))\n"', READ),
+        (
+            (
+                'python3 -c "\nimport ast\n'
+                r"print(ast.dump(ast.parse(\"x\")))"
+                '\n"'
+            ),
+            READ,
+        ),
         ("python3 -c '\nfor n in open(\"README.md\"):\n    print(n)\n'", READ),
-        ('python3 -c "import os\nos.remove(\\"README.md\\")"', WRITE),
+        (
+            (
+                'python3 -c "import os\n'
+                r'os.remove(\"README.md\")"'
+            ),
+            WRITE,
+        ),
         ("python3 - <<'EOF'\nimport sys\nprint(sys.argv)\nEOF", READ),
         ("python3 <<'EOF'\nimport os\nos.system('id')\nEOF", DANGER),
         ("cat <<'EOF' | python3\nprint(1)\nEOF", READ),
@@ -520,12 +543,12 @@ def test_stdlib_shadowing_by_packages_script_dir_and_pythonpath(root):
         ("PYTHONPATH=/tmp python3 -c 'print(1)'", None),
     ],
 )
-def test_python_invocations(root, command, expected):
+def test_python_invocations(root: Path, command: str, expected: CommandLevel | None) -> None:
     verdict = classify(command, root=root)
     assert verdict.level is expected, verdict.reason
 
 
-def test_python_script_is_analyzed(root):
+def test_python_script_is_analyzed(root: Path) -> None:
     (root / "check.py").write_text("import json\nprint(json.load(open('package.json')))\n")
     (root / "bad.py").write_text("import os\nos.system('id')\n")
     (root / "uses_pkg.py").write_text("import pkg\n")
@@ -537,7 +560,7 @@ def test_python_script_is_analyzed(root):
     assert signature.startswith("python uses_pkg.py#")
 
 
-def test_project_venv_with_executable_pth_is_exec(root):
+def test_project_venv_with_executable_pth_is_exec(root: Path) -> None:
     venv = root / ".venv"
     site = venv / "lib" / "python3.13" / "site-packages"
     site.mkdir(parents=True)

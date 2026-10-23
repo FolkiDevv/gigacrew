@@ -3,28 +3,45 @@
 from __future__ import annotations
 
 import os
+import shutil
+import ssl
+import subprocess
+from collections.abc import Callable
+from pathlib import Path
+from typing import TypedDict, Unpack, cast
 
+import certifi
 import pytest
+from fakes import ScriptedProvider, text_turn
 
 from gigacrew.cli import main
 from gigacrew.config import Config, ConfigError, load_environment, read_dotenv
+from gigacrew.llm.base import LLMProvider
+from gigacrew.permissions import PermissionMode
 
 
-def _env_file(path, text):
+class _LoadOverrides(TypedDict, total=False):
+    """Необязательные аргументы ``Config.load``, которые тесты передают поверх окружения."""
+
+    save_chats: bool
+    mode: PermissionMode
+
+
+def _env_file(path: Path, text: str) -> None:
     path.mkdir(parents=True, exist_ok=True)
     (path / ".env").write_text(text, encoding="utf-8")
 
 
-def test_read_dotenv_parses_quotes_comments_export(tmp_path):
+def test_read_dotenv_parses_quotes_comments_export(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text(
         "# comment\nA=1\nexport B=\"two\"\nC='three'\nbroken line\n",
         encoding="utf-8",
     )
     assert read_dotenv(tmp_path / ".env") == {"A": "1", "B": "two", "C": "three"}
-    assert read_dotenv(tmp_path / "missing.env") == {}
+    assert not read_dotenv(tmp_path / "missing.env")
 
 
-def test_read_dotenv_inline_comments_and_quotes(tmp_path):
+def test_read_dotenv_inline_comments_and_quotes(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text(
         "MODEL=Alpha-2-Max # быстрая\n"
         'Q="x # не комментарий" # а это — да\n'
@@ -42,20 +59,20 @@ def test_read_dotenv_inline_comments_and_quotes(tmp_path):
     }
 
 
-def test_read_dotenv_with_bom_keeps_first_setting(tmp_path):
+def test_read_dotenv_with_bom_keeps_first_setting(tmp_path: Path) -> None:
     # UTF-8 с BOM пишут PowerShell 5 и старый Блокнот: первая настройка не теряется
     (tmp_path / ".env").write_bytes("GIGACREW_VERIFY_SSL=1\nB=2\n".encode("utf-8-sig"))
     assert read_dotenv(tmp_path / ".env") == {"GIGACREW_VERIFY_SSL": "1", "B": "2"}
     assert Config.load(project_root=tmp_path, environ={}, cwd=tmp_path).verify_ssl is True
 
 
-def test_undecodable_dotenv_is_a_config_error(tmp_path):
+def test_undecodable_dotenv_is_a_config_error(tmp_path: Path) -> None:
     (tmp_path / ".env").write_bytes(b"\xff\xfe=1\n")
     with pytest.raises(ConfigError, match=r"\.env"):
         Config.load(project_root=tmp_path, environ={}, cwd=tmp_path)
 
 
-def test_priority_environ_over_root_over_cwd(tmp_path):
+def test_priority_environ_over_root_over_cwd(tmp_path: Path) -> None:
     root, cwd = tmp_path / "proj", tmp_path / "cwd"
     _env_file(root, "GIGACREW_MODEL=from-root\nGIGACREW_SCOPE=root-scope\n")
     _env_file(cwd, "GIGACREW_MODEL=from-cwd\nGIGACREW_SCOPE=cwd-scope\nGIGACREW_TIMEOUT=7\n")
@@ -70,7 +87,7 @@ def test_priority_environ_over_root_over_cwd(tmp_path):
     assert cfg.timeout == 7
 
 
-def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
+def test_load_does_not_touch_os_environ(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GIGACREW_ACCESS_KEY", raising=False)
     _env_file(tmp_path, "GIGACREW_ACCESS_KEY=secret-from-dotenv\n")
     cfg = Config.load(project_root=tmp_path, environ={}, cwd=tmp_path)
@@ -79,54 +96,63 @@ def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "env",
+    ("name", "raw"),
     [
-        {"GIGACREW_TIMEOUT": "abc"},
-        {"GIGACREW_TIMEOUT": "0"},
-        {"GIGACREW_TEMPERATURE": "warm"},
-        {"GIGACREW_TEMPERATURE": "5"},
-        {"GIGACREW_MODE": "yolo"},
-        {"GIGACREW_COMPACT_THRESHOLD": "5"},
-        {"GIGACREW_COMPACT_THRESHOLD": "99"},
-        {"GIGACREW_COMPACT_THRESHOLD": "0.8"},
-        {"GIGACREW_SUBAGENT_MAX_STEPS": "0"},
-        {"GIGACREW_SUBAGENT_CONTEXT": "5"},
-        {"GIGACREW_SUBAGENT_CONTEXT": "99"},
-        {"GIGACREW_SUBAGENT_TIMEOUT": "5"},
-        {"GIGACREW_SUBAGENT_TIMEOUT": "long"},
-        {"GIGACREW_READ_TIMEOUT": "0"},
-        {"GIGACREW_READ_TIMEOUT": "long"},
-        {"GIGACREW_PROVIDER": "openai"},
-        {"GIGACREW_USER_AGENT": "агент/1.0"},
-        {"GIGACREW_USER_AGENT": "agent\x1b[31m"},
+        ("GIGACREW_TIMEOUT", "abc"),
+        ("GIGACREW_TIMEOUT", "0"),
+        ("GIGACREW_TEMPERATURE", "warm"),
+        ("GIGACREW_TEMPERATURE", "5"),
+        ("GIGACREW_MODE", "yolo"),
+        ("GIGACREW_COMPACT_THRESHOLD", "5"),
+        ("GIGACREW_COMPACT_THRESHOLD", "99"),
+        ("GIGACREW_COMPACT_THRESHOLD", "0.8"),
+        ("GIGACREW_SUBAGENT_MAX_STEPS", "0"),
+        ("GIGACREW_SUBAGENT_CONTEXT", "5"),
+        ("GIGACREW_SUBAGENT_CONTEXT", "99"),
+        ("GIGACREW_SUBAGENT_TIMEOUT", "5"),
+        ("GIGACREW_SUBAGENT_TIMEOUT", "long"),
+        ("GIGACREW_READ_TIMEOUT", "0"),
+        ("GIGACREW_READ_TIMEOUT", "long"),
+        ("GIGACREW_PROVIDER", "openai"),
+        ("GIGACREW_USER_AGENT", "агент/1.0"),
+        ("GIGACREW_USER_AGENT", "agent\x1b[31m"),
     ],
 )
-def test_bad_values_raise_config_error(tmp_path, env):
-    (name,) = env  # ошибка называет ту переменную, что задана неверно
+def test_bad_values_raise_config_error(tmp_path: Path, name: str, raw: str) -> None:
+    # ошибка называет ту переменную, что задана неверно
     with pytest.raises(ConfigError, match=name):
-        Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+        Config.load(project_root=tmp_path, environ={name: raw}, cwd=tmp_path)
 
 
 @pytest.mark.parametrize(
-    ("env", "field", "value"),
+    ("env", "field", "expected"),
     [
-        ({"GIGACREW_TEMPERATURE": "0"}, "temperature", 0.0),
+        ({"GIGACREW_TEMPERATURE": "0"}, "temperature", float(0)),
         ({"GIGACREW_TEMPERATURE": "2"}, "temperature", 2.0),
-        ({"GIGACREW_COMPACT_THRESHOLD": "10"}, "compact_threshold", 0.10),
+        ({"GIGACREW_COMPACT_THRESHOLD": "10"}, "compact_threshold", 0.1),
         ({"GIGACREW_COMPACT_THRESHOLD": "95"}, "compact_threshold", 0.95),
-        ({"GIGACREW_SUBAGENT_CONTEXT": "10"}, "subagent_context_share", 0.10),
+        ({"GIGACREW_SUBAGENT_CONTEXT": "10"}, "subagent_context_share", 0.1),
         ({"GIGACREW_SUBAGENT_CONTEXT": "95"}, "subagent_context_share", 0.95),
         ({"GIGACREW_SUBAGENT_TIMEOUT": "10"}, "subagent_timeout", 10),
         ({"GIGACREW_TIMEOUT": "1"}, "timeout", 1),
         ({"GIGACREW_RATE_LIMIT_WAIT": "0"}, "rate_limit_wait", 0),
     ],
 )
-def test_bounds_are_inclusive(tmp_path, env, field, value):
+def test_bounds_are_inclusive(
+    tmp_path: Path,
+    env: dict[str, str],
+    field: str,
+    expected: float,
+) -> None:
     cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
-    assert getattr(cfg, field) == value
+    assert getattr(cfg, field) == expected
 
 
-def test_main_reports_config_error(tmp_path, monkeypatch, capsys):
+def test_main_reports_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GIGACREW_ACCESS_KEY", "dummy")
     monkeypatch.setenv("GIGACREW_TIMEOUT", "abc")
@@ -134,7 +160,11 @@ def test_main_reports_config_error(tmp_path, monkeypatch, capsys):
     assert "GIGACREW_TIMEOUT" in capsys.readouterr().out
 
 
-def test_main_without_credentials(tmp_path, monkeypatch, capsys):
+def test_main_without_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     monkeypatch.chdir(tmp_path)
     for name in ("GIGACREW_ACCESS_KEY", "GIGACREW_CERT", "GIGACREW_KEY", "GIGACREW_PROVIDER"):
         monkeypatch.delenv(name, raising=False)
@@ -142,7 +172,11 @@ def test_main_without_credentials(tmp_path, monkeypatch, capsys):
     assert "реквизиты" in capsys.readouterr().out
 
 
-def test_endpoints_and_model_have_no_defaults(tmp_path, monkeypatch, capsys):
+def test_endpoints_and_model_have_no_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Адреса API и модель задаёт только пользователь — без них клиент не стартует."""
     cfg = Config.load(project_root=tmp_path, environ={"GIGACREW_ACCESS_KEY": "k"}, cwd=tmp_path)
     assert (cfg.base_url, cfg.auth_url, cfg.model, cfg.scope) == ("", None, "", None)
@@ -159,8 +193,9 @@ def test_endpoints_and_model_have_no_defaults(tmp_path, monkeypatch, capsys):
     # mTLS адрес выдачи токена не нужен
     Config(cert="c.pem", key="c.key", base_url="https://api.test/v1").require_credentials()
     # половина пары — не mTLS: понятная ошибка, а не сбой при сборке TLS
-    for half in ({"cert": "c.pem"}, {"key": "c.key"}):
-        cfg = Config(base_url="https://api.test/v1", **half)
+    halves: tuple[tuple[str | None, str | None], ...] = (("c.pem", None), (None, "c.key"))
+    for cert, key in halves:
+        cfg = Config(base_url="https://api.test/v1", cert=cert, key=key)
         assert cfg.auth_mode == "none"
         with pytest.raises(RuntimeError, match="GIGACREW_CERT и GIGACREW_KEY"):
             cfg.require_credentials()
@@ -175,8 +210,8 @@ def test_endpoints_and_model_have_no_defaults(tmp_path, monkeypatch, capsys):
     assert "GIGACREW_MODEL" in capsys.readouterr().out
 
 
-def test_provider_choice(tmp_path):
-    def load(env):
+def test_provider_choice(tmp_path: Path) -> None:
+    def load(env: dict[str, str]) -> Config:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     cfg = load({"GIGACREW_ACCESS_KEY": "k"})
@@ -190,10 +225,10 @@ def test_provider_choice(tmp_path):
         load({"GIGACREW_PROVIDER": "openai"})
 
 
-def test_gigacode_settings(tmp_path):
+def test_gigacode_settings(tmp_path: Path) -> None:
     """Для GigaCode нужен адрес; каталог CLI с токеном — GIGACODE_HOME, по умолчанию нет."""
 
-    def load(env):
+    def load(env: dict[str, str]) -> Config:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     base = {"GIGACREW_PROVIDER": "gigacode", "GIGACREW_API_URL": "https://code.test"}
@@ -203,10 +238,10 @@ def test_gigacode_settings(tmp_path):
         load({"GIGACREW_PROVIDER": "gigacode", "GIGACREW_USER_AGENT": "x"}).require_credentials()
 
 
-def test_gigacode_user_agent_has_no_default(tmp_path):
+def test_gigacode_user_agent_has_no_default(tmp_path: Path) -> None:
     """User-Agent запросов к GigaCode тоже задаёт только пользователь."""
 
-    def load(env):
+    def load(env: dict[str, str]) -> Config:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     base = {
@@ -229,17 +264,17 @@ def test_gigacode_user_agent_has_no_default(tmp_path):
     ).require_credentials()
 
 
-def test_save_chats_flag_and_env(tmp_path):
-    def load(env, **kw):
-        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path, **kw).save_chats
+def test_save_chats_flag_and_env(tmp_path: Path) -> None:
+    def load(env: dict[str, str], **overrides: Unpack[_LoadOverrides]) -> bool:
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path, **overrides).save_chats
 
     assert load({}) is True
     assert load({"GIGACREW_SAVE_CHATS": "0"}) is False
     assert load({"GIGACREW_SAVE_CHATS": "1"}, save_chats=False) is False  # --no-save сильнее
 
 
-def test_command_safety_settings(tmp_path):
-    def load(env):
+def test_command_safety_settings(tmp_path: Path) -> None:
+    def load(env: dict[str, str]) -> tuple[bool, bool]:
         cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
         return cfg.safe_commands, cfg.remember_approvals
 
@@ -250,11 +285,9 @@ def test_command_safety_settings(tmp_path):
     )
 
 
-def test_mode_flag_and_env(tmp_path):
-    from gigacrew.permissions import PermissionMode
-
-    def load(env, **kw):
-        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path, **kw).mode
+def test_mode_flag_and_env(tmp_path: Path) -> None:
+    def load(env: dict[str, str], **overrides: Unpack[_LoadOverrides]) -> PermissionMode:
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path, **overrides).mode
 
     assert load({}) is PermissionMode.AUTO
     assert load({"GIGACREW_MODE": " Plan "}) is PermissionMode.PLAN
@@ -267,8 +300,8 @@ def test_mode_flag_and_env(tmp_path):
         load({"GIGACREW_MODE": "yolo"})
 
 
-def test_reviewer_model(tmp_path):
-    def load(env):
+def test_reviewer_model(tmp_path: Path) -> None:
+    def load(env: dict[str, str]) -> str | None:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).reviewer_model
 
     assert load({}) is None
@@ -276,20 +309,20 @@ def test_reviewer_model(tmp_path):
     assert load({"GIGACREW_REVIEWER_MODEL": " Reviewer-Max "}) == "Reviewer-Max"
 
 
-def test_compaction_settings(tmp_path):
-    def load(env):
+def test_compaction_settings(tmp_path: Path) -> None:
+    def load(env: dict[str, str]) -> Config:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     cfg = load({})
     assert cfg.auto_compact is True
-    assert cfg.compact_threshold == 0.8
+    assert cfg.compact_threshold == pytest.approx(0.8)
     cfg = load({"GIGACREW_AUTO_COMPACT": "0", "GIGACREW_COMPACT_THRESHOLD": "65"})
     assert cfg.auto_compact is False
-    assert cfg.compact_threshold == 0.65
+    assert cfg.compact_threshold == pytest.approx(0.65)
 
 
-def test_subagent_limits(tmp_path):
-    def load(env):
+def test_subagent_limits(tmp_path: Path) -> None:
+    def load(env: dict[str, str]) -> Config:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     cfg = load({})
@@ -312,16 +345,16 @@ def test_subagent_limits(tmp_path):
     )
 
 
-def test_read_timeout(tmp_path):
-    def load(env):
+def test_read_timeout(tmp_path: Path) -> None:
+    def load(env: dict[str, str]) -> Config:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     assert (load({}).timeout, load({}).read_timeout) == (120, 600)
     assert load({"GIGACREW_READ_TIMEOUT": "900"}).read_timeout == 900
 
 
-def test_reasoning_mode(tmp_path):
-    def load(env):
+def test_reasoning_mode(tmp_path: Path) -> None:
+    def load(env: dict[str, str]) -> Config:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     assert load({}).reasoning == "turn"
@@ -330,8 +363,8 @@ def test_reasoning_mode(tmp_path):
         load({"GIGACREW_REASONING": "always"})
 
 
-def test_rate_limit_wait(tmp_path):
-    def load(env):
+def test_rate_limit_wait(tmp_path: Path) -> None:
+    def load(env: dict[str, str]) -> Config:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
     assert load({}).rate_limit_wait == 120
@@ -341,7 +374,7 @@ def test_rate_limit_wait(tmp_path):
         load({"GIGACREW_RATE_LIMIT_WAIT": "-1"})
 
 
-def test_yes_all_implies_auto_approve(tmp_path):
+def test_yes_all_implies_auto_approve(tmp_path: Path) -> None:
     cfg = Config.load(project_root=tmp_path, yes_all=True, environ={}, cwd=tmp_path)
     assert cfg.auto_approve
     assert cfg.yes_all
@@ -350,11 +383,7 @@ def test_yes_all_implies_auto_approve(tmp_path):
     assert not cfg.yes_all
 
 
-def test_ca_bundle_enables_verification(tmp_path):
-    import ssl
-
-    import certifi
-
+def test_ca_bundle_enables_verification(tmp_path: Path) -> None:
     env = {"GIGACREW_ACCESS_KEY": "k", "GIGACREW_CA_BUNDLE": certifi.where()}
     cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
     assert cfg.verify_ssl
@@ -378,26 +407,23 @@ def test_ca_bundle_enables_verification(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("value", "expected"),
+    ("flag", "expected"),
     [("1", True), (" Yes ", True), ("ON", True), ("off", False), ("No", False)],
 )
-def test_boolean_settings(tmp_path, value, expected):
-    env = {"GIGACREW_PROVIDER": "gigacode", "GIGACREW_VERIFY_SSL": value}
+def test_boolean_settings(tmp_path: Path, flag: str, *, expected: bool) -> None:
+    env = {"GIGACREW_PROVIDER": "gigacode", "GIGACREW_VERIFY_SSL": flag}
     assert Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).verify_ssl is expected
 
 
-@pytest.mark.parametrize("value", ["ture", "enabled", "y"])
-def test_invalid_boolean_is_an_error(tmp_path, value):
+@pytest.mark.parametrize("flag", ["ture", "enabled", "y"])
+def test_invalid_boolean_is_an_error(tmp_path: Path, flag: str) -> None:
     """Опечатка не выключает проверку TLS молча — ошибка конфигурации."""
-    env = {"GIGACREW_PROVIDER": "gigacode", "GIGACREW_VERIFY_SSL": value}
+    env = {"GIGACREW_PROVIDER": "gigacode", "GIGACREW_VERIFY_SSL": flag}
     with pytest.raises(ConfigError, match="GIGACREW_VERIFY_SSL"):
         Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
 
 
-def _self_signed(tmp_path, cn="test"):
-    import shutil
-    import subprocess
-
+def _self_signed(tmp_path: Path, cn: str = "test") -> tuple[Path, Path]:
     if shutil.which("openssl") is None:
         pytest.skip("нет openssl")
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -426,27 +452,29 @@ def _self_signed(tmp_path, cn="test"):
 
 
 @pytest.fixture
-def _certifi_roots(monkeypatch):
-    """Стандартные корни — из certifi, как у httpx: не из SSL_CERT_FILE/SSL_CERT_DIR машины
-    (корни из каталога грузятся лениво, и get_ca_certs() их не показал бы).
+def _certifi_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Стандартные корни — из certifi, как у httpx.
+
+    Не из SSL_CERT_FILE/SSL_CERT_DIR машины: корни из каталога грузятся лениво, и
+    get_ca_certs() их не показал бы.
     """
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     monkeypatch.delenv("SSL_CERT_DIR", raising=False)
 
 
-def _common_names(context):
-    return {
-        value
-        for cert in context.get_ca_certs()
-        for rdn in cert["subject"]
-        for key, value in rdn
-        if key == "commonName"
-    }
+def _common_names(cfg: Config) -> set[str]:
+    context = cfg.build_ssl_verify()
+    assert isinstance(context, ssl.SSLContext)
+    names: set[str] = set()
+    for cert in context.get_ca_certs():
+        # В typeshed subject — объединение типов; на деле — кортеж RDN из пар (ключ, значение).
+        subject = cast("tuple[tuple[tuple[str, str], ...], ...]", cert["subject"])
+        names.update(name for rdn in subject for key, name in rdn if key == "commonName")
+    return names
 
 
-def test_gigacode_verifies_tls_by_default(tmp_path, _certifi_roots):
-    import ssl
-
+@pytest.mark.usefixtures("_certifi_roots")
+def test_gigacode_verifies_tls_by_default(tmp_path: Path) -> None:
     env = {"GIGACREW_PROVIDER": "gigacode"}
     cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
     assert cfg.verify_ssl  # токен официального CLI без проверки сервера не уходит
@@ -463,7 +491,8 @@ def test_gigacode_verifies_tls_by_default(tmp_path, _certifi_roots):
     assert cfg.build_ssl_verify() is False  # явное значение важнее
 
 
-def test_gigacode_trusts_official_cli_certificates(tmp_path, _isolated_home, _certifi_roots):
+@pytest.mark.usefixtures("_certifi_roots")
+def test_gigacode_trusts_official_cli_certificates(tmp_path: Path, _isolated_home: Path) -> None:
     certs = _isolated_home / ".gigacode" / "certs"
     certs.mkdir(parents=True)
     _self_signed(tmp_path / "a", "bundled")[0].rename(certs / "gigacode-bundled-1.pem")
@@ -471,8 +500,8 @@ def test_gigacode_trusts_official_cli_certificates(tmp_path, _isolated_home, _ce
     (certs / "README.txt").write_text("не сертификат — не читается")
     env = {"GIGACREW_PROVIDER": "gigacode"}
 
-    context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
-    assert {"bundled", "extra"} <= _common_names(context)
+    cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+    assert {"bundled", "extra"} <= _common_names(cfg)
 
     own, _ = _self_signed(tmp_path / "c", "own")  # GIGACREW_CA_BUNDLE — в дополнение
     cfg = Config.load(
@@ -480,7 +509,7 @@ def test_gigacode_trusts_official_cli_certificates(tmp_path, _isolated_home, _ce
         environ={**env, "GIGACREW_CA_BUNDLE": str(own)},
         cwd=tmp_path,
     )
-    names = _common_names(cfg.build_ssl_verify())
+    names = _common_names(cfg)
     assert {"bundled", "extra", "own"} <= names
     assert len(names) > 3
 
@@ -492,12 +521,12 @@ def test_gigacode_trusts_official_cli_certificates(tmp_path, _isolated_home, _ce
         environ={**env, "GIGACODE_HOME": str(other)},
         cwd=tmp_path,
     )
-    names = _common_names(cfg.build_ssl_verify())
+    names = _common_names(cfg)
     assert "other" in names
     assert "bundled" not in names
 
 
-def test_gigacode_broken_certificate_is_an_error(tmp_path, _isolated_home):
+def test_gigacode_broken_certificate_is_an_error(tmp_path: Path, _isolated_home: Path) -> None:
     certs = _isolated_home / ".gigacode" / "certs"
     certs.mkdir(parents=True)
     (certs / "broken.pem").write_text("-----BEGIN CERTIFICATE-----\nмусор\n")
@@ -506,14 +535,15 @@ def test_gigacode_broken_certificate_is_an_error(tmp_path, _isolated_home):
         environ={"GIGACREW_PROVIDER": "gigacode"},
         cwd=tmp_path,
     )
-    with pytest.raises(RuntimeError, match="broken.pem"):
+    with pytest.raises(RuntimeError, match=r"broken\.pem"):
         cfg.build_ssl_verify()
 
 
-def test_mtls_verification_loads_trust_anchors(tmp_path, monkeypatch):
+def test_mtls_verification_loads_trust_anchors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Голый SSLContext без корневых сертификатов не проверил бы ни один сервер."""
-    import ssl
-
     cert, key = _self_signed(tmp_path)
     # Системные корни бывают только в capath (подгружаются лениво, счётчики пусты) —
     # подменяем хранилище по умолчанию, чтобы проверка не зависела от машины.
@@ -525,6 +555,7 @@ def test_mtls_verification_loads_trust_anchors(tmp_path, monkeypatch):
         cwd=tmp_path,
     )
     context = cfg.build_ssl_verify()
+    assert isinstance(context, ssl.SSLContext)
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.cert_store_stats()["x509_ca"] > 0 or context.get_ca_certs() != []
     cfg = Config.load(
@@ -533,17 +564,18 @@ def test_mtls_verification_loads_trust_anchors(tmp_path, monkeypatch):
         cwd=tmp_path,
     )
     context = cfg.build_ssl_verify()
+    assert isinstance(context, ssl.SSLContext)
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert len(context.get_ca_certs()) == 1
 
 
 # ------------------------- проверка TLS у API v2 ------------------------- #
-def test_api_verifies_tls_by_default(tmp_path, _certifi_roots):
-    """Ключ OAuth и Bearer-токен не уходят на непроверенный сервер: проверка TLS у API v2
-    включена и без GIGACREW_CA_BUNDLE — стандартными корнями.
-    """
-    import ssl
+@pytest.mark.usefixtures("_certifi_roots")
+def test_api_verifies_tls_by_default(tmp_path: Path) -> None:
+    """Ключ OAuth и Bearer-токен не уходят на непроверенный сервер.
 
+    Проверка TLS у API v2 включена и без GIGACREW_CA_BUNDLE — стандартными корнями.
+    """
     assert Config().verify_ssl  # и у конфигурации, собранной вручную
     cfg = Config.load(project_root=tmp_path, environ={"GIGACREW_ACCESS_KEY": "k"}, cwd=tmp_path)
     assert cfg.verify_ssl
@@ -558,17 +590,18 @@ def test_api_verifies_tls_by_default(tmp_path, _certifi_roots):
     assert cfg.build_ssl_verify() is False
 
 
-def test_mtls_verifies_server_by_default(tmp_path, _certifi_roots):
-    import ssl
-
+@pytest.mark.usefixtures("_certifi_roots")
+def test_mtls_verifies_server_by_default(tmp_path: Path) -> None:
     cert, key = _self_signed(tmp_path)
     env = {"GIGACREW_CERT": str(cert), "GIGACREW_KEY": str(key)}
     context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
+    assert isinstance(context, ssl.SSLContext)
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname
     assert context.get_ca_certs()
     env["GIGACREW_VERIFY_SSL"] = "0"
     context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
+    assert isinstance(context, ssl.SSLContext)
     assert context.verify_mode == ssl.CERT_NONE
 
 
@@ -584,12 +617,12 @@ _SECURITY = (
 )
 
 
-def test_project_dotenv_cannot_set_security_settings(tmp_path):
-    """Закоммиченный .env репозитория не перенаправит ключ на чужой адрес, не выключит
-    проверку TLS и не подложит свои корни или токен; ключ доступа и прочие настройки — можно.
-    """
-    import certifi
+def test_project_dotenv_cannot_set_security_settings(tmp_path: Path) -> None:
+    """Закоммиченный .env репозитория не меняет настройки безопасности.
 
+    Он не перенаправит ключ на чужой адрес, не выключит проверку TLS и не подложит свои
+    корни или токен; ключ доступа и прочие настройки — можно.
+    """
     root, cwd = tmp_path / "repo", tmp_path / "repo" / "sub"
     _env_file(
         root,
@@ -602,7 +635,7 @@ def test_project_dotenv_cannot_set_security_settings(tmp_path):
     assert cfg.verify_ssl
     assert (cfg.cert, cfg.key) == (None, None)
     assert (cfg.access_key, cfg.model, cfg.timeout, cfg.mode.value) == ("k", "M", 7, "plan")
-    assert cfg.temperature == 1.0
+    assert cfg.temperature == pytest.approx(1.0)
     keys = {key for key, _ in cfg.ignored_env}
     assert keys == {
         "GIGACREW_API_URL",
@@ -615,13 +648,15 @@ def test_project_dotenv_cannot_set_security_settings(tmp_path):
     }
     assert ("GIGACREW_AUTH_URL", str(cwd.resolve() / ".env")) in cfg.ignored_env
     text = cfg.ignored_env_warning
+    assert text is not None
     assert "GIGACREW_AUTH_URL" in text
     assert "~/.gigacode/.env" in text
 
 
-def test_user_dotenv_and_environment_are_trusted(tmp_path, _isolated_home):
-    """Настройки безопасности задаются окружением или ~/.gigacode/.env; файл пользователя
-    важнее .env проекта, окружение — важнее всего.
+def test_user_dotenv_and_environment_are_trusted(tmp_path: Path, _isolated_home: Path) -> None:
+    """Настройки безопасности задаются окружением или ~/.gigacode/.env.
+
+    Файл пользователя важнее .env проекта, окружение — важнее всего.
     """
     root = tmp_path / "repo"
     _env_file(root, "GIGACREW_AUTH_URL=https://collector.test/oauth\nGIGACREW_MODEL=repo-M\n")
@@ -643,11 +678,11 @@ def test_user_dotenv_and_environment_are_trusted(tmp_path, _isolated_home):
     # то же значение, что задано доверенно, — не повод для предупреждения
     _env_file(root, "GIGACREW_AUTH_URL=https://auth.mine/oauth\n")
     cfg = Config.load(project_root=root, environ={}, cwd=root)
-    assert cfg.ignored_env == ()
+    assert not cfg.ignored_env
     assert cfg.ignored_env_warning is None
 
 
-def test_trusted_dotenv_reads_security_settings(tmp_path):
+def test_trusted_dotenv_reads_security_settings(tmp_path: Path) -> None:
     """Явный доверенный режим — для собственного .env разработчиков (live-тесты)."""
     _env_file(tmp_path, "GIGACREW_AUTH_URL=https://auth.dev/oauth\nGIGACREW_VERIFY_SSL=0\n")
     env = load_environment(tmp_path, environ={}, cwd=tmp_path, trusted_dotenv=True)
@@ -656,12 +691,14 @@ def test_trusted_dotenv_reads_security_settings(tmp_path):
     cfg = Config.load(project_root=tmp_path, environ={}, cwd=tmp_path, trusted_dotenv=True)
     assert cfg.auth_url == "https://auth.dev/oauth"
     assert not cfg.verify_ssl
-    assert cfg.ignored_env == ()
+    assert not cfg.ignored_env
 
 
-def test_main_warns_about_ignored_project_settings(tmp_path, oneshot, capsys):
-    from fakes import ScriptedProvider, text_turn
-
+def test_main_warns_about_ignored_project_settings(
+    tmp_path: Path,
+    oneshot: Callable[[LLMProvider], None],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     _env_file(tmp_path, "GIGACREW_AUTH_URL=https://collector.test/oauth\nGIGACREW_KEY=x\n")
     oneshot(ScriptedProvider([text_turn("ok")]))
     assert main(["-C", str(tmp_path), "-p", "x", "--no-color", "--no-stream"]) == 0

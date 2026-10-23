@@ -47,6 +47,8 @@ SkillSource = Literal["project", "user"]
 
 @dataclass(frozen=True)
 class Skill:
+    """Скилл: имя команды, описание, путь к ``SKILL.md`` и источник."""
+
     name: str
     description: str
     path: Path  # SKILL.md
@@ -54,6 +56,7 @@ class Skill:
 
     @property
     def directory(self) -> Path:
+        """Каталог скилла (в нём ``SKILL.md`` и файлы скилла)."""
         return self.path.parent
 
     @property
@@ -78,34 +81,54 @@ def split_frontmatter(text: str) -> tuple[dict[str, str], str]:
     if not lines or lines[0].strip() != "---":
         return {}, text
     try:
-        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+        end = next(index for index in range(1, len(lines)) if lines[index].strip() == "---")
     except StopIteration:
         return {}, text
+    return _parse_fields(lines[1:end]), "\n".join(lines[end + 1 :])
+
+
+def _parse_fields(header: list[str]) -> dict[str, str]:
+    """Строки frontmatter между ``---`` → поля (ключи — в нижнем регистре)."""
     fields: dict[str, str] = {}
-    i = 1
-    while i < end:
-        match = _KEY_RE.fullmatch(lines[i].rstrip())
-        i += 1
+    pos = 0
+    while pos < len(header):
+        match = _KEY_RE.fullmatch(header[pos].rstrip())
+        pos += 1
         if match is None:
             continue
-        key, value = match.group(1).lower(), match.group(2).strip()
-        block: list[str] = []
-        while i < end and (not lines[i].strip() or lines[i][:1] in " \t"):
-            block.append(lines[i].strip())
-            i += 1
-        if value[:1] in "|>":
-            joiner = "\n" if value[:1] == "|" else " "
-            value = joiner.join(block).strip()
-        elif block:  # значение, перенесённое на следующие строки
-            value = " ".join([value, *block]).strip()
-        fields[key] = _unquote(value)
-    return fields, "\n".join(lines[end + 1 :])
+        block_end = _continuation_end(header, pos)
+        block = [line.strip() for line in header[pos:block_end]]
+        pos = block_end
+        fields[match.group(1).lower()] = _field_text(match.group(2).strip(), block)
+    return fields
 
 
-def _unquote(value: str) -> str:
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
-    return value
+def _continuation_end(header: list[str], start: int) -> int:
+    """Конец строк продолжения с ``start``: пустых или сдвинутых отступом."""
+    end = start
+    while end < len(header):
+        line = header[end]
+        if line.strip() and line[:1] not in " \t":
+            break
+        end += 1
+    return end
+
+
+def _field_text(inline: str, block: list[str]) -> str:
+    """Значение поля: текст после ``:`` и строки продолжения ``block`` (без отступа)."""
+    text = inline
+    if inline[:1] in "|>":
+        joiner = "\n" if inline[:1] == "|" else " "
+        text = joiner.join(block).strip()
+    elif block:  # значение, перенесённое на следующие строки
+        text = " ".join([inline, *block]).strip()
+    return _unquote(text)
+
+
+def _unquote(text: str) -> str:
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
 
 
 def parse_skill(path: Path, source: SkillSource = "project") -> Skill | None:
@@ -156,15 +179,15 @@ def discover_skills(workspace: Workspace, user_dir: Path | None = None) -> list[
     user_dir = user_skills_dir() if user_dir is None else user_dir
     found: dict[str, Skill] = {}
     project = _scan(workspace.skills_dir, "project", within=workspace.root)
-    for skill in (*_scan(user_dir, "user"), *project):
-        found[skill.name.casefold()] = skill
-    return sorted(found.values(), key=lambda s: s.name.casefold())
+    for candidate in (*_scan(user_dir, "user"), *project):
+        found[candidate.name.casefold()] = candidate
+    return sorted(found.values(), key=lambda skill: skill.name.casefold())
 
 
 def find_skill(skills: list[Skill], name: str) -> Skill | None:
     """Скилл по имени (с ведущим ``/`` или без, без учёта регистра)."""
     key = name.removeprefix("/").casefold()
-    return next((s for s in skills if s.name.casefold() == key), None)
+    return next((skill for skill in skills if skill.name.casefold() == key), None)
 
 
 class SkillCatalog:
@@ -174,18 +197,23 @@ class SkillCatalog:
     """
 
     def __init__(self, workspace: Workspace, user_dir: Path | None = None):
+        """Каталог скиллов проекта ``workspace`` и пользователя (``user_dir``)."""
         self._workspace = workspace
         self._user_dir = user_dir
         self._skills: list[Skill] = []
 
     def refresh(self) -> None:
+        """Перечитать скиллы с диска."""
         self._skills = discover_skills(self._workspace, self._user_dir)
 
     def get(self, name: str) -> Skill | None:
+        """Скилл по имени (с ``/`` или без, без учёта регистра); None — нет такого."""
         return find_skill(self._skills, name)
 
     def __iter__(self) -> Iterator[Skill]:
+        """Скиллы по имени."""
         return iter(self._skills)
 
     def __len__(self) -> int:
+        """Число скиллов."""
         return len(self._skills)

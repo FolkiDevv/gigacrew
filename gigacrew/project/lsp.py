@@ -13,21 +13,26 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
 import signal
 import subprocess
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 # Обработчик запроса сервера: params -> result.
 ServerRequestHandler = Callable[[Any], Any]
 
+# Место для ответа на запрос: ответ сервера или None — сигнал «сервер завершился».
+_Slot = queue.Queue[dict[str, Any] | None]
+
 _MAX_HEADER_LINE = 8192
-_MAX_MESSAGE = 64 * 1024 * 1024
+_MAX_MESSAGE = 67_108_864  # 64 МиБ
+_INTERNAL_ERROR = -32603  # код JSON-RPC «внутренняя ошибка»
 
 
 class LspError(Exception):
@@ -36,9 +41,6 @@ class LspError(Exception):
 
 class LspTimeoutError(LspError):
     """Сервер не ответил вовремя."""
-
-
-_DIED = object()  # сигнал ожидающим: сервер завершился
 
 
 class LspClient:
@@ -52,17 +54,18 @@ class LspClient:
         env: Mapping[str, str] | None = None,
         stderr_path: Path | None = None,
         handlers: Mapping[str, ServerRequestHandler] | None = None,
-    ):
+    ) -> None:
+        """Запоминает команду запуска сервера и обработчики его запросов."""
         self._argv = list(argv)
         self._cwd = cwd
-        self._env = dict(env) if env is not None else None
+        self._env = None if env is None else dict(env)
         self._stderr_path = stderr_path
         self._handlers = dict(handlers or {})
         self._proc: subprocess.Popen[bytes] | None = None
         self._outbox: queue.Queue[bytes | None] = queue.Queue()
         self._writer: threading.Thread | None = None
         self._reader: threading.Thread | None = None
-        self._pending: dict[int, queue.Queue[object]] = {}
+        self._pending: dict[int, _Slot] = {}
         self._pending_lock = threading.Lock()
         self._next_id = 0
         self._dead = threading.Event()
@@ -70,6 +73,7 @@ class LspClient:
     # ------------------------------------------------------------------ #
     @property
     def alive(self) -> bool:
+        """Сервер запущен и не завершился."""
         return self._proc is not None and not self._dead.is_set() and self._proc.poll() is None
 
     def start(self) -> None:
@@ -79,8 +83,13 @@ class LspClient:
             kwargs["start_new_session"] = True
         else:
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        stderr = Path(self._stderr_path).open("ab") if self._stderr_path else subprocess.DEVNULL  # noqa: SIM115
-        try:
+        with contextlib.ExitStack() as stack:
+            # свой файл журнала закрывается сразу после запуска: у процесса своя копия дескриптора
+            stderr: IO[bytes] | int = (
+                stack.enter_context(Path(self._stderr_path).open("ab"))
+                if self._stderr_path
+                else subprocess.DEVNULL
+            )
             self._proc = subprocess.Popen(
                 self._argv,
                 cwd=self._cwd,
@@ -90,9 +99,6 @@ class LspClient:
                 stderr=stderr,
                 **kwargs,
             )
-        finally:
-            if stderr is not subprocess.DEVNULL:
-                stderr.close()  # у процесса своя копия дескриптора
         self._reader = threading.Thread(target=self._read_loop, name="lsp-reader", daemon=True)
         self._reader.start()
         self._writer = threading.Thread(target=self._write_loop, name="lsp-writer", daemon=True)
@@ -100,35 +106,25 @@ class LspClient:
 
     def request(self, method: str, params: Any = None, *, timeout: float) -> Any:
         """Запрос и ожидание ответа. LspError — ошибка сервера, LspTimeoutError — нет ответа."""
-        with self._pending_lock:
-            self._next_id += 1
-            msg_id = self._next_id
-            slot: queue.Queue[object] = queue.Queue(maxsize=1)
-            self._pending[msg_id] = slot
-        try:
-            self._send({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params})
+        with self._pending_slot() as (msg_id, slot):
+            self._send(_jsonrpc(id=msg_id, method=method, params=params))
             try:
                 reply = slot.get(timeout=timeout)
             except queue.Empty:
                 self._cancel(msg_id)
-                raise LspTimeoutError(f"{method}: сервер не ответил за {timeout:g} с") from None
+                waited = format(timeout, "g")
+                raise LspTimeoutError(f"{method}: сервер не ответил за {waited} с") from None
             except BaseException:  # Ctrl+C посреди ожидания: ответ больше не нужен
                 self._cancel(msg_id)
                 raise
-        finally:
-            with self._pending_lock:
-                self._pending.pop(msg_id, None)
-        if reply is _DIED:
-            raise LspError(f"{method}: сервер завершился")
-        assert isinstance(reply, dict)
-        if "error" in reply:
-            err = reply["error"]
-            message = err.get("message") if isinstance(err, dict) else None
-            raise LspError(f"{method}: {message or 'ошибка сервера'}")
-        return reply.get("result")
+        if reply is not None and "error" not in reply:
+            return reply.get("result")
+        reason = _failure_reason(reply)
+        raise LspError(f"{method}: {reason}")
 
     def notify(self, method: str, params: Any = None) -> None:
-        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+        """Уведомление серверу, без ответа. LspError — сервер не запущен."""
+        self._send(_jsonrpc(method=method, params=params))
 
     def close(self, timeout: float = 2.0) -> None:
         """Вежливое завершение (shutdown/exit), при неудаче — kill всей группы процессов.
@@ -146,55 +142,69 @@ class LspClient:
                 self.notify("exit")
             proc.wait(timeout=timeout)
         except (LspError, OSError, subprocess.TimeoutExpired):
-            pass
+            return  # вежливо не вышло — процесс всё равно убивается (finally)
         finally:
-            _kill(proc, timeout)
-            # процесс мёртв: застрявшая запись получает EPIPE, чтение — конец потока
-            self._outbox.put(None)
-            for thread in (self._writer, self._reader):
-                if thread is not None:
-                    thread.join(timeout=timeout)
-            # поток, всё ещё занятый каналом, держит его блокировку — такой не закрываем
-            for stream, thread in ((proc.stdin, self._writer), (proc.stdout, self._reader)):
-                if stream is not None and (thread is None or not thread.is_alive()):
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
-            self._dead.set()
-            self._proc = None
+            self._release(proc, timeout)
 
     # ------------------------------------------------------------------ #
-    def _cancel(self, msg_id: int) -> None:
+    def _release(self, proc: subprocess.Popen[bytes], timeout: float) -> None:
+        """Убивает сервер, дожидается потоков и закрывает свободные каналы."""
+        _kill(proc, timeout)
+        # процесс мёртв: застрявшая запись получает EPIPE, чтение — конец потока
+        self._outbox.put(None)
+        for worker in (self._writer, self._reader):
+            if worker is not None:
+                worker.join(timeout=timeout)
+        # поток, всё ещё занятый каналом, держит его блокировку — такой не закрываем
+        for stream, owner in ((proc.stdin, self._writer), (proc.stdout, self._reader)):
+            if stream is not None and (owner is None or not owner.is_alive()):
+                with contextlib.suppress(OSError):
+                    stream.close()
+        self._dead.set()
+        self._proc = None
+
+    @contextlib.contextmanager
+    def _pending_slot(self) -> Generator[tuple[int, _Slot]]:
+        """Номер нового запроса и место для ответа на него; по выходе место снимается."""
+        with self._pending_lock:
+            self._next_id += 1
+            msg_id = self._next_id
+            slot: _Slot = queue.Queue(maxsize=1)
+            self._pending[msg_id] = slot
         try:
+            yield msg_id, slot
+        finally:
+            with self._pending_lock:
+                self._pending.pop(msg_id, None)
+
+    def _cancel(self, msg_id: int) -> None:
+        with contextlib.suppress(LspError):
             self.notify("$/cancelRequest", {"id": msg_id})
-        except LspError:
-            pass
 
     def _send(self, message: dict[str, Any]) -> None:
         """Ставит сообщение в очередь писателя — не блокирует, даже если сервер не читает."""
         if self._proc is None or self._dead.is_set():
             raise LspError("сервер не запущен")
-        data = json.dumps(message, ensure_ascii=False).encode("utf-8")
-        self._outbox.put(f"Content-Length: {len(data)}\r\n\r\n".encode("ascii") + data)
+        body = json.dumps(message, ensure_ascii=False).encode("utf-8")
+        self._outbox.put(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
 
     def _write_loop(self) -> None:
         proc = self._proc
-        assert proc is not None
-        assert proc.stdin is not None
+        if proc is None or proc.stdin is None:
+            raise AssertionError("писатель запущен без канала к серверу")
+        stdin = proc.stdin
         while True:
             chunk = self._outbox.get()
             if chunk is None:
                 return
             try:
-                proc.stdin.write(chunk)
-                proc.stdin.flush()
+                stdin.write(chunk)
+                stdin.flush()
             except (OSError, ValueError):  # ValueError — запись в закрытый поток
-                self._dead.set()
-                self._wake_all()
+                self._server_gone()
                 return
 
-    def _read_message(self, stream) -> dict[str, Any] | None:
+    def _read_message(self, stream: IO[bytes]) -> dict[str, Any] | None:
         length = None
         while True:
             line = stream.readline(_MAX_HEADER_LINE)
@@ -203,9 +213,9 @@ class LspClient:
             line = line.strip()
             if not line:
                 break
-            name, _, value = line.decode("ascii", errors="replace").partition(":")
-            if name.strip().lower() == "content-length":
-                length = int(value.strip())
+            header, _, header_value = line.decode("ascii", errors="replace").partition(":")
+            if header.strip().lower() == "content-length":
+                length = int(header_value.strip())
         if length is None or not 0 <= length <= _MAX_MESSAGE:
             raise LspError("нарушен протокол: нет или неверная длина сообщения")
         body = stream.read(length)
@@ -218,29 +228,28 @@ class LspClient:
 
     def _read_loop(self) -> None:
         proc = self._proc
-        assert proc is not None
-        assert proc.stdout is not None
+        if proc is None or proc.stdout is None:
+            raise AssertionError("читатель запущен без канала от сервера")
+        stdout = proc.stdout
         try:
             while True:
-                message = self._read_message(proc.stdout)
+                message = self._read_message(stdout)
                 if message is None:
                     break
                 self._dispatch(message)
         except (LspError, OSError, ValueError):
-            pass  # оборванный или испорченный поток — как завершение сервера
+            return  # оборванный или испорченный поток — как завершение сервера
         finally:
-            self._dead.set()
-            self._wake_all()
+            self._server_gone()
 
-    def _wake_all(self) -> None:
+    def _server_gone(self) -> None:
         """Сервер недоступен: ожидающие запросы получают отказ сразу, а не по таймауту."""
+        self._dead.set()
         with self._pending_lock:
             waiting = list(self._pending.values())
         for slot in waiting:
-            try:
-                slot.put_nowait(_DIED)
-            except queue.Full:
-                pass
+            with contextlib.suppress(queue.Full):
+                slot.put_nowait(None)
 
     def _dispatch(self, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -249,27 +258,35 @@ class LspClient:
             with self._pending_lock:
                 slot = self._pending.get(msg_id) if isinstance(msg_id, int) else None
             if slot is not None:
-                try:
+                with contextlib.suppress(queue.Full):
                     slot.put_nowait(message)
-                except queue.Full:
-                    pass
             return
         if "id" not in message:
             return  # уведомление сервера
         handler = self._handlers.get(method)
-        reply: dict[str, Any] = {"jsonrpc": "2.0", "id": message["id"]}
+        request_id = message["id"]
         try:
-            reply["result"] = handler(message.get("params")) if handler else None
-        except Exception as e:  # ошибка обработчика — ответ-ошибка, а не падение читателя
-            reply = {
-                "jsonrpc": "2.0",
-                "id": message["id"],
-                "error": {"code": -32603, "message": str(e)},
-            }
-        try:
+            outcome = handler(message.get("params")) if handler else None
+        except Exception as exc:  # ошибка обработчика — ответ-ошибка, а не падение читателя
+            reply = _jsonrpc(id=request_id, error={"code": _INTERNAL_ERROR, "message": str(exc)})
+        else:
+            reply = _jsonrpc(id=request_id, result=outcome)
+        with contextlib.suppress(LspError):
             self._send(reply)
-        except LspError:
-            pass
+
+
+def _failure_reason(reply: dict[str, Any] | None) -> object:
+    """Почему запрос не удался: сервер завершился или прислал ответ-ошибку."""
+    if reply is None:
+        return "сервер завершился"
+    error = reply["error"]
+    message = error.get("message") if isinstance(error, dict) else None
+    return message or "ошибка сервера"
+
+
+def _jsonrpc(**fields: Any) -> dict[str, Any]:
+    """Сообщение JSON-RPC 2.0: версия протокола, затем поля в порядке передачи."""
+    return {"jsonrpc": "2.0", **fields}
 
 
 def _kill(proc: subprocess.Popen[bytes], timeout: float) -> None:
@@ -281,7 +298,5 @@ def _kill(proc: subprocess.Popen[bytes], timeout: float) -> None:
             proc.kill()
     except OSError:
         proc.kill()
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        pass

@@ -25,7 +25,7 @@ __all__ = [
     "scope_of_path",
 ]
 
-SINKS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty"})
+SINKS = frozenset(("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin", "/dev/tty"))
 
 # Файлы с ключами и учётными данными (имя или путь). .env и .env.* — is_secret_path.
 _SECRET_NAME = re.compile(
@@ -35,7 +35,7 @@ _SECRET_NAME = re.compile(
     r".*_history|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|ppk|gpg|asc))$",
     re.IGNORECASE,
 )
-SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".gcloud"})
+SECRET_DIRS = frozenset((".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".gcloud"))
 _PROC_ENV = re.compile(r"^/proc/[^/]+/(environ|cmdline|mem|maps)$")
 # Известные места учётных данных: пароли системы, ключи хоста ssh, токены gh и gcloud.
 _SECRET_PATH = re.compile(
@@ -45,15 +45,21 @@ _SECRET_PATH = re.compile(
 
 
 class Scope(Enum):
+    """Область пути: проект, снаружи, секреты, стандартный поток или неизвестно до запуска."""
+
     INSIDE = "inside"
     OUTSIDE = "outside"
-    SECRET = "secret"  # внутри проекта, но с ключами/паролями (.env, *.pem)
-    SECRET_OUTSIDE = "secret-outside"  # ~/.ssh, ~/.aws, /proc/*/environ
+    # Внутри проекта, но с ключами/паролями (.env, *.pem). S105 — ложное срабатывание:
+    # это имя области, а не пароль.
+    SECRET = "secret"  # noqa: S105
+    # ~/.ssh, ~/.aws, /proc/*/environ. S105 — то же ложное срабатывание на имя области.
+    SECRET_OUTSIDE = "secret-outside"  # noqa: S105
     SINK = "sink"  # /dev/null и стандартные потоки
     DYNAMIC = "dynamic"  # значение известно только при выполнении
 
 
 def is_secret_name(name: str) -> bool:
+    """Имя файла с ключами или учётными данными (открытый ключ ``*.pub`` — не секрет)."""
     return bool(_SECRET_NAME.match(name)) and not name.casefold().endswith(".pub")
 
 
@@ -90,11 +96,12 @@ _SECRET_SCOPES = (Scope.SECRET, Scope.SECRET_OUTSIDE, Scope.DYNAMIC)
 
 
 def is_secret_target(root: Path, path: Path) -> bool:
-    """Файл с ключами или учётными данными — по тому же правилу, что у классификатора
-    команд (``cat .env`` там — непроверенная команда): ``.env*``, ``*.pem``, ``id_rsa``,
-    ``.npmrc``, ``credentials.json``, всё в ``.ssh/``, ``.aws/``… Симлинк проверяется и
-    по цели; путь, который не раскрыть, считается секретом. Так файлы с секретами
-    отказываются показывать все инструменты: чтение, поиск, навигация, индекс.
+    """Файл с ключами или учётными данными — по тому же правилу, что у классификатора команд.
+
+    У классификатора ``cat .env`` — непроверенная команда. Секреты: ``.env*``, ``*.pem``,
+    ``id_rsa``, ``.npmrc``, ``credentials.json``, всё в ``.ssh/``, ``.aws/``… Симлинк
+    проверяется и по цели; путь, который не раскрыть, считается секретом. Так файлы с
+    секретами отказываются показывать все инструменты: чтение, поиск, навигация, индекс.
     """
     return scope_of_path(path, root) in _SECRET_SCOPES
 

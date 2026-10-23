@@ -17,10 +17,14 @@ from gigacrew.ui.theme import MINT, Palette
 WIDTH = 8  # ширина полосы полёта, в колонках
 INTERVAL = 0.11  # длительность кадра, с
 
-# Клетки — (символ, роль цвета в палитре).
+# Клетка — (символ, роль цвета в палитре).
+type _Cell = tuple[str, str]
+# Искра — (позиция, возраст).
+type _Spark = tuple[int, int]
+
 _ROCKET = ("➤", "brand")
 # Варианты пламени по удалённости от сопла: ближе — горячее.
-_FLAME: tuple[tuple[tuple[str, str], ...], ...] = (
+_FLAME: tuple[tuple[_Cell, ...], ...] = (
     (("≈", "flame"), ("≈", "warn"), ("=", "flame")),
     (("~", "warn"), ("≈", "danger"), ("=", "danger")),
     (("-", "danger"), ("~", "dim")),
@@ -29,35 +33,66 @@ _FLAME: tuple[tuple[tuple[str, str], ...], ...] = (
 _SPARK = (("·", "warn"), ("˙", "dim"))  # искра на месте: вспыхнула → гаснет
 _SPARK_CHANCE = 0.45
 _BLANK = (" ", "")
+# Пролёт по клетке за кадр (с вылетом за край полосы), затем два кадра догорают искры.
+_FLIGHT = (*range(WIDTH + 4), None, None)
+
+
+def _blank_cells() -> list[_Cell]:
+    """Пустая полоса полёта."""
+    return [_BLANK for _ in range(WIDTH)]
+
+
+def _draw_sparks(cells: list[_Cell], sparks: list[_Spark]) -> None:
+    """Рисует искры, попавшие в полосу."""
+    for pos, age in sparks:
+        if 0 <= pos < WIDTH:
+            cells[pos] = _SPARK[age]
+
+
+def _draw_rocket(
+    cells: list[_Cell],
+    sparks: list[_Spark],
+    rnd: random.Random,
+    nose: int,
+) -> None:
+    """Рисует ракету с пламенем в колонке ``nose``; за пламенем может вспыхнуть искра."""
+    length = rnd.randint(2, 4)
+    for distance in range(1, length + 1):
+        if 0 <= nose - distance < WIDTH:
+            cells[nose - distance] = rnd.choice(_FLAME[min(distance, len(_FLAME)) - 1])
+    if rnd.random() < _SPARK_CHANCE:
+        sparks.append((nose - length - 1, -1))
+    if nose < WIDTH:
+        cells[nose] = _ROCKET
+
+
+def _flight_cells(rnd: random.Random) -> list[list[_Cell]]:
+    """Клетки кадров одного пролёта ракеты."""
+    flight: list[list[_Cell]] = []
+    sparks: list[_Spark] = []
+    for nose in _FLIGHT:
+        cells = _blank_cells()
+        sparks = [(pos, age + 1) for pos, age in sparks if age + 1 < len(_SPARK)]
+        _draw_sparks(cells, sparks)
+        if nose is not None:
+            _draw_rocket(cells, sparks, rnd, nose)
+        flight.append(cells)
+    return flight
+
+
+def _frame_text(palette: Palette, cells: list[_Cell]) -> Text:
+    """Кадр из клеток в цветах палитры."""
+    return Text.assemble(*((ch, getattr(palette, role) if role else "") for ch, role in cells))
 
 
 def _build_frames(palette: Palette, seed: int = 11, passes: int = 3) -> tuple[Text, ...]:
-    rnd = random.Random(seed)
-    frames: list[list[tuple[str, str]]] = []
+    # Анимация, а не криптография: нужен воспроизводимый генератор с фиксированным seed.
+    rnd = random.Random(seed)  # noqa: S311
+    all_cells: list[list[_Cell]] = []
     for _ in range(passes):
-        sparks: list[tuple[int, int]] = []  # (позиция, возраст)
-        # Пролёт по клетке за кадр, затем два кадра догорают искры.
-        for x in [*range(WIDTH + 4), None, None]:
-            cells = [_BLANK] * WIDTH
-            sparks = [(pos, age + 1) for pos, age in sparks if age + 1 < len(_SPARK)]
-            for pos, age in sparks:
-                if 0 <= pos < WIDTH:
-                    cells[pos] = _SPARK[age]
-            if x is not None:
-                length = rnd.randint(2, 4)
-                for i in range(1, length + 1):
-                    if 0 <= x - i < WIDTH:
-                        cells[x - i] = rnd.choice(_FLAME[min(i, len(_FLAME)) - 1])
-                if rnd.random() < _SPARK_CHANCE:
-                    sparks.append((x - length - 1, -1))
-                if x < WIDTH:
-                    cells[x] = _ROCKET
-            frames.append(cells)
-        frames.append([_BLANK] * WIDTH)  # пауза между пролётами
-    return tuple(
-        Text.assemble(*((ch, getattr(palette, role) if role else "") for ch, role in cells))
-        for cells in frames
-    )
+        all_cells.extend(_flight_cells(rnd))
+        all_cells.append(_blank_cells())  # пауза между пролётами
+    return tuple(_frame_text(palette, cells) for cells in all_cells)
 
 
 @cache

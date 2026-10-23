@@ -9,13 +9,23 @@ from gigacrew.ui.theme import MODE_ICONS
 
 SKIPPED_MARK = "…"
 
+# Второй десяток — всегда «много»: «11 шагов», «12–14 шагов», хотя оканчиваются на 1–4.
+_TEEN_ONE = 11
+_TEEN_FEW_FIRST = 12
+_TEEN_FEW_LAST = 14
+_MILLION = 1_000_000
+# С этого значения десятые не пишутся: 99.95k округлилось бы до «100.0k».
+_FRACTION_LIMIT = 99.95
+_HOUR_SECONDS = 3600
+_ELLIPSIS = "…"
+
 
 def plural(n: int, one: str, few: str, many: str) -> str:
     """Форма слова для числа: 1 шаг, 2 шага, 5 шагов."""
-    n = abs(n)
-    if n % 10 == 1 and n % 100 != 11:
+    number = abs(n)
+    if number % 10 == 1 and number % 100 != _TEEN_ONE:
         return one
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+    if 2 <= number % 10 <= 4 and not _TEEN_FEW_FIRST <= number % 100 <= _TEEN_FEW_LAST:
         return few
     return many
 
@@ -26,9 +36,11 @@ def chat_size(requests: int, messages: int) -> str:
     Запросы — только набранные в приглашении; ответы на вопросы модели и шаги с
     инструментами видны лишь в числе сообщений.
     """
-    text = f"{requests} {plural(requests, 'запрос', 'запроса', 'запросов')}"
+    requests_word = plural(requests, "запрос", "запроса", "запросов")
+    text = f"{requests} {requests_word}"
     if messages:
-        text += f" · {messages} {plural(messages, 'сообщение', 'сообщения', 'сообщений')}"
+        messages_word = plural(messages, "сообщение", "сообщения", "сообщений")
+        text = f"{text} · {messages} {messages_word}"
     return text
 
 
@@ -42,15 +54,25 @@ def format_tokens(n: int) -> str:
     """Компактная запись числа токенов: 950, 12.3k, 120k, 1.2M."""
     if n < 1000:
         return str(n)
-    value, suffix = n / 1000, "k"
-    if round(value) >= 1000:
-        value, suffix = n / 1_000_000, "M"
-    text = f"{value:.1f}" if value < 99.95 else f"{value:.0f}"
+    scaled, suffix = n / 1000, "k"
+    if round(scaled) >= 1000:
+        scaled, suffix = n / _MILLION, "M"
+    text = f"{scaled:.1f}" if scaled < _FRACTION_LIMIT else f"{scaled:.0f}"
     return text.removesuffix(".0") + suffix
 
 
 def skipped_line(count: int) -> str:
-    return f"{SKIPPED_MARK} пропущено {count} {plural(count, 'строка', 'строки', 'строк')} …"
+    """Строка на месте пропущенных: «… пропущено 5 строк …»."""
+    word = plural(count, "строка", "строки", "строк")
+    return f"{SKIPPED_MARK} пропущено {count} {word} …"
+
+
+def _clip_line(line: str, max_line: int) -> str:
+    """Обрезает строку длиннее ``max_line`` символов, последний из них — «…»."""
+    if len(line) <= max_line:
+        return line
+    kept = line[: max_line - 1]
+    return f"{kept}{_ELLIPSIS}"
 
 
 def clip_lines(
@@ -68,15 +90,17 @@ def clip_lines(
     """
     lines = text.rstrip("\n").split("\n")
     if len(lines) > head + tail + 1:
-        lines = [*lines[:head], skipped_line(len(lines) - head - tail), *lines[-tail:]]
-    lines = [line if len(line) <= max_line else line[: max_line - 1] + "…" for line in lines]
-    result = "\n".join(lines)
-    if len(result) > max_chars:
+        skipped = skipped_line(len(lines) - head - tail)
+        lines = [*lines[:head], skipped, *lines[-tail:]]
+    lines = [_clip_line(line, max_line) for line in lines]
+    clipped = "\n".join(lines)
+    if len(clipped) > max_chars:
         # Конец важнее начала (итог команды) — делим бюджет, пропуск посередине.
         head_chars = (max_chars - 1) // 2
         tail_chars = max_chars - 1 - head_chars
-        result = result[:head_chars] + "…" + result[len(result) - tail_chars :]
-    return result
+        start, end = clipped[:head_chars], clipped[len(clipped) - tail_chars :]
+        clipped = f"{start}{_ELLIPSIS}{end}"
+    return clipped
 
 
 def format_when(when: datetime, now: datetime | None = None) -> str:
@@ -89,13 +113,14 @@ def format_when(when: datetime, now: datetime | None = None) -> str:
     seconds = (now - when).total_seconds()
     if 0 <= seconds < 60:
         return "только что"
-    if 0 <= seconds < 3600:
+    if 0 <= seconds < _HOUR_SECONDS:
         return f"{int(seconds // 60)} мин назад"
     days = (now.date() - when.date()).days
+    clock = when.strftime("%H:%M")
     if days == 0:
-        return f"сегодня {when:%H:%M}"
+        return f"сегодня {clock}"
     if days == 1:
-        return f"вчера {when:%H:%M}"
+        return f"вчера {clock}"
     if when.year == now.year:
-        return f"{when:%d.%m %H:%M}"
-    return f"{when:%d.%m.%Y}"
+        return when.strftime("%d.%m %H:%M")
+    return when.strftime("%d.%m.%Y")

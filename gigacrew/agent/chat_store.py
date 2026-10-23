@@ -28,7 +28,7 @@ import stat
 import subprocess
 import tempfile
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -39,7 +39,13 @@ from gigacrew.project.workspace import Workspace
 
 TITLE_LIMIT = 60
 PREVIEW_LIMIT = 160
+# Версия формата файла чата.
+FORMAT_VERSION = 1
 _ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z_-]*$")
+# Время создания в начале id чата.
+_ID_TIME_FORMAT = "%Y%m%d-%H%M%S"
+# Каталог чатов доступен только владельцу.
+_PRIVATE_DIR_MODE = 0o700
 
 
 class ChatStoreError(Exception):
@@ -59,9 +65,31 @@ class ChatInfo:
     preview: str = ""  # начало последнего ответа модели
     messages: int = 0  # сообщений диалога, с шагами инструментов (0 — неизвестно)
 
+    @classmethod
+    def from_record(cls, record: Any, chat_id: str) -> ChatInfo:
+        """Метаданные из разобранного JSON файла чата.
+
+        Чужая версия формата — ``ValueError``; повреждённые поля — ``KeyError``,
+        ``TypeError`` или ``ValueError``.
+        """
+        if not isinstance(record, dict) or record.get("version") != FORMAT_VERSION:
+            raise ValueError("неподдерживаемая версия формата")
+        return cls(
+            id=chat_id,
+            title=str(record.get("title") or "(без названия)"),
+            created_at=_parse_time(record["created_at"]),
+            updated_at=_parse_time(record["updated_at"]),
+            model=str(record.get("model") or ""),
+            requests=int(record.get("requests") or 0),
+            preview=str(record.get("preview") or ""),
+            messages=_message_count(record),
+        )
+
 
 @dataclass(frozen=True)
 class SavedChat:
+    """Сохранённый чат: метаданные и диалог."""
+
     info: ChatInfo
     conversation: Conversation
 
@@ -70,42 +98,59 @@ def _now() -> datetime:
     return datetime.now().astimezone().replace(microsecond=0)
 
 
-def _parse_time(value: str) -> datetime:
+def _parse_time(text: str) -> datetime:
     """Время из файла; без часового пояса (файл правили вручную) — считается местным.
 
     Иначе наивное и aware-время нельзя было бы сравнить при сортировке списка чатов.
     """
-    when = datetime.fromisoformat(value)
-    return when if when.tzinfo is not None else when.astimezone()
+    when = datetime.fromisoformat(text)
+    return when.astimezone() if when.tzinfo is None else when
 
 
 def _one_line(text: str, limit: int) -> str:
     line = " ".join(text.split())
-    return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+    if len(line) <= limit:
+        return line
+    head = line[: limit - 1].rstrip()
+    return f"{head}…"
 
 
 def chat_title(messages: Iterable[Message]) -> str:
     """Заголовок чата — первый запрос пользователя в одну строку."""
-    for m in messages:
-        if m.is_request and m.content.strip():
-            return _one_line(request_text(m.content), TITLE_LIMIT)
+    for message in messages:
+        if message.is_request and message.content.strip():
+            return _one_line(request_text(message.content), TITLE_LIMIT)
     return "(без названия)"
 
 
 def _preview(messages: tuple[Message, ...]) -> str:
-    for m in reversed(messages):
-        if m.role == "assistant" and not m.function_calls and m.content.strip():
-            return _one_line(m.content, PREVIEW_LIMIT)
+    for message in reversed(messages):
+        if message.role == "assistant" and not message.function_calls and message.content.strip():
+            return _one_line(message.content, PREVIEW_LIMIT)
     return ""
 
 
-def _message_count(data: dict[str, Any]) -> int:
+def _message_count(record: dict[str, Any]) -> int:
     """Число сообщений чата; в файлах до появления ключа ``messages`` — по самому диалогу."""
-    if "messages" in data:
-        return int(data["messages"] or 0)
-    raw = data.get("conversation")
-    messages = raw.get("messages") if isinstance(raw, dict) else None
-    return len(messages) if isinstance(messages, list) else 0
+    try:
+        count = record["messages"]
+    except KeyError:
+        raw = record.get("conversation")
+        messages = raw.get("messages") if isinstance(raw, dict) else None
+        return len(messages) if isinstance(messages, list) else 0
+    return int(count or 0)
+
+
+def _saved_chat(record: Any, chat_id: str) -> SavedChat:
+    """Чат из разобранного JSON файла.
+
+    Повреждённый файл — ``KeyError``, ``TypeError`` или ``ValueError``.
+    """
+    chat_info = ChatInfo.from_record(record, chat_id)
+    raw = record["conversation"]
+    if not isinstance(raw, dict):
+        raise TypeError("поле conversation — не объект")
+    return SavedChat(chat_info, Conversation.from_dict(raw))
 
 
 _GIT_TIMEOUT = 10
@@ -149,23 +194,34 @@ def _move(src: Path, dst: Path) -> None:
     """
     try:
         Path(src).replace(dst)
-        return
-    except OSError as e:
-        if e.errno != errno.EXDEV:
+    except OSError as error:
+        if error.errno != errno.EXDEV:
             raise
-    fd, tmp = tempfile.mkstemp(prefix=f".{dst.stem}.", suffix=".tmp", dir=dst.parent)
+    else:
+        return
+    fd, temp_name = tempfile.mkstemp(prefix=f".{dst.stem}.", suffix=".tmp", dir=dst.parent)
     os.close(fd)
     try:
-        shutil.copyfile(src, tmp)  # mkstemp уже дал права 0600
-        Path(tmp).replace(dst)
+        shutil.copyfile(src, temp_name)  # mkstemp уже дал права 0600
+        Path(temp_name).replace(dst)
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        Path(temp_name).unlink(missing_ok=True)
         raise
     src.unlink()
 
 
+@dataclass
+class _Migration:
+    """Итог переноса чатов с прежнего места: сколько перенесено и что — нет."""
+
+    moved: int = 0
+    shipped: list[str] = field(default_factory=list)  # отслеживает git
+    existing: list[str] = field(default_factory=list)  # чат с тем же id уже есть
+    failed: list[str] = field(default_factory=list)  # «id (ошибка)»
+
+
 class ChatStore:
-    FORMAT_VERSION = 1
+    """Хранилище сохранённых чатов проекта в каталоге пользователя (:attr:`directory`)."""
 
     def __init__(self, workspace: Workspace):
         """Конструктор не трогает файловую систему."""
@@ -175,6 +231,7 @@ class ChatStore:
 
     @property
     def directory(self) -> Path:
+        """Каталог чатов проекта."""
         if self._directory is None:  # ключ проекта читает .git — один раз
             self._directory = self._workspace.chats_dir
         return self._directory
@@ -199,10 +256,12 @@ class ChatStore:
             if legacy.parent.is_symlink() or legacy.is_symlink() or not legacy.is_dir():
                 return []
             files = sorted(
-                p for p in legacy.iterdir() if p.suffix == ".json" and _ID_RE.match(p.stem)
+                candidate
+                for candidate in legacy.iterdir()
+                if candidate.suffix == ".json" and _ID_RE.match(candidate.stem)
             )
-        except OSError as e:
-            return [f"не удалось прочитать прежний каталог чатов {legacy}: {e}"]
+        except OSError as error:
+            return [f"не удалось прочитать прежний каталог чатов {legacy}: {error}"]
         if not files:
             return []
         if not self._workspace.in_git_repo():
@@ -221,56 +280,29 @@ class ChatStore:
                     "они с репозиторием; оттуда они не загружаются"
                 ),
             ]
-        moved, shipped, existing, failed = 0, [], [], []
+        report = _Migration()
         for path in files:
             if path.name in tracked:
-                shipped.append(path.stem)
+                report.shipped.append(path.stem)
                 continue
             try:
-                if not stat.S_ISREG(os.lstat(path).st_mode):
-                    continue  # симлинк или не файл — не наш чат
-                target = self._path(path.stem)
-                if target.exists():
-                    existing.append(path.stem)
-                    continue
-                self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                _move(path, target)
-            except OSError as e:
-                failed.append(f"{path.stem} ({e})")
-                continue
-            moved += 1
+                self._migrate_file(path, report)
+            except OSError as move_error:
+                report.failed.append(f"{path.stem} ({move_error})")
         with contextlib.suppress(OSError):
             legacy.rmdir()  # только пустой
-        notices = []
-        if moved:
-            notices.append(
-                f"перенесено чатов: {moved} — из {legacy} в {self.directory} (чаты теперь "
-                "хранятся у пользователя, а не в проекте)",
-            )
-        if shipped:
-            notices.append(
-                f"чаты {', '.join(shipped)} в {legacy} отслеживает git — они пришли с "
-                "репозиторием и не загружаются",
-            )
-        if existing:
-            notices.append(
-                f"чаты {', '.join(existing)} уже есть в {self.directory} — копии в {legacy} "
-                "оставлены и не загружаются",
-            )
-        if failed:
-            notices.append(
-                f"не удалось перенести чаты из {legacy}: {'; '.join(failed)} — они остались "
-                "на месте и не загружаются",
-            )
-        return notices
+        return self._migration_notices(legacy, report)
 
     # ------------------------------------------------------------------ #
     @staticmethod
     def new_id(now: datetime | None = None) -> str:
         """Id сортируется по времени создания; суффикс — от коллизий чатов одной секунды."""
-        return f"{(now or _now()):%Y%m%d-%H%M%S}-{secrets.token_hex(4)}"
+        stamp = (now or _now()).strftime(_ID_TIME_FORMAT)
+        suffix = secrets.token_hex(4)
+        return f"{stamp}-{suffix}"
 
     def exists(self, chat_id: str) -> bool:
+        """Есть ли сохранённый чат с этим id."""
         self.migrate()
         return self._path(chat_id).exists()
 
@@ -286,11 +318,6 @@ class ChatStore:
             return None
         return st.st_ino, st.st_mtime_ns, st.st_size
 
-    def _path(self, chat_id: str) -> Path:
-        if not _ID_RE.match(chat_id):
-            raise ChatStoreError(f"некорректный id чата: {chat_id!r}")
-        return self.directory / f"{chat_id}.json"
-
     def save(
         self,
         chat_id: str,
@@ -302,115 +329,79 @@ class ChatStore:
         """Записывает чат (атомарно). Ошибки записи — ``OSError``."""
         messages = conversation.messages
         now = _now()
-        info = ChatInfo(
+        chat_info = ChatInfo(
             id=chat_id,
             title=chat_title(messages),
             created_at=created_at or now,
             updated_at=now,
             model=model,
-            requests=sum(1 for m in messages if m.is_request),
+            requests=sum(1 for message in messages if message.is_request),
             preview=_preview(messages),
             messages=len(messages),
         )
-        data = {
-            "version": self.FORMAT_VERSION,
-            "id": info.id,
-            "title": info.title,
-            "created_at": info.created_at.isoformat(),
-            "updated_at": info.updated_at.isoformat(),
-            "model": info.model,
-            "requests": info.requests,
-            "preview": info.preview,
-            "messages": info.messages,
+        record = {
+            "version": FORMAT_VERSION,
+            "id": chat_info.id,
+            "title": chat_info.title,
+            "created_at": chat_info.created_at.isoformat(),
+            "updated_at": chat_info.updated_at.isoformat(),
+            "model": chat_info.model,
+            "requests": chat_info.requests,
+            "preview": chat_info.preview,
+            "messages": chat_info.messages,
             "conversation": conversation.to_dict(),
         }
         path = self._path(chat_id)
         self.migrate()
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.directory.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIR_MODE)
         # mkstemp создаёт файл с правами 0600 в том же каталоге — os.replace атомарен.
-        fd, tmp = tempfile.mkstemp(prefix=f".{chat_id}.", suffix=".tmp", dir=self.directory)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{chat_id}.", suffix=".tmp", dir=self.directory)
         try:
             # backslashreplace: одиночный суррогат (имя файла не в UTF-8), если он всё же
             # попал в диалог, пишется экранированным «\udcee» — это корректный JSON.
-            with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as f:
-                json.dump(data, f, ensure_ascii=False)
-            Path(tmp).replace(path)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as stream:
+                json.dump(record, stream, ensure_ascii=False)
+            Path(temp_name).replace(path)
         except BaseException:
-            Path(tmp).unlink(missing_ok=True)
+            Path(temp_name).unlink(missing_ok=True)
             raise
-        return info
+        return chat_info
 
     # ------------------------------------------------------------------ #
     def load(self, chat_id: str) -> SavedChat:
+        """Читает чат; не найден, не читается или повреждён — :class:`ChatStoreError`."""
         path = self._path(chat_id)
         self.migrate()
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            record = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             raise ChatStoreError(f"чат {chat_id} не найден") from None
-        except (OSError, ValueError) as e:
-            raise ChatStoreError(f"не удалось прочитать чат {chat_id}: {e}") from None
+        except (OSError, ValueError) as read_error:
+            raise ChatStoreError(f"не удалось прочитать чат {chat_id}: {read_error}") from None
         try:
-            info = self._info(data, chat_id)
-            raw = data["conversation"]
-            if not isinstance(raw, dict):
-                raise ValueError("поле conversation — не объект")
-            conversation = Conversation.from_dict(raw)
-        except (KeyError, TypeError, ValueError) as e:
-            raise ChatStoreError(f"файл чата {chat_id} повреждён: {e}") from None
-        conversation.repair()  # на случай файла, записанного посреди вызова инструмента
-        return SavedChat(info, conversation)
-
-    def _info(self, data: Any, chat_id: str) -> ChatInfo:
-        if not isinstance(data, dict) or data.get("version") != self.FORMAT_VERSION:
-            raise ValueError("неподдерживаемая версия формата")
-        return ChatInfo(
-            id=chat_id,
-            title=str(data.get("title") or "(без названия)"),
-            created_at=_parse_time(data["created_at"]),
-            updated_at=_parse_time(data["updated_at"]),
-            model=str(data.get("model") or ""),
-            requests=int(data.get("requests") or 0),
-            preview=str(data.get("preview") or ""),
-            messages=_message_count(data),
-        )
-
-    def _files(self) -> list[Path]:
-        """Файлы чатов, свежие первыми (по времени изменения)."""
-        self.migrate()
-        try:
-            files = [p for p in self.directory.glob("*.json") if _ID_RE.match(p.stem)]
-        except OSError:
-            return []
-        stamped = []
-        for p in files:
-            try:
-                stamped.append((p.stat().st_mtime, p))
-            except OSError:
-                continue
-        return [p for _, p in sorted(stamped, key=lambda x: (x[0], x[1].name), reverse=True)]
+            saved = _saved_chat(record, chat_id)
+        except (KeyError, TypeError, ValueError) as parse_error:
+            raise ChatStoreError(f"файл чата {chat_id} повреждён: {parse_error}") from None
+        saved.conversation.repair()  # на случай файла, записанного посреди вызова инструмента
+        return saved
 
     def recent(self, limit: int | None = 20) -> list[ChatInfo]:
         """Последние чаты, свежие первыми. Битые файлы и чужие версии пропускаются."""
-        result: list[ChatInfo] = []
+        chats: list[ChatInfo] = []
         for path in self._files():
-            if limit is not None and len(result) >= limit:
+            if limit is not None and len(chats) >= limit:
                 break
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                result.append(self._info(data, path.stem))
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
-        result.sort(key=lambda info: info.updated_at, reverse=True)
-        return result
+            with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+                record = json.loads(path.read_text(encoding="utf-8"))
+                chats.append(ChatInfo.from_record(record, path.stem))
+        chats.sort(key=lambda chat: chat.updated_at, reverse=True)
+        return chats
 
     def latest(self) -> SavedChat | None:
         """Последний чат, который удаётся прочитать (битые файлы пропускаются)."""
         for path in self._files():
-            try:
+            with contextlib.suppress(ChatStoreError):
                 return self.load(path.stem)
-            except ChatStoreError:
-                continue
         return None
 
     def find(self, ref: str) -> ChatInfo:
@@ -418,16 +409,76 @@ class ChatStore:
         ref = ref.strip()
         if not ref:
             raise ChatStoreError("не указан id чата")
-        ids = [p.stem for p in self._files()]
+        ids = [path.stem for path in self._files()]
         if ref in ids:
             return self.load(ref).info
-        matches = [i for i in ids if i.startswith(ref)]
+        matches = [chat_id for chat_id in ids if chat_id.startswith(ref)]
         if not matches:
             raise ChatStoreError(f"чат {ref} не найден")
         if len(matches) > 1:
             shown = ", ".join(matches[:5])
             raise ChatStoreError(f"под «{ref}» подходит несколько чатов: {shown}")
         return self.load(matches[0]).info
+
+    # ------------------------------------------------------------------ #
+    def _path(self, chat_id: str) -> Path:
+        if not _ID_RE.match(chat_id):
+            raise ChatStoreError(f"некорректный id чата: {chat_id!r}")
+        return self.directory / f"{chat_id}.json"
+
+    def _files(self) -> list[Path]:
+        """Файлы чатов, свежие первыми (по времени изменения)."""
+        self.migrate()
+        try:
+            files = [path for path in self.directory.glob("*.json") if _ID_RE.match(path.stem)]
+        except OSError:
+            return []
+        stamped: list[tuple[float, Path]] = []
+        for chat_file in files:
+            with contextlib.suppress(OSError):
+                stamped.append((chat_file.stat().st_mtime, chat_file))
+        stamped.sort(key=lambda stamp: (stamp[0], stamp[1].name), reverse=True)
+        return [path for _, path in stamped]
+
+    def _migrate_file(self, path: Path, report: _Migration) -> None:
+        """Перенести один чат с прежнего места; сбой — ``OSError``."""
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return  # симлинк или не файл — не наш чат
+        target = self._path(path.stem)
+        if target.exists():
+            report.existing.append(path.stem)
+            return
+        self.directory.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIR_MODE)
+        _move(path, target)
+        report.moved += 1
+
+    def _migration_notices(self, legacy: Path, report: _Migration) -> list[str]:
+        """Тексты для пользователя об итогах переноса чатов."""
+        notices = []
+        if report.moved:
+            notices.append(
+                f"перенесено чатов: {report.moved} — из {legacy} в {self.directory} (чаты теперь "
+                "хранятся у пользователя, а не в проекте)",
+            )
+        if report.shipped:
+            shipped = ", ".join(report.shipped)
+            notices.append(
+                f"чаты {shipped} в {legacy} отслеживает git — они пришли с "
+                "репозиторием и не загружаются",
+            )
+        if report.existing:
+            existing = ", ".join(report.existing)
+            notices.append(
+                f"чаты {existing} уже есть в {self.directory} — копии в {legacy} "
+                "оставлены и не загружаются",
+            )
+        if report.failed:
+            failed = "; ".join(report.failed)
+            notices.append(
+                f"не удалось перенести чаты из {legacy}: {failed} — они остались "
+                "на месте и не загружаются",
+            )
+        return notices
 
 
 class ChatRecorder:
@@ -443,6 +494,7 @@ class ChatRecorder:
     """
 
     def __init__(self, store: ChatStore, *, enabled: bool = True):
+        """Новый чат в хранилище ``store``; ``enabled=False`` — без сохранения."""
         self.store = store
         self.enabled = enabled
         self._chat_id = store.new_id()
@@ -452,9 +504,11 @@ class ChatRecorder:
 
     @property
     def chat_id(self) -> str:
+        """Id текущего чата."""
         return self._chat_id
 
     def start_new(self) -> None:
+        """Дальнейшие сохранения идут в новый чат."""
         self._chat_id = self.store.new_id()
         self._created_at = None
         self._version = None
@@ -468,10 +522,11 @@ class ChatRecorder:
         self.title = info.title
 
     def save(self, conversation: Conversation, *, model: str = "") -> str | None:
-        """Сохраняет диалог; возвращает предупреждение, если запись не удалась или
-        диалог пришлось сохранить новым чатом.
+        """Сохраняет диалог; возвращает предупреждение или None.
+
+        Предупреждение — если запись не удалась или диалог пришлось сохранить новым чатом.
         """
-        if not self.enabled or not any(m.is_request for m in conversation.messages):
+        if not self.enabled or not any(message.is_request for message in conversation.messages):
             return None
         warning = None
         try:
@@ -491,15 +546,15 @@ class ChatRecorder:
                 # (другое окно gigacrew, начатое в ту же секунду).
                 while self.store.exists(self._chat_id):
                     self._chat_id = self.store.new_id()
-            info = self.store.save(
+            saved = self.store.save(
                 self._chat_id,
                 conversation,
                 model=model,
                 created_at=self._created_at,
             )
-        except (OSError, ValueError) as e:  # ValueError — в том числе UnicodeEncodeError
+        except (OSError, ValueError) as error:  # ValueError — в том числе UnicodeEncodeError
             self.enabled = False
-            return f"чат не сохранён, автосохранение отключено: {e}"
-        self._created_at = info.created_at
+            return f"чат не сохранён, автосохранение отключено: {error}"
+        self._created_at = saved.created_at
         self._version = self.store.version(self._chat_id)
         return warning

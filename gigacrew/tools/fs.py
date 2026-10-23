@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import difflib
+import functools
+import itertools
 import os
 import re
 import shutil
@@ -10,6 +12,8 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import MappingProxyType
+from typing import override
 
 from pydantic import BaseModel, Field
 
@@ -43,34 +47,39 @@ def _rel(ctx: ToolContext, path: Path) -> str:
 # адреса и проверку TLS — нет). Правка без вопроса подменила бы ключ или модель при
 # следующем запуске — поэтому её подтверждает пользователь всегда, даже с -y.
 CONFIG_FILE_NAME = ".env"
+# Не пароль, а текст отказа: S105 срабатывает на слово SECRET в имени.
 SECRET_READ_NOTE = (
-    "Файл с секретами (ключи, пароли, токены) инструменты не читают: {path}. Если его "
+    "Файл с секретами (ключи, пароли, токены) инструменты не читают: {path}. Если его "  # noqa: S105
     "содержимое действительно нужно, спросите пользователя или прочитайте его через "
     "run_shell — такая команда требует подтверждения."
 )
 
 
 def _write_assessment(ctx: ToolContext, path: str) -> Assessment:
-    """Оценка записи в ``path``: план — без риска, настройки gigacrew (.env) — как опасная
-    операция (``-y`` и хук не снимают вопрос), другие секреты — с вопросом в режиме «авто»
-    (вид OTHER: правка без вопроса — только для обычных файлов проекта).
+    """Оценка записи в ``path``: план, настройки gigacrew (.env) и другие секреты — особо.
+
+    План — без риска, настройки gigacrew (.env) — как опасная операция (``-y`` и хук
+    не снимают вопрос), другие секреты — с вопросом в режиме «авто» (вид OTHER: правка
+    без вопроса — только для обычных файлов проекта).
     """
     if _is_plan_file(ctx, path):
         return Assessment(RiskLevel.SAFE)  # план — данные агента: в любом режиме без вопроса
     try:
-        p = resolve_in_root(ctx.root, path)
+        target = resolve_in_root(ctx.root, path)
     except SandboxError:
         return Assessment(RiskLevel.WRITE)  # откажет сама запись
-    if p.name.casefold() == CONFIG_FILE_NAME:
+    if target.name.casefold() == CONFIG_FILE_NAME:
         return Assessment(
             RiskLevel.DANGEROUS,
-            reason=f"{_rel(ctx, p)} — настройки gigacrew: ключ доступа, адреса API, проверка TLS",
+            reason=(
+                f"{_rel(ctx, target)} — настройки gigacrew: ключ доступа, адреса API, проверка TLS"
+            ),
             kind=ToolKind.OTHER,
         )
-    if is_secret_target(ctx.root, p):
+    if is_secret_target(ctx.root, target):
         return Assessment(
             RiskLevel.WRITE,
-            reason=f"файл с секретами ({_rel(ctx, p)})",
+            reason=f"файл с секретами ({_rel(ctx, target)})",
             kind=ToolKind.OTHER,
         )
     return Assessment(RiskLevel.WRITE)
@@ -80,7 +89,10 @@ def _write_assessment(ctx: ToolContext, path: str) -> Assessment:
 # Текст файла: переводы строк, BOM, атомарная запись
 # --------------------------------------------------------------------------- #
 _BOM = "﻿"
-_EOL_NAMES = {"\n": "LF", "\r\n": "CRLF", "\r": "CR"}
+_LF = "\n"
+_CRLF = "\r\n"
+_CR = "\r"  # одиночный перевод строки старых файлов Mac
+_EOL_NAMES = MappingProxyType({_LF: "LF", _CRLF: "CRLF", _CR: "CR"})
 
 
 @dataclass(frozen=True)
@@ -98,16 +110,19 @@ class TextFile:
     mixed: bool = False  # в файле были разные окончания строк — запишутся как ``eol``
 
     def encode(self, text: str | None = None) -> bytes:
+        """Байты для записи: ``text`` (по умолчанию — свой текст) с оформлением файла."""
         body = self.text if text is None else text
         if self.eol != "\n":
             body = body.replace("\n", self.eol)
-        return ((_BOM if self.bom else "") + body).encode("utf-8")
+        prefix = _BOM if self.bom else ""
+        return f"{prefix}{body}".encode()
 
     def eol_note(self) -> str:
         """Пометка для результата: окончания строк файла будут выровнены."""
         if not self.mixed:
             return ""
-        return f" (окончания строк приведены к {_EOL_NAMES[self.eol]})"
+        eol_name = _EOL_NAMES[self.eol]
+        return f" (окончания строк приведены к {eol_name})"
 
 
 def decode_text(raw: str) -> TextFile:
@@ -119,17 +134,17 @@ def decode_text(raw: str) -> TextFile:
     bom = raw.startswith(_BOM)
     if bom:
         raw = raw[1:]
-    crlf = raw.count("\r\n")
-    counts = {"\n": raw.count("\n") - crlf, "\r\n": crlf, "\r": raw.count("\r") - crlf}
-    eol = max(("\n", "\r\n", "\r"), key=lambda k: (counts[k], k == "\n"))
+    crlf = raw.count(_CRLF)
+    counts = {_LF: raw.count(_LF) - crlf, _CRLF: crlf, _CR: raw.count(_CR) - crlf}
+    eol = max((_LF, _CRLF, _CR), key=lambda candidate: (counts[candidate], candidate == _LF))
     if counts[eol] == 0:
-        eol = "\n"
-    if eol == "\r":
-        text = raw.replace("\r\n", "\n").replace("\r", "\n")
-        mixed = counts["\n"] + counts["\r\n"] > 0
+        eol = _LF
+    if eol == _CR:
+        text = raw.replace(_CRLF, _LF).replace(_CR, _LF)
+        mixed = counts[_LF] + counts[_CRLF] > 0
     else:
-        text = raw.replace("\r\n", "\n")
-        mixed = counts["\n"] > 0 and counts["\r\n"] > 0
+        text = raw.replace(_CRLF, _LF)
+        mixed = counts[_LF] > 0 and counts[_CRLF] > 0
     return TextFile(text, eol, bom, mixed)
 
 
@@ -148,44 +163,72 @@ def write_atomic(path: Path, data: bytes) -> None:
         path.write_bytes(data)
         return
     try:
-        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     except PermissionError:
         path.write_bytes(data)
         return
+    tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        shutil.copymode(path, tmp)
-        gid = path.stat().st_gid
-        if hasattr(os, "chown") and os.stat(tmp).st_gid != gid:
-            try:
-                os.chown(tmp, -1, gid)  # чужая группа файла или каталог с setgid
-            except PermissionError:
-                Path(tmp).unlink(missing_ok=True)
-                path.write_bytes(data)
-                return
-        Path(tmp).replace(path)
+        _replace_through_temp(path, data, fd, tmp_path)
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        tmp_path.unlink(missing_ok=True)
         raise
 
 
+def _replace_through_temp(path: Path, payload: bytes, fd: int, tmp_path: Path) -> None:
+    """Пишет ``payload`` во временный файл ``tmp_path`` (открыт как ``fd``) и заменяет им файл.
+
+    Если группу файла временному файлу не передать, временный файл удаляется, а файл
+    перезаписывается на месте.
+    """
+    with os.fdopen(fd, "wb") as tmp_file:
+        tmp_file.write(payload)
+    shutil.copymode(path, tmp_path)
+    if not _copy_group(path, tmp_path):
+        tmp_path.unlink(missing_ok=True)
+        path.write_bytes(payload)
+        return
+    tmp_path.replace(path)
+
+
+def _copy_group(path: Path, tmp_path: Path) -> bool:
+    """Даёт временному файлу группу файла ``path``; False — сменить группу нельзя."""
+    gid = path.stat().st_gid
+    if hasattr(os, "chown") and tmp_path.stat().st_gid != gid:
+        try:
+            os.chown(tmp_path, -1, gid)  # чужая группа файла или каталог с setgid
+        except PermissionError:
+            return False
+    return True
+
+
 def _replace_keeps_metadata(path: Path) -> bool:
-    """Замену через новый inode можно делать без потерь: файл наш, без жёстких
-    ссылок и расширенных атрибутов (ACL хранятся в xattr).
+    """Замену через новый inode можно делать без потерь.
+
+    Файл наш, без жёстких ссылок и расширенных атрибутов (ACL хранятся в xattr).
     """
     st = path.stat()
     if st.st_nlink > 1:
         return False
     if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
         return False
-    if hasattr(os, "listxattr"):
-        try:
-            if os.listxattr(path):
-                return False
-        except OSError:
-            pass  # ФС без xattr
-    return True
+    return not (hasattr(os, "listxattr") and _has_xattrs(path))
+
+
+def _has_xattrs(path: Path) -> bool:
+    """У файла есть расширенные атрибуты (ФС без xattr — нет)."""
+    try:
+        return bool(os.listxattr(path))
+    except OSError:
+        return False  # ФС без xattr
+
+
+def _require_regular_file(path: Path, shown: str) -> None:
+    """Путь — обычный файл, а не каталог, FIFO, сокет или устройство; иначе ToolError."""
+    if path.is_dir():
+        raise ToolError(f"Это директория, а не файл: {shown}")
+    if not path.is_file():
+        raise ToolError(f"Не обычный файл (FIFO, сокет или устройство): {shown}")
 
 
 def load_existing(path: Path, shown: str) -> TextFile:
@@ -195,15 +238,12 @@ def load_existing(path: Path, shown: str) -> TextFile:
     выглядело бы как создание нового файла, а запись в UTF-8 испортила бы
     содержимое (или зависла бы на FIFO).
     """
-    if path.is_dir():
-        raise ToolError(f"Это директория, а не файл: {shown}")
-    if not path.is_file():
-        raise ToolError(f"Не обычный файл (FIFO, сокет или устройство): {shown}")
-    data = path.read_bytes()
-    if b"\0" in data[:_BINARY_PROBE]:
+    _require_regular_file(path, shown)
+    raw = path.read_bytes()
+    if b"\0" in raw[:_BINARY_PROBE]:
         raise ToolError(f"Бинарный файл — write_file/edit_file меняют только текст: {shown}")
     try:
-        return decode_text(data.decode("utf-8"))
+        return decode_text(raw.decode("utf-8"))
     except UnicodeDecodeError:
         raise ToolError(
             f"Файл не в UTF-8 (например, cp1251): {shown}. write_file/edit_file его не "
@@ -219,7 +259,7 @@ def _lines(text: str) -> list[str]:
     разошлись бы с ``read_file``, а строки диффа склеились бы.
     """
     parts = text.split("\n")
-    lines = [part + "\n" for part in parts[:-1]]
+    lines = [f"{part}\n" for part in parts[:-1]]
     if parts[-1]:
         lines.append(parts[-1])
     return lines
@@ -235,14 +275,14 @@ def _is_plan_file(ctx: ToolContext, path: str) -> bool:
         return False
 
 
-def _plan_written(ctx: ToolContext, p: Path) -> bool:
+def _plan_written(ctx: ToolContext, path: Path) -> bool:
     """Отмечает изменение плана после записи; True — записан файл плана.
 
     «План ждёт показа» (``dirty``) — только после правки в режиме плана: отметки о
     выполненных шагах в режиме «авто» — не новый план, иначе в следующем цикле
     планирования harness показал бы старый план сам.
     """
-    if ctx.plan is None or not ctx.plan.is_target(p):
+    if ctx.plan is None or not ctx.plan.is_target(path):
         return False
     if ctx.get_mode is None or ctx.get_mode() is PermissionMode.PLAN:
         ctx.plan.dirty = True
@@ -260,74 +300,83 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
     diff``, которые выполняются без подтверждения. Проверка срабатывает и в превью,
     то есть до вопроса о подтверждении.
     """
-    p = resolve_in_root(ctx.root, path)
-    if is_git_internal(ctx.root, p, path):
+    target = resolve_in_root(ctx.root, path)
+    if is_git_internal(ctx.root, target, path):
         raise ToolError(
             f"Внутренности git ({GIT_DIR_NAME}/) недоступны для записи: {path}. "
             "Для операций с репозиторием используйте инструмент git.",
         )
-    if ctx.plan is not None and ctx.plan.is_target(p):
-        return p
+    if ctx.plan is not None and ctx.plan.is_target(target):
+        return target
     data_dir = ctx.workspace.data_dir.resolve()  # .gigacode может быть симлинком
     # is_data_path — ещё и без учёта регистра: на macOS/Windows .GIGACODE — та же папка.
-    if p == data_dir or data_dir in p.parents or ctx.workspace.is_data_path(p):
+    if target == data_dir or data_dir in target.parents or ctx.workspace.is_data_path(target):
+        plan_hint = ""
+        if ctx.plan is not None:
+            plan_hint = f". Файл плана этого чата: {_rel(ctx, ctx.plan.path)}"
         raise ToolError(
             f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента, скиллы) "
-            f"недоступна для записи: {path}"
-            + (
-                f". Файл плана этого чата: {_rel(ctx, ctx.plan.path)}"
-                if ctx.plan is not None
-                else ""
-            ),
+            f"недоступна для записи: {path}{plan_hint}",
         )
-    return p
+    return target
 
 
-_NO_NEWLINE = "\\ No newline at end of file\n"
+_NO_NEWLINE_MARK = r"\ No newline at end of file"
 
 
 def make_diff(old: str, new: str, path: str) -> str:
-    r"""Unified diff двух текстов (с ``\\n``), как у git: последняя строка без
-    перевода строки помечается ``\\ No newline at end of file``, а не склеивается
-    со следующей строкой диффа.
+    r"""Unified diff двух текстов (с ``\\n``), как у git.
+
+    Последняя строка без перевода строки помечается ``\\ No newline at end of file``,
+    а не склеивается со следующей строкой диффа.
     """
     diff = difflib.unified_diff(_lines(old), _lines(new), fromfile=f"a/{path}", tofile=f"b/{path}")
-    return "".join(line if line.endswith("\n") else f"{line}\n{_NO_NEWLINE}" for line in diff)
+    return "".join(
+        line if line.endswith("\n") else f"{line}\n{_NO_NEWLINE_MARK}\n" for line in diff
+    )
 
 
 # Последовательности двойной экранизации: ``\r\n`` — один перевод строки (текст
 # сравнивается в виде с ``\n``), ``\\`` — обратная косая черта. Разбор — за один проход
 # слева направо: в ``\\n`` экранирована косая черта, а ``n`` — обычная буква.
 _ESCAPE_RE = re.compile(r"\\r\\n|\\([nt\"'\\])")
-_ESCAPES = {"n": "\n", "t": "\t", '"': '"', "'": "'", "\\": "\\"}
+_ESCAPES = MappingProxyType({"n": "\n", "t": "\t", '"': '"', "'": "'", "\\": "\\"})
 
 
-def _unescape(s: str) -> str:
+def _unescaped(match: re.Match[str]) -> str:
+    r"""Значение одной экранированной последовательности (``\\r\\n`` — перевод строки)."""
+    escaped = match.group(1)
+    return _ESCAPES[escaped] if escaped else "\n"
+
+
+def _unescape(text: str) -> str:
     r"""Разэкранирует частые последовательности (\\n, \\t, \\", \\', \\\\) без условий.
 
     Используется как один из вариантов-кандидатов при поиске old_string —
     применяется только если разэкранированная форма реально нашлась в файле.
     """
-    return _ESCAPE_RE.sub(lambda m: _ESCAPES[m.group(1)] if m.group(1) else "\n", s)
+    return _ESCAPE_RE.sub(_unescaped, text)
 
 
 _LINE_NUM_RE = re.compile(r"^\s*\d+\t")
+# Префиксы-номера снимаются, если ими помечена хотя бы такая доля непустых строк.
+_NUMBERED_SHARE = 0.6
 
 
-def _strip_line_numbers(s: str) -> str:
+def _strip_line_numbers(text: str) -> str:
     r"""Удаляет префиксы-номера строк (``N\\t``), если ими помечено большинство строк.
 
     read_file показывает содержимое с номерами (как ``cat -n``); слабые модели
     иногда копируют эти префиксы прямо в old_string/new_string. Снимаем их,
     чтобы фрагмент совпал с реальным файлом.
     """
-    lines = s.split("\n")
+    lines = text.split("\n")
     nonempty = [ln for ln in lines if ln.strip()]
     if not nonempty:
-        return s
+        return text
     marked = sum(1 for ln in nonempty if _LINE_NUM_RE.match(ln))
-    if marked < max(2, 0.6 * len(nonempty)):
-        return s
+    if marked < max(2, _NUMBERED_SHARE * len(nonempty)):
+        return text
     return "\n".join(_LINE_NUM_RE.sub("", ln) for ln in lines)
 
 
@@ -347,7 +396,7 @@ def repair_escaped_content(content: str) -> tuple[str, bool]:
 
     Возвращает (исправленный_текст, был_ли_ремонт).
     """
-    if "\n" in content or content.count("\\n") < 2:
+    if "\n" in content or content.count(r"\n") < 2:
         return content, False
     fixed = _unescape(content)
     lines = fixed.split("\n")
@@ -359,14 +408,21 @@ def repair_escaped_content(content: str) -> tuple[str, bool]:
     return fixed, True
 
 
+def _numbered(number: int, width: int, line: str) -> str:
+    """Строка с номером, выровненным вправо по ширине ``width``, через табуляцию."""
+    column = str(number).rjust(width)
+    return f"{column}\t{line}"
+
+
 def _numbered_excerpt(text: str, max_lines: int = 60) -> str:
     """Содержимое файла с номерами строк (для подсказки при неудачном edit)."""
     lines = [line.rstrip("\n") for line in _lines(text)]
     shown = lines[:max_lines]
     width = len(str(len(shown)))
-    body = "\n".join(f"{str(i + 1).rjust(width)}\t{ln}" for i, ln in enumerate(shown))
+    body = "\n".join(_numbered(number, width, line) for number, line in enumerate(shown, start=1))
     if len(lines) > max_lines:
-        body += f"\n… (ещё {len(lines) - max_lines} строк)"
+        rest = len(lines) - max_lines
+        body = f"{body}\n… (ещё {rest} строк)"
     return body
 
 
@@ -377,6 +433,53 @@ def _leading(line: str) -> str:
 IndentRule = Callable[[str], "str | None"]
 
 
+def _strip_suffix(text: str, suffix: str) -> str | None:
+    """``text`` без окончания ``suffix``; None — ``text`` им не кончается."""
+    if not text.endswith(suffix):
+        return None
+    return text[: len(text) - len(suffix)]
+
+
+def _single(candidates: set[str | None]) -> str | None:
+    """Единственный вариант; None — вариантов несколько, нет ни одного или среди них None."""
+    if len(candidates) == 1 and None not in candidates:
+        return candidates.pop()
+    return None
+
+
+def _add_prefix(prefix: str, indent: str) -> str | None:
+    """Отступ файла: к отступу шаблона добавлен общий префикс."""
+    return prefix + indent
+
+
+def _remove_prefix(extra: str, indent: str) -> str | None:
+    """Отступ файла: у отступа шаблона убран лишний общий префикс; None — его там нет."""
+    return indent[len(extra) :] if indent.startswith(extra) else None
+
+
+def _scale_units(pattern_unit: str, file_unit: str, indent: str) -> str | None:
+    """Отступ файла: единицы отступа шаблона заменены единицами файла; None — не кратен."""
+    repeats = len(indent) // len(pattern_unit)
+    return file_unit * repeats if indent == pattern_unit * repeats else None
+
+
+def _unit_rule(mapping: dict[str, str]) -> IndentRule | None:
+    """Соответствие отступов кратными единицами (пробелы ↔ табы); None — не оно."""
+    units = [
+        (pat_indent, file_indent)
+        for pat_indent, file_indent in mapping.items()
+        if pat_indent and file_indent
+    ]
+    if not units:
+        return None
+    pattern_unit, file_unit = min(units, key=lambda unit: len(unit[0]))
+    for pat_indent, file_indent in mapping.items():
+        repeats = len(pat_indent) // len(pattern_unit)
+        if pat_indent != pattern_unit * repeats or file_indent != file_unit * repeats:
+            return None
+    return functools.partial(_scale_units, pattern_unit, file_unit)
+
+
 def _indent_rule(pairs: list[tuple[str, str]]) -> IndentRule | None:
     """Как перевести отступ из фрагмента модели в отступ файла.
 
@@ -385,32 +488,18 @@ def _indent_rule(pairs: list[tuple[str, str]]) -> IndentRule | None:
     (лишний общий отступ) или согласованное соответствие отступов (пробелы ↔ табы,
     в том числе кратными единицами). Иначе None — правку не угадываем.
     """
-    added = {f[: len(f) - len(p)] if f.endswith(p) else None for p, f in pairs}
-    if len(added) == 1 and None not in added:
-        prefix = added.pop()
-        return lambda indent: prefix + indent
-    removed = {p[: len(p) - len(f)] if p.endswith(f) else None for p, f in pairs}
-    if len(removed) == 1 and None not in removed:
-        extra = removed.pop()
-        return lambda indent: indent[len(extra) :] if indent.startswith(extra) else None
+    added = _single({_strip_suffix(file_indent, pat_indent) for pat_indent, file_indent in pairs})
+    if added is not None:
+        return functools.partial(_add_prefix, added)
+    removed = _single(set(itertools.starmap(_strip_suffix, pairs)))
+    if removed is not None:
+        return functools.partial(_remove_prefix, removed)
     mapping: dict[str, str] = {}
-    for p, f in pairs:
-        if mapping.setdefault(p, f) != f:
+    for pat_indent, file_indent in pairs:
+        if mapping.setdefault(pat_indent, file_indent) != file_indent:
             return None
-    units = [(p, f) for p, f in mapping.items() if p and f]
-    if units:
-        pu, fu = min(units, key=lambda pf: len(pf[0]))
-        if all(
-            p == pu * (len(p) // len(pu)) and f == fu * (len(p) // len(pu))
-            for p, f in mapping.items()
-        ):
-
-            def by_units(indent: str) -> str | None:
-                k = len(indent) // len(pu)
-                return fu * k if indent == pu * k else None
-
-            return by_units
-    return mapping.get
+    by_units = _unit_rule(mapping)
+    return mapping.get if by_units is None else by_units
 
 
 @dataclass(frozen=True)
@@ -446,6 +535,55 @@ class _Match:
         return "\n".join(out)
 
 
+def _trim_blank_lines(pattern: str) -> tuple[list[str], int, int]:
+    """Строки шаблона без пустых строк по краям: (строки, срезано в начале, срезано в конце)."""
+    pat_lines = pattern.split("\n")
+    lead = 0
+    while pat_lines and not pat_lines[0].strip():
+        pat_lines.pop(0)
+        lead += 1
+    trail = 0
+    while pat_lines and not pat_lines[-1].strip():
+        pat_lines.pop()
+        trail += 1
+    return pat_lines, lead, trail
+
+
+def _normalized(line: str, *, strict: bool) -> str:
+    """Строка для сравнения: strict — без хвостовых пробелов, иначе — без пробелов по краям."""
+    return line.rstrip() if strict else line.strip()
+
+
+def _unique_block(file_lines: list[str], pat_lines: list[str], *, strict: bool) -> int | None:
+    """Номер первой строки блока, совпавшего с шаблоном; None — совпадений нет или несколько."""
+    target = [_normalized(line, strict=strict) for line in pat_lines]
+    size = len(pat_lines)
+    hits = [
+        first
+        for first in range(len(file_lines) - size + 1)
+        if [_normalized(line, strict=strict) for line in file_lines[first : first + size]] == target
+    ]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _block_span(raw: list[str], first: int, size: int) -> tuple[int, int]:
+    r"""Границы блока из ``size`` строк с ``first`` в тексте (конец — без последнего ``\\n``)."""
+    last = first + size - 1
+    start = sum(len(line) for line in raw[:first])
+    before_last = sum(len(line) for line in raw[:last])
+    end = before_last + len(raw[last].rstrip("\n"))
+    return start, end
+
+
+def _indent_pairs(pat_lines: list[str], block: list[str]) -> list[tuple[str, str]]:
+    """Пары (отступ строки шаблона, отступ строки файла) для непустых строк шаблона."""
+    return [
+        (_leading(pat), _leading(line))
+        for pat, line in zip(pat_lines, block, strict=True)
+        if pat.strip()
+    ]
+
+
 def _tolerant_find(text: str, pattern: str) -> _Match | None:
     """Ищет блок строк, совпадающий с pattern с точностью до пробелов/отступов.
 
@@ -457,53 +595,25 @@ def _tolerant_find(text: str, pattern: str) -> _Match | None:
     raw = _lines(text)
     if not raw:
         return None
-    offsets = []
-    pos = 0
-    for ln in raw:
-        offsets.append(pos)
-        pos += len(ln)
-    contents = [ln.rstrip("\n") for ln in raw]
-
-    pat_lines = pattern.split("\n")
-    lead = trail = 0
-    while pat_lines and not pat_lines[0].strip():
-        pat_lines.pop(0)
-        lead += 1
-    while pat_lines and not pat_lines[-1].strip():
-        pat_lines.pop()
-        trail += 1
-    n = len(pat_lines)
-    if n == 0:
+    file_lines = [line.rstrip("\n") for line in raw]
+    pat_lines, lead, trail = _trim_blank_lines(pattern)
+    if not pat_lines:
         return None
 
     # От более строгой нормализации (только хвостовые пробелы) к более мягкой
     # (полный strip — игнор отступов). Берём первый режим с уникальным совпадением.
-    for strict in (True, False):
-
-        def norm(s: str, strict: bool = strict) -> str:
-            return s.rstrip() if strict else s.strip()
-
-        target = [norm(ln) for ln in pat_lines]
-        hits = [
-            i
-            for i in range(len(contents) - n + 1)
-            if [norm(contents[j]) for j in range(i, i + n)] == target
-        ]
-        if len(hits) != 1:
-            continue
-        i = hits[0]
-        start = offsets[i]
-        end = offsets[i + n - 1] + len(contents[i + n - 1])
-        if strict:
-            return _Match(start, end, lead, trail)
-        pairs = [
-            (_leading(pat), _leading(contents[i + j]))
-            for j, pat in enumerate(pat_lines)
-            if pat.strip()
-        ]
-        rule = _indent_rule(pairs)
-        return None if rule is None else _Match(start, end, lead, trail, rule)
-    return None
+    exact = _unique_block(file_lines, pat_lines, strict=True)
+    if exact is not None:
+        start, end = _block_span(raw, exact, len(pat_lines))
+        return _Match(start, end, lead, trail)
+    loose = _unique_block(file_lines, pat_lines, strict=False)
+    if loose is None:
+        return None
+    rule = _indent_rule(_indent_pairs(pat_lines, file_lines[loose : loose + len(pat_lines)]))
+    if rule is None:
+        return None
+    start, end = _block_span(raw, loose, len(pat_lines))
+    return _Match(start, end, lead, trail, rule)
 
 
 # --------------------------------------------------------------------------- #
@@ -516,6 +626,8 @@ class ReadFileParams(BaseModel):
 
 
 class ReadFileTool(Tool[ReadFileParams]):
+    """Инструмент read_file: текст файла с номерами строк, по частям."""
+
     name = "read_file"
     read_only = True
     description = (
@@ -526,57 +638,97 @@ class ReadFileTool(Tool[ReadFileParams]):
     )
     Params = ReadFileParams
 
+    @override
     def run(self, params: ReadFileParams, ctx: ToolContext) -> ToolResult:
-        p = resolve_in_root(ctx.root, params.path)
-        if not p.exists():
-            raise ToolError(f"Файл не найден: {params.path}")
-        if p.is_dir():
-            raise ToolError(f"Это директория, а не файл: {params.path}")
-        if not p.is_file():  # FIFO/сокет/устройство — чтение может заблокироваться
-            raise ToolError(f"Не обычный файл (FIFO, сокет или устройство): {params.path}")
-        if is_secret_target(ctx.root, p):
-            raise ToolError(SECRET_READ_NOTE.format(path=params.path))
-        if p.stat().st_size > MAX_READ_BYTES:
-            raise ToolError(
-                f"Файл слишком большой (>{MAX_READ_BYTES} байт). Используйте search_content.",
-            )
-        with p.open("rb") as fh:
+        """Читает файл и возвращает выбранные строки с номерами."""
+        path = resolve_in_root(ctx.root, params.path)
+        _check_readable(ctx, path, params.path)
+        with path.open("rb") as fh:
             if b"\0" in fh.read(_BINARY_PROBE):
                 raise ToolError(f"Бинарный файл, чтение не поддерживается: {params.path}")
 
         start = max(params.start_line or 1, 1)
         encoding_note = ""
         try:
-            selected, total, stopped_at = _select_lines(p, start, params.end_line, "utf-8")
+            selected, total, stopped_at = _select_lines(path, start, params.end_line, "utf-8")
         except UnicodeDecodeError:
             # Чаще всего — старый русский текст в cp1251: показать его полезнее отказа.
-            selected, total, stopped_at = _select_lines(p, start, params.end_line, "cp1251")
-            encoding_note = CP1251_NOTE + "\n"
+            selected, total, stopped_at = _select_lines(path, start, params.end_line, "cp1251")
+            encoding_note = f"{CP1251_NOTE}\n"
 
-        if not selected:
-            numbered = "(пусто)" if total == 0 else f"(нет строк в диапазоне; всего строк: {total})"
-        else:
-            width = len(str(selected[-1][0]))
-            numbered = "\n".join(f"{str(n).rjust(width)}\t{line}" for n, line in selected)
-        first = selected[0][0] if selected else start
-        if stopped_at is not None:
-            numbered += (
-                f"\n… показаны строки {first}–{stopped_at - 1} из {total}. "
-                f"Продолжение: start_line={stopped_at}."
-            )
-        elif selected and (first > 1 or selected[-1][0] < total):
-            last = selected[-1][0]
-            numbered += f"\n… показаны строки {first}–{last} из {total}."
-            if last < total:
-                numbered += f" Продолжение: start_line={last + 1}."
+        numbered = _numbered_body(selected, total) + _range_note(
+            selected,
+            total,
+            start,
+            stopped_at,
+        )
         encoding = " · cp1251" if encoding_note else ""
         return ToolResult(
             content=encoding_note + numbered,
-            summary=f"прочитан {_rel(ctx, p)} ({len(selected)} строк){encoding}",
+            summary=f"прочитан {_rel(ctx, path)} ({len(selected)} строк){encoding}",
         )
 
 
 CP1251_NOTE = "(файл не в UTF-8 — показан как cp1251; edit_file и write_file такие файлы не меняют)"
+
+_NumberedLine = tuple[int, str]
+
+
+def _check_readable(ctx: ToolContext, path: Path, shown: str) -> None:
+    """Файл можно читать: он есть, обычный, не с секретами и не слишком большой."""
+    if not path.exists():
+        raise ToolError(f"Файл не найден: {shown}")
+    # FIFO/сокет/устройство — чтение может заблокироваться.
+    _require_regular_file(path, shown)
+    if is_secret_target(ctx.root, path):
+        raise ToolError(SECRET_READ_NOTE.format(path=shown))
+    if path.stat().st_size > MAX_READ_BYTES:
+        raise ToolError(
+            f"Файл слишком большой (>{MAX_READ_BYTES} байт). Используйте search_content.",
+        )
+
+
+def _numbered_body(selected: list[_NumberedLine], total: int) -> str:
+    """Выбранные строки с номерами; если строк нет — пометка, почему."""
+    if not selected:
+        return "(пусто)" if total == 0 else f"(нет строк в диапазоне; всего строк: {total})"
+    width = len(str(selected[-1][0]))
+    return "\n".join(_numbered(number, width, line) for number, line in selected)
+
+
+def _range_note(
+    selected: list[_NumberedLine],
+    total: int,
+    start: int,
+    stopped_at: int | None,
+) -> str:
+    """Какая часть файла показана и откуда продолжить; пусто — показан весь файл."""
+    first = selected[0][0] if selected else start
+    if stopped_at is not None:
+        shown_last = stopped_at - 1
+        return (
+            f"\n… показаны строки {first}–{shown_last} из {total}. "
+            f"Продолжение: start_line={stopped_at}."
+        )
+    if not selected:
+        return ""
+    last = selected[-1][0]
+    if first <= 1 and last >= total:
+        return ""
+    note = f"\n… показаны строки {first}–{last} из {total}."
+    if last < total:
+        next_line = last + 1
+        note = f"{note} Продолжение: start_line={next_line}."
+    return note
+
+
+def _clip_line(raw: str) -> str:
+    """Строка файла без перевода строки, обрезанная до ``MAX_LINE_CHARS`` символов."""
+    line = raw.rstrip("\r\n")
+    if len(line) > MAX_LINE_CHARS:
+        head = line[:MAX_LINE_CHARS]
+        return f"{head} …[строка обрезана]"
+    return line
 
 
 def _select_lines(
@@ -584,31 +736,30 @@ def _select_lines(
     start: int,
     end: int | None,
     encoding: str,
-) -> tuple[list[tuple[int, str]], int, int | None]:
+) -> tuple[list[_NumberedLine], int, int | None]:
     """Строки ``start..end`` в пределах лимитов чтения.
 
     Возвращает (выбранные (номер, строка), всего строк в файле, первая строка,
     не поместившаяся в лимит, или None). Для UTF-8 — ``UnicodeDecodeError`` на
     неверных байтах, иначе неверные байты заменяются.
     """
-    selected: list[tuple[int, str]] = []
+    selected: list[_NumberedLine] = []
     budget = MAX_READ_CHARS
     total = 0
     stopped_at: int | None = None
     errors = "strict" if encoding == "utf-8" else "replace"
     with path.open(encoding=encoding, errors=errors) as fh:
-        for total, raw in enumerate(fh, start=1):
-            if total < start or (end is not None and total > end):
+        for number, raw in enumerate(fh, start=1):
+            total = number
+            if number < start or (end is not None and number > end):
                 continue
             if stopped_at is not None:
                 continue  # досчитываем общее число строк
-            line = raw.rstrip("\r\n")
-            if len(line) > MAX_LINE_CHARS:
-                line = line[:MAX_LINE_CHARS] + " …[строка обрезана]"
+            line = _clip_line(raw)
             if len(selected) >= MAX_READ_LINES or len(line) + 1 > budget:
-                stopped_at = total
+                stopped_at = number
                 continue
-            selected.append((total, line))
+            selected.append((number, line))
             budget -= len(line) + 1
     return selected, total, stopped_at
 
@@ -622,6 +773,8 @@ class WriteFileParams(BaseModel):
 
 
 class WriteFileTool(Tool[WriteFileParams]):
+    """Инструмент write_file: создаёт файл или перезаписывает его целиком."""
+
     name = "write_file"
     description = (
         "Creates a new file or completely overwrites an existing one with the given "
@@ -631,11 +784,47 @@ class WriteFileTool(Tool[WriteFileParams]):
     Params = WriteFileParams
     kind = ToolKind.EDIT
 
+    @override
     def assess(self, params: WriteFileParams, ctx: ToolContext) -> Assessment:
+        """Оценка записи: план, настройки gigacrew и секреты — особо."""
         return _write_assessment(ctx, params.path)
 
+    @override
     def risk(self, params: WriteFileParams, ctx: ToolContext) -> RiskLevel:
+        """Уровень риска — из оценки записи."""
         return self.assess(params, ctx).risk
+
+    @override
+    def preview(self, params: WriteFileParams, ctx: ToolContext) -> Display | None:
+        """Дифф прежнего и нового содержимого файла."""
+        _, old, new, _ = self._prepare(params, ctx)
+        diff = make_diff(old.text if old else "", new.text, params.path)
+        if not diff:
+            diff = "(новый пустой файл)" if old is None else "(без изменений)"
+        return Display(diff, kind="diff", title=f"{params.path}{new.eol_note()}")
+
+    @override
+    def run(self, params: WriteFileParams, ctx: ToolContext) -> ToolResult:
+        """Записывает файл (каталоги создаются при необходимости)."""
+        target, old, new, repaired = self._prepare(params, ctx)
+        if ctx.plan is not None and ctx.plan.is_target(target):
+            ctx.workspace.ensure_data_dir()  # .gitignore папки — до первого файла в ней
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(target, new.encode())
+        verb = "создан" if old is None else "перезаписан"
+        shown = "план" if _plan_written(ctx, target) else _rel(ctx, target)
+        line_count = len(_lines(new.text))
+        repair_note = " (автокоррекция экранирования)" if repaired else ""
+        note = repair_note + new.eol_note()
+        return ToolResult(
+            content=f"Файл {verb}: {params.path} ({line_count} строк).{note}",
+            summary=f"{verb} {shown}{note}",
+            display=Display(
+                make_diff(old.text if old else "", new.text, params.path),
+                kind="diff",
+                title=params.path,
+            ),
+        )
 
     def _prepare(
         self,
@@ -646,40 +835,13 @@ class WriteFileTool(Tool[WriteFileParams]):
 
         Существующий файл сохраняет свои переводы строк и BOM; новый — как прислано.
         """
-        p = _writable_path(ctx, params.path)
-        old = load_existing(p, params.path) if p.exists() else None
+        target = _writable_path(ctx, params.path)
+        old = load_existing(target, params.path) if target.exists() else None
         content, repaired = repair_escaped_content(params.content)
         new = decode_text(content)
         if old is not None:
             new = TextFile(new.text, old.eol, old.bom, old.mixed)
-        return p, old, new, repaired
-
-    def preview(self, params: WriteFileParams, ctx: ToolContext) -> Display | None:
-        _, old, new, _ = self._prepare(params, ctx)
-        diff = make_diff(old.text if old else "", new.text, params.path)
-        if not diff:
-            diff = "(без изменений)" if old is not None else "(новый пустой файл)"
-        return Display(diff, kind="diff", title=f"{params.path}{new.eol_note()}")
-
-    def run(self, params: WriteFileParams, ctx: ToolContext) -> ToolResult:
-        p, old, new, repaired = self._prepare(params, ctx)
-        if ctx.plan is not None and ctx.plan.is_target(p):
-            ctx.workspace.ensure_data_dir()  # .gitignore папки — до первого файла в ней
-        p.parent.mkdir(parents=True, exist_ok=True)
-        write_atomic(p, new.encode())
-        verb = "перезаписан" if old is not None else "создан"
-        target = "план" if _plan_written(ctx, p) else _rel(ctx, p)
-        n = len(_lines(new.text))
-        note = (" (автокоррекция экранирования)" if repaired else "") + new.eol_note()
-        return ToolResult(
-            content=f"Файл {verb}: {params.path} ({n} строк).{note}",
-            summary=f"{verb} {target}{note}",
-            display=Display(
-                make_diff(old.text if old else "", new.text, params.path),
-                kind="diff",
-                title=params.path,
-            ),
-        )
+        return target, old, new, repaired
 
 
 # --------------------------------------------------------------------------- #
@@ -695,7 +857,109 @@ class EditFileParams(BaseModel):
     )
 
 
+def _as_sent(fragment: str) -> str:
+    """Фрагмент как прислан моделью."""
+    return fragment
+
+
+def _unescape_and_strip(fragment: str) -> str:
+    """Фрагмент без экранизации и без префиксов-номеров строк."""
+    return _strip_line_numbers(_unescape(fragment))
+
+
+# Слабые модели часто слегка искажают old_string: экранируют переносы
+# (литералы \n, \"), либо копируют префиксы-номера строк (N\t) прямо из
+# вывода read_file. Пробуем набор согласованных преобразований к ОБОИМ
+# фрагментам и берём первое, которое реально находится в файле — это
+# безопасно: преобразованная форма применяется, только если совпала.
+_FRAGMENT_TRANSFORMS: tuple[Callable[[str], str], ...] = (
+    _as_sent,  # как прислано
+    _unescape,  # снять экранизацию \n/\"
+    _strip_line_numbers,  # снять префиксы номеров строк
+    _unescape_and_strip,  # и то, и другое
+)
+
+
+def _check_edit_fragments(old_param: str, new_param: str) -> None:
+    """Заменяемый фрагмент не пуст и отличается от замены; иначе ToolError."""
+    if not old_param:
+        # "" нашлось бы между каждой парой символов: replace_all вставил бы
+        # new_string повсюду.
+        raise ToolError(
+            "old_string пуст — укажите заменяемый фрагмент. Чтобы создать файл "
+            "или заменить его целиком, используйте write_file.",
+        )
+    if old_param == new_param:
+        raise ToolError("old_string и new_string совпадают — нечего менять.")
+
+
+def _replace_fragment(
+    text: str,
+    old_string: str,
+    new_string: str,
+    *,
+    replace_all: bool,
+) -> tuple[str, int] | None:
+    """Новый текст и число замен; None — фрагмент не нашёлся ни точно, ни с поправкой."""
+    # Тир 1: точное совпадение.
+    count = text.count(old_string)
+    if count == 1 or (count > 1 and replace_all):
+        return text.replace(old_string, new_string), count
+    if count > 1 and not replace_all:
+        raise ToolError(
+            f"old_string встречается {count} раз. Добавьте контекста, чтобы "
+            "фрагмент стал уникальным, или укажите replace_all=true.",
+        )
+    # Тир 2: совпадение с поправкой на пробелы/отступы (одиночная замена).
+    match = _tolerant_find(text, old_string)
+    if match is None:
+        return None
+    replacement = match.adapt(new_string)
+    if replacement is None:
+        return None
+    return text[: match.start] + replacement + text[match.end :], 1
+
+
+def _apply_edit(
+    text: str,
+    old_param: str,
+    new_param: str,
+    *,
+    replace_all: bool,
+) -> tuple[str, int] | None:
+    """Правка с первым преобразованием фрагментов, которое нашлось в тексте; None — ни одно."""
+    seen: set[str] = set()
+    for transform in _FRAGMENT_TRANSFORMS:
+        old_string = transform(old_param)
+        if not old_string or old_string in seen:
+            continue
+        seen.add(old_string)
+        edited = _replace_fragment(
+            text,
+            old_string,
+            transform(new_param),
+            replace_all=replace_all,
+        )
+        if edited is not None:
+            return edited
+    return None
+
+
+def _not_found_error(ctx: ToolContext, path: Path, text: str) -> ToolError:
+    """Ошибка «old_string не найден» с содержимым файла, чтобы модель скопировала точно.
+
+    Файл с секретами не показываем: ошибка превью уходит модели до вопроса пользователю.
+    """
+    missing = "old_string не найден в файле (ни точно, ни с поправкой на пробелы)."
+    if is_secret_target(ctx.root, path):
+        return ToolError(f"{missing} Это файл с секретами — его содержимое не показывается.")
+    excerpt = _numbered_excerpt(text)
+    return ToolError(f"{missing} Скопируйте фрагмент дословно из содержимого ниже:\n\n{excerpt}")
+
+
 class EditFileTool(Tool[EditFileParams]):
+    """Инструмент edit_file: заменяет фрагмент файла на месте."""
+
     name = "edit_file"
     description = (
         "Edits a file in place: replaces old_string with new_string. old_string must "
@@ -707,100 +971,60 @@ class EditFileTool(Tool[EditFileParams]):
     Params = EditFileParams
     kind = ToolKind.EDIT
 
+    @override
     def assess(self, params: EditFileParams, ctx: ToolContext) -> Assessment:
+        """Оценка записи: план, настройки gigacrew и секреты — особо."""
         return _write_assessment(ctx, params.path)
 
+    @override
     def risk(self, params: EditFileParams, ctx: ToolContext) -> RiskLevel:
+        """Уровень риска — из оценки записи."""
         return self.assess(params, ctx).risk
 
-    def _compute(self, params: EditFileParams, ctx: ToolContext):
-        p = _writable_path(ctx, params.path)
-        if not p.exists():
+    @override
+    def preview(self, params: EditFileParams, ctx: ToolContext) -> Display | None:
+        """Дифф правки."""
+        _, source, new_text, _ = self._compute(params, ctx)
+        return Display(
+            make_diff(source.text, new_text, params.path),
+            kind="diff",
+            title=f"{params.path}{source.eol_note()}",
+        )
+
+    @override
+    def run(self, params: EditFileParams, ctx: ToolContext) -> ToolResult:
+        """Применяет правку и записывает файл."""
+        target, source, new_text, count = self._compute(params, ctx)
+        write_atomic(target, source.encode(new_text))
+        replaced = count if params.replace_all else 1
+        note = source.eol_note()
+        shown = "план" if _plan_written(ctx, target) else _rel(ctx, target)
+        return ToolResult(
+            content=f"Отредактирован {params.path}: заменено вхождений — {replaced}.{note}",
+            summary=f"изменён {shown}{note}",
+            display=Display(
+                make_diff(source.text, new_text, params.path),
+                kind="diff",
+                title=params.path,
+            ),
+        )
+
+    def _compute(self, params: EditFileParams, ctx: ToolContext) -> tuple[Path, TextFile, str, int]:
+        """Путь, файл, новый текст и число замен; ToolError — правку не применить."""
+        target = _writable_path(ctx, params.path)
+        if not target.exists():
             raise ToolError(f"Файл не найден: {params.path}")
-        file = load_existing(p, params.path)
-        old = file.text
+        source = load_existing(target, params.path)
         # Сравнение и правка — в виде с \n; переводы строк файла вернёт запись.
         old_param = params.old_string.replace("\r\n", "\n")
         new_param = params.new_string.replace("\r\n", "\n")
-        if not old_param:
-            # "" нашлось бы между каждой парой символов: replace_all вставил бы
-            # new_string повсюду.
-            raise ToolError(
-                "old_string пуст — укажите заменяемый фрагмент. Чтобы создать файл "
-                "или заменить его целиком, используйте write_file.",
-            )
-        if old_param == new_param:
-            raise ToolError("old_string и new_string совпадают — нечего менять.")
-
-        # Слабые модели часто слегка искажают old_string: экранируют переносы
-        # (литералы \n, \"), либо копируют префиксы-номера строк (N\t) прямо из
-        # вывода read_file. Пробуем набор согласованных преобразований к ОБОИМ
-        # фрагментам и берём первое, которое реально находится в файле — это
-        # безопасно: преобразованная форма применяется, только если совпала.
-        def both(s):
-            return _strip_line_numbers(_unescape(s))
-
-        transforms = [
-            lambda s: s,  # как прислано
-            _unescape,  # снять экранизацию \n/\"
-            _strip_line_numbers,  # снять префиксы номеров строк
-            both,  # и то, и другое
-        ]
-
-        seen = set()
-        for tf in transforms:
-            old_string = tf(old_param)
-            if not old_string or old_string in seen:
-                continue
-            seen.add(old_string)
-            new_string = tf(new_param)
-
-            # Тир 1: точное совпадение.
-            count = old.count(old_string)
-            if count == 1 or (count > 1 and params.replace_all):
-                new = old.replace(old_string, new_string)
-                return p, file, new, count
-            if count > 1 and not params.replace_all:
-                raise ToolError(
-                    f"old_string встречается {count} раз. Добавьте контекста, чтобы "
-                    "фрагмент стал уникальным, или укажите replace_all=true.",
-                )
-            # Тир 2: совпадение с поправкой на пробелы/отступы (одиночная замена).
-            match = _tolerant_find(old, old_string)
-            replacement = match.adapt(new_string) if match is not None else None
-            if match is not None and replacement is not None:
-                new = old[: match.start] + replacement + old[match.end :]
-                return p, file, new, 1
-
-        # Не найдено — даём модели контекст файла, чтобы скопировать точно. Файл с
-        # секретами не показываем: ошибка превью уходит модели до вопроса пользователю.
-        missing = "old_string не найден в файле (ни точно, ни с поправкой на пробелы)."
-        if is_secret_target(ctx.root, p):
-            raise ToolError(f"{missing} Это файл с секретами — его содержимое не показывается.")
-        raise ToolError(
-            f"{missing} Скопируйте фрагмент дословно из содержимого ниже:\n\n"
-            + _numbered_excerpt(old),
-        )
-
-    def preview(self, params: EditFileParams, ctx: ToolContext) -> Display | None:
-        _, file, new, _ = self._compute(params, ctx)
-        return Display(
-            make_diff(file.text, new, params.path),
-            kind="diff",
-            title=f"{params.path}{file.eol_note()}",
-        )
-
-    def run(self, params: EditFileParams, ctx: ToolContext) -> ToolResult:
-        p, file, new, count = self._compute(params, ctx)
-        write_atomic(p, file.encode(new))
-        replaced = count if params.replace_all else 1
-        note = file.eol_note()
-        target = "план" if _plan_written(ctx, p) else _rel(ctx, p)
-        return ToolResult(
-            content=f"Отредактирован {params.path}: заменено вхождений — {replaced}.{note}",
-            summary=f"изменён {target}{note}",
-            display=Display(make_diff(file.text, new, params.path), kind="diff", title=params.path),
-        )
+        _check_edit_fragments(old_param, new_param)
+        edited = _apply_edit(source.text, old_param, new_param, replace_all=params.replace_all)
+        if edited is None:
+            # Не найдено — даём модели контекст файла, чтобы скопировать точно.
+            raise _not_found_error(ctx, target, source.text)
+        new_text, count = edited
+        return target, source, new_text, count
 
 
 # --------------------------------------------------------------------------- #
@@ -814,6 +1038,8 @@ class ListDirParams(BaseModel):
 
 
 class ListDirTool(Tool[ListDirParams]):
+    """Инструмент list_dir: содержимое каталога."""
+
     name = "list_dir"
     read_only = True
     description = (
@@ -822,22 +1048,34 @@ class ListDirTool(Tool[ListDirParams]):
     )
     Params = ListDirParams
 
+    @override
     def run(self, params: ListDirParams, ctx: ToolContext) -> ToolResult:
-        p = resolve_in_root(ctx.root, params.path)
-        if not p.is_dir():
+        """Перечисляет файлы и подкаталоги: сначала каталоги, затем файлы."""
+        directory = resolve_in_root(ctx.root, params.path)
+        if not directory.is_dir():
             raise ToolError(f"Не директория: {params.path}")
-        entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
-        lines = [f"{e.name}/" if e.is_dir() else e.name for e in entries[:MAX_LIST_ENTRIES]]
+        entries = sorted(
+            directory.iterdir(),
+            key=lambda entry: (entry.is_file(), entry.name.lower()),
+        )
+        lines = [
+            f"{entry.name}/" if entry.is_dir() else entry.name
+            for entry in entries[:MAX_LIST_ENTRIES]
+        ]
         body = "\n".join(lines) if lines else "(пусто)"
         if len(entries) > MAX_LIST_ENTRIES:
-            body += f"\n… показано {MAX_LIST_ENTRIES} из {len(entries)}"
-        return ToolResult(content=body, summary=f"{_rel(ctx, p)}: {len(entries)} элементов")
+            body = f"{body}\n… показано {MAX_LIST_ENTRIES} из {len(entries)}"
+        return ToolResult(
+            content=body,
+            summary=f"{_rel(ctx, directory)}: {len(entries)} элементов",
+        )
 
 
 # --------------------------------------------------------------------------- #
 # find_files
 # --------------------------------------------------------------------------- #
 MAX_FIND_RESULTS = 1000
+_DEFAULT_FIND_RESULTS = 200
 
 
 class FindFilesParams(BaseModel):
@@ -845,7 +1083,10 @@ class FindFilesParams(BaseModel):
         description="Glob pattern: '*.py' — by name in any directory, 'src/**/*.ts' — by path "
         "from the root",
     )
-    max_results: int = Field(default=200, description="Maximum number of results")
+    max_results: int = Field(
+        default=_DEFAULT_FIND_RESULTS,
+        description="Maximum number of results",
+    )
 
 
 def _check_pattern(pattern: str) -> None:
@@ -859,6 +1100,8 @@ def _check_pattern(pattern: str) -> None:
 
 
 class FindFilesTool(Tool[FindFilesParams]):
+    """Инструмент find_files: поиск файлов проекта по glob-шаблону."""
+
     name = "find_files"
     read_only = True
     description = (
@@ -869,18 +1112,17 @@ class FindFilesTool(Tool[FindFilesParams]):
     )
     Params = FindFilesParams
 
+    @override
     def run(self, params: FindFilesParams, ctx: ToolContext) -> ToolResult:
+        """Находит файлы проекта, подходящие под шаблон (пути от корня, по алфавиту)."""
         pattern = params.pattern.strip()
         _check_pattern(pattern)
         limit = min(max(params.max_results, 1), MAX_FIND_RESULTS)
         root = ctx.root
-        matches = sorted(
-            rel
-            for rel in (path.relative_to(root).as_posix() for path in walk_files(root))
-            if glob_match(rel, pattern)
-        )
+        relative = (path.relative_to(root).as_posix() for path in walk_files(root))
+        matches = sorted(rel for rel in relative if glob_match(rel, pattern))
         shown = matches[:limit]
         body = "\n".join(shown) if shown else "(ничего не найдено)"
         if len(matches) > limit:
-            body += f"\n… показано {limit} из {len(matches)}; уточните шаблон"
+            body = f"{body}\n… показано {limit} из {len(matches)}; уточните шаблон"
         return ToolResult(content=body, summary=f"найдено файлов: {len(matches)}")

@@ -25,8 +25,10 @@
 
 from __future__ import annotations
 
+import inspect
 import math
-from collections import defaultdict
+import sqlite3
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -38,15 +40,30 @@ DEFAULT_MAP_CHARS = 6_000
 _DAMPING = 0.85
 _MAX_ITERATIONS = 100
 _TOLERANCE = 1e-8
+_FOCUS_SHARE = 50  # во сколько раз файл в фокусе щедрее к определениям, которые использует
+_UNUSED_RANK_SCALE = 1e-6  # неиспользуемые определения — после всех используемых
 _SKIP_KINDS = ("section",)  # заголовки Markdown — не определения кода
 # Методы встроенных коллекций и строк: вызовы ``x.get()`` чаще всего не про свой ``get``.
 _COMMON_METHODS = frozenset(
-    name for t in (dict, list, set, str, bytes) for name in dir(t) if not name.startswith("_")
+    name
+    for builtin in (dict, list, set, str, bytes)
+    for name, _member in inspect.getmembers(builtin)
+    if not name.startswith("_")
+)
+
+# В запрос подставляются только плейсхолдеры «?»: сами виды передаются параметрами.
+_SKIP_MARKS = ",".join("?" * len(_SKIP_KINDS))
+_DEFINITIONS_SQL = f"SELECT DISTINCT path, name FROM symbols WHERE kind NOT IN ({_SKIP_MARKS})"  # noqa: S608
+_REFERENCES_SQL = (
+    "SELECT r.path, r.name, COUNT(*) FROM refs r "
+    "WHERE r.name IN (SELECT name FROM symbols) GROUP BY r.path, r.name"
 )
 
 
 @dataclass(frozen=True)
 class RankedDefinition:
+    """Определение ``name`` из файла ``path`` и его ранг."""
+
     path: str
     name: str
     rank: float
@@ -54,6 +71,8 @@ class RankedDefinition:
 
 @dataclass(frozen=True)
 class RepoMap:
+    """Отрисованная карта проекта и её счётчики."""
+
     text: str
     definitions: int  # показано определений
     files: int  # показано файлов
@@ -76,33 +95,61 @@ def pagerank(
     рёбер) распределяют ранг по ``personalization`` (без неё — равномерно).
     Сумма рангов — 1.
     """
-    names = sorted(set(nodes) | set(edges) | {v for t in edges.values() for v in t})
+    names = sorted(
+        set(nodes) | set(edges) | {target for outgoing in edges.values() for target in outgoing},
+    )
     if not names:
         return {}
-    if personalization:
-        total = sum(max(personalization.get(n, 0.0), 0.0) for n in names)
-    else:
-        total = 0.0
-    if total > 0:
-        teleport = {n: max(personalization.get(n, 0.0), 0.0) / total for n in names}  # type: ignore[union-attr]
-    else:
-        teleport = {n: 1.0 / len(names) for n in names}
-    out_weight = {n: sum(edges.get(n, {}).values()) for n in names}
+    teleport = _teleport(names, personalization)
+    out_weight = {name: sum(edges.get(name, {}).values()) for name in names}
     rank = dict.fromkeys(names, 1.0 / len(names))
     for _ in range(_MAX_ITERATIONS):
-        dangling = sum(rank[n] for n in names if out_weight[n] <= 0)
-        new = {n: (1 - damping + damping * dangling) * teleport[n] for n in names}
-        for u, targets in edges.items():
-            if out_weight[u] <= 0:
+        new = _teleport_step(names, rank, teleport, out_weight, damping)
+        for source, targets in edges.items():
+            if out_weight[source] <= 0:
                 continue
-            share = damping * rank[u] / out_weight[u]
-            for v, w in targets.items():
-                new[v] += share * w
-        error = sum(abs(new[n] - rank[n]) for n in names)
+            share = damping * rank[source] / out_weight[source]
+            for target, weight in targets.items():
+                new[target] += share * weight
+        if _converged(new, rank, names):
+            return new
         rank = new
-        if error < _TOLERANCE * len(names):
-            break
     return rank
+
+
+def _teleport(
+    names: Sequence[str],
+    personalization: Mapping[str, float] | None,
+) -> dict[str, float]:
+    """Вероятности телепорта: по ``personalization`` (отрицательные — 0), без неё — поровну."""
+    if personalization:
+        weights = {name: max(personalization.get(name, 0), 0) for name in names}
+        total = sum(weights.values())
+        if total > 0:
+            return {name: weight / total for name, weight in weights.items()}
+    return {name: 1.0 / len(names) for name in names}
+
+
+def _teleport_step(
+    names: Sequence[str],
+    rank: Mapping[str, float],
+    teleport: Mapping[str, float],
+    out_weight: Mapping[str, float],
+    damping: float,
+) -> dict[str, float]:
+    """Ранг шага до раздачи по рёбрам: телепорт и ранг «висячих» вершин (без рёбер)."""
+    dangling = sum(rank[name] for name in names if out_weight.get(name, 0) <= 0)
+    return {name: (1 - damping + damping * dangling) * teleport[name] for name in names}
+
+
+def _converged(
+    new: Mapping[str, float],
+    rank: Mapping[str, float],
+    names: Sequence[str],
+) -> bool:
+    """Сошёлся ли степенной метод: суммарное изменение рангов — в пределах допуска."""
+    error = sum(abs(new[name] - rank[name]) for name in names)
+    return error < _TOLERANCE * len(names)
 
 
 # --------------------------------------------------------------------------- #
@@ -111,7 +158,7 @@ def pagerank(
 def _is_compound(name: str) -> bool:
     letters = name.strip("_")
     snake = "_" in letters
-    camel = any(c.isupper() for c in letters) and any(c.islower() for c in letters)
+    camel = any(char.isupper() for char in letters) and any(char.islower() for char in letters)
     return (snake or camel) and len(name) >= 8
 
 
@@ -131,42 +178,154 @@ def _name_weight(name: str, definers: int, mentioned: set[str]) -> float:
     return mul
 
 
-def _file_pagerank(
-    uses: Mapping[str, Mapping[str, float]],
+def _load_definitions(db: sqlite3.Connection) -> dict[str, list[str]]:
+    """Файлы, где определено каждое имя (без заголовков Markdown)."""
+    found: dict[str, set[str]] = defaultdict(set)
+    for path, defined in db.execute(_DEFINITIONS_SQL, _SKIP_KINDS):
+        found[defined].add(path)
+    return {name: sorted(paths) for name, paths in found.items()}
+
+
+def _load_references(
+    db: sqlite3.Connection,
     defines: Mapping[str, Sequence[str]],
-    out_weight: Mapping[str, float],
-    nodes: Iterable[str],
-    personalization: Mapping[str, float] | None,
-) -> dict[str, float]:
-    """PageRank графа файлов без самого графа: :func:`pagerank` по рёбрам «файл, где
-    имя используется → каждый файл, где оно определено» (вес — ``uses[name][user]``).
+) -> dict[str, dict[str, int]]:
+    """Число использований определённых имён по файлам: ``{имя: {файл: число}}``."""
+    references: dict[str, dict[str, int]] = defaultdict(dict)
+    for path, name, count in db.execute(_REFERENCES_SQL):
+        if name in defines:
+            references[name][path] = count
+    return references
+
+
+class _FileGraph:
+    """Граф файлов по общим именам: от файлов, где имя используется, к файлам, где определено.
 
     Пары «использует × определяет» не строятся: имя, которое определено и вызывается
-    в тысячах файлов (``handle``, ``String``), дало бы их миллионы. Поток по имени
-    считается один раз — сумма от всех использующих — и достаётся каждому
-    определяющему: время и память линейны по числу использований и определений.
+    в тысячах файлов (``handle``, ``String``), дало бы их миллионы. Хранятся веса
+    рёбер по имени — ``uses[имя][файл]`` — и список файлов, где имя определено.
     """
-    names = sorted(set(nodes) | set(out_weight))
-    if not names:
-        return {}
-    total = sum(personalization.values()) if personalization else 0.0
-    if personalization and total > 0:
-        teleport = {n: personalization.get(n, 0.0) / total for n in names}
-    else:
-        teleport = {n: 1.0 / len(names) for n in names}
-    rank = dict.fromkeys(names, 1.0 / len(names))
-    for _ in range(_MAX_ITERATIONS):
-        dangling = sum(rank[n] for n in names if out_weight.get(n, 0.0) <= 0)
-        new = {n: (1 - _DAMPING + _DAMPING * dangling) * teleport[n] for n in names}
-        for name, users in uses.items():
-            flow = _DAMPING * sum(rank[u] * w / out_weight[u] for u, w in users.items())
-            for definer in defines[name]:
+
+    def __init__(
+        self,
+        defines: Mapping[str, Sequence[str]],
+        references: Mapping[str, Mapping[str, int]],
+        mentioned: set[str],
+    ) -> None:
+        self._defines = defines
+        # Вес ребра «использующий файл → каждый определяющий» по имени: uses[имя][файл].
+        self._uses: dict[str, dict[str, float]] = {}
+        # Сумма исходящих рёбер файла.
+        self._out_weight: defaultdict[str, float] = defaultdict(float)
+        # (файл, имя) — определено, но не используется.
+        self._unused: list[tuple[str, str]] = []
+        for name, definers in defines.items():
+            self._add_name(name, definers, references.get(name), mentioned)
+
+    def file_ranks(self, focus: set[str]) -> dict[str, float]:
+        """PageRank графа файлов без самого графа; телепорт — в файлы фокуса.
+
+        Это :func:`pagerank` по рёбрам «файл, где имя используется → каждый файл, где оно
+        определено» (вес — ``uses[name][user]``). Поток по имени считается один раз —
+        сумма от всех использующих — и достаётся каждому определяющему: время и память
+        линейны по числу использований и определений.
+        """
+        nodes = {path for paths in self._defines.values() for path in paths}
+        personalization = {
+            path: 1.0 for path in focus if path in nodes or path in self._out_weight
+        } or None
+        names = sorted(set(nodes) | set(self._out_weight))
+        if not names:
+            return {}
+        total = sum(personalization.values()) if personalization else 0
+        if personalization and total > 0:
+            teleport = {name: personalization.get(name, 0) / total for name in names}
+        else:
+            teleport = {name: 1.0 / len(names) for name in names}
+        rank = dict.fromkeys(names, 1.0 / len(names))
+        for _ in range(_MAX_ITERATIONS):
+            new = _teleport_step(names, rank, teleport, self._out_weight, _DAMPING)
+            self._spread(new, rank)
+            if _converged(new, rank, names):
+                return new
+            rank = new
+        return rank
+
+    def ranked_used(
+        self,
+        ranks: Mapping[str, float],
+        focus: set[str],
+    ) -> list[RankedDefinition]:
+        """Используемые определения по убыванию ранга."""
+        # Ранг файла делится между его рёбрами. Файл в фокусе отдаёт определениям, которые
+        # использует, ×50: множитель на рёбрах внутри PageRank ничего бы не менял — и там,
+        # и здесь вес ребра делится на сумму исходящих рёбер того же файла.
+        boost = dict.fromkeys(focus, _FOCUS_SHARE)
+        ranked: dict[tuple[str, str], float] = {}
+        for name, users in self._uses.items():
+            share = self._share(users, ranks, boost)
+            for definer in self._defines[name]:
+                ranked[definer, name] = share
+        return sorted(
+            (
+                RankedDefinition(file_path, symbol_name, rank)
+                for (file_path, symbol_name), rank in ranked.items()
+            ),
+            key=lambda definition: (-definition.rank, definition.path, definition.name),
+        )
+
+    def ranked_unused(self, ranks: Mapping[str, float]) -> list[RankedDefinition]:
+        """Неиспользуемые определения — по рангу своего файла."""
+        per_file = Counter(path for path, _name in self._unused)
+        return sorted(
+            (
+                RankedDefinition(
+                    path,
+                    name,
+                    ranks.get(path, 0) / per_file[path] * _UNUSED_RANK_SCALE,
+                )
+                for path, name in self._unused
+            ),
+            key=lambda definition: (-definition.rank, definition.path, definition.name),
+        )
+
+    def _add_name(
+        self,
+        name: str,
+        definers: Sequence[str],
+        users: Mapping[str, int] | None,
+        mentioned: set[str],
+    ) -> None:
+        """Рёбра имени: от каждого использующего файла ко всем определяющим."""
+        if not users:
+            self._unused.extend((definer, name) for definer in definers)
+            return
+        mul = _name_weight(name, len(definers), mentioned)
+        weights = {user: mul * math.sqrt(count) for user, count in users.items()}
+        self._uses[name] = weights
+        for user, weight in weights.items():
+            self._out_weight[user] += weight * len(definers)
+
+    def _spread(self, new: dict[str, float], rank: Mapping[str, float]) -> None:
+        """Шаг PageRank по рёбрам: поток по имени достаётся каждому определяющему."""
+        for name, users in self._uses.items():
+            flow = _DAMPING * sum(
+                rank[user] * weight / self._out_weight[user] for user, weight in users.items()
+            )
+            for definer in self._defines[name]:
                 new[definer] += flow
-        error = sum(abs(new[n] - rank[n]) for n in names)
-        rank = new
-        if error < _TOLERANCE * len(names):
-            break
-    return rank
+
+    def _share(
+        self,
+        users: Mapping[str, float],
+        ranks: Mapping[str, float],
+        boost: Mapping[str, int],
+    ) -> float:
+        """Доля ранга, которую использующие файлы отдают каждому определению имени."""
+        return sum(
+            ranks.get(user, 0) * weight / self._out_weight[user] * boost.get(user, 1)
+            for user, weight in users.items()
+        )
 
 
 def rank_definitions(
@@ -176,70 +335,16 @@ def rank_definitions(
     focus_names: Iterable[str] = (),
 ) -> list[RankedDefinition]:
     """Определения (файл, имя) по убыванию важности."""
-    db = index._db  # noqa: SLF001 — карта — часть слоя индекса, агрегаты нужны на SQL
-    marks = ",".join("?" * len(_SKIP_KINDS))
-    found: dict[str, set[str]] = defaultdict(set)
-    for path, name in db.execute(
-        f"SELECT DISTINCT path, name FROM symbols WHERE kind NOT IN ({marks})",
-        _SKIP_KINDS,
-    ):
-        found[name].add(path)
-    if not found:
+    # Карта — часть слоя индекса: агрегаты нужны на SQL.
+    db = index._db  # noqa: SLF001
+    defines = _load_definitions(db)
+    if not defines:
         return []
-    defines = {name: sorted(paths) for name, paths in found.items()}
-    references: dict[str, dict[str, int]] = defaultdict(dict)
-    for path, name, count in db.execute(
-        "SELECT r.path, r.name, COUNT(*) FROM refs r "
-        "WHERE r.name IN (SELECT name FROM symbols) GROUP BY r.path, r.name",
-    ):
-        if name in defines:
-            references[name][path] = count
-
+    references = _load_references(db, defines)
     focus = set(focus_files)
-    mentioned = set(focus_names)
-    # Вес ребра «использующий файл → каждый определяющий» по имени: uses[имя][файл].
-    uses: dict[str, dict[str, float]] = {}
-    out_weight: dict[str, float] = defaultdict(float)  # сумма исходящих рёбер файла
-    unused: list[tuple[str, str]] = []  # (файл, имя) — определено, но не используется
-    for name, definers in defines.items():
-        users = references.get(name)
-        if not users:
-            unused += [(definer, name) for definer in definers]
-            continue
-        mul = _name_weight(name, len(definers), mentioned)
-        uses[name] = {user: mul * math.sqrt(count) for user, count in users.items()}
-        for user, weight in uses[name].items():
-            out_weight[user] += weight * len(definers)
-    nodes = {p for paths in defines.values() for p in paths}
-    personalization = {p: 1.0 for p in focus if p in nodes or p in out_weight} or None
-    ranks = _file_pagerank(uses, defines, out_weight, nodes, personalization)
-
-    # Ранг файла делится между его рёбрами. Файл в фокусе отдаёт определениям, которые
-    # использует, ×50: множитель на рёбрах внутри PageRank ничего бы не менял — и там,
-    # и здесь вес ребра делится на сумму исходящих рёбер того же файла.
-    ranked: dict[tuple[str, str], float] = {}
-    for name, users in uses.items():
-        share = sum(
-            ranks.get(u, 0.0) * w / out_weight[u] * (50 if u in focus else 1)
-            for u, w in users.items()
-        )
-        for definer in defines[name]:
-            ranked[definer, name] = share
-    used = sorted(
-        (RankedDefinition(path, name, rank) for (path, name), rank in ranked.items()),
-        key=lambda d: (-d.rank, d.path, d.name),
-    )
-    per_file: dict[str, int] = defaultdict(int)
-    for path, _ in unused:
-        per_file[path] += 1
-    rest = sorted(
-        (
-            RankedDefinition(path, name, ranks.get(path, 0.0) / per_file[path] * 1e-6)
-            for path, name in unused
-        ),
-        key=lambda d: (-d.rank, d.path, d.name),
-    )
-    return used + rest
+    graph = _FileGraph(defines, references, set(focus_names))
+    ranks = graph.file_ranks(focus)
+    return graph.ranked_used(ranks, focus) + graph.ranked_unused(ranks)
 
 
 # --------------------------------------------------------------------------- #
@@ -252,33 +357,43 @@ def _render(
 ) -> tuple[str, int, int]:
     """Файлы в порядке важности, в каждом — выбранные определения по строкам.
 
-    Для метода показывается и его класс (контекст), пропущенные определения файла —
-    строкой «⋮ ещё N». ``outlines`` — кэш оглавлений между попытками.
+    ``outlines`` — кэш оглавлений между попытками.
     """
     by_file: dict[str, set[str]] = {}
-    for d in chosen:
-        by_file.setdefault(d.path, set()).add(d.name)
+    for definition in chosen:
+        by_file.setdefault(definition.path, set()).add(definition.name)
     out: list[str] = []
     shown = 0
     for path, names in by_file.items():
         if path not in outlines:
-            outlines[path] = [s for s in index.outline(path) if s.kind not in _SKIP_KINDS]
-        symbols = outlines[path]
-        picked = {s for s in symbols if s.name in names}
-        parents = {s.parent for s in picked if s.parent}
-        keep = [s for s in symbols if s in picked or s.qualname in parents]
+            outlines[path] = [
+                symbol for symbol in index.outline(path) if symbol.kind not in _SKIP_KINDS
+            ]
+        lines, picked = _file_lines(outlines[path], names)
         out.append(f"{path}:")
-        out += [_symbol_line(s) for s in keep]
-        rest = len(symbols) - len(keep)
-        if rest > 0:
-            out.append(f"  ⋮ ещё {rest}")
-        shown += len(picked)
+        out += lines
+        shown += picked
     return "\n".join(out), shown, len(by_file)
 
 
-def _symbol_line(symbol: Symbol) -> str:
-    text = symbol.signature or f"{symbol.kind} {symbol.name}"
-    return f"{symbol.line:>6}  {'  ' * symbol.depth}{text}"
+def _file_lines(symbols: Sequence[Symbol], names: set[str]) -> tuple[list[str], int]:
+    """Строки определений файла в карте и число выбранных среди них.
+
+    Для метода показывается и его класс (контекст), пропущенные определения файла —
+    строкой «⋮ ещё N».
+    """
+    picked = {symbol for symbol in symbols if symbol.name in names}
+    parents = {symbol.parent for symbol in picked if symbol.parent}
+    lines: list[str] = []
+    for symbol in symbols:
+        if symbol in picked or symbol.qualname in parents:
+            text = symbol.signature or f"{symbol.kind} {symbol.name}"
+            indent = "  " * symbol.depth
+            lines.append(f"{symbol.line:>6}  {indent}{text}")
+    hidden = len(symbols) - len(lines)
+    if hidden > 0:
+        lines.append(f"  ⋮ ещё {hidden}")
+    return lines, len(picked)
 
 
 def build_repo_map(

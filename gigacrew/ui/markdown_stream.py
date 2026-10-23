@@ -92,23 +92,38 @@ _TAIL_SOURCE_LINES = 200
 
 
 def _fence_opener(block: str) -> str | None:
-    """Ограда, если ``block`` (от начала блока верхнего уровня) — блок кода и его первая
-    строка уже пришла целиком; иначе None.
+    """Ограда, если ``block`` (от начала блока верхнего уровня) — блок кода; иначе None.
+
+    Блок кода узнаётся, только когда его первая строка уже пришла целиком.
     """
     first, newline, _ = block.partition("\n")
     if not newline:
         return None
-    m = _FENCE_OPEN_RE.match(first)
-    return m.group(1) if m else None
+    match = _FENCE_OPEN_RE.match(first)
+    return match.group(1) if match else None
 
 
 def _closes(line: str, fence: str) -> bool:
-    m = _FENCE_CLOSE_RE.match(line)
-    return m is not None and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence)
+    match = _FENCE_CLOSE_RE.match(line)
+    if match is None:
+        return False
+    closing = match.group(1)
+    return closing[0] == fence[0] and len(closing) >= len(fence)
 
 
 def _is_blank(line: list[Segment]) -> bool:
     return not "".join(segment.text for segment in line).strip()
+
+
+def _tail_source(tail: str) -> str:
+    """Исходный текст хвоста для временной области: у длинного блока кода — лишь конец."""
+    if _fence_opener(tail) is None or tail.count("\n") <= _TAIL_SOURCE_LINES:
+        return tail
+    # Длинный блок кода: на экране — лишь его конец, а рендер всего блока на
+    # каждом кадре занимал бы поток обновления. Окончательно он печатается целиком.
+    opener, _, body = tail.partition("\n")
+    kept = "".join(body.splitlines(keepends=True)[-_TAIL_SOURCE_LINES:])
+    return f"{opener}\n{kept}"
 
 
 class MarkdownStream:
@@ -118,7 +133,8 @@ class MarkdownStream:
     не совпали бы с перерендеренным префиксом.
     """
 
-    def __init__(self, console: Console, *, width: int | None = None):
+    def __init__(self, console: Console, *, width: int | None = None) -> None:
+        """Накопитель для ``console``; ``width`` — ширина рендера (по умолчанию — консоли)."""
         self._console = console
         self._options = console.options.update_width(width or console.width)
         # (весь текст, длина завершённой части, сколько строк уже отдано,
@@ -131,19 +147,12 @@ class MarkdownStream:
 
     @property
     def text(self) -> str:
+        """Весь накопленный текст ответа."""
         return self._state[0]
 
     def render(self, source: str) -> Lines:
+        """Строки Markdown-рендера ``source`` в ширине накопителя."""
         return self._console.render_lines(Markdown(source), self._options, pad=False)
-
-    def _after_context(self, text: str, anchor: int, committed: int, end: int) -> Lines:
-        """Строки ``text[committed:end]`` так, как они выглядят после уже напечатанного.
-
-        Рендерится вместе с последним напечатанным блоком ``text[anchor:committed]``
-        (от него зависит отступ), его строки отбрасываются.
-        """
-        context = len(self.render(text[anchor:committed])) if committed > anchor else 0
-        return self.render(text[anchor:end])[context:]
 
     def feed(self, delta: str) -> Lines:
         """Добавляет кусок текста. Возвращает новые окончательные строки (часто — ни одной)."""
@@ -159,23 +168,6 @@ class MarkdownStream:
         self._state = (text, committed, printed, anchor)
         return []
 
-    def _in_open_fence(self, text: str, committed: int) -> bool:
-        """Хвост — блок кода, который ещё не закрыт: внутри него блок не кончится, и
-        разбирать текст незачем (длинный блок кода разбирался бы на каждой строке).
-        """
-        fence = _fence_opener(text[committed:])
-        if fence is None:
-            return False
-        start, scanned = self._fence_scan
-        if start != committed:
-            scanned = text.index("\n", committed) + 1  # строки после открывающей
-        end = text.rfind("\n") + 1
-        if any(_closes(line, fence) for line in text[scanned:end].splitlines()):
-            self._fence_scan = (-1, 0)
-            return False
-        self._fence_scan = (committed, end)
-        return True
-
     def tail_lines(self) -> Lines:
         """Строки незавершённого хвоста (для временной области). Потокобезопасно."""
         text, committed, printed, _anchor = self._state
@@ -183,13 +175,7 @@ class MarkdownStream:
         cached = self._tail_cache
         if cached is not None and cached[0] == tail and cached[1] == printed:
             return cached[2]
-        source = tail
-        fence = _fence_opener(tail)
-        if fence is not None and tail.count("\n") > _TAIL_SOURCE_LINES:
-            # Длинный блок кода: на экране — лишь его конец, а рендер всего блока на
-            # каждом кадре занимал бы поток обновления. Окончательно он печатается целиком.
-            opener, _, body = tail.partition("\n")
-            source = opener + "\n" + "".join(body.splitlines(True)[-_TAIL_SOURCE_LINES:])
+        source = _tail_source(tail)
         lines = self.render(source) if tail.strip() else []
         while lines and _is_blank(lines[0]):
             lines.pop(0)
@@ -207,3 +193,30 @@ class MarkdownStream:
         lines = self._after_context(text, anchor, committed, len(text))
         self._state = (text, len(text), printed + len(lines), anchor)
         return lines
+
+    def _after_context(self, text: str, anchor: int, committed: int, end: int) -> Lines:
+        """Строки ``text[committed:end]`` так, как они выглядят после уже напечатанного.
+
+        Рендерится вместе с последним напечатанным блоком ``text[anchor:committed]``
+        (от него зависит отступ), его строки отбрасываются.
+        """
+        context = len(self.render(text[anchor:committed])) if committed > anchor else 0
+        return self.render(text[anchor:end])[context:]
+
+    def _in_open_fence(self, text: str, committed: int) -> bool:
+        """Хвост — блок кода, который ещё не закрыт: внутри него блок не кончится.
+
+        Тогда разбирать текст незачем (длинный блок кода разбирался бы на каждой строке).
+        """
+        fence = _fence_opener(text[committed:])
+        if fence is None:
+            return False
+        start, scanned = self._fence_scan
+        if start != committed:
+            scanned = text.index("\n", committed) + 1  # строки после открывающей
+        end = text.rfind("\n") + 1
+        if any(_closes(line, fence) for line in text[scanned:end].splitlines()):
+            self._fence_scan = (-1, 0)
+            return False
+        self._fence_scan = (committed, end)
+        return True

@@ -1,10 +1,13 @@
-"""Скиллы: разбор SKILL.md, поиск в .gigacode/skills и ~/.gigacode/skills, инструмент skill,
-вызов /скилл в REPL и одноразовом режиме.
+"""Скиллы: разбор SKILL.md, поиск, инструмент skill и вызов /скилл.
+
+Поиск — в .gigacode/skills и ~/.gigacode/skills; вызов /скилл — в REPL и одноразовом режиме.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from itertools import count
 from pathlib import Path
 
 import pytest
@@ -26,9 +29,12 @@ from gigacrew.project.skills import (
     user_skills_dir,
 )
 from gigacrew.project.workspace import Workspace
+from gigacrew.tools import skill as skill_module
 from gigacrew.tools.base import ToolContext, ToolError, build_default_registry
 from gigacrew.tools.skill import SkillTool
 from gigacrew.ui.console import Console
+
+_ReplEnv = tuple[Agent, Console, ScriptedProvider]
 
 
 def _skill(base: Path, dirname: str, text: str) -> Path:
@@ -44,7 +50,7 @@ def _project_skill(root: Path, name: str, description: str, body: str = "Сде�
 
 
 # ------------------------------- разбор ------------------------------- #
-def test_frontmatter_values():
+def test_frontmatter_values() -> None:
     fields, body = split_frontmatter(
         "---\n"
         "name: 'release'\n"
@@ -69,11 +75,11 @@ def test_frontmatter_values():
 
 
 @pytest.mark.parametrize("text", ["Просто текст", "---\nname: x\nбез закрытия\n"])
-def test_no_frontmatter_keeps_whole_text(text):
+def test_no_frontmatter_keeps_whole_text(text: str) -> None:
     assert split_frontmatter(text) == ({}, text)
 
 
-def test_parse_skill_name_defaults_to_directory(tmp_path):
+def test_parse_skill_name_defaults_to_directory(tmp_path: Path) -> None:
     skill = parse_skill(_skill(tmp_path, "lint-fix", "Без frontmatter.\n"))
     assert skill is not None
     assert (skill.name, skill.description, skill.command) == ("lint-fix", "", "/lint-fix")
@@ -81,18 +87,24 @@ def test_parse_skill_name_defaults_to_directory(tmp_path):
 
 
 @pytest.mark.parametrize("name", ["with space", "-dash", "a/b", "_x", "2fa", "αβ"])
-def test_parse_skill_rejects_names_unfit_for_command(tmp_path, name):
+def test_parse_skill_rejects_names_unfit_for_command(tmp_path: Path, name: str) -> None:
     assert parse_skill(_skill(tmp_path, "d", f"---\nname: {name}\n---\nx\n")) is None
 
 
-def test_body_strips_frontmatter(tmp_path):
+def test_body_strips_frontmatter(tmp_path: Path) -> None:
     skill = parse_skill(_skill(tmp_path, "d", "---\nname: d\ndescription: x\n---\n\nШаги.\n"))
     assert skill is not None
     assert skill.body() == "Шаги."
 
 
 # ------------------------------- поиск -------------------------------- #
-def test_discover_project_and_user_skills(tmp_path, _isolated_home):
+@pytest.fixture
+def home(_isolated_home: Path) -> Path:
+    """Временный домашний каталог теста (его подставляет ``_isolated_home`` из conftest)."""
+    return _isolated_home
+
+
+def test_discover_project_and_user_skills(tmp_path: Path, home: Path) -> None:
     project = tmp_path / "proj"
     _project_skill(project, "deploy", "проектный")
     _skill(user_skills_dir(), "deploy", "---\ndescription: пользовательский\n---\nx\n")
@@ -100,44 +112,47 @@ def test_discover_project_and_user_skills(tmp_path, _isolated_home):
     (project / ".gigacode" / "skills" / "empty").mkdir()  # без SKILL.md — не скилл
 
     skills = discover_skills(Workspace(project))
-    assert [(s.name, s.description, s.source) for s in skills] == [
+    assert [(skill.name, skill.description, skill.source) for skill in skills] == [
         ("deploy", "проектный", "project"),  # проектный перекрывает пользовательский
         ("notes", "заметки", "user"),
     ]
-    assert user_skills_dir() == _isolated_home / ".gigacode" / "skills"
+    assert user_skills_dir() == home / ".gigacode" / "skills"
 
 
-def test_project_skill_overrides_user_skill_ignoring_case(tmp_path):
+def test_project_skill_overrides_user_skill_ignoring_case(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     _skill(user_skills_dir(), "Deploy", "---\ndescription: пользовательский\n---\nx\n")
     _project_skill(project, "deploy", "проектный")
     skills = discover_skills(Workspace(project))
-    assert [(s.name, s.description, s.source) for s in skills] == [
+    assert [(skill.name, skill.description, skill.source) for skill in skills] == [
         ("deploy", "проектный", "project"),
     ]
 
 
-def test_oversized_skill_is_ignored(tmp_path):
-    path = _skill(tmp_path, "big", "---\nname: big\n---\n" + "x" * MAX_SKILL_BYTES)
+def test_oversized_skill_is_ignored(tmp_path: Path) -> None:
+    filler = "x" * MAX_SKILL_BYTES
+    path = _skill(tmp_path, "big", f"---\nname: big\n---\n{filler}")
     assert parse_skill(path) is None
 
 
-def test_old_gigacrew_folder_is_not_used(tmp_path):
+def test_old_gigacrew_folder_is_not_used(tmp_path: Path) -> None:
     _skill(tmp_path / ".gigacrew" / "skills", "old", "---\ndescription: x\n---\nx\n")
-    assert discover_skills(Workspace(tmp_path)) == []
+    assert not discover_skills(Workspace(tmp_path))
 
 
-def test_catalog_refresh_and_lookup(tmp_path):
+def test_catalog_refresh_and_lookup(tmp_path: Path) -> None:
     catalog = SkillCatalog(Workspace(tmp_path))
     _project_skill(tmp_path, "Review", "ревью")
     assert len(catalog) == 0  # до refresh ФС не читается
     catalog.refresh()
-    assert catalog.get("/review") is catalog.get("REVIEW") is not None
+    review = catalog.get("/review")
+    assert review is catalog.get("REVIEW")
+    assert review is not None
     assert catalog.get("nope") is None
 
 
 # ------------------------------ промпты ------------------------------- #
-def test_project_context_lists_skills(tmp_path):
+def test_project_context_lists_skills(tmp_path: Path) -> None:
     assert "Skills" not in build_project_context(Workspace(tmp_path))
     _project_skill(tmp_path, "deploy", "выкатка на стенд")
     context = build_project_context(Workspace(tmp_path))
@@ -145,7 +160,7 @@ def test_project_context_lists_skills(tmp_path):
     assert "- deploy: выкатка на стенд" in context
 
 
-def test_invocation_prompt_substitutes_arguments(tmp_path):
+def test_invocation_prompt_substitutes_arguments(tmp_path: Path) -> None:
     skill = parse_skill(_project_skill(tmp_path, "fix", "x"))
     assert skill is not None
     text = skill_invocation_prompt(skill, "Почини $ARGUMENTS.", "/fix тесты", "тесты")
@@ -157,20 +172,20 @@ def test_invocation_prompt_substitutes_arguments(tmp_path):
 
 
 # ----------------------------- инструмент ----------------------------- #
-def test_skill_tool_loads_instructions_and_files(ctx):
+def test_skill_tool_loads_instructions_and_files(ctx: ToolContext) -> None:
     _project_skill(ctx.root, "deploy", "выкатка", body="Прочитай reference.md.")
     (ctx.root / ".gigacode" / "skills" / "deploy" / "reference.md").write_text("справка")
     tool = SkillTool()
-    result = tool.run(tool.parse({"name": "deploy"}), ctx)
-    assert result.ok
-    assert "Прочитай reference.md." in result.content
-    assert "description:" not in result.content  # frontmatter не нужен модели
-    assert "- reference.md" in result.content
+    loaded = tool.run(tool.parse({"name": "deploy"}), ctx)
+    assert loaded.ok
+    assert "Прочитай reference.md." in loaded.content
+    assert "description:" not in loaded.content  # frontmatter не нужен модели
+    assert "- reference.md" in loaded.content
     ref = tool.run(tool.parse({"name": "deploy", "file": "reference.md"}), ctx)
     assert ref.content == "справка"
 
 
-def test_skill_tool_reads_user_skill_outside_project(ctx):
+def test_skill_tool_reads_user_skill_outside_project(ctx: ToolContext) -> None:
     _skill(user_skills_dir(), "notes", "---\ndescription: x\n---\nТело.\n")
     (user_skills_dir() / "notes" / "tpl.md").write_text("шаблон")
     tool = SkillTool()
@@ -178,13 +193,13 @@ def test_skill_tool_reads_user_skill_outside_project(ctx):
     assert tool.run(tool.parse({"name": "notes", "file": "tpl.md"}), ctx).content == "шаблон"
 
 
-@pytest.mark.parametrize("file", ["../other/SKILL.md", "/etc/passwd", "missing.md"])
-def test_skill_tool_file_stays_in_skill_dir(ctx, file):
+@pytest.mark.parametrize("rel_path", ["../other/SKILL.md", "/etc/passwd", "missing.md"])
+def test_skill_tool_file_stays_in_skill_dir(ctx: ToolContext, rel_path: str) -> None:
     _project_skill(ctx.root, "deploy", "x")
     _project_skill(ctx.root, "other", "x")
     tool = SkillTool()
     with pytest.raises(ToolError):
-        tool.run(tool.parse({"name": "deploy", "file": file}), ctx)
+        tool.run(tool.parse({"name": "deploy", "file": rel_path}), ctx)
 
 
 def _outside_skill(base: Path) -> Path:
@@ -194,7 +209,7 @@ def _outside_skill(base: Path) -> Path:
 
 @pytest.mark.skipif(os.name == "nt", reason="симлинки")
 @pytest.mark.parametrize("link", ["file", "dir"])
-def test_symlinked_project_skill_outside_is_not_a_skill(tmp_path, link):
+def test_symlinked_project_skill_outside_is_not_a_skill(tmp_path: Path, link: str) -> None:
     # Репозиторий коммитит .gigacode/skills/<имя>/SKILL.md (или весь каталог) симлинком
     # наружу: содержимое чужого файла не должно попасть к модели без вопроса.
     project = tmp_path / "proj"
@@ -207,42 +222,45 @@ def test_symlinked_project_skill_outside_is_not_a_skill(tmp_path, link):
         skills.mkdir(parents=True)
         (skills / "keys").symlink_to(target.parent)
     ws = Workspace(project)
-    assert discover_skills(ws) == []
+    assert not discover_skills(ws)
     tool = SkillTool()
     with pytest.raises(ToolError, match="Скилл не найден"):
         tool.run(tool.parse({"name": "keys"}), ToolContext(workspace=ws))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="симлинки")
-def test_symlinked_skills_dir_outside_project_is_ignored(tmp_path):
+def test_symlinked_skills_dir_outside_project_is_ignored(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     target = _outside_skill(tmp_path)
     (project / ".gigacode").mkdir(parents=True)
     (project / ".gigacode" / "skills").symlink_to(target.parent.parent)
-    assert discover_skills(Workspace(project)) == []
+    assert not discover_skills(Workspace(project))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="симлинки")
-def test_symlinked_user_skill_outside_is_not_a_skill(tmp_path):
+def test_symlinked_user_skill_outside_is_not_a_skill(tmp_path: Path) -> None:
     target = _outside_skill(tmp_path)
     user_skills_dir().mkdir(parents=True)
     (user_skills_dir() / "keys").symlink_to(target.parent)
-    assert discover_skills(Workspace(tmp_path / "proj")) == []
+    assert not discover_skills(Workspace(tmp_path / "proj"))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="симлинки")
-def test_symlinks_inside_skills_dir_still_work(tmp_path, _isolated_home):
+def test_symlinks_inside_skills_dir_still_work(tmp_path: Path, home: Path) -> None:
     # Каталог скиллов целиком — симлинк (dotfiles), скилл — симлинк на соседний: можно.
-    real = _isolated_home / "dotfiles" / "skills"
+    real = home / "dotfiles" / "skills"
     _skill(real, "notes", "---\ndescription: заметки\n---\nТело.\n")
     (real / "alias").symlink_to(real / "notes")
     user_skills_dir().parent.mkdir(parents=True)
     user_skills_dir().symlink_to(real)
-    assert [s.name for s in discover_skills(Workspace(tmp_path))] == ["alias", "notes"]
+    assert [skill.name for skill in discover_skills(Workspace(tmp_path))] == ["alias", "notes"]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="симлинки")
-def test_skill_tool_does_not_list_or_read_files_outside_skill_dir(ctx, tmp_path):
+def test_skill_tool_does_not_list_or_read_files_outside_skill_dir(
+    ctx: ToolContext,
+    tmp_path: Path,
+) -> None:
     secret = tmp_path / "outside" / "id_rsa"
     secret.parent.mkdir()
     secret.write_text("PRIVATE KEY")
@@ -251,40 +269,39 @@ def test_skill_tool_does_not_list_or_read_files_outside_skill_dir(ctx, tmp_path)
     (skill_dir / "key").symlink_to(secret)
     (skill_dir / "ref").symlink_to(secret.parent)
     tool = SkillTool()
-    result = tool.run(tool.parse({"name": "deploy"}), ctx)
-    assert "- key" not in result.content
-    assert "- ref/" not in result.content
-    for file in ("key", "ref/id_rsa"):
+    listing = tool.run(tool.parse({"name": "deploy"}), ctx)
+    assert "- key" not in listing.content
+    assert "- ref/" not in listing.content
+    for rel_path in ("key", "ref/id_rsa"):
         with pytest.raises(ToolError, match="за пределы каталога скилла"):
-            tool.run(tool.parse({"name": "deploy", "file": file}), ctx)
+            tool.run(tool.parse({"name": "deploy", "file": rel_path}), ctx)
 
 
-def test_skill_tool_unknown_lists_available(ctx):
+def test_skill_tool_unknown_lists_available(ctx: ToolContext) -> None:
     _project_skill(ctx.root, "deploy", "x")
     tool = SkillTool()
     with pytest.raises(ToolError, match="Доступные: deploy"):
         tool.run(tool.parse({"name": "nope"}), ctx)
 
 
-def test_skill_tool_truncates_large_file(ctx, monkeypatch):
-    import gigacrew.tools.skill as skill_module
-
+def test_skill_tool_truncates_large_file(ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(skill_module, "MAX_SKILL_CHARS", 10)
     _project_skill(ctx.root, "deploy", "x")
     (ctx.root / ".gigacode" / "skills" / "deploy" / "big.md").write_text("я" * 50)
     tool = SkillTool()
     text = tool.run(tool.parse({"name": "deploy", "file": "big.md"}), ctx).content
-    assert text.startswith("я" * 10 + "\n…")
+    head = "я" * 10
+    assert text.startswith(f"{head}\n…")
     assert "обрезано" in text
 
 
-def test_skill_tool_registered():
+def test_skill_tool_registered() -> None:
     assert "skill" in build_default_registry()
 
 
 # ------------------------------ REPL и -p ----------------------------- #
 @pytest.fixture
-def repl_env(tmp_path):
+def repl_env(tmp_path: Path) -> _ReplEnv:
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, auto_approve=True)
     provider = ScriptedProvider([text_turn("готово")])
     ui = Console(no_color=True)
@@ -292,12 +309,12 @@ def repl_env(tmp_path):
     return agent, ui, provider
 
 
-def _reader(*items):
-    queue = list(items)
+def _reader(*lines: str) -> Callable[[], str]:
+    queue = list(lines)
     return lambda: queue.pop(0)
 
 
-def test_expand_skill(tmp_path):
+def test_expand_skill(tmp_path: Path) -> None:
     _project_skill(tmp_path, "deploy", "x", body="Выкати $ARGUMENTS.")
     _project_skill(tmp_path, "help", "скилл с именем встроенной команды")
     catalog = SkillCatalog(Workspace(tmp_path))
@@ -311,7 +328,11 @@ def test_expand_skill(tmp_path):
     assert expand_skill("deploy", commands, catalog) is None
 
 
-def test_repl_runs_skill_as_agent_turn(repl_env, tmp_path, capsys):
+def test_repl_runs_skill_as_agent_turn(
+    repl_env: _ReplEnv,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     agent, ui, _ = repl_env
     _project_skill(tmp_path, "deploy", "выкатка", body="Выкати на стенд.")
     read = _reader("/deploy stage", "/exit")
@@ -324,15 +345,17 @@ def test_repl_runs_skill_as_agent_turn(repl_env, tmp_path, capsys):
     assert "готово" in capsys.readouterr().out
 
 
-def test_repl_sees_skill_installed_during_session(repl_env, tmp_path, capsys):
+def test_repl_sees_skill_installed_during_session(
+    repl_env: _ReplEnv,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     agent, ui, _ = repl_env
     lines = iter(["/later", "/later", "/exit"])
-    calls = 0
+    calls = count(1)
 
-    def read():
-        nonlocal calls
-        calls += 1
-        if calls == 2:  # скилл установлен между первым и вторым вводом
+    def read() -> str:
+        if next(calls) == 2:  # скилл установлен между первым и вторым вводом
             _project_skill(tmp_path, "later", "появился позже")
         return next(lines)
 
@@ -342,7 +365,11 @@ def test_repl_sees_skill_installed_during_session(repl_env, tmp_path, capsys):
     assert len(agent.conversation.messages) == 2
 
 
-def test_help_and_unknown_hint_include_skills(repl_env, tmp_path, capsys):
+def test_help_and_unknown_hint_include_skills(
+    repl_env: _ReplEnv,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     agent, ui, _ = repl_env
     _project_skill(tmp_path, "deploy", "выкатка [на стенд]")
     catalog = SkillCatalog(agent.workspace)
@@ -358,21 +385,23 @@ def test_help_and_unknown_hint_include_skills(repl_env, tmp_path, capsys):
     assert "возможно, /deploy?" in capsys.readouterr().out
 
 
-def test_oneshot_expands_skill(tmp_path, monkeypatch):
+def test_oneshot_expands_skill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
-    for name, value in {
+    for name, env_value in {
         "GIGACREW_ACCESS_KEY": "dummy",
         "GIGACREW_AUTH_URL": "https://auth.test/oauth",
         "GIGACREW_API_URL": "https://api.test/v1",
         "GIGACREW_MODEL": "M-default",
         "GIGACREW_AUTO_MEASURE": "0",
     }.items():
-        monkeypatch.setenv(name, value)
+        monkeypatch.setenv(name, env_value)
     provider = ScriptedProvider([text_turn("сделано")])
     monkeypatch.setattr(app, "_make_provider", lambda _cfg: provider)
     _project_skill(tmp_path, "deploy", "x", body="Выкати $ARGUMENTS.")
     code = app.main(["-C", str(tmp_path), "-p", "/deploy prod", "--no-color", "--no-stream"])
     assert code == 0
-    assert "Выкати prod." in provider.requests[-1]["messages"][-1].content
-    (saved,) = ChatStore(Workspace(tmp_path)).recent()
-    assert saved.title.startswith("/deploy prod ")  # название чата — с команды
+    last_request = provider.requests[-1]
+    assert "Выкати prod." in last_request["messages"][-1].content
+    saved = ChatStore(Workspace(tmp_path)).recent()
+    assert len(saved) == 1
+    assert saved[0].title.startswith("/deploy prod ")  # название чата — с команды

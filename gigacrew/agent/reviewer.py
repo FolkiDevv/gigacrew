@@ -25,7 +25,7 @@ from gigacrew.agent.events import Review
 from gigacrew.agent.prompts import REVIEWER_PROMPT
 from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.llm.types import Message, Usage
-from gigacrew.safety import CommandLevel, Verdict
+from gigacrew.safety import CommandLevel, Part, Verdict
 
 REVIEWER_ENV = "GIGACREW_REVIEWER_MODEL"
 # Команду длиннее рецензент не смотрит: её читает пользователь.
@@ -40,6 +40,12 @@ DISABLED_NOTE = (
     "модель-рецензент отключена: в режиме «авто» больше команд будут требовать ручного "
     "подтверждения"
 )
+# Сколько символов причины из ответа рецензента сохраняется.
+_REASON_CLIP = 300
+# Сколько символов ответа рецензента цитирует ошибка разбора.
+_SNIPPET_CLIP = 120
+# Сколько символов ошибки проверки модели попадает в предупреждение.
+_ERROR_CLIP = 200
 
 
 class ReviewError(LLMError):
@@ -49,17 +55,19 @@ class ReviewError(LLMError):
 # ------------------------------- запрос ------------------------------- #
 def recent_requests(messages: Sequence[Message], limit: int = MAX_REQUESTS) -> list[str]:
     """Последние ``limit`` запросов пользователя (без служебных сообщений harness'а)."""
-    requests = [m.content for m in messages if m.is_request and m.content.strip()]
+    requests = [
+        message.content for message in messages if message.is_request and message.content.strip()
+    ]
     return requests[-limit:]
 
 
 def _level(level: CommandLevel | None) -> str:
-    return level.name if level is not None else "UNVERIFIED"
+    return "UNVERIFIED" if level is None else level.name
 
 
 def _fence(text: str) -> str:
     """Ограждение длиннее любой цепочки обратных кавычек в тексте: команда не закроет его."""
-    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    longest = max((len(ticks) for ticks in re.findall(r"`+", text)), default=0)
     return "`" * max(3, longest + 1)
 
 
@@ -68,14 +76,29 @@ def _one_line(text: str) -> str:
     return " ".join(text.split())
 
 
+def _part_line(part: Part) -> str:
+    """Строка о части команды, которая не только читает.
+
+    Текст части — из команды (с переводами строк в кавычках) и стоит вне ограждения:
+    строкой JSON, чтобы не начать в запросе свой раздел («# The user's requests»).
+    """
+    text = json.dumps(clip_middle(part.text or "?", PART_CLIP), ensure_ascii=False)
+    return f"- {text}: {_level(part.level)} — {_one_line(part.reason)}"
+
+
 def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> str:
     """Текст запроса рецензенту: запросы пользователя, команда, факты разбора."""
     lines = ["# The user's requests (oldest first)"]
     if requests:
-        lines += [f"{i}. {clip_middle(r.strip(), REQUEST_CLIP)}" for i, r in enumerate(requests, 1)]
+        lines += [
+            f"{number}. {clip_middle(request.strip(), REQUEST_CLIP)}"
+            for number, request in enumerate(requests, 1)
+        ]
     else:
         lines.append("(none)")
     fence = _fence(command)
+    overall_level = _level(verdict.level)
+    overall_reason = _one_line(verdict.reason) or "no details"
     lines += [
         "",
         "# Command",
@@ -85,23 +108,30 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
         fence,
         "",
         "# Static analysis",
-        f"Overall: {_level(verdict.level)} — {_one_line(verdict.reason) or 'no details'}",
+        f"Overall: {overall_level} — {overall_reason}",
     ]
-    parts = [p for p in verdict.parts if p.level is not CommandLevel.READ]
+    parts = [part for part in verdict.parts if part.level is not CommandLevel.READ]
     if parts:
-        # Текст части — из команды (с переводами строк в кавычках) и стоит вне ограждения:
-        # строкой JSON, чтобы не начать в запросе свой раздел («# The user's requests»).
         lines.append("Parts that are not read-only:")
-        lines += [
-            f"- {json.dumps(clip_middle(p.text or '?', PART_CLIP), ensure_ascii=False)}: "
-            f"{_level(p.level)} — {_one_line(p.reason)}"
-            for p in parts
-        ]
+        lines += [_part_line(part) for part in parts]
     lines.append(
         "Levels: EXEC runs project code or tools, WRITE changes files or the local "
         "environment, UNVERIFIED — the analyzer could not check the command.",
     )
     return "\n".join(lines)
+
+
+def _decision(candidate: object) -> tuple[bool, str] | None:
+    """Решение из одного JSON-значения ответа: ``(allow, причина)`` или None — не решение."""
+    if not isinstance(candidate, dict) or "allow" not in candidate:
+        return None
+    allow = candidate["allow"]
+    if isinstance(allow, str) and allow.strip().lower() in {"true", "false"}:
+        allow = allow.strip().lower() == "true"
+    if not isinstance(allow, bool):
+        return None
+    reason = " ".join(str(candidate.get("reason") or "").split())
+    return allow, reason[:_REASON_CLIP]
 
 
 def parse_review(text: str) -> tuple[bool, str]:
@@ -117,21 +147,16 @@ def parse_review(text: str) -> tuple[bool, str]:
     found: list[tuple[bool, str]] = []
     for match in re.finditer(r"\{", text):
         try:
-            obj, _ = decoder.raw_decode(text, match.start())
+            candidate, _ = decoder.raw_decode(text, match.start())
         except ValueError:
             continue
-        if not isinstance(obj, dict) or "allow" not in obj:
-            continue
-        allow = obj["allow"]
-        if isinstance(allow, str) and allow.strip().lower() in {"true", "false"}:
-            allow = allow.strip().lower() == "true"
-        if not isinstance(allow, bool):
-            continue
-        reason = " ".join(str(obj.get("reason") or "").split())
-        found.append((allow, reason[:300]))
-    snippet = " ".join(text.split())[:120]
+        decision = _decision(candidate)
+        if decision is not None:
+            found.append(decision)
+    snippet = " ".join(text.split())[:_SNIPPET_CLIP]
     if not found:
-        raise ReviewError(f"ответ рецензента не разобран: {snippet or '(пусто)'}")
+        shown = snippet or "(пусто)"
+        raise ReviewError(f"ответ рецензента не разобран: {shown}")
     if len({allow for allow, _ in found}) > 1:
         raise ReviewError(f"противоречивый ответ рецензента: {snippet}")
     return found[-1]
@@ -154,7 +179,7 @@ def review_command(
         Message(role="system", content=REVIEWER_PROMPT),
         Message(role="user", content=review_request(command, verdict, requests)),
     ]
-    turn = provider.complete(request, tools=None, model=model, temperature=0.0)
+    turn = provider.complete(request, tools=None, model=model, temperature=float(0))
     if on_usage is not None:
         on_usage(turn.usage)
     if turn.finish_reason != "stop":
@@ -172,12 +197,14 @@ class Reviewer:
     """
 
     def __init__(self, model: str | None = None, *, disabled: str = ""):
+        """Рецензент с моделью ``model``; ``disabled`` — причина отключения ("" — работает)."""
         self.model = model
         self.disabled = disabled
         self._failures = 0
 
     @property
     def enabled(self) -> bool:
+        """Рецензент работает (не отключён)."""
         return not self.disabled
 
     @property
@@ -186,6 +213,7 @@ class Reviewer:
         return f"{self.disabled} — {DISABLED_NOTE}" if self.disabled else ""
 
     def model_for(self, chat_model: str) -> str:
+        """Модель для проверки: заданная явно или модель чата ``chat_model``."""
         return self.model or chat_model
 
     def describe(self, chat_model: str) -> str:
@@ -197,6 +225,7 @@ class Reviewer:
         return f"команды проверяет модель чата ({chat_model})"
 
     def succeeded(self) -> None:
+        """Учесть успешную проверку: серия сбоев прервалась."""
         self._failures = 0
 
     def failed(self, error: str) -> bool:
@@ -221,8 +250,9 @@ def check_reviewer(provider: LLMProvider, model: str | None) -> tuple[Reviewer, 
     unchecked = f"не удалось проверить модель-рецензент «{model}» ({REVIEWER_ENV})"
     try:
         known = provider.list_models()
-    except Exception as e:  # сеть/авторизация: проверим делом
-        return Reviewer(model), f"{unchecked}: {' '.join(str(e).split())[:200]}"
+    except Exception as error:  # сеть/авторизация: проверим делом
+        detail = " ".join(str(error).split())[:_ERROR_CLIP]
+        return Reviewer(model), f"{unchecked}: {detail}"
     if not known:
         return Reviewer(model), f"{unchecked}: список моделей пуст"
     match = (

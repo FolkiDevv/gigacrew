@@ -51,6 +51,36 @@ class CompactionPlan:
     messages: list[Message]
 
 
+def _block_starts(messages: Sequence[Message], start: int) -> list[int]:
+    """Начала блоков «сообщение + результаты его вызова» от прежней границы ``start``."""
+    return [
+        index
+        for index in range(start, len(messages))
+        if index == start or messages[index].role != "function"
+    ]
+
+
+def _fold_boundary(messages: Sequence[Message], starts: Sequence[int], keep_tokens: int) -> int:
+    """Новая граница сжатия: свежие блоки в пределах ``keep_tokens`` остаются.
+
+    Блоки перебираются с конца; последний остаётся всегда. ``keep_tokens`` ≤ 0 —
+    свернуть всё.
+    """
+    total = len(messages)
+    upto = total
+    if keep_tokens <= 0:
+        return upto
+    kept = 0
+    for position in range(len(starts) - 1, -1, -1):
+        end = starts[position + 1] if position + 1 < len(starts) else total
+        size = estimate_tokens(messages[starts[position] : end])
+        if upto < total and kept + size > keep_tokens:
+            break
+        kept += size
+        upto = starts[position]
+    return upto
+
+
 def plan_compaction(
     conversation: Conversation,
     *,
@@ -65,21 +95,8 @@ def plan_compaction(
     сжатие не стоит запроса к модели.
     """
     messages = conversation.messages
-    start = conversation.summary.upto if conversation.summary is not None else 0
-    starts = [
-        i for i in range(start, len(messages)) if i == start or messages[i].role != "function"
-    ]
-
-    upto = len(messages)
-    if keep_tokens > 0:
-        kept = 0
-        for k in range(len(starts) - 1, -1, -1):
-            end = starts[k + 1] if k + 1 < len(starts) else len(messages)
-            size = estimate_tokens(messages[starts[k] : end])
-            if upto < len(messages) and kept + size > keep_tokens:
-                break
-            kept += size
-            upto = starts[k]
+    start = 0 if conversation.summary is None else conversation.summary.upto
+    upto = _fold_boundary(messages, _block_starts(messages, start), keep_tokens)
     if upto <= start:
         return None
 
@@ -95,10 +112,12 @@ def clip_middle(text: str, limit: int) -> str:
     """Обрезка с вырезом середины: в начале — суть, в конце — итог (вывод тестов)."""
     if len(text) <= limit:
         return text
-    head = limit * 2 // 3
-    tail = limit - head
-    cut = len(text) - head - tail
-    return f"{text[:head]}\n…[{cut} chars cut]…\n{text[len(text) - tail :]}"
+    head_size = limit * 2 // 3
+    tail_size = limit - head_size
+    cut = len(text) - head_size - tail_size
+    head = text[:head_size]
+    tail = text[len(text) - tail_size :]
+    return f"{head}\n…[{cut} chars cut]…\n{tail}"
 
 
 def render_message(message: Message) -> str:
@@ -107,7 +126,8 @@ def render_message(message: Message) -> str:
         title = "gigacrew (harness note)" if message.meta else "User"
         return f"## {title}\n{clip_middle(message.content, USER_CLIP)}"
     if message.role == "function":
-        return f"## Result of {message.name or ''}\n{clip_middle(message.content, RESULT_CLIP)}"
+        name = message.name or ""
+        return f"## Result of {name}\n{clip_middle(message.content, RESULT_CLIP)}"
     parts = []
     if message.content.strip():
         parts.append(clip_middle(message.content, ASSISTANT_CLIP))
@@ -115,11 +135,13 @@ def render_message(message: Message) -> str:
         args = json.dumps(call.arguments, ensure_ascii=False, default=str)
         parts.append(f"→ call {call.name}({clip_middle(args, ARGS_CLIP)})")
     title = "Assistant" if message.role == "assistant" else message.role
-    return f"## {title}\n" + "\n".join(parts)
+    body = "\n".join(parts)
+    return f"## {title}\n{body}"
 
 
 def render_transcript(messages: Sequence[Message]) -> list[str]:
-    return [render_message(m) for m in messages]
+    """Переписка плоским текстом: по записи на сообщение (см. :func:`render_message`)."""
+    return [render_message(message) for message in messages]
 
 
 def chunk_entries(entries: Sequence[str], budget_tokens: int) -> list[list[str]]:
@@ -132,14 +154,15 @@ def chunk_entries(entries: Sequence[str], budget_tokens: int) -> list[list[str]]
     current: list[str] = []
     size = 0
     for entry in entries:
-        tokens = estimate_text_tokens(entry)
+        text = entry
+        tokens = estimate_text_tokens(text)
         if tokens > budget_tokens:
-            entry = clip_middle(entry, budget_tokens * CHARS_PER_TOKEN - 100)
-            tokens = estimate_text_tokens(entry)
+            text = clip_middle(entry, budget_tokens * CHARS_PER_TOKEN - 100)
+            tokens = estimate_text_tokens(text)
         if current and size + tokens > budget_tokens:
             chunks.append(current)
             current, size = [], 0
-        current.append(entry)
+        current.append(text)
         size += tokens
     if current:
         chunks.append(current)
@@ -155,10 +178,13 @@ def _recent_chunks(messages: Sequence[Message], budget_tokens: int) -> list[list
     entries = render_transcript(messages)
     chunks = chunk_entries(entries, budget_tokens)
     kept = chunks[-MAX_INPUT_CHUNKS:]
-    last_user = max((i for i, m in enumerate(messages) if m.is_request), default=None)
+    last_user = max(
+        (index for index, message in enumerate(messages) if message.is_request),
+        default=None,
+    )
     if len(chunks) <= MAX_INPUT_CHUNKS or last_user is None:
         return kept
-    first_kept = len(entries) - sum(len(c) for c in kept)
+    first_kept = len(entries) - sum(len(chunk) for chunk in kept)
     if last_user >= first_kept:
         return kept
     # Запрос — в отброшенном куске: он идёт первым, переписка после него — следом,
@@ -175,6 +201,7 @@ def _request_text(
     previous: str | None,
     chunk: str,
     instructions: str,
+    *,
     omitted: bool,
     max_chars: int,
 ) -> str:
@@ -215,7 +242,35 @@ def _clip_summary(text: str, max_chars: int) -> str:
     return head.rstrip() + CLIPPED_MARK
 
 
-def summarize(
+def _complete_summary(
+    provider: LLMProvider,
+    prompt: str,
+    *,
+    model: str,
+    temperature: float,
+    max_chars: int,
+    on_usage: Callable[[Usage], None] | None,
+) -> str:
+    """Один запрос суммаризации: новое краткое содержание не длиннее ``max_chars``."""
+    request = [
+        Message(role="system", content=COMPACT_PROMPT),
+        Message(role="user", content=prompt),
+    ]
+    turn = provider.complete(request, tools=None, model=model, temperature=temperature)
+    if on_usage is not None:
+        on_usage(turn.usage)
+    if turn.finish_reason != "stop":
+        raise CompactionError(
+            f"модель не закончила краткое содержание (finish_reason={turn.finish_reason})",
+        )
+    text = turn.message.content.strip()
+    if not text:
+        raise CompactionError("модель вернула пустое краткое содержание")
+    return _clip_summary(text, max_chars)
+
+
+# Параметры запроса передаются только по имени; набор задаёт агент (gigacrew.agent.loop).
+def summarize(  # noqa: WPS211
     provider: LLMProvider,
     messages: Sequence[Message],
     *,
@@ -246,34 +301,25 @@ def summarize(
         + REQUEST_OVERHEAD_TOKENS
     )
     chunks = _recent_chunks(messages, input_budget - reserve)
-    omitted = sum(len(c) for c in chunks) < len(messages)
+    omitted = sum(len(chunk) for chunk in chunks) < len(messages)
 
     summary = previous
-    for i, chunk in enumerate(chunks):
-        request = [
-            Message(role="system", content=COMPACT_PROMPT),
-            Message(
-                role="user",
-                content=_request_text(
-                    summary,
-                    "\n\n".join(chunk),
-                    instructions,
-                    omitted and i == 0,
-                    max_chars,
-                ),
-            ),
-        ]
-        turn = provider.complete(request, tools=None, model=model, temperature=temperature)
-        if on_usage is not None:
-            on_usage(turn.usage)
-        if turn.finish_reason != "stop":
-            raise CompactionError(
-                f"модель не закончила краткое содержание (finish_reason={turn.finish_reason})",
-            )
-        text = turn.message.content.strip()
-        if not text:
-            raise CompactionError("модель вернула пустое краткое содержание")
-        summary = _clip_summary(text, max_chars)
+    for index, chunk in enumerate(chunks):
+        prompt = _request_text(
+            summary,
+            "\n\n".join(chunk),
+            instructions,
+            omitted=omitted and index == 0,
+            max_chars=max_chars,
+        )
+        summary = _complete_summary(
+            provider,
+            prompt,
+            model=model,
+            temperature=temperature,
+            max_chars=max_chars,
+            on_usage=on_usage,
+        )
     if summary is None:
         raise CompactionError("нечего сжимать")
     return summary

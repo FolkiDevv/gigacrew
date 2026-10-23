@@ -37,8 +37,9 @@ from __future__ import annotations
 import json
 import posixpath
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Literal
 
 from gigacrew.llm.types import FunctionCall
@@ -58,7 +59,7 @@ StopKind = Literal[
 SIMILAR_GRACE = 2
 # Причина остановки — для модели (запрос итога, отчёт суб-агента); пользователю
 # показывается ``StopReason.message``.
-MODEL_STOP_REASONS: dict[str, str] = {
+MODEL_STOP_REASONS: Mapping[str, str] = MappingProxyType({
     "max_steps": "the step limit is reached",
     "tool_failures": "too many failed tool calls in a row",
     "tool_repeats": "the same call was repeated without any changes (a loop)",
@@ -67,14 +68,14 @@ MODEL_STOP_REASONS: dict[str, str] = {
     "time_limit": "the time limit is reached",
     "user_stop": "the user stopped the work early",
     "output_limit": "your replies were cut off before they finished, several times in a row",
-}
+})
 
 # С какой доли любого лимита модель получает напоминание о бюджете.
 PRESSURE_SHARE = 0.7
 # Поля аргументов, задающие «цель» вызова, — по убыванию приоритета.
 _TARGET_FIELDS = ("pattern", "query", "path", "command", "subcommand", "focus")
 # Аргументы, от которых результат не зависит (пояснение для пользователя у run_shell и task).
-_COSMETIC_FIELDS = frozenset({"description"})
+_COSMETIC_FIELDS = frozenset(("description",))
 
 FAILURES_WARNING = (
     "WARNING: the last {count} tool calls failed or were not executed. Do not try "
@@ -86,6 +87,8 @@ FAILURES_WARNING = (
 
 @dataclass(frozen=True)
 class StopReason:
+    """Причина остановки хода: ``kind`` — вид ограничителя, ``message`` — для пользователя."""
+
     kind: StopKind
     message: str
 
@@ -128,9 +131,9 @@ def call_key(call: FunctionCall) -> str:
     строка (``null``) — не пояснение, а ошибка аргументов: такой вызов — другой.
     """
     arguments = {
-        name: value
-        for name, value in call.arguments.items()
-        if not (name in _COSMETIC_FIELDS and isinstance(value, str))
+        name: argument
+        for name, argument in call.arguments.items()
+        if not (name in _COSMETIC_FIELDS and isinstance(argument, str))
     }
     args = json.dumps(
         arguments,
@@ -149,9 +152,9 @@ def target_key(call: FunctionCall) -> str:
     шаблона в разных каталогах — похожие вызовы. Без цели — ключ по имени.
     """
     for field in _TARGET_FIELDS:
-        value = call.arguments.get(field)
-        if value not in (None, "", []):
-            text = value if isinstance(value, str) else json.dumps(value, default=str)
+        target = call.arguments.get(field)
+        if target not in (None, "", []):
+            text = target if isinstance(target, str) else json.dumps(target, default=str)
             # ./a.py и a.py, src/ и src — одна цель; пробелы внутри имени — его часть
             if field == "path":
                 text = posixpath.normpath(text.strip().replace("\\", "/"))
@@ -175,6 +178,7 @@ class LoopGuard:
         time_limit: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
+        """Ограничители хода; ``None`` у лимитов суб-агента — ограничитель выключен."""
         self._max_steps = max_steps
         self._max_failures = max_failures
         self._max_repeats = max_repeats
@@ -196,15 +200,13 @@ class LoopGuard:
 
     @property
     def steps(self) -> int:
+        """Шагов (обращений к модели) за ход."""
         return self._steps
 
     @property
     def changes(self) -> int:
         """Успешных изменяющих операций за ход."""
         return self._changes
-
-    def _elapsed(self) -> float:
-        return self._clock() - self._started
 
     def before_step(self, context_tokens: int = 0) -> StopReason | None:
         """Вызывается перед обращением к модели; учитывает шаг.
@@ -250,9 +252,10 @@ class LoopGuard:
             parts.append(f"time {int(elapsed)} of {int(self._time_limit)} s")
         if max(shares) < PRESSURE_SHARE:
             return None
+        used = ", ".join(parts)
         return (
             "# Budget\n"
-            f"Used: {', '.join(parts)}. Do not start new directions: finish the current "
+            f"Used: {used}. Do not start new directions: finish the current "
             "check and move on to the final report. When any limit is reached, the work "
             "will be stopped and you will be asked for the report."
         )
@@ -288,7 +291,8 @@ class LoopGuard:
                 ),
                 rejected_before=rejected,
             )
-        warning = notice = None
+        warning: str | None = None
+        notice: str | None = None
         if repeats == self._max_repeats:
             warning = (
                 f"WARNING: this is call #{repeats} of {call.name} with the same arguments, "
@@ -314,8 +318,10 @@ class LoopGuard:
         return CallCheck(repeats, warning=warning, rejected_before=rejected, notice=notice)
 
     def failure_warning(self) -> GuardWarning | None:
-        """Предупреждение о серии неудач для следующего запроса: до предела — одна неудача
-        (или серия уже на пределе: её дотянула пачка вызовов одного ответа).
+        """Предупреждение о серии неудач для следующего запроса.
+
+        До предела — одна неудача (или серия уже на пределе: её дотянула пачка вызовов
+        одного ответа).
 
         Заметка модели (``model``) — в каждый такой запрос: ответ может быть отброшен
         (оборван, самопроверка), и предупреждение не должно пропасть вместе с ним. Строка
@@ -334,16 +340,6 @@ class LoopGuard:
             )
         return GuardWarning(FAILURES_WARNING.format(count=self._failures), notice)
 
-    def _count_similar(self, call: FunctionCall) -> int:
-        """Учесть вызов как похожий на предыдущие (та же цель, без изменений между)."""
-        if self._max_similar is None:
-            return 0
-        key = target_key(call)
-        unchanged = self._similar_seen.get(key) == self._changes
-        count = self._similar.get(key, 0) + 1 if unchanged else 1
-        self._similar[key] = count
-        return count
-
     def after_tool(self, call: FunctionCall, outcome: ToolOutcome) -> StopReason | None:
         """Вызывается после каждого выполненного (или отклонённого) вызова."""
         key = call_key(call)
@@ -354,7 +350,8 @@ class LoopGuard:
             self._failures = 0 if outcome.ok else self._failures + 1
             if self._failures < self._max_failures - 1:
                 # Серия прервалась — новая предупреждается снова.
-                self._failures_warned = self._failures_noticed = False
+                self._failures_warned = False
+                self._failures_noticed = False
         if outcome.changed:
             self._changes += 1
         self._seen[key] = self._changes
@@ -377,3 +374,16 @@ class LoopGuard:
                 "Похоже, агент застрял — уточните задачу или попробуйте другую модель.",
             )
         return None
+
+    def _elapsed(self) -> float:
+        return self._clock() - self._started
+
+    def _count_similar(self, call: FunctionCall) -> int:
+        """Учесть вызов как похожий на предыдущие (та же цель, без изменений между)."""
+        if self._max_similar is None:
+            return 0
+        key = target_key(call)
+        unchanged = self._similar_seen.get(key) == self._changes
+        count = self._similar.get(key, 0) + 1 if unchanged else 1
+        self._similar[key] = count
+        return count

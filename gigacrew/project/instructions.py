@@ -33,6 +33,8 @@ MAX_DIRECTORY_CHARS = 30_000  # все файлы одного каталога 
 
 @dataclass(frozen=True)
 class InstructionFile:
+    """Прочитанный файл инструкций: путь от корня, текст и признак обрезки."""
+
     name: str  # путь от корня проекта (POSIX): "AGENTS.md", "src/api/AGENTS.md"
     content: str
     truncated: bool = False
@@ -46,16 +48,21 @@ def load_instructions(
     directory: Path | None = None,
     max_total: int = MAX_DIRECTORY_CHARS,
 ) -> list[InstructionFile]:
-    """Читает существующие файлы инструкций каталога ``directory`` (по умолчанию —
-    корня) в порядке ``names``.
+    """Читает существующие файлы инструкций каталога ``directory`` в порядке ``names``.
 
-    Пустые и нечитаемые файлы пропускаются, симлинки за пределы корня и повторы
-    одного файла под разными именами (симлинк ``GIGACREW.md → AGENTS.md``) —
-    тоже. Файл длиннее ``max_chars`` обрезается; если все вместе длиннее
-    ``max_total``, место сначала получают более приоритетные (поздние в ``names``).
+    Каталог по умолчанию — корень. Пустые и нечитаемые файлы пропускаются, симлинки
+    за пределы корня и повторы одного файла под разными именами (симлинк
+    ``GIGACREW.md → AGENTS.md``) — тоже. Файл длиннее ``max_chars`` обрезается; если
+    все вместе длиннее ``max_total``, место сначала получают более приоритетные
+    (поздние в ``names``).
     """
     root = root.resolve()
     base = root if directory is None else directory
+    return _fit_budget(_read_files(root, base, names), max_chars, max_total)
+
+
+def _read_files(root: Path, base: Path, names: Sequence[str]) -> list[tuple[str, str]]:
+    """Непустые файлы инструкций каталога ``base``: (путь от корня, текст) в порядке ``names``."""
     found: list[tuple[str, str]] = []
     seen: set[Path] = set()
     for name in names:
@@ -72,18 +79,25 @@ def load_instructions(
         if text:
             seen.add(real)
             found.append((path.relative_to(root).as_posix(), text))
+    return found
 
+
+def _fit_budget(
+    found: list[tuple[str, str]],
+    max_chars: int,
+    max_total: int,
+) -> list[InstructionFile]:
+    """Обрезка по лимитам; общий бюджет сначала получают поздние (приоритетные) файлы."""
     budget = max_total
-    result: list[InstructionFile] = []
+    fitted: list[InstructionFile] = []
     for name, text in reversed(found):
         limit = max(min(max_chars, budget), 0)
         truncated = len(text) > limit
-        if truncated:
-            text = text[:limit]
-        budget -= len(text)
-        result.append(InstructionFile(name=name, content=text, truncated=truncated))
-    result.reverse()
-    return result
+        content = text[:limit] if truncated else text
+        budget -= len(content)
+        fitted.append(InstructionFile(name=name, content=content, truncated=truncated))
+    fitted.reverse()
+    return fitted
 
 
 class NestedInstructions:
@@ -100,6 +114,7 @@ class NestedInstructions:
     """
 
     def __init__(self, root: Path):
+        """Инструкции подкаталогов проекта с корнем ``root``."""
         self._root = root
         self._checked: set[str] = set()
         self._files: list[InstructionFile] = []
@@ -110,6 +125,7 @@ class NestedInstructions:
         return tuple(self._files)
 
     def reset(self) -> None:
+        """Забыть найденные инструкции и проверенные каталоги (смена диалога)."""
         self._checked.clear()
         self._files.clear()
 

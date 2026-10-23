@@ -7,7 +7,12 @@ import pytest
 from gigacrew.project import treesitter
 from gigacrew.project.symbols import extract
 
-CASES = [
+# Ожидаемые определения: (вид, полное имя, первая строка, последняя строка).
+type _Symbols = list[tuple[str, str, int, int]]
+# Ожидаемые вызовы: (имя вызываемого, область, где вызван).
+type _Calls = list[tuple[str, str]]
+
+CASES: tuple[tuple[str, str, str, _Symbols, _Calls], ...] = (
     (
         "javascript",
         "a.js",
@@ -271,80 +276,86 @@ CASES = [
         ],
         [("start", "Player.play"), ("halt", "Player.stop")],
     ),
-]
+)
 
 
 @pytest.mark.parametrize(
     ("language", "path", "src", "symbols", "calls"),
     CASES,
-    ids=[f"{c[0]}:{c[1]}" for c in CASES],
+    ids=[f"{case[0]}:{case[1]}" for case in CASES],
 )
-def test_languages(language, path, src, symbols, calls):
+def test_languages(language: str, path: str, src: str, symbols: _Symbols, calls: _Calls) -> None:
     facts = extract(src, language, path)
-    assert [(s.kind, s.qualname, s.line, s.end_line) for s in facts.symbols] == symbols
-    assert [(r.name, r.scope) for r in facts.refs] == calls
-    assert all(r.kind == "call" for r in facts.refs)
+    found = [
+        (symbol.kind, symbol.qualname, symbol.line, symbol.end_line) for symbol in facts.symbols
+    ]
+    assert found == symbols
+    assert [(ref.name, ref.scope) for ref in facts.refs] == calls
+    assert all(ref.kind == "call" for ref in facts.refs)
     assert facts.imports == []
 
 
-def test_depth_signature_and_column():
+def test_depth_signature_and_column() -> None:
     facts = extract("class Ёлка {\n  fn() { }\n  рост(x) {\n    return x;\n  }\n}\n", "javascript")
-    by_name = {s.name: s for s in facts.symbols}
+    by_name = {symbol.name: symbol for symbol in facts.symbols}
     assert (by_name["Ёлка"].depth, by_name["рост"].depth) == (0, 1)
     assert by_name["рост"].signature == "рост(x)"
     assert by_name["Ёлка"].col == 6
     assert by_name["рост"].col == 2
 
 
-def test_nested_functions_are_not_definitions_but_calls_count():
+def test_nested_functions_are_not_definitions_but_calls_count() -> None:
     facts = extract(
         "function outer() {\n  function inner() { deep(); }\n  inner();\n}\n",
         "javascript",
     )
-    assert [s.qualname for s in facts.symbols] == ["outer"]
-    assert [(r.name, r.scope) for r in facts.refs] == [("deep", "outer"), ("inner", "outer")]
+    assert [symbol.qualname for symbol in facts.symbols] == ["outer"]
+    calls = [(ref.name, ref.scope) for ref in facts.refs]
+    assert calls == [("deep", "outer"), ("inner", "outer")]
 
 
-def test_unloadable_grammar_returns_none(monkeypatch):
+def test_unloadable_grammar_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(treesitter._parsers, "go", None)
     assert treesitter.extract("package x\nfunc main() {}\n", "go") is None
     # индекс тогда откатывается на построчные шаблоны
-    assert [s.name for s in extract("package x\nfunc main() {}\n", "go").symbols] == ["main"]
+    fallback = extract("package x\nfunc main() {}\n", "go")
+    assert [symbol.name for symbol in fallback.symbols] == ["main"]
     assert treesitter.extract("x", "cobol") is None
     assert treesitter.supports("rust")
     assert not treesitter.supports("markdown")
 
 
-def test_csharp_namespaces_keep_full_name_and_file_scope():
+def test_csharp_namespaces_keep_full_name_and_file_scope() -> None:
     facts = extract(
         "namespace Company.App;\n\nclass Service { void Run() { Log.Write(); } }\n",
         "csharp",
     )
-    assert [(s.qualname, s.depth) for s in facts.symbols] == [
+    assert [(symbol.qualname, symbol.depth) for symbol in facts.symbols] == [
         ("Company.App", 0),
         ("Company.App.Service", 1),
         ("Company.App.Service.Run", 2),
     ]
-    assert [(r.name, r.scope) for r in facts.refs] == [("Write", "Company.App.Service.Run")]
+    calls = [(ref.name, ref.scope) for ref in facts.refs]
+    assert calls == [("Write", "Company.App.Service.Run")]
     block = extract("namespace A.B { class S {} }\nclass Outside {}\n", "csharp")
-    assert [s.qualname for s in block.symbols] == ["A.B", "A.B.S", "Outside"]
+    assert [symbol.qualname for symbol in block.symbols] == ["A.B", "A.B.S", "Outside"]
 
 
-def test_js_private_members_are_called():
+def test_js_private_members_are_called() -> None:
     facts = extract("class A {\n  #persist() {}\n  save() { this.#persist(); }\n}\n", "javascript")
-    assert [s.qualname for s in facts.symbols] == ["A", "A.#persist", "A.save"]
-    assert [(r.name, r.scope) for r in facts.refs] == [("#persist", "A.save")]
+    assert [symbol.qualname for symbol in facts.symbols] == ["A", "A.#persist", "A.save"]
+    assert [(ref.name, ref.scope) for ref in facts.refs] == [("#persist", "A.save")]
 
 
-def test_parenthesized_callees_quoted_methods_and_arrow_signatures():
+def test_parenthesized_callees_quoted_methods_and_arrow_signatures() -> None:
     facts = extract(
         'class A {\n  "save"() { (load)(); (obj.persist)(); }\n}\n'
         "const handler = (req) => { respond(req); };\n",
         "javascript",
     )
-    assert [(s.qualname, s.signature) for s in facts.symbols] == [
+    assert [(symbol.qualname, symbol.signature) for symbol in facts.symbols] == [
         ("A", "class A"),
         ("A.save", '"save"()'),
         ("handler", "handler = (req) =>"),  # без тела функции
     ]
-    assert [r.name for r in facts.refs] == ["load", "persist", "respond"]
+    assert [ref.name for ref in facts.refs] == ["load", "persist", "respond"]

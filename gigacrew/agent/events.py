@@ -50,7 +50,8 @@ class ToolCallInfo:
 class Approval(Enum):
     """Ответ на подтверждение операции."""
 
-    NO = "no"
+    # Член перечисления рядом с YES и ALWAYS, а не булево значение: не спутать.
+    NO = "no"  # noqa: WPS110
     YES = "yes"
     # Да, и не спрашивать: для команд — сохранённое для проекта разрешение, для прочего —
     # этот же вызов до конца сессии.
@@ -85,7 +86,7 @@ class TurnStats:
     # Почему ход прерван ограничителем (None — модель завершила ход сама).
     stop_reason: str | None = None
     # Длительность хода, секунды.
-    duration_s: float = 0.0
+    duration_s: float = float(0)
     # Успешных изменяющих вызовов за ход (правки, изменяющие команды).
     changes: int = 0
     # Повторов запроса после ответа, оборванного до конца (finish_reason length/incomplete).
@@ -96,6 +97,7 @@ class TurnStats:
 
     @property
     def billed_tokens(self) -> int:
+        """Оплаченные токены хода: промпт и ответ по всем обращениям."""
         return self.prompt_tokens + self.completion_tokens
 
 
@@ -183,8 +185,9 @@ class AgentEvents:
         """Модель-рецензент проверяет команду (режим «авто»)."""
 
     def on_review_end(self, call: ToolCallInfo, review: Review | None) -> None:
-        """Проверка закончилась (вызывается всегда). None — прервана; при отказе или
-        сбое дальше придёт ``confirm`` с ``call.review``.
+        """Проверка закончилась (вызывается всегда).
+
+        None — прервана; при отказе или сбое дальше придёт ``confirm`` с ``call.review``.
         """
 
     def on_tool_start(self, call: ToolCallInfo) -> None:

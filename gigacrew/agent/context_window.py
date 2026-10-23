@@ -39,10 +39,12 @@ def budget_for_window(window: int) -> int:
 
 
 def estimate_text_tokens(text: str) -> int:
+    """Оценка числа токенов текста (с округлением вверх)."""
     return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
 
 
 def estimate_message_tokens(message: Message) -> int:
+    """Оценка размера сообщения: текст, вызовы инструментов, рассуждения и обвязка."""
     size = estimate_text_tokens(message.content)
     for call in message.function_calls:
         args = json.dumps(call.arguments, ensure_ascii=False)
@@ -53,12 +55,15 @@ def estimate_message_tokens(message: Message) -> int:
 
 
 def estimate_tokens(messages: Iterable[Message]) -> int:
-    return sum(estimate_message_tokens(m) for m in messages)
+    """Оценка размера сообщений в токенах (сумма по сообщениям)."""
+    return sum(estimate_message_tokens(message) for message in messages)
 
 
 def estimate_specs_tokens(specs: Iterable[ToolSpec]) -> int:
     """Схемы инструментов уходят в каждом запросе и тоже занимают окно."""
-    return sum(estimate_text_tokens(json.dumps(s.model_dump(), ensure_ascii=False)) for s in specs)
+    return sum(
+        estimate_text_tokens(json.dumps(spec.model_dump(), ensure_ascii=False)) for spec in specs
+    )
 
 
 def _blocks(history: Sequence[Message]) -> list[list[Message]]:
@@ -72,6 +77,32 @@ def _blocks(history: Sequence[Message]) -> list[list[Message]]:
     return blocks
 
 
+def _pinned_blocks(blocks: Sequence[Sequence[Message]]) -> set[int]:
+    """Блоки, которые не отбрасываются: самый свежий и с последним запросом пользователя."""
+    pinned_user = max(
+        (index for index, block in enumerate(blocks) if block[0].is_request),
+        default=None,
+    )
+    pinned = {len(blocks) - 1}
+    if pinned_user is not None:
+        pinned.add(pinned_user)
+    return pinned
+
+
+def _dropped_blocks(sizes: Sequence[int], pinned: set[int], budget_tokens: int) -> set[int]:
+    """Блоки, отбрасываемые от самых старых, пока история не уложится в ``budget_tokens``."""
+    total = sum(sizes)
+    dropped: set[int] = set()
+    for position, size in enumerate(sizes):  # от старых к новым
+        if total <= budget_tokens:
+            break
+        if position in pinned:
+            continue
+        dropped.add(position)
+        total -= size
+    return dropped
+
+
 def fit_history(history: Sequence[Message], budget_tokens: int) -> list[Message]:
     """Сообщения истории, укладывающиеся в ``budget_tokens`` (по оценке).
 
@@ -83,24 +114,12 @@ def fit_history(history: Sequence[Message], budget_tokens: int) -> list[Message]
         return _strip_leading_results(list(history))
 
     blocks = _blocks(history)
-    sizes = [estimate_tokens(b) for b in blocks]
-    pinned_user = max((i for i, b in enumerate(blocks) if b[0].is_request), default=None)
-    pinned = {len(blocks) - 1}
-    if pinned_user is not None:
-        pinned.add(pinned_user)
-
-    total = sum(sizes)
-    keep = [True] * len(blocks)
-    for i in range(len(blocks)):  # от старых к новым
-        if total <= budget_tokens:
-            break
-        if i in pinned:
-            continue
-        keep[i] = False
-        total -= sizes[i]
-
-    result = [m for i, block in enumerate(blocks) if keep[i] for m in block]
-    return _strip_leading_results(result)
+    sizes = [estimate_tokens(block) for block in blocks]
+    dropped = _dropped_blocks(sizes, _pinned_blocks(blocks), budget_tokens)
+    kept = [
+        message for index, block in enumerate(blocks) if index not in dropped for message in block
+    ]
+    return _strip_leading_results(kept)
 
 
 def _strip_leading_results(messages: list[Message]) -> list[Message]:

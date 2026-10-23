@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sys
+from collections.abc import Callable, Iterable, Sequence
+from itertools import repeat
 from pathlib import Path
+from typing import Any, NoReturn, override
 
 import pytest
 from fakes import (
+    FakeParams,
     FakeTool,
     RecordingEvents,
     ScriptedProvider,
@@ -17,9 +22,18 @@ from fakes import (
     tool_turn,
     tools_turn,
 )
+from test_agent_hooks import FakeHooks
 
-from gigacrew.agent.context_window import estimate_text_tokens
-from gigacrew.agent.conversation import INTERRUPTED_NOTE
+from gigacrew.agent.compaction import CompactionError
+from gigacrew.agent.context_window import (
+    DEFAULT_CONTEXT_WINDOW,
+    budget_for_window,
+    estimate_text_tokens,
+)
+from gigacrew.agent.conversation import INTERRUPTED_NOTE, Conversation, Summary
+from gigacrew.agent.decisions import DecisionMemory, history_key
+from gigacrew.agent.events import AgentEvents, Approval, ConfirmResult, ToolCallInfo
+from gigacrew.agent.hooks import HookResult, HookRunner, PromptBlockedError
 from gigacrew.agent.loop import (
     LOOP_STOP_NOTE,
     PLAN_BLOCKED_NOTE,
@@ -30,18 +44,40 @@ from gigacrew.agent.loop import (
     SKIPPED_NOTE,
     Agent,
 )
+from gigacrew.agent.prompts import COMPACT_PROMPT, NESTED_HEADER, SUMMARY_HEADER
+from gigacrew.agent.reviewer import Reviewer
 from gigacrew.config import Config
 from gigacrew.errors import ToolError
-from gigacrew.llm.base import LLMError
-from gigacrew.llm.types import FunctionCall, Message, Usage
+from gigacrew.llm.base import LLMError, LLMProvider
+from gigacrew.llm.context_probe import ProbeResult
+from gigacrew.llm.model_windows import ModelWindows
+from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec, Usage
 from gigacrew.permissions import PermissionMode, ToolKind
-from gigacrew.tools.base import Display, ToolRegistry, ToolResult, build_default_registry
+from gigacrew.project.settings import HookCommand, HookEvent, HookGroup, HookSettings
+from gigacrew.safety import classify
+from gigacrew.security import RiskLevel
+from gigacrew.tools.base import (
+    Display,
+    Tool,
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+    build_default_registry,
+)
 from gigacrew.tools.plan import APPROVE
-from gigacrew.tools.questions import Answer, QuestionsUnavailableError
+from gigacrew.tools.questions import Answer, Question, QuestionsUnavailableError
+from gigacrew.tools.shell import RunShellParams, RunShellTool
 from gigacrew.tools.task import EXPLORE
 
 
-def _agent(provider, tmp_path: Path, *, events=None, registry=None, **cfg_kw) -> Agent:
+def _agent(
+    provider: LLMProvider,
+    tmp_path: Path,
+    *,
+    events: AgentEvents | None = None,
+    registry: ToolRegistry | None = None,
+    **cfg_kw: Any,
+) -> Agent:
     cfg_kw.setdefault("auto_approve", True)
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, **cfg_kw)
     return Agent(
@@ -52,16 +88,16 @@ def _agent(provider, tmp_path: Path, *, events=None, registry=None, **cfg_kw) ->
     )
 
 
-def _registry_with(tool) -> ToolRegistry:
+def _registry_with(tool: Tool[Any]) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(tool)
     return reg
 
 
-def test_loop_stops_after_repeated_failures(tmp_path):
+def test_loop_stops_after_repeated_failures(tmp_path: Path) -> None:
     # модель упорно вызывает read_file на несуществующих файлах (разных — иначе
     # первым сработает детектор повторов)
-    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(20)]
+    bad = [tool_turn("read_file", {"path": f"nope{attempt}.txt"}) for attempt in range(20)]
     provider = ScriptedProvider(bad)
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, max_tool_failures=4)
@@ -71,8 +107,8 @@ def test_loop_stops_after_repeated_failures(tmp_path):
     # должно остановиться на пороге, а не крутить 50 шагов: 4 шага + запрос итога
     assert provider.calls == 5
     # просьба об итоге — заметкой в хвосте запроса, а не в системном сообщении
-    assert "# Turn stopped" in provider.requests[-1]["messages"][-1].content
-    assert "# Turn stopped" not in provider.requests[-1]["messages"][0].content
+    assert "# Turn stopped" in _tails(provider)[-1]
+    assert "# Turn stopped" not in _system_prompts(provider)[-1]
     assert provider.requests[-1]["tool_choice"] == "none"  # итог — только текстом
     assert len(_function_results(agent)) == 4  # вызов из запроса итога не выполнялся
     assert events.stats[-1].stop_reason == "tool_failures"
@@ -80,13 +116,17 @@ def test_loop_stops_after_repeated_failures(tmp_path):
     assert events.notices[-1][0] == "error"
 
 
-def _function_results(agent) -> list[str]:
-    return [m.content for m in agent.conversation.messages if m.role == "function"]
+def _function_messages(agent: Agent) -> list[Message]:
+    return [message for message in agent.conversation.messages if message.role == "function"]
 
 
-def test_loop_stops_on_repeated_identical_calls(tmp_path):
+def _function_results(agent: Agent) -> list[str]:
+    return [message.content for message in _function_messages(agent)]
+
+
+def test_loop_stops_on_repeated_identical_calls(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
-    provider = ScriptedProvider([tool_turn("read_file", {"path": "f.txt"})] * 10)
+    provider = ScriptedProvider(repeat(tool_turn("read_file", {"path": "f.txt"}), 10))
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
     final = agent.run_turn("прочитай")
@@ -95,26 +135,26 @@ def test_loop_stops_on_repeated_identical_calls(tmp_path):
     assert events.stats[-1].stop_reason == "tool_repeats"
     assert events.stats[-1].tool_calls == 3  # 4-й вызов не выполнялся
     assert [level for level, _ in events.notices] == ["warn", "error"]
-    results = _function_results(agent)
-    assert len(results) == 4
-    assert ["WARNING" in r for r in results] == [False, False, True, False]
-    assert "hello" in results[2]  # предупреждение дописано к результату
-    assert results[3] == LOOP_STOP_NOTE
+    outputs = _function_results(agent)
+    assert len(outputs) == 4
+    assert ["WARNING" in output for output in outputs] == [False, False, True, False]
+    assert "hello" in outputs[2]  # предупреждение дописано к результату
+    assert outputs[3] == LOOP_STOP_NOTE
     assert agent.conversation.pending_calls() == []
     _assert_well_formed(agent.conversation.messages)
 
 
-def test_loop_stops_on_repeated_identical_changes(tmp_path):
+def test_loop_stops_on_repeated_identical_changes(tmp_path: Path) -> None:
     # изменяющая операция без изменений между повторами (как pytest без правок)
     tool = FakeTool()
-    provider = ScriptedProvider([tool_turn("fake_write", {})] * 10)
+    provider = ScriptedProvider(repeat(tool_turn("fake_write", {}), 10))
     events = RecordingEvents()
     _agent(provider, tmp_path, events=events, registry=_registry_with(tool)).run_turn("x")
     assert tool.runs == 3
     assert events.stats[-1].stop_reason == "tool_repeats"
 
 
-def test_change_between_repeats_is_not_a_loop(tmp_path):
+def test_change_between_repeats_is_not_a_loop(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
     read = tool_turn("read_file", {"path": "f.txt"})
     write = tool_turn("write_file", {"path": "g.txt", "content": "x"})
@@ -123,10 +163,11 @@ def test_change_between_repeats_is_not_a_loop(tmp_path):
     agent = _agent(provider, tmp_path, events=events)
     assert agent.run_turn("x") == "ок"
     assert events.stats[-1].stop_reason is None
-    assert sum("WARNING" in r for r in _function_results(agent)) == 1  # только 3-е чтение
+    # только 3-е чтение
+    assert sum("WARNING" in output for output in _function_results(agent)) == 1
 
 
-def test_repeated_rejected_call_is_not_asked_again(tmp_path):
+def test_repeated_rejected_call_is_not_asked_again(tmp_path: Path) -> None:
     tool = FakeTool()
     call = tool_turn("fake_write", {})
     provider = ScriptedProvider([call, call, text_turn("ок"), call, text_turn("ок")])
@@ -147,9 +188,9 @@ def test_repeated_rejected_call_is_not_asked_again(tmp_path):
     assert len(events.confirms) == 2
 
 
-def test_rejections_do_not_count_as_failures(tmp_path):
+def test_rejections_do_not_count_as_failures(tmp_path: Path) -> None:
     tool = FakeTool()
-    calls = [tool_turn("fake_write", {"path": p}) for p in "abc"]
+    calls = [tool_turn("fake_write", {"path": path}) for path in "abc"]
     provider = ScriptedProvider([*calls, text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
     agent = _agent(
@@ -165,7 +206,7 @@ def test_rejections_do_not_count_as_failures(tmp_path):
     assert events.stats[-1].stop_reason is None
 
 
-def test_loop_completes_on_text(tmp_path):
+def test_loop_completes_on_text(tmp_path: Path) -> None:
     provider = ScriptedProvider([text_turn("Готово!")])
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
@@ -173,7 +214,7 @@ def test_loop_completes_on_text(tmp_path):
     assert ("text", "Готово!") in events.events
 
 
-def test_loop_runs_tool_then_finishes(tmp_path):
+def test_loop_runs_tool_then_finishes(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
     provider = ScriptedProvider([tool_turn("read_file", {"path": "f.txt"}), text_turn("прочитал")])
     agent = _agent(provider, tmp_path)
@@ -181,32 +222,33 @@ def test_loop_runs_tool_then_finishes(tmp_path):
     assert provider.calls == 2
 
 
-def test_call_info_from_history(tmp_path):
+def test_call_info_from_history(tmp_path: Path) -> None:
     """Строка вызова при продолжении чата — та же, что во время хода."""
     agent = _agent(ScriptedProvider(), tmp_path)
-    info = agent.call_info(FunctionCall(name="read_file", arguments={"path": "a.txt"}))
-    assert info.summary == "a.txt"
-    assert info.read_only
+    read = agent.call_info(FunctionCall(name="read_file", arguments={"path": "a.txt"}))
+    assert read.summary == "a.txt"
+    assert read.read_only
     edit = agent.call_info(FunctionCall(name="edit_file", arguments={"path": "a.txt"}))
     assert edit.kind is ToolKind.EDIT
     assert not edit.read_only
-    assert agent.call_info(FunctionCall(name="nope", arguments={"path": "a.txt"})).summary == ""
+    unknown = agent.call_info(FunctionCall(name="nope", arguments={"path": "a.txt"}))
+    assert not unknown.summary
     bad = agent.call_info(FunctionCall(name="read_file", arguments={"path": 1.5}))
-    assert bad.summary == ""
+    assert not bad.summary
     assert bad.read_only
 
 
-def test_streaming_events_wrap_each_request(tmp_path):
+def test_streaming_events_wrap_each_request(tmp_path: Path) -> None:
     provider = ScriptedProvider([text_turn("поток")])
     events = RecordingEvents()
     cfg = Config(access_key="x", project_root=tmp_path, stream=True)
     agent = Agent(provider, build_default_registry(), cfg, events)
     agent.run_turn("hi")
-    kinds = [k for k, _ in events.events]
+    kinds = [kind for kind, _ in events.events]
     assert kinds == ["stream_start", "delta", "stream_end"]
 
 
-def test_write_outside_sandbox_does_not_crash_without_auto_approve(tmp_path):
+def test_write_outside_sandbox_does_not_crash_without_auto_approve(tmp_path: Path) -> None:
     # Раньше SandboxError из preview() пробивал run_turn и ронял REPL.
     root = tmp_path / "proj"
     root.mkdir()
@@ -218,13 +260,13 @@ def test_write_outside_sandbox_does_not_crash_without_auto_approve(tmp_path):
     assert agent.run_turn("запиши файл") == "не вышло"
     assert not (tmp_path / "escape.txt").exists()
     assert events.confirms == []  # невыполнимую операцию не предлагаем подтверждать
-    results = [m for m in agent.conversation.messages if m.role == "function"]
-    assert "за пределы" in results[-1].content
+    replies = _function_messages(agent)
+    assert "за пределы" in replies[-1].content
 
 
 @pytest.mark.parametrize("exc", [ToolError("нельзя"), ValueError("сбой превью")])
-def test_preview_failure_never_runs_tool(tmp_path, exc):
-    def boom():
+def test_preview_failure_never_runs_tool(tmp_path: Path, exc: Exception) -> None:
+    def boom() -> NoReturn:
         raise exc
 
     tool = FakeTool(preview=boom)
@@ -243,7 +285,7 @@ def test_preview_failure_never_runs_tool(tmp_path, exc):
     assert events.results[-1][1].ok is False
 
 
-def test_rejection_does_not_run_and_tells_model(tmp_path):
+def test_rejection_does_not_run_and_tells_model(tmp_path: Path) -> None:
     tool = FakeTool()
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
@@ -258,13 +300,14 @@ def test_rejection_does_not_run_and_tells_model(tmp_path):
     assert tool.runs == 0
     call, preview, dangerous = events.confirms[0]
     assert call.name == "fake_write"
+    assert preview is not None
     assert preview.kind == "diff"
     assert dangerous is False
-    function_msgs = [m for m in agent.conversation.messages if m.role == "function"]
+    function_msgs = _function_messages(agent)
     assert function_msgs[-1].content == REJECTED_NOTE
 
 
-def test_auto_approve_skips_confirmation(tmp_path):
+def test_auto_approve_skips_confirmation(tmp_path: Path) -> None:
     tool = FakeTool()
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
@@ -274,7 +317,7 @@ def test_auto_approve_skips_confirmation(tmp_path):
     assert events.confirms == []
 
 
-def test_custom_tool_display_reaches_ui(tmp_path):
+def test_custom_tool_display_reaches_ui(tmp_path: Path) -> None:
     display = Display("+new line", kind="diff", title="x")
     tool = FakeTool(run=lambda: ToolResult(content="ok", summary="готово", display=display))
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
@@ -287,12 +330,12 @@ def test_custom_tool_display_reaches_ui(tmp_path):
         auto_approve=False,
     )
     agent.run_turn("x")
-    _call, result, previewed = events.results[-1]
-    assert result.display == display
+    _call, tool_result, previewed = events.results[-1]
+    assert tool_result.display == display
     assert previewed is True
 
 
-def test_disallowed_git_subcommand_is_not_confirmed(tmp_path):
+def test_disallowed_git_subcommand_is_not_confirmed(tmp_path: Path) -> None:
     provider = ScriptedProvider([tool_turn("git", {"subcommand": "push"}), text_turn("ок")])
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, auto_approve=False)
@@ -301,7 +344,7 @@ def test_disallowed_git_subcommand_is_not_confirmed(tmp_path):
     assert events.results[-1][1].ok is False
 
 
-def test_turn_stats_split_billed_and_context(tmp_path):
+def test_turn_stats_split_billed_and_context(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
     provider = ScriptedProvider(
         [
@@ -321,23 +364,23 @@ def test_turn_stats_split_billed_and_context(tmp_path):
     assert stats.context_tokens == 7_050
 
 
-def _assert_well_formed(messages):
+def _assert_well_formed(messages: Sequence[Message]) -> None:
     """На каждый вызов — ровно один результат (то же имя и id), сразу после вызовов."""
-    i = 0
-    while i < len(messages):
-        m = messages[i]
-        assert m.role != "function", f"результат без вызова: {i}"
-        i += 1
-        calls = m.function_calls if m.role == "assistant" else []
-        results = messages[i : i + len(calls)]
-        assert [(r.role, r.name, r.call_id) for r in results] == [
-            ("function", c.name, c.id) for c in calls
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        assert message.role != "function", f"результат без вызова: {index}"
+        index += 1
+        calls = message.function_calls if message.role == "assistant" else []
+        replies = messages[index : index + len(calls)]
+        assert [(reply.role, reply.name, reply.call_id) for reply in replies] == [
+            ("function", call.name, call.id) for call in calls
         ]
-        i += len(calls)
+        index += len(calls)
 
 
-def test_ctrl_c_during_tool_repairs_history(tmp_path):
-    def interrupted():
+def test_ctrl_c_during_tool_repairs_history(tmp_path: Path) -> None:
+    def interrupted() -> NoReturn:
         raise KeyboardInterrupt
 
     tool = FakeTool(run=interrupted)
@@ -352,13 +395,13 @@ def test_ctrl_c_during_tool_repairs_history(tmp_path):
 
 
 # ------------------------- несколько вызовов за ответ ------------------------- #
-def _with_fake(tool) -> ToolRegistry:
+def _with_fake(tool: Tool[Any]) -> ToolRegistry:
     reg = build_default_registry()
     reg.register(tool)
     return reg
 
 
-def test_parallel_calls_run_in_order_and_each_gets_result(tmp_path):
+def test_parallel_calls_run_in_order_and_each_gets_result(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
     (tmp_path / "b.txt").write_text("BBB", encoding="utf-8")
     batch = tools_turn([("read_file", {"path": "a.txt"}), ("read_file", {"path": "b.txt"})])
@@ -368,11 +411,11 @@ def test_parallel_calls_run_in_order_and_each_gets_result(tmp_path):
 
     assert agent.run_turn("прочитай оба") == "готово"
     assert provider.calls == 2  # оба вызова — за один шаг
-    results = [m for m in agent.conversation.messages if m.role == "function"]
-    assert [r.call_id for r in results] == ["c1", "c2"]
-    assert "AAA" in results[0].content
-    assert "BBB" in results[1].content
-    shown = [c.summary for kind, c in events.events if kind == "tool_call"]
+    replies = _function_messages(agent)
+    assert [reply.call_id for reply in replies] == ["c1", "c2"]
+    assert "AAA" in replies[0].content
+    assert "BBB" in replies[1].content
+    shown = [call.summary for kind, call in events.events if kind == "tool_call"]
     assert len(shown) == 2
     assert "a.txt" in shown[0]
     assert "b.txt" in shown[1]
@@ -380,7 +423,7 @@ def test_parallel_calls_run_in_order_and_each_gets_result(tmp_path):
     _assert_well_formed(provider.requests[-1]["messages"][1:])
 
 
-def test_rejected_call_in_batch_does_not_block_the_rest(tmp_path):
+def test_rejected_call_in_batch_does_not_block_the_rest(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
     tool = FakeTool()
     batch = tools_turn([("fake_write", {}), ("read_file", {"path": "a.txt"})])
@@ -390,7 +433,7 @@ def test_rejected_call_in_batch_does_not_block_the_rest(tmp_path):
 
     agent.run_turn("x")
     assert tool.runs == 0
-    rejected, read = [m for m in agent.conversation.messages if m.role == "function"]
+    rejected, read = _function_messages(agent)
     assert rejected.content == REJECTED_NOTE
     assert rejected.call_id == "c1"
     assert "AAA" in read.content
@@ -398,7 +441,7 @@ def test_rejected_call_in_batch_does_not_block_the_rest(tmp_path):
     _assert_well_formed(agent.conversation.messages)
 
 
-def test_guard_stop_mid_batch_closes_remaining_calls(tmp_path):
+def test_guard_stop_mid_batch_closes_remaining_calls(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
     batch = tools_turn(
         [
@@ -415,32 +458,34 @@ def test_guard_stop_mid_batch_closes_remaining_calls(tmp_path):
 
     assert agent.run_turn("x") == "итог"
     assert events.stats[-1].stop_reason == "tool_failures"
-    results = [m for m in agent.conversation.messages if m.role == "function"][1:]
-    assert [r.call_id for r in results] == ["c1", "c2", "c3"]
-    assert [r.content for r in results[1:]] == [SKIPPED_NOTE] * 2  # не выполнялись
+    replies = _function_messages(agent)[1:]
+    assert [reply.call_id for reply in replies] == ["c1", "c2", "c3"]
+    # не выполнялись
+    assert [reply.content for reply in replies[1:]] == [SKIPPED_NOTE, SKIPPED_NOTE]
     _assert_well_formed(agent.conversation.messages)
     _assert_well_formed(provider.requests[-1]["messages"][1:])
 
 
-def test_guard_stop_before_a_call_mid_batch_closes_remaining_calls(tmp_path):
+def test_guard_stop_before_a_call_mid_batch_closes_remaining_calls(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
     (tmp_path / "b.txt").write_text("BBB", encoding="utf-8")
-    batch = tools_turn([("read_file", {"path": "a.txt"})] * 4 + [("read_file", {"path": "b.txt"})])
+    read_a = ("read_file", {"path": "a.txt"})
+    batch = tools_turn([*repeat(read_a, 4), ("read_file", {"path": "b.txt"})])
     provider = ScriptedProvider([batch, text_turn("итог")])
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
 
     assert agent.run_turn("x") == "итог"
     assert events.stats[-1].stop_reason == "tool_repeats"
-    results = [m for m in agent.conversation.messages if m.role == "function"]
-    assert [r.call_id for r in results] == ["c1", "c2", "c3", "c4", "c5"]
-    assert [r.content for r in results[3:]] == [LOOP_STOP_NOTE, SKIPPED_NOTE]
+    replies = _function_messages(agent)
+    assert [reply.call_id for reply in replies] == ["c1", "c2", "c3", "c4", "c5"]
+    assert [reply.content for reply in replies[3:]] == [LOOP_STOP_NOTE, SKIPPED_NOTE]
     _assert_well_formed(agent.conversation.messages)
     _assert_well_formed(provider.requests[-1]["messages"][1:])
 
 
-def test_ctrl_c_mid_batch_closes_all_remaining_calls(tmp_path):
-    def interrupted():
+def test_ctrl_c_mid_batch_closes_all_remaining_calls(tmp_path: Path) -> None:
+    def interrupted() -> NoReturn:
         raise KeyboardInterrupt
 
     (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
@@ -451,8 +496,8 @@ def test_ctrl_c_mid_batch_closes_all_remaining_calls(tmp_path):
 
     with pytest.raises(KeyboardInterrupt):
         agent.run_turn("x")
-    results = [m for m in agent.conversation.messages if m.role == "function"]
-    assert [(r.call_id, r.content) for r in results] == [
+    replies = _function_messages(agent)
+    assert [(reply.call_id, reply.content) for reply in replies] == [
         ("c1", INTERRUPTED_NOTE),
         ("c2", INTERRUPTED_NOTE),
     ]
@@ -460,18 +505,19 @@ def test_ctrl_c_mid_batch_closes_all_remaining_calls(tmp_path):
     _assert_well_formed(provider.requests[-1]["messages"][1:])
 
 
-def test_set_model_is_passed_to_provider(tmp_path):
+def test_set_model_is_passed_to_provider(tmp_path: Path) -> None:
     provider = ScriptedProvider([text_turn("a"), text_turn("b")])
     agent = _agent(provider, tmp_path)
     agent.run_turn("1")
     agent.set_model("Alpha-2-Max")
     agent.run_turn("2")
-    assert [r["model"] for r in provider.requests] == [agent._cfg.model, "Alpha-2-Max"]
-    with pytest.raises(ValueError):
+    models = [request["model"] for request in provider.requests]
+    assert models == [agent._cfg.model, "Alpha-2-Max"]
+    with pytest.raises(ValueError, match="Имя модели не может быть пустым"):
         agent.set_model("  ")
 
 
-def test_reset_rebuilds_system_prompt(tmp_path):
+def test_reset_rebuilds_system_prompt(tmp_path: Path) -> None:
     provider = ScriptedProvider([text_turn("a"), text_turn("b")])
     agent = _agent(provider, tmp_path)
     agent.run_turn("1")
@@ -482,12 +528,10 @@ def test_reset_rebuilds_system_prompt(tmp_path):
     system = provider.requests[-1]["messages"][0]
     assert system.role == "system"
     assert "new_file.py" in system.content
-    assert [m.role for m in provider.requests[-1]["messages"]] == ["system", "user"]
+    assert [message.role for message in provider.requests[-1]["messages"]] == ["system", "user"]
 
 
-def test_reset_with_saved_conversation_continues_it(tmp_path):
-    from gigacrew.agent.conversation import Conversation
-
+def test_reset_with_saved_conversation_continues_it(tmp_path: Path) -> None:
     saved = Conversation()
     saved.add_user("старый запрос")
     saved.add_assistant(
@@ -500,7 +544,7 @@ def test_reset_with_saved_conversation_continues_it(tmp_path):
     assert agent.conversation is saved
     assert agent.context_tokens == 7_005
     agent.run_turn("дальше")
-    roles = [(m.role, m.content) for m in provider.requests[-1]["messages"][1:]]
+    roles = [(message.role, message.content) for message in provider.requests[-1]["messages"][1:]]
     assert roles == [
         ("user", "старый запрос"),
         ("assistant", "старый ответ"),
@@ -508,15 +552,16 @@ def test_reset_with_saved_conversation_continues_it(tmp_path):
     ]
 
 
-def test_constructor_has_no_filesystem_side_effects(tmp_path, monkeypatch):
-    from gigacrew.agent import loop
-
-    def boom(_ws):
+def test_constructor_has_no_filesystem_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(_ws: object) -> NoReturn:
         raise AssertionError("системный промпт собран в конструкторе")
 
-    monkeypatch.setattr(loop, "build_project_context", boom)
+    monkeypatch.setattr("gigacrew.agent.loop.build_project_context", boom)
     parent = _agent(ScriptedProvider(), tmp_path)  # не падает
-    loop.Agent(  # суб-агент — тоже
+    Agent(  # суб-агент — тоже
         parent.provider,
         build_default_registry(),
         parent.config,
@@ -525,7 +570,7 @@ def test_constructor_has_no_filesystem_side_effects(tmp_path, monkeypatch):
     )
 
 
-def test_long_turn_keeps_current_task_in_context(tmp_path):
+def test_long_turn_keeps_current_task_in_context(tmp_path: Path) -> None:
     (tmp_path / "big.txt").write_text("y" * 5000, encoding="utf-8")
     steps = [tool_turn("read_file", {"path": "big.txt"}) for _ in range(6)] + [text_turn("ок")]
     provider = ScriptedProvider(steps)
@@ -533,15 +578,13 @@ def test_long_turn_keeps_current_task_in_context(tmp_path):
     agent = _agent(provider, tmp_path, context_budget_tokens=4000, auto_compact=False)
     agent.run_turn("ТЕКУЩАЯ ЗАДАЧА")
     for request in provider.requests:
-        contents = [m.content for m in request["messages"] if m.role == "user"]
-        assert contents == ["ТЕКУЩАЯ ЗАДАЧА"]
+        user_texts = [message.content for message in request["messages"] if message.role == "user"]
+        assert user_texts == ["ТЕКУЩАЯ ЗАДАЧА"]
         _assert_well_formed(request["messages"])
     assert len(provider.requests[-1]["messages"]) < len(agent.conversation) + 1
 
 
-def test_empty_conversation_instance_is_used(tmp_path):
-    from gigacrew.agent.conversation import Conversation
-
+def test_empty_conversation_instance_is_used(tmp_path: Path) -> None:
     conv = Conversation()  # пустой — ложен по __len__
     cfg = Config(access_key="x", project_root=tmp_path, stream=False)
     agent = Agent(
@@ -556,13 +599,13 @@ def test_empty_conversation_instance_is_used(tmp_path):
 
 
 # ------------------------- события для индикаторов ------------------------- #
-def _kinds(events) -> list[str]:
-    return [k for k, _ in events.events]
+def _kinds(events: RecordingEvents) -> list[str]:
+    return [kind for kind, _ in events.events]
 
 
 @pytest.mark.parametrize("error", [None, ToolError("нельзя"), ValueError("сбой")])
-def test_tool_start_end_bracket_run(tmp_path, error):
-    def run():
+def test_tool_start_end_bracket_run(tmp_path: Path, error: Exception | None) -> None:
+    def run() -> ToolResult:
         if error is not None:
             raise error
         return ToolResult(content="ok", summary="ok")
@@ -576,8 +619,8 @@ def test_tool_start_end_bracket_run(tmp_path, error):
     assert kinds[start : start + 3] == ["tool_start", "tool_end", "tool_result"]
 
 
-def test_tool_end_called_on_ctrl_c(tmp_path):
-    def interrupted():
+def test_tool_end_called_on_ctrl_c(tmp_path: Path) -> None:
+    def interrupted() -> NoReturn:
         raise KeyboardInterrupt
 
     tool = FakeTool(run=interrupted)
@@ -596,25 +639,38 @@ def test_tool_end_called_on_ctrl_c(tmp_path):
 class _InterruptAfterRun(RecordingEvents):
     """Ctrl+C/Esc (асинхронный SIGINT) приходит, когда инструмент уже отработал."""
 
-    def __init__(self, at: str):
+    def __init__(self, at: str) -> None:
         super().__init__()
         self.at = at
 
-    def on_tool_end(self, call):
+    @override
+    def on_tool_end(self, call: ToolCallInfo) -> None:
         super().on_tool_end(call)
         if self.at == "tool_end":
             raise KeyboardInterrupt
 
-    def on_tool_result(self, call, result, *, previewed):
-        super().on_tool_result(call, result, previewed=previewed)
+    @override
+    def on_tool_result(
+        self,
+        call: ToolCallInfo,
+        tool_result: ToolResult,
+        *,
+        previewed: bool,
+    ) -> None:
+        super().on_tool_result(call, tool_result, previewed=previewed)
         if self.at == "tool_result":
             raise KeyboardInterrupt
 
 
-@pytest.mark.parametrize("at", ["tool_end", "tool_result"])
-def test_interrupt_after_tool_ran_keeps_its_result(tmp_path, at):
-    from gigacrew.agent.decisions import DecisionMemory
+def _journal(memory: DecisionMemory) -> list[str]:
+    """Строки журнала решений (память загружена с диска — журнал ведётся)."""
+    journal_path = memory.journal_path
+    assert journal_path is not None
+    return journal_path.read_text().splitlines()
 
+
+@pytest.mark.parametrize("at", ["tool_end", "tool_result"])
+def test_interrupt_after_tool_ran_keeps_its_result(tmp_path: Path, at: str) -> None:
     script = _script(tmp_path)
     memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
     events = _InterruptAfterRun(at)
@@ -624,21 +680,22 @@ def test_interrupt_after_tool_ran_keeps_its_result(tmp_path, at):
     with pytest.raises(KeyboardInterrupt):
         agent.run_turn("x")
     # действие совершено: модель видит результат, а не «прервано, результата нет»
-    [result] = _function_results(agent)
-    assert "built" in result
-    assert result != INTERRUPTED_NOTE
-    lines = [json.loads(line) for line in memory.journal_path.read_text().splitlines()]
-    assert [x["event"] for x in lines] == ["decision", "outcome"]
+    outputs = _function_results(agent)
+    assert len(outputs) == 1
+    assert "built" in outputs[0]
+    assert outputs[0] != INTERRUPTED_NOTE
+    lines = [json.loads(line) for line in _journal(memory)]
+    assert [entry["event"] for entry in lines] == ["decision", "outcome"]
     assert lines[1]["ok"] is True
     assert "interrupted" not in lines[1]
     _assert_well_formed(agent.conversation.messages)
 
 
-def test_interrupt_during_tool_run_is_journaled_as_interrupted(tmp_path, monkeypatch):
-    from gigacrew.agent.decisions import DecisionMemory
-    from gigacrew.tools.shell import RunShellTool
-
-    def interrupted(self, params, ctx):
+def test_interrupt_during_tool_run_is_journaled_as_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupted(self: RunShellTool, params: RunShellParams, ctx: ToolContext) -> NoReturn:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(RunShellTool, "run", interrupted)
@@ -649,12 +706,12 @@ def test_interrupt_during_tool_run_is_journaled_as_interrupted(tmp_path, monkeyp
     with pytest.raises(KeyboardInterrupt):
         agent.run_turn("x")
     assert _function_results(agent) == [INTERRUPTED_NOTE]
-    outcome = json.loads(memory.journal_path.read_text().splitlines()[-1])
+    outcome = json.loads(_journal(memory)[-1])
     assert outcome["event"] == "outcome"
     assert outcome["interrupted"] is True
 
 
-def test_rejected_tool_is_not_started(tmp_path):
+def test_rejected_tool_is_not_started(tmp_path: Path) -> None:
     tool = FakeTool()
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
@@ -668,15 +725,13 @@ def test_rejected_tool_is_not_started(tmp_path):
     assert "tool_start" not in _kinds(events)
 
 
-def test_non_stream_mode_signals_waiting(tmp_path):
+def test_non_stream_mode_signals_waiting(tmp_path: Path) -> None:
     events = RecordingEvents()
     _agent(ScriptedProvider([text_turn("ответ")]), tmp_path, events=events).run_turn("x")
     assert _kinds(events) == ["stream_start", "stream_end", "text"]
 
 
-def test_non_stream_error_still_ends_waiting(tmp_path):
-    from gigacrew.llm.base import LLMError
-
+def test_non_stream_error_still_ends_waiting(tmp_path: Path) -> None:
     events = RecordingEvents()
     agent = _agent(ScriptedProvider([LLMError("сеть")]), tmp_path, events=events)
     with pytest.raises(LLMError):
@@ -684,7 +739,7 @@ def test_non_stream_error_still_ends_waiting(tmp_path):
     assert _kinds(events) == ["stream_start", "stream_end"]
 
 
-def test_session_counters(tmp_path):
+def test_session_counters(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             text_turn("a", Usage(prompt_tokens=7_000, completion_tokens=10)),
@@ -707,9 +762,7 @@ def test_session_counters(tmp_path):
     assert agent.context_budget > 0
 
 
-def test_ask_user_reaches_ui_and_model(tmp_path):
-    from gigacrew.tools.questions import Answer
-
+def test_ask_user_reaches_ui_and_model(tmp_path: Path) -> None:
     question = {
         "question": "Какой формат?",
         "options": [{"label": "JSON"}, {"label": "YAML", "description": "читаемее"}],
@@ -720,7 +773,8 @@ def test_ask_user_reaches_ui_and_model(tmp_path):
     events = RecordingEvents(answers=[Answer(("YAML",))])
     agent = _agent(provider, tmp_path, events=events, auto_approve=False)
     assert agent.run_turn("сохрани конфиг") == "Сделаю YAML"
-    assert events.questions[0][0].options[1].description == "читаемее"
+    asked = events.questions[0][0]
+    assert asked.options[1].description == "читаемее"
     assert events.confirms == []  # вопрос — не изменяющая операция
     sent = provider.requests[-1]["messages"][-1]
     assert sent.role == "function"
@@ -729,9 +783,7 @@ def test_ask_user_reaches_ui_and_model(tmp_path):
     assert kinds[kinds.index("tool_start") + 1] == "tool_end"
 
 
-def test_ask_user_without_ui_tells_model(tmp_path):
-    from gigacrew.agent.events import AgentEvents
-
+def test_ask_user_without_ui_tells_model(tmp_path: Path) -> None:
     question = {"question": "Да?", "options": [{"label": "да"}, {"label": "нет"}]}
     provider = ScriptedProvider(
         [tool_turn("ask_user", {"questions": [question]}), text_turn("решу сам")],
@@ -739,30 +791,35 @@ def test_ask_user_without_ui_tells_model(tmp_path):
     cfg = Config(access_key="x", project_root=tmp_path, stream=False)
     agent = Agent(provider, build_default_registry(), cfg, AgentEvents())
     assert agent.run_turn("x") == "решу сам"
-    assert "Нельзя задать вопрос" in provider.requests[-1]["messages"][-1].content
+    assert "Нельзя задать вопрос" in _tails(provider)[-1]
 
 
 # ------------------------------ окно контекста ------------------------------ #
-def _probe(model: str, window: int):
-    from gigacrew.llm.context_probe import ProbeResult
+def _probe(model: str, window: int) -> ProbeResult:
+    return ProbeResult(
+        model,
+        window,
+        window + 1000,
+        capped=False,
+        probes=5,
+        billed_tokens=window,
+    )
 
-    return ProbeResult(model, window, window + 1000, False, 5, window)
 
-
-def test_context_budget_follows_model_window(tmp_path):
-    from gigacrew.agent.context_window import DEFAULT_CONTEXT_WINDOW, budget_for_window
-    from gigacrew.llm.model_windows import ModelWindows
-
+def test_context_budget_follows_model_window(tmp_path: Path) -> None:
     windows = ModelWindows()
     windows.record(_probe("big", 128_000))
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="small")
     agent = Agent(ScriptedProvider(), build_default_registry(), cfg, windows=windows)
     assert agent.windows is windows
-    assert agent.context_window is None
+    unknown_window = agent.context_window
+    assert unknown_window is None
     assert agent.context_budget == budget_for_window(DEFAULT_CONTEXT_WINDOW)
     agent.set_model("big")
     assert agent.context_window == 128_000
-    assert agent.context_budget == budget_for_window(128_000) < 128_000 - 8_000
+    big_budget = budget_for_window(128_000)
+    assert agent.context_budget == big_budget
+    assert big_budget < 128_000 - 8_000
 
     explicit = Config(access_key="x", project_root=tmp_path, context_budget_tokens=5_000)
     agent = Agent(ScriptedProvider(), build_default_registry(), explicit, windows=windows)
@@ -770,14 +827,13 @@ def test_context_budget_follows_model_window(tmp_path):
     assert agent.context_budget == 5_000
 
 
-def test_request_budget_includes_tool_schemas(tmp_path):
-    from gigacrew.agent.conversation import Conversation
-    from gigacrew.llm.types import Message, ToolSpec
-
+def test_request_budget_includes_tool_schemas(tmp_path: Path) -> None:
     conv = Conversation()
-    for i in range(20):
-        conv.add_user(f"вопрос {i} " + "x" * 1500)
-        conv.add_assistant(Message(role="assistant", content=f"ответ {i} " + "y" * 1500))
+    question_tail = "x" * 1500
+    answer_tail = "y" * 1500
+    for index in range(20):
+        conv.add_user(f"вопрос {index} {question_tail}")
+        conv.add_assistant(Message(role="assistant", content=f"ответ {index} {answer_tail}"))
     agent = _agent(ScriptedProvider(), tmp_path, context_budget_tokens=12_000)
     agent.reset(conv)
     heavy = [ToolSpec(name="t", description="d" * 15_000, parameters={})]  # ~5000 токенов
@@ -788,11 +844,11 @@ def test_request_budget_includes_tool_schemas(tmp_path):
 
 
 # ----------------------------- режимы разрешений ----------------------------- #
-def _system_prompts(provider) -> list[str]:
+def _system_prompts(provider: ScriptedProvider) -> list[str]:
     return [request["messages"][0].content for request in provider.requests]
 
 
-def test_plan_mode_blocks_edits_without_asking(tmp_path):
+def test_plan_mode_blocks_edits_without_asking(tmp_path: Path) -> None:
     tool = FakeTool(kind=ToolKind.EDIT)
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=True)
@@ -811,7 +867,7 @@ def test_plan_mode_blocks_edits_without_asking(tmp_path):
     assert _function_results(agent)[-1] == PLAN_BLOCKED_NOTE.format(path=agent._plan_display())
 
 
-def test_plan_mode_blocks_even_with_auto_approve(tmp_path):
+def test_plan_mode_blocks_even_with_auto_approve(tmp_path: Path) -> None:
     tool = FakeTool(kind=ToolKind.EDIT)
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     agent = _agent(provider, tmp_path, registry=_registry_with(tool), mode=PermissionMode.PLAN)
@@ -819,7 +875,7 @@ def test_plan_mode_blocks_even_with_auto_approve(tmp_path):
     assert tool.runs == 0
 
 
-def test_plan_mode_asks_for_commands(tmp_path):
+def test_plan_mode_asks_for_commands(tmp_path: Path) -> None:
     tool = FakeTool(kind=ToolKind.COMMAND)
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=True)
@@ -836,8 +892,10 @@ def test_plan_mode_asks_for_commands(tmp_path):
     assert len(events.confirms) == 1
 
 
-def test_plan_mode_stops_model_that_keeps_editing(tmp_path):
-    edits = [tool_turn("write_file", {"path": f"f{i}.txt", "content": "x"}) for i in range(10)]
+def test_plan_mode_stops_model_that_keeps_editing(tmp_path: Path) -> None:
+    edits = [
+        tool_turn("write_file", {"path": f"f{index}.txt", "content": "x"}) for index in range(10)
+    ]
     provider = ScriptedProvider(edits)
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, mode=PermissionMode.PLAN)
@@ -846,7 +904,7 @@ def test_plan_mode_stops_model_that_keeps_editing(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_auto_mode_applies_edits_without_asking(tmp_path):
+def test_auto_mode_applies_edits_without_asking(tmp_path: Path) -> None:
     tool = FakeTool(kind=ToolKind.EDIT)
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
@@ -864,7 +922,7 @@ def test_auto_mode_applies_edits_without_asking(tmp_path):
 
 
 @pytest.mark.parametrize("kind", [ToolKind.COMMAND, ToolKind.OTHER])
-def test_auto_mode_still_asks_for_the_rest(tmp_path, kind):
+def test_auto_mode_still_asks_for_the_rest(tmp_path: Path, kind: ToolKind) -> None:
     # команда без вердикта классификатора рецензенту не отдаётся
     tool = FakeTool(kind=kind)
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
@@ -882,7 +940,7 @@ def test_auto_mode_still_asks_for_the_rest(tmp_path, kind):
     assert len(events.confirms) == 1
 
 
-def test_plan_rules_are_sent_only_in_plan_mode(tmp_path):
+def test_plan_rules_are_sent_only_in_plan_mode(tmp_path: Path) -> None:
     # «OK» — ответ на самопроверку: ход в режиме плана кончился текстом
     provider = ScriptedProvider([text_turn("план"), text_turn("OK"), text_turn("готово")])
     agent = _agent(provider, tmp_path, mode=PermissionMode.PLAN)
@@ -895,9 +953,10 @@ def test_plan_rules_are_sent_only_in_plan_mode(tmp_path):
     assert "# Plan mode" not in auto
 
 
-def test_mode_survives_reset_and_cycles(tmp_path):
+def test_mode_survives_reset_and_cycles(tmp_path: Path) -> None:
     agent = _agent(ScriptedProvider(), tmp_path)
-    assert agent.mode is PermissionMode.AUTO
+    initial_mode = agent.mode
+    assert initial_mode is PermissionMode.AUTO
     assert agent.cycle_mode() is PermissionMode.PLAN
     agent.reset()
     assert agent.mode is PermissionMode.PLAN
@@ -907,13 +966,24 @@ def test_mode_survives_reset_and_cycles(tmp_path):
 PLAN_REL = ".gigacode/plans/chat1.md"
 
 
-def _planning_agent(provider, tmp_path, events=None) -> Agent:
+def _planning_agent(
+    provider: LLMProvider,
+    tmp_path: Path,
+    events: AgentEvents | None = None,
+) -> Agent:
     agent = _agent(provider, tmp_path, events=events, auto_approve=False, mode=PermissionMode.PLAN)
     agent.chat_id = "chat1"
     return agent
 
 
-def test_approved_plan_switches_mode_within_the_turn(tmp_path):
+def _plan_dirty(agent: Agent) -> bool:
+    """План записан, но ещё не показан пользователю (у основного агента план есть)."""
+    plan = agent._plan
+    assert plan is not None
+    return plan.dirty
+
+
+def test_approved_plan_switches_mode_within_the_turn(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План\n1. создать a.txt"}),
@@ -928,17 +998,20 @@ def test_approved_plan_switches_mode_within_the_turn(tmp_path):
     assert agent.mode is PermissionMode.AUTO
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
     assert events.confirms == []  # ни план в режиме плана, ни правка после одобрения
-    (question,) = events.questions[0]
-    assert question.body.startswith("# План\n1. создать a.txt")
+    asked = events.questions[0]
+    assert len(asked) == 1
+    assert asked[0].body.startswith("# План\n1. создать a.txt")
     # правила плана (с путём файла плана) — только до одобрения
     prompts = _system_prompts(provider)
-    assert ["# Plan mode" in p for p in prompts] == [True, True, False, False]
+    assert ["# Plan mode" in prompt for prompt in prompts] == [True, True, False, False]
     assert PLAN_REL in prompts[0]
 
 
-def test_plan_mode_reminder_goes_with_every_request(tmp_path):
-    """Правила режима плана — не только в системном промпте: короткое напоминание с путём
-    файла плана — в хвосте каждого запроса (модели теряют правила к концу хода).
+def test_plan_mode_reminder_goes_with_every_request(tmp_path: Path) -> None:
+    """Правила режима плана — не только в системном промпте.
+
+    Короткое напоминание с путём файла плана — в хвосте каждого запроса (модели теряют
+    правила к концу хода).
     """
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
     provider = ScriptedProvider(
@@ -954,12 +1027,13 @@ def test_plan_mode_reminder_goes_with_every_request(tmp_path):
     agent = _planning_agent(provider, tmp_path, events)
     agent.run_turn("спланируй и сделай")
     reminder = PLAN_REMINDER_NOTE.format(path=PLAN_REL)
-    tails = [r["messages"][-1].content for r in provider.requests]
+    tails = _tails(provider)
     assert [reminder in tail for tail in tails] == [True, True, True, False, False]
     assert tails[0].startswith("спланируй и сделай")
     assert "<system-reminder>" in tails[0]
-    assert all(reminder not in r["messages"][0].content for r in provider.requests)
-    assert all(reminder not in m.content for m in agent.conversation.messages)  # не в истории
+    assert all(reminder not in prompt for prompt in _system_prompts(provider))
+    # не в истории
+    assert all(reminder not in message.content for message in agent.conversation.messages)
 
 
 @pytest.mark.parametrize(
@@ -967,9 +1041,14 @@ def test_plan_mode_reminder_goes_with_every_request(tmp_path):
     [None, QuestionsUnavailableError("нет терминала")],
     ids=["esc", "no_approver"],
 )
-def test_no_plan_reminder_after_the_plan_was_shown(tmp_path, answer):
-    """План показан — что дальше, говорит исход показа («перескажи суть», «дождись
-    указаний»); напоминание «план — не текстом ответа» ему бы противоречило.
+def test_no_plan_reminder_after_the_plan_was_shown(
+    tmp_path: Path,
+    answer: QuestionsUnavailableError | None,
+) -> None:
+    """План показан — что дальше, говорит исход показа.
+
+    Исход — «перескажи суть», «дождись указаний»; напоминание «план — не текстом ответа»
+    ему бы противоречило.
     """
     provider = ScriptedProvider(
         [
@@ -984,7 +1063,7 @@ def test_no_plan_reminder_after_the_plan_was_shown(tmp_path, answer):
     assert [reminder in tail for tail in _tails(provider)] == [True, True, False]
 
 
-def test_plan_mode_allows_only_the_plan_file(tmp_path):
+def test_plan_mode_allows_only_the_plan_file(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": "a.txt", "content": "x"}),
@@ -997,25 +1076,28 @@ def test_plan_mode_allows_only_the_plan_file(tmp_path):
     events = RecordingEvents(answers=None)
     agent = _planning_agent(provider, tmp_path, events)
     agent.run_turn("спланируй")
-    results = _function_results(agent)
+    outputs = _function_results(agent)
     blocked = PLAN_BLOCKED_NOTE.format(path=PLAN_REL)  # отказ называет файл плана
-    assert results[0] == blocked
-    assert results[1] == blocked  # чужой план — обычная правка
+    assert outputs[0] == blocked
+    assert outputs[1] == blocked  # чужой план — обычная правка
     assert (tmp_path / PLAN_REL).read_text(encoding="utf-8") == "# План"
     assert not (tmp_path / "a.txt").exists()
     assert events.confirms == []
 
 
 class _PlanAnswers(RecordingEvents):
-    """Ответы на вопросы по очереди: ``None`` — отказ (Esc), исключение — бросается
-    (``QuestionsUnavailableError`` — спросить некого).
+    """Ответы на вопросы по очереди.
+
+    ``None`` — отказ (Esc), исключение — бросается (``QuestionsUnavailableError`` —
+    спросить некого).
     """
 
-    def __init__(self, *answers):
+    def __init__(self, *answers: list[Answer] | BaseException | None) -> None:
         super().__init__(confirm_answer=False)
         self._queue = list(answers)
 
-    def ask_user(self, questions):
+    @override
+    def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
         self.questions.append(list(questions))
         answer = self._queue.pop(0) if self._queue else None
         if isinstance(answer, BaseException):
@@ -1023,11 +1105,15 @@ class _PlanAnswers(RecordingEvents):
         return answer
 
 
-def _user_messages(agent) -> list[tuple[str, bool]]:
-    return [(m.content, m.meta) for m in agent.conversation.messages if m.role == "user"]
+def _user_messages(agent: Agent) -> list[tuple[str, bool]]:
+    return [
+        (message.content, message.meta)
+        for message in agent.conversation.messages
+        if message.role == "user"
+    ]
 
 
-def test_plan_left_in_text_is_shown_and_approved(tmp_path):
+def test_plan_left_in_text_is_shown_and_approved(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План\n1. создать a.txt"}),
@@ -1041,8 +1127,9 @@ def test_plan_left_in_text_is_shown_and_approved(tmp_path):
     assert agent.run_turn("спланируй и сделай") == "готово"
     assert agent.mode is PermissionMode.AUTO
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
-    (question,) = events.questions[0]
-    assert question.body.startswith("# План\n1. создать a.txt")
+    asked = events.questions[0]
+    assert len(asked) == 1
+    assert asked[0].body.startswith("# План\n1. создать a.txt")
     # ответ модели остался в истории, за ним — служебное сообщение с решением пользователя
     request = provider.requests[2]["messages"]
     assert request[-2].role == "assistant"
@@ -1060,7 +1147,7 @@ def test_plan_left_in_text_is_shown_and_approved(tmp_path):
     assert any(text.startswith("план одобрен") for text in notices)
 
 
-def test_plan_left_in_text_with_remarks_is_revised_and_shown_again(tmp_path):
+def test_plan_left_in_text_with_remarks_is_revised_and_shown_again(tmp_path: Path) -> None:
     fix = {"path": PLAN_REL, "old_string": "1. код", "new_string": "1. код\n2. тесты"}
     provider = ScriptedProvider(
         [
@@ -1088,13 +1175,13 @@ def test_plan_left_in_text_with_remarks_is_revised_and_shown_again(tmp_path):
 FAILURES_MARK = "One more failed call will stop"
 
 
-def _tails(provider) -> list[str]:
-    return [r["messages"][-1].content for r in provider.requests]
+def _tails(provider: ScriptedProvider) -> list[str]:
+    return [request["messages"][-1].content for request in provider.requests]
 
 
-def test_failure_warning_survives_cut_retry(tmp_path):
+def test_failure_warning_survives_cut_retry(tmp_path: Path) -> None:
     """Ответ на запрос с предупреждением оборван — повтор запроса тоже с предупреждением."""
-    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(3)]
+    bad = [tool_turn("read_file", {"path": f"nope{attempt}.txt"}) for attempt in range(3)]
     provider = ScriptedProvider(
         [*bad, cut_turn("частичный"), tool_turn("read_file", {"path": "nope9.txt"})],
     )
@@ -1108,8 +1195,8 @@ def test_failure_warning_survives_cut_retry(tmp_path):
     assert len(warned) == 1  # пользователю — один раз
 
 
-def test_failure_warning_goes_with_plan_self_check(tmp_path):
-    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(3)]
+def test_failure_warning_goes_with_plan_self_check(tmp_path: Path) -> None:
+    bad = [tool_turn("read_file", {"path": f"nope{attempt}.txt"}) for attempt in range(3)]
     provider = ScriptedProvider(
         [*bad, text_turn("ответ"), tool_turn("read_file", {"path": "nope9.txt"}), text_turn("x")],
     )
@@ -1121,11 +1208,11 @@ def test_failure_warning_goes_with_plan_self_check(tmp_path):
     assert FAILURES_MARK in tails[4]
 
 
-def test_failures_crossing_the_limit_in_one_batch_are_warned_first(tmp_path):
+def test_failures_crossing_the_limit_in_one_batch_are_warned_first(tmp_path: Path) -> None:
     """Пачка вызовов перешла предел — модель сначала предупреждается, стоп — после."""
 
-    def batch(*paths):
-        return tools_turn([("read_file", {"path": p}) for p in paths])
+    def batch(*paths: str) -> AssistantTurn:
+        return tools_turn([("read_file", {"path": path}) for path in paths])
 
     provider = ScriptedProvider([batch("n1", "n2"), batch("n3", "n4"), batch("n5"), text_turn("x")])
     events = RecordingEvents()
@@ -1138,22 +1225,23 @@ def test_failures_crossing_the_limit_in_one_batch_are_warned_first(tmp_path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="симлинки")
 @pytest.mark.parametrize("variant", ["data", "dir", "file"])
-def test_plan_argument_is_not_written_through_a_link(tmp_path, variant):
-    """exit_plan_mode(plan=...) не пишет через ссылку на месте файла или папки плана:
-    запись шла бы мимо проверки риска write_file — в файл проекта без вопроса.
+def test_plan_argument_is_not_written_through_a_link(tmp_path: Path, variant: str) -> None:
+    """exit_plan_mode(plan=...) не пишет через ссылку на месте файла или папки плана.
+
+    Запись шла бы мимо проверки риска write_file — в файл проекта без вопроса.
     """
     (tmp_path / "src").mkdir()
-    data = tmp_path / ".gigacode"
+    service_dir = tmp_path / ".gigacode"
     if variant == "data":  # служебная папка — ссылка в каталог проекта
-        Path(data).symlink_to("src")
+        Path(service_dir).symlink_to("src")
         target = tmp_path / "src" / "plans" / "chat1.md"
     elif variant == "dir":
-        data.mkdir()
-        Path(data / "plans").symlink_to("../src")
+        service_dir.mkdir()
+        Path(service_dir / "plans").symlink_to("../src")
         target = tmp_path / "src" / "chat1.md"
     else:
-        (data / "plans").mkdir(parents=True)
-        Path(data / "plans" / "chat1.md").symlink_to("../../conftest.py")
+        (service_dir / "plans").mkdir(parents=True)
+        Path(service_dir / "plans" / "chat1.md").symlink_to("../../conftest.py")
         target = tmp_path / "conftest.py"
     provider = ScriptedProvider(
         [tool_turn("exit_plan_mode", {"plan": "import os  # x"}), text_turn("ok")],
@@ -1166,9 +1254,11 @@ def test_plan_argument_is_not_written_through_a_link(tmp_path, variant):
     assert "символическая ссылка" in _function_results(agent)[-1]
 
 
-def test_plan_edited_after_approval_does_not_hide_the_next_plan(tmp_path):
-    """Отметки в плане после одобрения (режим «авто») — не новый план: в новом цикле
-    планирования план из аргумента не теряется молча, старый план не показывается.
+def test_plan_edited_after_approval_does_not_hide_the_next_plan(tmp_path: Path) -> None:
+    """Отметки в плане после одобрения (режим «авто») — не новый план.
+
+    В новом цикле планирования план из аргумента не теряется молча, старый план не
+    показывается.
     """
     (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
     provider = ScriptedProvider(
@@ -1190,21 +1280,27 @@ def test_plan_edited_after_approval_does_not_hide_the_next_plan(tmp_path):
     agent.run_turn("спланируй и сделай A")
     # правка плана в режиме «авто» — не план, ждущий показа
     assert agent.mode is PermissionMode.AUTO
-    assert not agent._plan.dirty
+    assert not _plan_dirty(agent)
     agent.set_mode(PermissionMode.PLAN)
     agent.run_turn("теперь спланируй B")
     assert len(events.questions) == 1  # план A второй раз не показан
-    result = _function_results(agent)[-1]
-    assert "не менялся" in result
-    assert PLAN_REL in result
+    output = _function_results(agent)[-1]
+    assert "не менялся" in output
+    assert PLAN_REL in output
 
 
-def test_plan_written_in_this_cycle_survives_mode_toggle(tmp_path):
+def test_plan_written_in_this_cycle_survives_mode_toggle(tmp_path: Path) -> None:
     """Shift+Tab дважды посреди хода (план → авто → план) не теряет записанный план."""
-    holder: dict = {}
+    holder: dict[str, Agent] = {}
 
     class Toggle(ScriptedProvider):
-        def complete(self, messages, tools=None, **kwargs):
+        @override
+        def complete(
+            self,
+            messages: Sequence[Message],
+            tools: Sequence[ToolSpec] | None = None,
+            **kwargs: Any,
+        ) -> AssistantTurn:
             if tools is not None and len(self.requests) == 1:
                 holder["agent"].cycle_mode()
                 holder["agent"].cycle_mode()
@@ -1221,14 +1317,19 @@ def test_plan_written_in_this_cycle_survives_mode_toggle(tmp_path):
     holder["agent"] = agent
     agent.run_turn("спланируй")
     assert agent.mode is PermissionMode.PLAN
-    assert [q[0].body for q in events.questions] == ["# План C"]  # показан сам
+    assert [asked[0].body for asked in events.questions] == ["# План C"]  # показан сам
 
 
-def test_plan_revised_many_times_is_not_a_loop(tmp_path):
+def test_plan_revised_many_times_is_not_a_loop(tmp_path: Path) -> None:
     """Правка плана между показами — изменение: exit_plan_mode после неё — не повтор."""
-    rounds = []
-    for i in range(4):
-        fix = {"path": PLAN_REL, "old_string": f"{i}.", "new_string": f"{i}.\n{i + 1}."}
+    rounds: list[AssistantTurn] = []
+    for point in range(4):
+        next_point = point + 1
+        fix = {
+            "path": PLAN_REL,
+            "old_string": f"{point}.",
+            "new_string": f"{point}.\n{next_point}.",
+        }
         rounds += [tool_turn("exit_plan_mode", {}), tool_turn("edit_file", fix)]
     provider = ScriptedProvider(
         [
@@ -1238,16 +1339,16 @@ def test_plan_revised_many_times_is_not_a_loop(tmp_path):
             text_turn("жду"),
         ],
     )
-    remarks = [Answer((), custom=f"замечание {i}") for i in range(4)]
+    remarks = [Answer((), custom=f"замечание {number}") for number in range(4)]
     events = _PlanAnswers(*remarks, None)
     agent = _planning_agent(provider, tmp_path, events)
     assert agent.run_turn("спланируй") == "жду"
     assert len(events.questions) == 5
     assert events.stats[-1].stop_reason is None
-    assert not any("WARNING" in r for r in _function_results(agent))
+    assert not any("WARNING" in output for output in _function_results(agent))
 
 
-def test_unchanged_plan_shown_again_and_again_is_a_loop(tmp_path):
+def test_unchanged_plan_shown_again_and_again_is_a_loop(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
@@ -1266,7 +1367,10 @@ def test_unchanged_plan_shown_again_and_again_is_a_loop(tmp_path):
     [None, QuestionsUnavailableError("нет терминала")],
     ids=["esc", "no_approver"],
 )
-def test_plan_left_in_text_ends_the_turn_when_not_approved(tmp_path, answer):
+def test_plan_left_in_text_ends_the_turn_when_not_approved(
+    tmp_path: Path,
+    answer: QuestionsUnavailableError | None,
+) -> None:
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
@@ -1281,18 +1385,13 @@ def test_plan_left_in_text_ends_the_turn_when_not_approved(tmp_path, answer):
     assert events.stats[-1].self_checks == 0
     assert agent.conversation.messages[-1].content == "Вот план"
     assert agent.mode is PermissionMode.PLAN
-    assert not agent._plan.dirty
+    assert not _plan_dirty(agent)
     if answer is not None:  # одобрить некому — пользователь узнаёт, где план
         assert any(PLAN_REL in text for _, text in events.notices)
 
 
-def test_plan_declined_with_esc_skips_stop_hooks(tmp_path):
+def test_plan_declined_with_esc_skips_stop_hooks(tmp_path: Path) -> None:
     # Esc на показанном плане — пользователь остановил ход: хук Stop не возвращает к работе.
-    from test_agent_hooks import FakeHooks
-
-    from gigacrew.agent.hooks import HookResult
-    from gigacrew.project.settings import HookEvent
-
     hooks = FakeHooks({HookEvent.STOP: HookResult(blocked=True, reason="ещё")})
     provider = ScriptedProvider(
         [
@@ -1309,7 +1408,7 @@ def test_plan_declined_with_esc_skips_stop_hooks(tmp_path):
     assert provider.calls == 2
 
 
-def test_cut_reply_in_plan_mode_is_retried_not_self_checked(tmp_path):
+def test_cut_reply_in_plan_mode_is_retried_not_self_checked(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             cut_turn("Сейчас запишу план", "length"),
@@ -1321,10 +1420,10 @@ def test_cut_reply_in_plan_mode_is_retried_not_self_checked(tmp_path):
     agent = _planning_agent(provider, tmp_path, events)
     assert agent.run_turn("спланируй") == "Вот план"
     assert (events.stats[-1].cut_retries, events.stats[-1].self_checks) == (1, 0)
-    assert "# Reply cut off" in provider.requests[1]["messages"][-1].content
+    assert "# Reply cut off" in _tails(provider)[1]
 
 
-def test_empty_plan_file_is_not_shown(tmp_path):
+def test_empty_plan_file_is_not_shown(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [tool_turn("write_file", {"path": PLAN_REL, "content": " "}), text_turn("Вот план")],
     )
@@ -1332,11 +1431,11 @@ def test_empty_plan_file_is_not_shown(tmp_path):
     agent = _planning_agent(provider, tmp_path, events)
     assert agent.run_turn("спланируй") == "Вот план"
     assert events.questions == []
-    assert not agent._plan.dirty
+    assert not _plan_dirty(agent)
     assert events.notices[-1][0] == "warn"
 
 
-def test_promise_to_write_the_plan_gets_self_check(tmp_path):
+def test_promise_to_write_the_plan_gets_self_check(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
     provider = ScriptedProvider(
         [
@@ -1363,7 +1462,7 @@ def test_promise_to_write_the_plan_gets_self_check(tmp_path):
     _assert_well_formed(agent.conversation.messages)
 
 
-def test_answer_in_plan_mode_survives_self_check(tmp_path):
+def test_answer_in_plan_mode_survives_self_check(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             text_turn("foo считает сумму", Usage(prompt_tokens=7_000, completion_tokens=50)),
@@ -1376,9 +1475,9 @@ def test_answer_in_plan_mode_survives_self_check(tmp_path):
     assert agent.run_turn("что делает foo?") == "foo считает сумму"
     assert len(provider.requests) == 2
     # в истории нет ни служебного сообщения, ни «OK»
-    contents = [m.content for m in agent.conversation.messages]
-    assert contents == ["что делает foo?", "foo считает сумму"]
-    shown = [value for kind, value in events.events if kind in {"delta", "text"}]
+    history = [message.content for message in agent.conversation.messages]
+    assert history == ["что делает foo?", "foo считает сумму"]
+    shown = [payload for kind, payload in events.events if kind in {"delta", "text"}]
     assert shown == ["foo считает сумму"]  # ответ на самопроверку не показан
     stats = events.stats[-1]
     assert stats.self_checks == 1
@@ -1386,7 +1485,7 @@ def test_answer_in_plan_mode_survives_self_check(tmp_path):
     assert stats.context_tokens == agent.context_tokens == 7_050  # без служебного обмена
 
 
-def test_self_check_reply_with_calls_is_shown(tmp_path):
+def test_self_check_reply_with_calls_is_shown(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             text_turn("Сейчас запишу план."),
@@ -1400,11 +1499,11 @@ def test_self_check_reply_with_calls_is_shown(tmp_path):
     agent = Agent(provider, build_default_registry(), cfg, events)
     agent.chat_id = "chat1"
     assert agent.run_turn("спланируй") == "Жду."
-    shown = [(kind, value) for kind, value in events.events if kind in {"delta", "text"}]
+    shown = [(kind, payload) for kind, payload in events.events if kind in {"delta", "text"}]
     assert shown == [("delta", "Сейчас запишу план."), ("text", "Пишу."), ("delta", "Жду.")]
 
 
-def test_self_check_happens_once_per_turn(tmp_path):
+def test_self_check_happens_once_per_turn(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
     provider = ScriptedProvider(
         [
@@ -1421,7 +1520,7 @@ def test_self_check_happens_once_per_turn(tmp_path):
     assert events.stats[-1].self_checks == 1
 
 
-def test_self_check_follows_answered_question(tmp_path):
+def test_self_check_follows_answered_question(tmp_path: Path) -> None:
     options = [{"label": "SQLite"}, {"label": "Postgres"}]
     provider = ScriptedProvider(
         [
@@ -1444,7 +1543,7 @@ def test_self_check_follows_answered_question(tmp_path):
     [LLMError("сбой сети"), KeyboardInterrupt()],
     ids=["llm_error", "interrupt"],
 )
-def test_failed_self_check_leaves_the_answer(tmp_path, error):
+def test_failed_self_check_leaves_the_answer(tmp_path: Path, error: BaseException) -> None:
     provider = ScriptedProvider([text_turn("ответ"), error])
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, mode=PermissionMode.PLAN)
@@ -1455,10 +1554,10 @@ def test_failed_self_check_leaves_the_answer(tmp_path, error):
     else:
         with pytest.raises(KeyboardInterrupt):
             agent.run_turn("вопрос")
-    assert [m.content for m in agent.conversation.messages] == ["вопрос", "ответ"]
+    assert [message.content for message in agent.conversation.messages] == ["вопрос", "ответ"]
 
 
-def test_cut_self_check_reply_is_retried(tmp_path):
+def test_cut_self_check_reply_is_retried(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             text_turn("Сейчас запишу план."),
@@ -1482,7 +1581,7 @@ def test_cut_self_check_reply_is_retried(tmp_path):
 
 
 @pytest.mark.parametrize("mode", [PermissionMode.AUTO])
-def test_no_self_check_outside_plan_mode(tmp_path, mode):
+def test_no_self_check_outside_plan_mode(tmp_path: Path, mode: PermissionMode) -> None:
     provider = ScriptedProvider([text_turn("ответ на вопрос")])
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, mode=mode)
@@ -1491,7 +1590,7 @@ def test_no_self_check_outside_plan_mode(tmp_path, mode):
     assert events.stats[-1].self_checks == 0
 
 
-def test_no_self_check_after_plan_was_shown(tmp_path):
+def test_no_self_check_after_plan_was_shown(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
@@ -1504,13 +1603,13 @@ def test_no_self_check_after_plan_was_shown(tmp_path):
     assert len(provider.requests) == 3
 
 
-def test_chat_id_names_the_plan_file(tmp_path):
+def test_chat_id_names_the_plan_file(tmp_path: Path) -> None:
     agent = _agent(ScriptedProvider(), tmp_path)
     agent.chat_id = "a1"
     assert agent.plan_path == tmp_path.resolve() / ".gigacode" / "plans" / "a1.md"
     agent.reset(chat_id="b2")
     assert agent.chat_id == "b2"
-    assert agent.plan_path.name == "b2.md"
+    assert _plan_path(agent).name == "b2.md"
     agent.reset()
     assert agent.chat_id not in {"a1", "b2"}
 
@@ -1518,24 +1617,35 @@ def test_chat_id_names_the_plan_file(tmp_path):
 needs_flock = pytest.mark.skipif(os.name != "posix", reason="блокировка плана — через flock")
 
 
-def _resumed_planner(tmp_path, turns, events=None) -> Agent:
+def _resumed_planner(
+    tmp_path: Path,
+    turns: Iterable[AssistantTurn | BaseException],
+    events: AgentEvents | None = None,
+) -> Agent:
     """Сессия, продолжившая чат chat1 (как `gigacrew -c`): пишет план в режиме плана."""
     agent = _agent(ScriptedProvider(turns), tmp_path, events=events, mode=PermissionMode.PLAN)
     agent.reset(chat_id="chat1")
     return agent
 
 
+def _plan_path(agent: Agent) -> Path:
+    """Файл плана основного агента (у суб-агента его нет)."""
+    plan_path = agent.plan_path
+    assert plan_path is not None
+    return plan_path
+
+
 @needs_flock
-def test_two_sessions_of_one_chat_do_not_clobber_the_plan(tmp_path):
+def test_two_sessions_of_one_chat_do_not_clobber_the_plan(tmp_path: Path) -> None:
     plans = tmp_path / ".gigacode" / "plans"
     plans.mkdir(parents=True)
     (plans / "chat1.md").write_text("# План чата", encoding="utf-8")
-    a = _resumed_planner(
+    session_a = _resumed_planner(
         tmp_path,
         [tool_turn("write_file", {"path": PLAN_REL, "content": "# План A"}), text_turn("A")],
     )
     events = RecordingEvents()
-    b = _resumed_planner(
+    session_b = _resumed_planner(
         tmp_path,
         [
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План B"}),
@@ -1543,57 +1653,58 @@ def test_two_sessions_of_one_chat_do_not_clobber_the_plan(tmp_path):
         ],
         events,
     )
-    a.run_turn("план")
-    b.run_turn("план")
+    session_a.run_turn("план")
+    session_b.run_turn("план")
     # Файл плана чата пишет A; запись B не прошла, а его план переехал в новый файл
     # с планом, каким B видел его при продолжении чата.
     assert (plans / "chat1.md").read_text(encoding="utf-8") == "# План A"
-    assert b.plan_path != a.plan_path
-    assert b.plan_path.parent == plans.resolve()
-    assert b.plan_path.read_text(encoding="utf-8") == "# План чата"
-    moved = b.plan_path.relative_to(tmp_path.resolve()).as_posix()
-    assert moved in _function_results(b)[0]
-    assert PLAN_REL in _function_results(b)[0]
+    assert session_b.plan_path != session_a.plan_path
+    assert _plan_path(session_b).parent == plans.resolve()
+    assert _plan_path(session_b).read_text(encoding="utf-8") == "# План чата"
+    moved = _plan_path(session_b).relative_to(tmp_path.resolve()).as_posix()
+    assert moved in _function_results(session_b)[0]
+    assert PLAN_REL in _function_results(session_b)[0]
     assert any(level == "warn" and moved in text for level, text in events.notices)
-    assert b.chat_id == "chat1"  # чат тот же: id для хуков и журнала не меняется
+    assert session_b.chat_id == "chat1"  # чат тот же: id для хуков и журнала не меняется
     # Запись в новый файл плана — без помех.
-    b._provider = ScriptedProvider(
+    session_b._provider = ScriptedProvider(
         [tool_turn("write_file", {"path": moved, "content": "# План B"}), text_turn("B")],
     )
-    b.run_turn("ещё раз")
-    assert b.plan_path.read_text(encoding="utf-8") == "# План B"
+    session_b.run_turn("ещё раз")
+    assert _plan_path(session_b).read_text(encoding="utf-8") == "# План B"
     assert (plans / "chat1.md").read_text(encoding="utf-8") == "# План A"
 
 
 @needs_flock
-def test_plan_follows_the_chat_forked_by_the_recorder(tmp_path):
-    a = _resumed_planner(
+def test_plan_follows_the_chat_forked_by_the_recorder(tmp_path: Path) -> None:
+    session_a = _resumed_planner(
         tmp_path,
         [tool_turn("write_file", {"path": PLAN_REL, "content": "# План A"}), text_turn("A")],
     )
-    a.run_turn("план")
-    a.continue_as("chat2")  # другая сессия изменила файл чата — запись ушла в новый чат
-    assert a.chat_id == "chat2"
-    assert a.plan_path.name == "chat2.md"
-    assert a.plan_path.read_text(encoding="utf-8") == "# План A"
+    session_a.run_turn("план")
+    # другая сессия изменила файл чата — запись ушла в новый чат
+    session_a.continue_as("chat2")
+    assert session_a.chat_id == "chat2"
+    assert _plan_path(session_a).name == "chat2.md"
+    assert _plan_path(session_a).read_text(encoding="utf-8") == "# План A"
     # Прежний файл плана свободен: его продолжает другая сессия.
-    b = _resumed_planner(
+    session_b = _resumed_planner(
         tmp_path,
         [tool_turn("write_file", {"path": PLAN_REL, "content": "# План B"}), text_turn("B")],
     )
-    b.run_turn("план")
-    assert b.plan_path.name == "chat1.md"
-    assert b.plan_path.read_text(encoding="utf-8") == "# План B"
+    session_b.run_turn("план")
+    assert _plan_path(session_b).name == "chat1.md"
+    assert _plan_path(session_b).read_text(encoding="utf-8") == "# План B"
 
 
 # ------------------------------ рассуждения ------------------------------ #
-def _thinking(turn, reasoning: str):
+def _thinking(turn: AssistantTurn, reasoning: str) -> AssistantTurn:
     turn.message.reasoning = reasoning
     return turn
 
 
 @pytest.mark.parametrize("mode", ["off", "turn"])
-def test_reasoning_is_returned_only_within_the_turn(tmp_path, mode):
+def test_reasoning_is_returned_only_within_the_turn(tmp_path: Path, mode: str) -> None:
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
     provider = ScriptedProvider(
         [
@@ -1605,12 +1716,13 @@ def test_reasoning_is_returned_only_within_the_turn(tmp_path, mode):
     agent = _agent(provider, tmp_path, reasoning=mode)
     agent.run_turn("что в f.txt?")
     second = provider.requests[1]["messages"]
-    call = next(m for m in second if m.function_calls)
-    assert call.reasoning == ("прочитаю f.txt" if mode == "turn" else "")
+    call = next(message for message in second if message.function_calls)
+    expected_reasoning = "прочитаю f.txt" if mode == "turn" else ""
+    assert call.reasoning == expected_reasoning
     agent.run_turn("повтори")
     # следующий запрос пользователя — рассуждения прошлого хода модели больше не нужны
-    assert all(not m.reasoning for m in provider.requests[2]["messages"])
-    assert all(not m.reasoning for m in agent.conversation.messages)
+    assert all(not message.reasoning for message in provider.requests[2]["messages"])
+    assert all(not message.reasoning for message in agent.conversation.messages)
 
 
 # ------------------------------ сжатие контекста ------------------------------ #
@@ -1618,10 +1730,10 @@ def _big_tool() -> FakeTool:
     return FakeTool(run=lambda: ToolResult(content="z" * 3000, summary="ok"))  # ~1000 токенов
 
 
-def test_auto_compaction_summarizes_old_steps_and_keeps_task(tmp_path):
-    from gigacrew.agent.prompts import COMPACT_PROMPT, SUMMARY_HEADER
-
-    steps = [tool_turn("fake_write", {"path": str(i)}) for i in range(4)] + [text_turn("готово")]
+def test_auto_compaction_summarizes_old_steps_and_keeps_task(tmp_path: Path) -> None:
+    steps = [tool_turn("fake_write", {"path": str(step)}) for step in range(4)] + [
+        text_turn("готово"),
+    ]
     provider = ScriptedProvider(
         steps,
         summaries=[text_turn("СВОДКА", Usage(prompt_tokens=500, completion_tokens=50))],
@@ -1637,18 +1749,19 @@ def test_auto_compaction_summarizes_old_steps_and_keeps_task(tmp_path):
     )
     assert agent.run_turn("ЗАДАЧА") == "готово"
 
-    (summary_request,) = provider.summary_requests
-    system, user = summary_request["messages"]
+    assert len(provider.summary_requests) == 1
+    system, user = provider.summary_requests[0]["messages"]
     assert system.content == COMPACT_PROMPT
     assert "ЗАДАЧА" in user.content
-    (result,) = events.compactions
-    assert result.auto
-    assert result.after_tokens < result.before_tokens
+    assert len(events.compactions) == 1
+    compaction = events.compactions[0]
+    assert compaction.auto
+    assert compaction.after_tokens < compaction.before_tokens
     assert ("compact_start", True) in events.events
 
     # После сжатия: резюме — в системном сообщении, задача — дословно, история короче.
     for request in provider.requests:
-        users = [m.content for m in request["messages"] if m.role == "user"]
+        users = [message.content for message in request["messages"] if message.role == "user"]
         assert users == ["ЗАДАЧА"]
         _assert_well_formed(request["messages"])
     last = provider.requests[-1]["messages"]
@@ -1660,10 +1773,10 @@ def test_auto_compaction_summarizes_old_steps_and_keeps_task(tmp_path):
     assert agent.billed_tokens == 550
 
 
-def test_auto_compaction_failure_warns_and_turn_continues(tmp_path):
-    from gigacrew.llm.base import LLMError
-
-    steps = [tool_turn("fake_write", {"path": str(i)}) for i in range(5)] + [text_turn("готово")]
+def test_auto_compaction_failure_warns_and_turn_continues(tmp_path: Path) -> None:
+    steps = [tool_turn("fake_write", {"path": str(step)}) for step in range(5)] + [
+        text_turn("готово"),
+    ]
     provider = ScriptedProvider(steps, summaries=[LLMError("сеть упала")])
     events = RecordingEvents()
     agent = _agent(
@@ -1680,8 +1793,10 @@ def test_auto_compaction_failure_warns_and_turn_continues(tmp_path):
     assert agent.conversation.summary is None
 
 
-def test_auto_compaction_can_be_disabled(tmp_path):
-    steps = [tool_turn("fake_write", {"path": str(i)}) for i in range(4)] + [text_turn("готово")]
+def test_auto_compaction_can_be_disabled(tmp_path: Path) -> None:
+    steps = [tool_turn("fake_write", {"path": str(step)}) for step in range(4)] + [
+        text_turn("готово"),
+    ]
     provider = ScriptedProvider(steps)
     agent = _agent(
         provider,
@@ -1695,16 +1810,14 @@ def test_auto_compaction_can_be_disabled(tmp_path):
     assert agent.conversation.summary is None
 
 
-def test_threshold_ignores_system_prompt_and_tool_schemas(tmp_path):
-    from gigacrew.agent.conversation import Conversation
-    from gigacrew.llm.types import Message
-
+def test_threshold_ignores_system_prompt_and_tool_schemas(tmp_path: Path) -> None:
     # Бюджет 4000 почти целиком занят системным промптом и схемами: доля считается
     # от остатка под историю, а не от всего бюджета — иначе сжатие на каждом шаге.
     conv = Conversation()
-    for i in range(10):
-        conv.add_user(f"вопрос {i}")
-        conv.add_assistant(Message(role="assistant", content=f"ответ {i} " + "y" * 100))
+    answer_tail = "y" * 100
+    for index in range(10):
+        conv.add_user(f"вопрос {index}")
+        conv.add_assistant(Message(role="assistant", content=f"ответ {index} {answer_tail}"))
     provider = ScriptedProvider([text_turn("ок")])
     agent = _agent(provider, tmp_path, context_budget_tokens=4_000)
     agent.reset(conv)
@@ -1712,8 +1825,8 @@ def test_threshold_ignores_system_prompt_and_tool_schemas(tmp_path):
     assert provider.summary_requests == []
 
 
-def test_interrupted_compaction_leaves_conversation_intact(tmp_path):
-    steps = [tool_turn("fake_write", {"path": str(i)}) for i in range(4)]
+def test_interrupted_compaction_leaves_conversation_intact(tmp_path: Path) -> None:
+    steps = [tool_turn("fake_write", {"path": str(step)}) for step in range(4)]
     provider = ScriptedProvider(steps, summaries=[KeyboardInterrupt()])
     events = RecordingEvents()
     agent = _agent(
@@ -1730,9 +1843,7 @@ def test_interrupted_compaction_leaves_conversation_intact(tmp_path):
     assert events.compactions == [None]
 
 
-def test_manual_compact_folds_whole_dialog(tmp_path):
-    from gigacrew.agent.prompts import SUMMARY_HEADER
-
+def test_manual_compact_folds_whole_dialog(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             text_turn("ответ 1", Usage(prompt_tokens=9_000, completion_tokens=10)),
@@ -1744,32 +1855,36 @@ def test_manual_compact_folds_whole_dialog(tmp_path):
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
     assert agent.compact() is None  # пустой диалог — сжимать нечего
-    agent.run_turn("вопрос 1 " + "x" * 600)
-    agent.run_turn("вопрос 2 " + "x" * 600)
+    long_tail = "x" * 600
+    agent.run_turn(f"вопрос 1 {long_tail}")
+    agent.run_turn(f"вопрос 2 {long_tail}")
     billed = agent.billed_tokens
 
-    result = agent.compact("сохрани имена файлов")
-    assert result is not None
-    assert not result.auto
-    assert result.messages == 4
-    assert "сохрани имена файлов" in provider.summary_requests[0]["messages"][1].content
-    assert agent.conversation.summary.upto == 4
+    compaction = agent.compact("сохрани имена файлов")
+    assert compaction is not None
+    assert not compaction.auto
+    assert compaction.messages == 4
+    summary_prompt = provider.summary_requests[0]["messages"][1]
+    assert "сохрани имена файлов" in summary_prompt.content
+    summary = agent.conversation.summary
+    assert summary is not None
+    assert summary.upto == 4
     assert agent.conversation.context_messages() == []
     # Оценка вместо устаревшего размера контекста (9 510) до следующего запроса.
-    assert agent.context_tokens == result.after_tokens < result.before_tokens < 9_510
+    assert agent.context_tokens == compaction.after_tokens
+    assert compaction.after_tokens < compaction.before_tokens
+    assert compaction.before_tokens < 9_510
     assert agent.billed_tokens == billed + 320
     assert agent.compact() is None  # нового с прошлого сжатия нет
 
     agent.run_turn("дальше")
     sent = provider.requests[-1]["messages"]
-    assert [(m.role, m.content) for m in sent[1:]] == [("user", "дальше")]
+    assert [(message.role, message.content) for message in sent[1:]] == [("user", "дальше")]
     assert SUMMARY_HEADER in sent[0].content
     assert "СВОДКА" in sent[0].content
 
 
-def test_compaction_that_does_not_shrink_is_rejected(tmp_path):
-    from gigacrew.agent.compaction import CompactionError
-
+def test_compaction_that_does_not_shrink_is_rejected(tmp_path: Path) -> None:
     provider = ScriptedProvider([text_turn("да")], summaries=[text_turn("многословно " * 500)])
     agent = _agent(provider, tmp_path)
     agent.run_turn("да?")
@@ -1779,9 +1894,7 @@ def test_compaction_that_does_not_shrink_is_rejected(tmp_path):
 
 
 # ------------------------- инструкции подкаталогов ------------------------- #
-def test_subdirectory_instructions_join_system_message(tmp_path):
-    from gigacrew.agent.prompts import NESTED_HEADER
-
+def test_subdirectory_instructions_join_system_message(tmp_path: Path) -> None:
     (tmp_path / "api").mkdir()
     (tmp_path / "api" / "AGENTS.md").write_text("В api только async-код.", encoding="utf-8")
     (tmp_path / "api" / "views.py").write_text("x = 1\n", encoding="utf-8")
@@ -1798,25 +1911,24 @@ def test_subdirectory_instructions_join_system_message(tmp_path):
     agent = _agent(provider, tmp_path, events=events, auto_approve=False)
     agent.run_turn("посмотри api")
 
-    systems = [r["messages"][0].content for r in provider.requests]
+    systems = _system_prompts(provider)
     assert [NESTED_HEADER in text for text in systems] == [False, False, True, True]
     assert "В api только async-код." in systems[-1]
     assert [text for _, text in events.notices] == [
         "подключены инструкции подкаталога: api/AGENTS.md",
     ]
     # Результат инструмента не дублирует инструкции — они в системном сообщении.
-    assert all("async-код" not in m.content for m in agent.conversation.messages)
+    assert all("async-код" not in message.content for message in agent.conversation.messages)
 
     agent.reset()  # новый диалог — инструкции подключатся заново при обращении
     agent.run_turn("ещё")
-    assert NESTED_HEADER not in provider.requests[-1]["messages"][0].content
+    assert NESTED_HEADER not in _system_prompts(provider)[-1]
 
 
-def test_resumed_compacted_chat_reports_estimated_context(tmp_path):
-    from gigacrew.agent.conversation import Conversation, Summary
-
+def test_resumed_compacted_chat_reports_estimated_context(tmp_path: Path) -> None:
     saved = Conversation()
-    saved.add_user("вопрос " + "x" * 3_000)
+    long_tail = "x" * 3_000
+    saved.add_user(f"вопрос {long_tail}")
     saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=9_000))
     saved.set_summary(Summary("СВОДКА", 2))  # чат сохранён после /compact
     agent = _agent(ScriptedProvider(), tmp_path)
@@ -1827,8 +1939,8 @@ def test_resumed_compacted_chat_reports_estimated_context(tmp_path):
 
 
 # --------------------------- итог при остановке --------------------------- #
-def test_stop_by_guard_asks_model_for_summary(tmp_path):
-    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(4)]
+def test_stop_by_guard_asks_model_for_summary(tmp_path: Path) -> None:
+    bad = [tool_turn("read_file", {"path": f"nope{attempt}.txt"}) for attempt in range(4)]
     summary = "Не нашёл файлов nope*.txt. Проверьте путь — дальше могу поискать по шаблону."
     provider = ScriptedProvider([*bad, text_turn(summary)])
     events = RecordingEvents()
@@ -1843,29 +1955,27 @@ def test_stop_by_guard_asks_model_for_summary(tmp_path):
     _assert_well_formed(agent.conversation.messages)
 
 
-def test_max_steps_summary_and_no_tool_execution(tmp_path):
+def test_max_steps_summary_and_no_tool_execution(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("x", encoding="utf-8")
     read = tool_turn("read_file", {"path": "f.txt"})
     provider = ScriptedProvider([read, text_turn("Прочитал f.txt, дальше — правка.")])
     agent = _agent(provider, tmp_path, max_steps=1)
     assert agent.run_turn("x") == "Прочитал f.txt, дальше — правка."
-    assert agent.last_turn.stop_reason == "max_steps"
+    last_turn = agent.last_turn
+    assert last_turn is not None
+    assert last_turn.stop_reason == "max_steps"
     assert len(_function_results(agent)) == 1
 
 
-def test_summary_failure_keeps_guard_message(tmp_path):
-    from gigacrew.llm.base import LLMError
-
-    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(2)]
+def test_summary_failure_keeps_guard_message(tmp_path: Path) -> None:
+    bad = [tool_turn("read_file", {"path": f"nope{attempt}.txt"}) for attempt in range(2)]
     provider = ScriptedProvider([*bad, LLMError("сеть")])
     agent = _agent(provider, tmp_path, max_tool_failures=2)
     assert "Прервано: 2 неудачных вызовов" in agent.run_turn("x")
 
 
 # --------------------------- калибровка оценки --------------------------- #
-def test_token_estimate_is_calibrated_by_usage(tmp_path):
-    from gigacrew.llm.model_windows import ModelWindows
-
+def test_token_estimate_is_calibrated_by_usage(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         # Размеры правдоподобны: реальных токенов меньше оценки в 2+ раза, затем больше.
         [text_turn("a", Usage(prompt_tokens=2_500)), text_turn("b", Usage(prompt_tokens=10**6))],
@@ -1876,25 +1986,25 @@ def test_token_estimate_is_calibrated_by_usage(tmp_path):
     specs = build_default_registry().specs()
     budget, history = agent.context_budget, agent._history_budget(specs)
     agent.run_turn("x")  # реальных токенов меньше оценки — бюджет в оценке растёт
-    assert agent.token_scale == 0.5
+    assert agent.token_scale == pytest.approx(0.5)
     assert agent.context_budget == budget  # статус-строка — в реальных токенах, как раньше
     assert agent._history_budget(specs) > history * 1.5
     agent.run_turn("y")  # больше оценки — бюджет сразу сжимается
-    assert agent.token_scale == 1.5
+    assert agent.token_scale == pytest.approx(1.5)
 
 
-def test_explicit_budget_is_not_scaled(tmp_path):
+def test_explicit_budget_is_not_scaled(tmp_path: Path) -> None:
     provider = ScriptedProvider([text_turn("a", Usage(prompt_tokens=2_500))])
     agent = _agent(provider, tmp_path, context_budget_tokens=20_000)
     agent.run_turn("x")
     assert agent._estimate_budget() == 20_000
     # Статус-строка сравнивает реальные токены с бюджетом в тех же единицах.
-    assert agent.token_scale == 0.5
+    assert agent.token_scale == pytest.approx(0.5)
     assert agent.context_budget == 10_000
 
 
 # --------------------------- счётчик контекста --------------------------- #
-def test_context_counts_cached_part_of_prompt(tmp_path):
+def test_context_counts_cached_part_of_prompt(tmp_path: Path) -> None:
     """API не включил закешированную часть в prompt_tokens: контекст — их сумма."""
     usage = Usage(prompt_tokens=300, precached_prompt_tokens=8_000, completion_tokens=50)
     events = RecordingEvents()
@@ -1905,7 +2015,7 @@ def test_context_counts_cached_part_of_prompt(tmp_path):
     assert agent.billed_tokens == 350  # оплата — как сообщил API
 
 
-def test_context_without_prompt_usage_falls_back_to_estimate(tmp_path):
+def test_context_without_prompt_usage_falls_back_to_estimate(tmp_path: Path) -> None:
     """Usage без размера запроса не обнуляет контекст и не сдвигает калибровку."""
     provider = ScriptedProvider(
         [
@@ -1923,9 +2033,7 @@ def test_context_without_prompt_usage_falls_back_to_estimate(tmp_path):
         assert agent.token_scale == scale
 
 
-def test_context_after_model_switch_is_estimated(tmp_path):
-    from gigacrew.llm.model_windows import ModelWindows
-
+def test_context_after_model_switch_is_estimated(tmp_path: Path) -> None:
     provider = ScriptedProvider([text_turn("a", Usage(prompt_tokens=20_000, completion_tokens=5))])
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="A")
     windows = ModelWindows(entries={"A": {"context_window": 40_000}})
@@ -1939,9 +2047,7 @@ def test_context_after_model_switch_is_estimated(tmp_path):
     assert agent.context_tokens == 20_005
 
 
-def test_resumed_chat_usage_belongs_to_its_model(tmp_path):
-    from gigacrew.agent.conversation import Conversation
-
+def test_resumed_chat_usage_belongs_to_its_model(tmp_path: Path) -> None:
     saved = Conversation()
     saved.add_user("вопрос")
     # usage заметно больше оценки (системный промпт + схемы инструментов, ~7k)
@@ -1957,9 +2063,7 @@ def test_resumed_chat_usage_belongs_to_its_model(tmp_path):
     assert agent.context_tokens < 10_000  # оценка в токенах модели A
 
 
-def test_resumed_chat_with_implausible_usage_is_estimated(tmp_path):
-    from gigacrew.agent.conversation import Conversation
-
+def test_resumed_chat_with_implausible_usage_is_estimated(tmp_path: Path) -> None:
     saved = Conversation()
     saved.add_user("вопрос")
     saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=300, completion_tokens=5))
@@ -1969,20 +2073,21 @@ def test_resumed_chat_with_implausible_usage_is_estimated(tmp_path):
 
 
 # --------------------------- «мягкие» ошибки команд --------------------------- #
-def test_nonzero_exit_codes_do_not_stop_the_turn(tmp_path):
+def test_nonzero_exit_codes_do_not_stop_the_turn(tmp_path: Path) -> None:
     turns = [tool_turn("run_shell", {"command": f"exit {code}"}) for code in (1, 2, 1, 3, 1)]
     provider = ScriptedProvider([*turns, text_turn("ок")])
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, max_tool_failures=4)
     assert agent.run_turn("x") == "ок"
     assert events.stats[-1].stop_reason is None
-    assert all(not result.ok for _, result, _ in events.results)  # в UI — по-прежнему неуспех
+    # в UI — по-прежнему неуспех
+    assert all(not tool_result.ok for _, tool_result, _ in events.results)
     # и не пугают модель: «ещё одна неудача остановит работу» не появляется
     assert not any("tool calls failed" in tail for tail in _tails(provider))
 
 
-def test_missing_commands_still_count_as_failures(tmp_path):
-    turns = [tool_turn("run_shell", {"command": f"no-such-cmd-{i}"}) for i in range(4)]
+def test_missing_commands_still_count_as_failures(tmp_path: Path) -> None:
+    turns = [tool_turn("run_shell", {"command": f"no-such-cmd-{number}"}) for number in range(4)]
     provider = ScriptedProvider([*turns, text_turn("ок")])
     events = RecordingEvents()
     _agent(provider, tmp_path, events=events, max_tool_failures=4).run_turn("x")
@@ -1991,17 +2096,26 @@ def test_missing_commands_still_count_as_failures(tmp_path):
 
 # --------------------------- прерванный поток --------------------------- #
 class _BrokenStream(ScriptedProvider):
-    def __init__(self, error):
+    def __init__(self, error: BaseException) -> None:
         super().__init__()
         self.error = error
 
-    def stream(self, messages, tools=None, *, on_delta=None, **kwargs):
+    @override
+    def stream(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None = None,
+        *,
+        on_delta: Callable[[str], None] | None = None,
+        **kwargs: Any,
+    ) -> AssistantTurn:
+        assert on_delta is not None
         on_delta("Начинаю: сначала прочитаю")
         raise self.error
 
 
 @pytest.mark.parametrize("error", [KeyboardInterrupt(), RuntimeError("сеть")])
-def test_interrupted_stream_keeps_shown_text(tmp_path, error):
+def test_interrupted_stream_keeps_shown_text(tmp_path: Path, error: BaseException) -> None:
     cfg = Config(access_key="x", project_root=tmp_path, stream=True)
     agent = Agent(_BrokenStream(error), build_default_registry(), cfg, RecordingEvents())
     with pytest.raises(type(error)):
@@ -2013,13 +2127,13 @@ def test_interrupted_stream_keeps_shown_text(tmp_path, error):
     assert note in last.content
 
 
-def test_invalid_call_is_shown_with_tool_line(tmp_path):
+def test_invalid_call_is_shown_with_tool_line(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [tool_turn("read_file", {}), tool_turn("nope", {}), text_turn("ок")],
     )
     events = RecordingEvents()
     _agent(provider, tmp_path, events=events).run_turn("x")
-    kinds = [(kind, getattr(value, "summary", None)) for kind, value in events.events]
+    kinds = [(kind, getattr(payload, "summary", None)) for kind, payload in events.events]
     assert ("tool_call", "(неверные аргументы)") in kinds
     assert ("tool_call", "(неизвестный инструмент)") in kinds
     first_call = kinds.index(("tool_call", "(неверные аргументы)"))
@@ -2028,11 +2142,18 @@ def test_invalid_call_is_shown_with_tool_line(tmp_path):
 
 # --------------------------- «всегда» и -y для опасного --------------------------- #
 class _ApprovingEvents(RecordingEvents):
-    def __init__(self, answers):
+    def __init__(self, answers: Iterable[bool | Approval | ConfirmResult]) -> None:
         super().__init__()
         self._answers = list(answers)
 
-    def confirm(self, call, preview, *, dangerous):
+    @override
+    def confirm(
+        self,
+        call: ToolCallInfo,
+        preview: Display | None,
+        *,
+        dangerous: bool,
+    ) -> bool | Approval | ConfirmResult:
         self.confirms.append((call, preview, dangerous))
         return self._answers.pop(0)
 
@@ -2044,9 +2165,7 @@ def _script(tmp_path: Path, name: str = "build.sh") -> str:
     return f"./{name}"
 
 
-def test_always_for_command_allows_only_the_same_call(tmp_path):
-    from gigacrew.agent.events import Approval
-
+def test_always_for_command_allows_only_the_same_call(tmp_path: Path) -> None:
     script = _script(tmp_path)
     run = tool_turn("run_shell", {"command": f"{script} one"})
     other = tool_turn("run_shell", {"command": f"{script} two"})
@@ -2061,9 +2180,7 @@ def test_always_for_command_allows_only_the_same_call(tmp_path):
     assert any("разрешено сохранённым правилом" in text for _, text in events.notices)
 
 
-def test_always_for_other_tools_lasts_the_session(tmp_path):
-    from gigacrew.agent.events import Approval
-
+def test_always_for_other_tools_lasts_the_session(tmp_path: Path) -> None:
     tool = FakeTool()
     same = tool_turn("fake_write", {"path": "a"})
     other = tool_turn("fake_write", {"path": "b"})
@@ -2083,14 +2200,11 @@ def test_always_for_other_tools_lasts_the_session(tmp_path):
     assert any("больше не требует подтверждения" in text for _, text in events.notices)
 
 
-def test_always_for_unverified_command_is_session_only_and_not_in_plan_mode(tmp_path):
-    from gigacrew.agent.decisions import DecisionMemory
-    from gigacrew.agent.events import Approval
-    from gigacrew.agent.reviewer import Reviewer
-
+def test_always_for_unverified_command_is_session_only_and_not_in_plan_mode(tmp_path: Path) -> None:
     memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
     run = tool_turn("run_shell", {"command": "frobnicate --all > out.txt"})
-    provider = ScriptedProvider([run, text_turn("ок")] * 3)
+    done = text_turn("ок")
+    provider = ScriptedProvider([run, done, run, done, run, done])
     events = _ApprovingEvents([Approval.ALWAYS, Approval.NO])
     cfg = Config(access_key="x", project_root=tmp_path, stream=False)
     agent = Agent(
@@ -2103,7 +2217,7 @@ def test_always_for_unverified_command_is_session_only_and_not_in_plan_mode(tmp_
     )
     agent.run_turn("x")
     # правило по частям не сверить: «всегда» не обещает проекта и не сохраняется
-    assert events.confirms[0][0].remember == ""
+    assert not events.confirms[0][0].remember
     assert memory.rules == []
     agent.run_turn("ещё")
     assert len(events.confirms) == 1  # до конца сессии — без вопроса
@@ -2115,9 +2229,11 @@ def test_always_for_unverified_command_is_session_only_and_not_in_plan_mode(tmp_
     assert not (tmp_path / "out.txt").exists()
 
 
-def test_read_only_commands_run_without_asking(tmp_path):
+def test_read_only_commands_run_without_asking(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("hello\n")
-    calls = [tool_turn("run_shell", {"command": c}) for c in ("ls", "cat a.txt | wc -l")]
+    calls = [
+        tool_turn("run_shell", {"command": command}) for command in ("ls", "cat a.txt | wc -l")
+    ]
     provider = ScriptedProvider([*calls, text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
     agent = _agent(provider, tmp_path, events=events, auto_approve=False)
@@ -2128,7 +2244,7 @@ def test_read_only_commands_run_without_asking(tmp_path):
     assert "1" in outputs[1]
 
 
-def test_safe_commands_can_be_turned_off(tmp_path):
+def test_safe_commands_can_be_turned_off(tmp_path: Path) -> None:
     provider = ScriptedProvider([tool_turn("run_shell", {"command": "ls"}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=True)
     agent = _agent(provider, tmp_path, events=events, auto_approve=False, safe_commands=False)
@@ -2136,9 +2252,7 @@ def test_safe_commands_can_be_turned_off(tmp_path):
     assert len(events.confirms) == 1
 
 
-def test_confirm_shows_reason_and_feedback_reaches_model(tmp_path):
-    from gigacrew.agent.events import Approval, ConfirmResult
-
+def test_confirm_shows_reason_and_feedback_reaches_model(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "pip install requests"}), text_turn("ок")],
     )
@@ -2148,12 +2262,12 @@ def test_confirm_shows_reason_and_feedback_reaches_model(tmp_path):
     call, _, dangerous = events.confirms[0]
     assert "сеть" in call.reason
     assert not dangerous
-    results = _function_results(agent)
-    assert "REJECTED" in results[0]
-    assert "используй uv add" in results[0]
+    outputs = _function_results(agent)
+    assert "REJECTED" in outputs[0]
+    assert "используй uv add" in outputs[0]
 
 
-def test_plan_mode_blocks_changing_commands_even_with_yes(tmp_path):
+def test_plan_mode_blocks_changing_commands_even_with_yes(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "touch new.txt"}), text_turn("ок")],
     )
@@ -2162,7 +2276,7 @@ def test_plan_mode_blocks_changing_commands_even_with_yes(tmp_path):
     assert not (tmp_path / "new.txt").exists()
 
 
-def test_plan_mode_asks_for_unverified_commands_even_with_yes(tmp_path):
+def test_plan_mode_asks_for_unverified_commands_even_with_yes(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "frobnicate --all"}), text_turn("ок")],
     )
@@ -2172,7 +2286,7 @@ def test_plan_mode_asks_for_unverified_commands_even_with_yes(tmp_path):
     assert len(events.confirms) == 1
 
 
-def test_plan_mode_blocks_known_changing_commands(tmp_path):
+def test_plan_mode_blocks_known_changing_commands(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "touch new.txt"}), text_turn("ок")],
     )
@@ -2185,14 +2299,13 @@ def test_plan_mode_blocks_known_changing_commands(tmp_path):
 
 @pytest.mark.parametrize("variant", ["ask", "yes", "hook_allow"])
 @pytest.mark.parametrize("command", ["rm a.txt", "git init -q"])
-def test_plan_mode_blocks_changing_commands_that_are_not_edits(tmp_path, variant, command):
+def test_plan_mode_blocks_changing_commands_that_are_not_edits(
+    tmp_path: Path,
+    variant: str,
+    command: str,
+) -> None:
     # touch/mkdir — правки (kind EDIT), их блокирует decide(); rm и git init — нет: их
     # блокирует уровень WRITE в вердикте, даже с -y и при ответе хука allow.
-    from test_agent_hooks import FakeHooks
-
-    from gigacrew.agent.hooks import HookResult
-    from gigacrew.project.settings import HookEvent
-
     (tmp_path / "a.txt").write_text("x")
     allow = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="allow")})
     events = RecordingEvents(confirm_answer=True)
@@ -2204,8 +2317,8 @@ def test_plan_mode_blocks_changing_commands_that_are_not_edits(tmp_path, variant
         auto_approve=variant == "yes",
     )
     provider = ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")])
-    hooks = {"hooks": allow} if variant == "hook_allow" else {}
-    agent = Agent(provider, build_default_registry(), cfg, events, **hooks)
+    hooks = allow if variant == "hook_allow" else None
+    agent = Agent(provider, build_default_registry(), cfg, events, hooks=hooks)
     agent.chat_id = "chat1"
     agent.run_turn("x")
     assert events.confirms == []
@@ -2214,11 +2327,8 @@ def test_plan_mode_blocks_changing_commands_that_are_not_edits(tmp_path, variant
     assert not (tmp_path / ".git").exists()
 
 
-def test_plan_mode_does_not_apply_saved_rules_for_unverified_commands(tmp_path):
+def test_plan_mode_does_not_apply_saved_rules_for_unverified_commands(tmp_path: Path) -> None:
     # Правило сохранено в «авто»; в плане действуют только правила для того, что не меняет.
-    from gigacrew.agent.decisions import DecisionMemory
-    from gigacrew.safety import classify
-
     memory = DecisionMemory()
     assert memory.approve(classify("frobnicate --all", root=tmp_path))
     provider = ScriptedProvider(
@@ -2230,9 +2340,7 @@ def test_plan_mode_does_not_apply_saved_rules_for_unverified_commands(tmp_path):
     assert len(events.confirms) == 1
 
 
-def test_ui_without_confirm_approves_nothing(tmp_path):
-    from gigacrew.agent.events import AgentEvents, ToolCallInfo
-
+def test_ui_without_confirm_approves_nothing(tmp_path: Path) -> None:
     assert AgentEvents().confirm(ToolCallInfo("x"), None, dangerous=False) is False
     tool = FakeTool()
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
@@ -2243,12 +2351,8 @@ def test_ui_without_confirm_approves_nothing(tmp_path):
     assert _function_results(agent) == [REJECTED_NOTE]
 
 
-def test_unanswered_prompt_is_not_a_rejection(tmp_path):
+def test_unanswered_prompt_is_not_a_rejection(tmp_path: Path) -> None:
     # Ctrl+C или конец ввода на вопросе: в журнале «no_answer», в истории отказов — нет.
-    from gigacrew.agent.decisions import DecisionMemory, history_key
-    from gigacrew.agent.events import Approval, ConfirmResult
-    from gigacrew.safety import classify
-
     script = _script(tmp_path)
     memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
     events = RecordingEvents(confirm_answer=ConfirmResult(Approval.NO, answered=False))
@@ -2258,11 +2362,11 @@ def test_unanswered_prompt_is_not_a_rejection(tmp_path):
     key = history_key(classify(script, root=tmp_path))
     assert memory.history(key) == (0, 0)
     assert not memory.rejected_in_session(key)
-    decision = json.loads(memory.journal_path.read_text().splitlines()[0])
+    decision = json.loads(_journal(memory)[0])
     assert (decision["decision"], decision["source"]) == ("no_answer", "user")
 
 
-def test_ui_learns_whether_a_preview_was_shown(tmp_path):
+def test_ui_learns_whether_a_preview_was_shown(tmp_path: Path) -> None:
     tool = FakeTool(preview=lambda: None)
     batch = tools_turn([("fake_write", {"path": "a"}), ("fake_write", {"path": "b"})])
     provider = ScriptedProvider([batch, text_turn("ок"), batch, text_turn("ок")])
@@ -2280,15 +2384,15 @@ def test_ui_learns_whether_a_preview_was_shown(tmp_path):
     assert [previewed for _, _, previewed in events.results] == [False, False, True, True]
 
 
-def test_failed_changing_call_is_not_marked_changed(tmp_path):
+def test_failed_changing_call_is_not_marked_changed(tmp_path: Path) -> None:
     tool = FakeTool(run=lambda: ToolResult(content="boom", ok=False, summary="boom"))
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
     events = RecordingEvents()
     _agent(provider, tmp_path, events=events, registry=_registry_with(tool)).run_turn("x")
-    assert [result.changed for _, result, _ in events.results] == [False]
+    assert [tool_result.changed for _, tool_result, _ in events.results] == [False]
 
 
-def test_auto_mode_runs_commands_that_only_edit_files(tmp_path):
+def test_auto_mode_runs_commands_that_only_edit_files(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("old\n")
     provider = ScriptedProvider(
         [tool_turn("run_shell", {"command": "sed -i 's/old/new/' a.txt"}), text_turn("ок")],
@@ -2300,10 +2404,7 @@ def test_auto_mode_runs_commands_that_only_edit_files(tmp_path):
     assert (tmp_path / "a.txt").read_text() == "new\n"
 
 
-def test_saved_approval_survives_new_session(tmp_path):
-    from gigacrew.agent.decisions import DecisionMemory
-    from gigacrew.agent.events import Approval
-
+def test_saved_approval_survives_new_session(tmp_path: Path) -> None:
     script = _script(tmp_path)
     home = tmp_path / "home"
     memory, _ = DecisionMemory.load(tmp_path, base=home)
@@ -2331,12 +2432,12 @@ def test_saved_approval_survives_new_session(tmp_path):
         decisions=memory2,
     ).run_turn("x")
     assert events2.confirms == []
-    journal = (memory2.journal_path).read_text().splitlines()
+    journal = _journal(memory2)
     assert any('"decision": "always"' in line for line in journal)
     assert any('"event": "outcome"' in line for line in journal)
 
 
-def test_yes_flag_still_asks_for_dangerous_commands(tmp_path):
+def test_yes_flag_still_asks_for_dangerous_commands(tmp_path: Path) -> None:
     rm = tool_turn("run_shell", {"command": "rm -rf build"})
     provider = ScriptedProvider([rm, text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
@@ -2350,17 +2451,14 @@ def test_yes_flag_still_asks_for_dangerous_commands(tmp_path):
 
 
 class _DangerTool(FakeTool):
-    def risk(self, params, ctx):
-        from gigacrew.security import RiskLevel
-
+    @override
+    def risk(self, params: FakeParams, ctx: ToolContext) -> RiskLevel:
         return RiskLevel.DANGEROUS
 
 
-def test_always_for_dangerous_call_is_a_one_time_yes(tmp_path):
+def test_always_for_dangerous_call_is_a_one_time_yes(tmp_path: Path) -> None:
     # Интерфейс «всегда» для опасного не предлагает; если ответ всё же пришёл — это «да»
     # один раз: вызов выполняется, а модель не слышит, что пользователь отказал.
-    from gigacrew.agent.events import Approval
-
     tool = _DangerTool()
     call = tool_turn("fake_write", {})
     provider = ScriptedProvider([call, text_turn("ок"), call, text_turn("ок")])
@@ -2380,10 +2478,7 @@ def test_always_for_dangerous_call_is_a_one_time_yes(tmp_path):
     assert not any("подтверждения" in text for _, text in events.notices)
 
 
-def test_always_for_dangerous_command_is_never_remembered(tmp_path):
-    from gigacrew.agent.decisions import DecisionMemory
-    from gigacrew.agent.events import Approval
-
+def test_always_for_dangerous_command_is_never_remembered(tmp_path: Path) -> None:
     memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
     rm = tool_turn("run_shell", {"command": "rm -rf build"})
     provider = ScriptedProvider([rm, text_turn("ок"), rm, text_turn("ок")])
@@ -2397,9 +2492,7 @@ def test_always_for_dangerous_command_is_never_remembered(tmp_path):
     assert [dangerous for _, _, dangerous in events.confirms] == [True, True]
     assert memory.rules == []
     decisions = [
-        json.loads(line)["decision"]
-        for line in memory.journal_path.read_text().splitlines()
-        if '"event": "decision"' in line
+        json.loads(line)["decision"] for line in _journal(memory) if '"event": "decision"' in line
     ]
     assert decisions == ["yes", "yes"]
 
@@ -2408,14 +2501,15 @@ def test_always_for_dangerous_command_is_never_remembered(tmp_path):
 UNVERIFIED_TOUCH = "for f in made.txt; do touch $f; done"
 
 
-def test_yes_flag_does_not_vouch_for_unverified_commands(tmp_path):
+def test_yes_flag_does_not_vouch_for_unverified_commands(tmp_path: Path) -> None:
     run = tool_turn("run_shell", {"command": UNVERIFIED_TOUCH})
     provider = ScriptedProvider([run, text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
     _agent(provider, tmp_path, events=events).run_turn("x")  # auto_approve=True
     # как без -y: сначала рецензент (его ответ не разобран), затем пользователь
     assert len(provider.summary_requests) == 1
-    [(call, _, dangerous)] = events.confirms
+    assert len(events.confirms) == 1
+    call, _, dangerous = events.confirms[0]
     assert call.reason.startswith("не удалось проверить:")
     assert not dangerous
     assert not (tmp_path / "made.txt").exists()
@@ -2428,24 +2522,18 @@ def test_yes_flag_does_not_vouch_for_unverified_commands(tmp_path):
     assert (tmp_path / "made.txt").exists()
 
 
-def _ask_hook_later():
-    """Хук PreToolUse: в первом ходе молчит, со второго требует спрашивать (как после
-    ``/hooks reload``).
+def _ask_hook_later() -> FakeHooks:
+    """Хук PreToolUse: в первом ходе молчит, со второго требует спрашивать.
+
+    Как после ``/hooks reload``.
     """
-    from test_agent_hooks import FakeHooks
-
-    from gigacrew.agent.hooks import HookResult
-    from gigacrew.project.settings import HookEvent
-
     return FakeHooks({HookEvent.PRE_TOOL_USE: [HookResult(), HookResult(decision="ask")]})
 
 
 @pytest.mark.parametrize("tool_name", ["run_shell", "fake_write"])
-def test_hook_ask_beats_earlier_always(tmp_path, tool_name):
+def test_hook_ask_beats_earlier_always(tmp_path: Path, tool_name: str) -> None:
     # «всегда» сохранено правилом (команда) или на сессию (прочее) — хук ask всё равно
     # требует вопроса
-    from gigacrew.agent.events import Approval
-
     args = {"command": _script(tmp_path)} if tool_name == "run_shell" else {"path": "a"}
     call = tool_turn(tool_name, args)
     provider = ScriptedProvider([call, text_turn("ок"), call, text_turn("ок")])
@@ -2460,14 +2548,7 @@ def test_hook_ask_beats_earlier_always(tmp_path, tool_name):
     assert "хук PreToolUse требует подтверждения" in events.confirms[1][0].reason
 
 
-def test_always_under_hook_ask_is_not_remembered(tmp_path):
-    from test_agent_hooks import FakeHooks
-
-    from gigacrew.agent.decisions import DecisionMemory
-    from gigacrew.agent.events import Approval
-    from gigacrew.agent.hooks import HookResult
-    from gigacrew.project.settings import HookEvent
-
+def test_always_under_hook_ask_is_not_remembered(tmp_path: Path) -> None:
     memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="ask")})
     run = tool_turn("run_shell", {"command": _script(tmp_path)})
@@ -2485,15 +2566,12 @@ def test_always_under_hook_ask_is_not_remembered(tmp_path):
     assert "built" in _function_results(agent)[0]  # выполнено один раз
     assert memory.rules == []
     assert agent._session_allowed == set()
-    assert not any("без вопросов" in t or "больше не требует" in t for _, t in events.notices)
+    assert not any(
+        "без вопросов" in text or "больше не требует" in text for _, text in events.notices
+    )
 
 
-def test_user_prompt_submit_json_block_stops_the_prompt(tmp_path):
-    import shlex
-
-    from gigacrew.agent.hooks import HookRunner, PromptBlockedError
-    from gigacrew.project.settings import HookCommand, HookEvent, HookGroup, HookSettings
-
+def test_user_prompt_submit_json_block_stops_the_prompt(tmp_path: Path) -> None:
     script = tmp_path / "hook.py"
     script.write_text("import json\nprint(json.dumps({'decision': 'block', 'reason': 'секрет'}))\n")
     command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
@@ -2508,12 +2586,10 @@ def test_user_prompt_submit_json_block_stops_the_prompt(tmp_path):
 
 
 @pytest.mark.parametrize("mode", [PermissionMode.AUTO, PermissionMode.PLAN])
-def test_hook_allow_does_not_vouch_for_unverified_commands(tmp_path, mode):
-    from test_agent_hooks import FakeHooks
-
-    from gigacrew.agent.hooks import HookResult
-    from gigacrew.project.settings import HookEvent
-
+def test_hook_allow_does_not_vouch_for_unverified_commands(
+    tmp_path: Path,
+    mode: PermissionMode,
+) -> None:
     hooks = FakeHooks({HookEvent.PRE_TOOL_USE: HookResult(decision="allow")})
     provider = ScriptedProvider([tool_turn("run_shell", {"command": UNVERIFIED_TOUCH})])
     events = RecordingEvents(confirm_answer=False)
@@ -2524,22 +2600,24 @@ def test_hook_allow_does_not_vouch_for_unverified_commands(tmp_path, mode):
     assert not (tmp_path / "made.txt").exists()
 
 
-def test_over_long_command_is_dangerous_even_with_yes(tmp_path):
+def test_over_long_command_is_dangerous_even_with_yes(tmp_path: Path) -> None:
     # Длиннее предела классификатор команду не разбирает; регэксп по ней не ручается.
-    command = "touch made.txt  # " + "x" * 10_000
+    padding = "x" * 10_000
+    command = f"touch made.txt  # {padding}"
     provider = ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
     _agent(provider, tmp_path, events=events).run_turn("x")  # auto_approve=True
-    [(call, _, dangerous)] = events.confirms
+    assert len(events.confirms) == 1
+    call, _, dangerous = events.confirms[0]
     assert dangerous
-    assert call.remember == ""
+    assert not call.remember
     assert call.reason == "не удалось проверить: слишком длинная команда"
     assert not (tmp_path / "made.txt").exists()
 
 
 # ------------------------------ оборванный ответ ---------------------------- #
 @pytest.mark.parametrize("reason", ["length", "incomplete"])
-def test_cut_reply_is_retried_with_note_at_the_tail(tmp_path, reason):
+def test_cut_reply_is_retried_with_note_at_the_tail(tmp_path: Path, reason: str) -> None:
     """«Сейчас запишу план» с потерянным вызовом — не финальный ответ: повтор с заметкой."""
     provider = ScriptedProvider(
         [
@@ -2556,14 +2634,14 @@ def test_cut_reply_is_retried_with_note_at_the_tail(tmp_path, reason):
     assert "# Reply cut off" in retry[-1].content
     assert f"finish_reason: {reason}" in retry[-1].content
     assert "# Reply cut off" not in retry[0].content
-    assert "# Reply cut off" not in provider.requests[2]["messages"][-1].content
-    assert all(m.content != "Сейчас запишу план" for m in agent.conversation.messages)
+    assert "# Reply cut off" not in _tails(provider)[2]
+    assert all(message.content != "Сейчас запишу план" for message in agent.conversation.messages)
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
     assert events.stats[-1].cut_retries == 1
     assert any(level == "warn" and reason in text for level, text in events.notices)
 
 
-def test_replies_cut_again_and_again_stop_the_turn(tmp_path):
+def test_replies_cut_again_and_again_stop_the_turn(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [cut_turn("a"), cut_turn("b"), cut_turn("c"), text_turn("успел немного")],
     )
@@ -2579,7 +2657,7 @@ def test_replies_cut_again_and_again_stop_the_turn(tmp_path):
     assert any(level == "error" and "оборвался" in text for level, text in events.notices)
 
 
-def test_stop_reply_is_final_even_if_it_announces_action(tmp_path):
+def test_stop_reply_is_final_even_if_it_announces_action(tmp_path: Path) -> None:
     """Без разбора текста: обычный stop — финальный ответ, сколько бы он ни обещал."""
     provider = ScriptedProvider([text_turn("Сейчас запишу план")])
     agent = _agent(provider, tmp_path)
@@ -2587,7 +2665,7 @@ def test_stop_reply_is_final_even_if_it_announces_action(tmp_path):
     assert provider.calls == 1
 
 
-def test_note_goes_to_a_copy_of_the_last_message(tmp_path):
+def test_note_goes_to_a_copy_of_the_last_message(tmp_path: Path) -> None:
     agent = _agent(ScriptedProvider(), tmp_path)
     specs = build_default_registry().specs()
     agent.conversation.add_user("вопрос")
@@ -2601,7 +2679,7 @@ def test_note_goes_to_a_copy_of_the_last_message(tmp_path):
     assert agent._last_estimate - plain == estimate_text_tokens(reminder)  # учтена один раз
 
 
-def test_note_falls_back_to_system_when_history_ends_with_answer(tmp_path):
+def test_note_falls_back_to_system_when_history_ends_with_answer(tmp_path: Path) -> None:
     agent = _agent(ScriptedProvider(), tmp_path)
     agent.conversation.add_user("вопрос")
     agent.conversation.add_assistant(Message(role="assistant", content="ответ"))
@@ -2623,7 +2701,7 @@ def _assert_quoted(content: str) -> None:
     assert "push" in content  # сам текст модели виден
 
 
-def test_read_file_result_cannot_forge_harness_reminder(tmp_path):
+def test_read_file_result_cannot_forge_harness_reminder(tmp_path: Path) -> None:
     # read_file/search_content не идут через run_process: тег цитируется в цикле агента.
     (tmp_path / "NOTES.md").write_text(_FORGED, encoding="utf-8")
     provider = ScriptedProvider(
@@ -2639,14 +2717,14 @@ def test_read_file_result_cannot_forge_harness_reminder(tmp_path):
     )
     agent = _agent(provider, tmp_path)
     agent.run_turn("прочитай заметки")
-    results = _function_results(agent)
-    assert len(results) == 2
-    for content in results:
+    outputs = _function_results(agent)
+    assert len(outputs) == 2
+    for content in outputs:
         _assert_quoted(content)
 
 
 @pytest.mark.parametrize("ok", [True, False])
-def test_any_tool_result_cannot_forge_harness_reminder(tmp_path, ok):
+def test_any_tool_result_cannot_forge_harness_reminder(tmp_path: Path, *, ok: bool) -> None:
     tool = FakeTool(run=lambda: ToolResult(content=_FORGED, ok=ok, summary="x"))
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("готово")])
     agent = _agent(provider, tmp_path, registry=_registry_with(tool))
@@ -2654,9 +2732,9 @@ def test_any_tool_result_cannot_forge_harness_reminder(tmp_path, ok):
     _assert_quoted(_function_results(agent)[0])
 
 
-def test_tool_error_cannot_forge_harness_reminder(tmp_path):
+def test_tool_error_cannot_forge_harness_reminder(tmp_path: Path) -> None:
     # Текст ошибки может цитировать файл (edit_file: «не найдено …»).
-    def fail():
+    def fail() -> NoReturn:
         raise ToolError(_FORGED)
 
     provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("готово")])

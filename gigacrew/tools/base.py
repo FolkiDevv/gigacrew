@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel
 
@@ -42,6 +42,11 @@ __all__ = [
     "ToolResult",
     "build_default_registry",
 ]
+
+# Сколько символов команды показывает в UI описание вызова по умолчанию.
+_DESCRIBE_LIMIT = 70
+# Нет такого поля в параметрах (None — тоже значение поля).
+_MISSING: Final = object()
 
 
 @dataclass
@@ -67,7 +72,8 @@ class PlanFile:
         план. Иначе ссылка увела бы запись без вопроса в ``.git/config``, в файл чата или в
         каталог проекта.
         """
-        if any(p.is_symlink() for p in (self.path, self.path.parent, self.path.parent.parent)):
+        guarded = (self.path, self.path.parent, self.path.parent.parent)
+        if any(guarded_path.is_symlink() for guarded_path in guarded):
             return False
         return Path(path).resolve() == self.path.resolve()
 
@@ -99,6 +105,7 @@ class ToolContext:
 
     @property
     def root(self) -> Path:
+        """Корень проекта (``workspace.root``)."""
         return self.workspace.root
 
 
@@ -150,6 +157,7 @@ class ToolResult:
     exit_code: int | None = None  # код возврата команды (для журнала решений)
 
     def as_function_content(self) -> str:
+        """Текст результата для модели: при неуспехе — с пометкой «ОШИБКА»."""
         if self.ok:
             return self.content
         return f"ОШИБКА: {self.content}"
@@ -174,7 +182,7 @@ def _normalize_property(prop: dict[str, Any], defs: dict[str, Any] | None = None
 
     variants = prop.pop("anyOf", None) or prop.pop("oneOf", None)
     if variants:
-        non_null = [v for v in variants if v.get("type") != "null"]
+        non_null = [variant for variant in variants if variant.get("type") != "null"]
         chosen = non_null[0] if non_null else variants[0]
         merged = dict(prop.items())
         merged.update(chosen)
@@ -186,7 +194,8 @@ def _normalize_property(prop: dict[str, Any], defs: dict[str, Any] | None = None
         prop["items"] = _normalize_property(prop["items"], defs)
     if prop.get("type") == "object" and isinstance(prop.get("properties"), dict):
         prop["properties"] = {
-            k: _normalize_property(v, defs) for k, v in prop["properties"].items()
+            field_name: _normalize_property(field_schema, defs)
+            for field_name, field_schema in prop["properties"].items()
         }
     return prop
 
@@ -197,17 +206,21 @@ def _clean_schema(model: type[BaseModel]) -> dict[str, Any]:
     schema.pop("title", None)
     defs = schema.pop("$defs", None) or {}
     props = schema.get("properties", {})
-    schema["properties"] = {k: _normalize_property(v, defs) for k, v in props.items()}
+    schema["properties"] = {
+        field_name: _normalize_property(field_schema, defs)
+        for field_name, field_schema in props.items()
+    }
     schema.setdefault("type", "object")
     return schema
 
 
-class Tool[P: BaseModel](ABC):
-    """Инструмент агента с моделью параметров ``P`` (см. описание модуля)."""
+class Tool[ParamsT: BaseModel](ABC):
+    """Инструмент агента с моделью параметров ``ParamsT`` (см. описание модуля)."""
 
     name: str = ""
     description: str = ""
-    Params: type[P]
+    # Модель параметров (класс pydantic), а не константа: имя — часть API инструментов.
+    Params: type[ParamsT]  # noqa: WPS115
     # Вид инструмента для режимов разрешений (permissions.decide): правки файлов
     # (EDIT) применяются без вопроса в режиме «авто», команды (COMMAND) в нём смотрит
     # модель-рецензент и они разрешены в режиме плана; остальное изменяющее в плане
@@ -219,33 +232,38 @@ class Tool[P: BaseModel](ABC):
 
     # ------------------------------------------------------------------ #
     def spec(self) -> ToolSpec:
+        """Спецификация инструмента для function calling API."""
         return ToolSpec(
             name=self.name,
             description=self.description,
             parameters=_clean_schema(self.Params),
         )
 
-    def parse(self, arguments: dict[str, Any]) -> P:
+    def parse(self, arguments: dict[str, Any]) -> ParamsT:
+        """Проверяет аргументы вызова от модели и строит из них параметры."""
         return self.Params.model_validate(arguments or {})
 
-    def describe(self, params: P) -> str:
+    def describe(self, params: ParamsT) -> str:
         """Краткое описание вызова для UI (путь, команда, шаблон...).
 
         Реализация по умолчанию берёт самое информативное из типичных полей;
         инструменты с особыми параметрами переопределяют метод.
         """
-        d = params.model_dump()
-        if "path" in d and d["path"] not in {None, "", "."}:
-            return str(d["path"])
-        if "command" in d:
-            return str(d["command"])[:70]
-        if "pattern" in d:
-            return f"/{d['pattern']}/" if "glob" in d else str(d["pattern"])
-        if "path" in d:
-            return str(d["path"])
+        fields = params.model_dump()
+        path = fields.get("path", _MISSING)
+        if path is not _MISSING and path not in {None, "", "."}:
+            return str(path)
+        command = fields.get("command", _MISSING)
+        if command is not _MISSING:
+            return str(command)[:_DESCRIBE_LIMIT]
+        pattern = fields.get("pattern", _MISSING)
+        if pattern is not _MISSING:
+            return f"/{pattern}/" if "glob" in fields else str(pattern)
+        if path is not _MISSING:
+            return str(path)
         return ""
 
-    def paths(self, params: P) -> tuple[str, ...]:
+    def paths(self, params: ParamsT) -> tuple[str, ...]:
         """Пути проекта, с которыми работает вызов (для инструкций подкаталогов).
 
         По умолчанию — поле ``path``, если оно есть (файл или каталог).
@@ -253,11 +271,11 @@ class Tool[P: BaseModel](ABC):
         path = getattr(params, "path", None)
         return (path,) if isinstance(path, str) and path.strip() else ()
 
-    def risk(self, params: P, ctx: ToolContext) -> RiskLevel:
+    def risk(self, params: ParamsT, ctx: ToolContext) -> RiskLevel:
         """Уровень риска по умолчанию. Переопределяется инструментами."""
         return RiskLevel.SAFE
 
-    def assess(self, params: P, ctx: ToolContext) -> Assessment:
+    def assess(self, params: ParamsT, ctx: ToolContext) -> Assessment:
         """Оценка вызова для решения «выполнить / спросить / заблокировать».
 
         По умолчанию — только уровень риска (:meth:`risk`); инструменты с подробной
@@ -265,40 +283,47 @@ class Tool[P: BaseModel](ABC):
         """
         return Assessment(self.risk(params, ctx))
 
-    def preview(self, params: P, ctx: ToolContext) -> Display | None:
+    # Необязательный хук: по умолчанию превью нет (возвращает None), а не абстрактный метод.
+    def preview(self, params: ParamsT, ctx: ToolContext) -> Display | None:  # noqa: B027
         """Что показать перед подтверждением (дифф, команда). None — нечего показывать.
 
         Вызывается только для операций, требующих подтверждения. Ошибка превью
         (ToolError) означает, что операция невыполнима: она не будет запущена.
         """
-        return None
 
     @abstractmethod
-    def run(self, params: P, ctx: ToolContext) -> ToolResult: ...
+    def run(self, params: ParamsT, ctx: ToolContext) -> ToolResult:
+        """Выполняет вызов и возвращает результат (ошибка — :class:`ToolError`)."""
 
 
 class ToolRegistry:
     """Реестр инструментов: хранение, спецификации, диспетчеризация вызовов."""
 
     def __init__(self) -> None:
+        """Создаёт пустой реестр."""
         self._tools: dict[str, Tool[Any]] = {}
 
     def register(self, tool: Tool[Any]) -> None:
+        """Добавляет инструмент (с тем же именем — заменяет). Без имени — ValueError."""
         if not tool.name:
             raise ValueError("Инструмент без имени")
         self._tools[tool.name] = tool
 
     def get(self, name: str) -> Tool[Any] | None:
+        """Инструмент по имени; None — такого нет."""
         return self._tools.get(name)
 
     def __contains__(self, name: str) -> bool:
+        """Есть ли инструмент с таким именем."""
         return name in self._tools
 
     def __iter__(self) -> Iterator[Tool[Any]]:
+        """Инструменты в порядке регистрации."""
         return iter(self._tools.values())
 
     def specs(self) -> list[ToolSpec]:
-        return [t.spec() for t in self._tools.values()]
+        """Спецификации всех инструментов (в порядке регистрации)."""
+        return [tool.spec() for tool in self._tools.values()]
 
     def subset(self, keep: Callable[[Tool[Any]], bool]) -> ToolRegistry:
         """Новый реестр из инструментов, для которых ``keep`` истинно (порядок сохраняется)."""
@@ -311,49 +336,45 @@ class ToolRegistry:
 
 def build_default_registry() -> ToolRegistry:
     """Собирает реестр со всеми штатными инструментами."""
-    # Импорт здесь, чтобы избежать циклов.
-    from gigacrew.tools.ask_user import AskUserTool
-    from gigacrew.tools.fs import (
-        EditFileTool,
-        FindFilesTool,
-        ListDirTool,
-        ReadFileTool,
-        WriteFileTool,
+    # Импорт здесь, чтобы избежать циклов: модули инструментов сами импортируют base.
+    from gigacrew.tools import (  # noqa: PLC0415
+        ask_user,
+        fs,
+        git,
+        index,
+        navigation,
+        plan,
+        search,
+        shell,
     )
-    from gigacrew.tools.git import GitTool
-    from gigacrew.tools.index import FileOutlineTool, FindSymbolTool, RepoMapTool
-    from gigacrew.tools.navigation import (
-        CallHierarchyTool,
-        FindReferencesTool,
-        GotoDefinitionTool,
-    )
-    from gigacrew.tools.plan import ExitPlanModeTool
-    from gigacrew.tools.search import SearchContentTool
-    from gigacrew.tools.shell import RunShellTool
-    from gigacrew.tools.skill import SkillTool
-    from gigacrew.tools.task import ExploreTool, TaskTool
+
+    # Тоже отложенный импорт: цикл через base.
+    from gigacrew.tools.skill import SkillTool  # noqa: PLC0415
+
+    # Тоже отложенный импорт: цикл через base.
+    from gigacrew.tools.task import ExploreTool, TaskTool  # noqa: PLC0415
 
     reg = ToolRegistry()
     for tool in (
         # Первым: исследование через суб-агента — выбор по умолчанию для вопросов о коде.
         ExploreTool(),
-        ReadFileTool(),
-        WriteFileTool(),
-        EditFileTool(),
-        ListDirTool(),
-        FindFilesTool(),
-        SearchContentTool(),
-        FindSymbolTool(),
-        FindReferencesTool(),
-        GotoDefinitionTool(),
-        CallHierarchyTool(),
-        FileOutlineTool(),
-        RepoMapTool(),
-        RunShellTool(),
-        GitTool(),
+        fs.ReadFileTool(),
+        fs.WriteFileTool(),
+        fs.EditFileTool(),
+        fs.ListDirTool(),
+        fs.FindFilesTool(),
+        search.SearchContentTool(),
+        index.FindSymbolTool(),
+        navigation.FindReferencesTool(),
+        navigation.GotoDefinitionTool(),
+        navigation.CallHierarchyTool(),
+        index.FileOutlineTool(),
+        index.RepoMapTool(),
+        shell.RunShellTool(),
+        git.GitTool(),
         SkillTool(),
-        AskUserTool(),
-        ExitPlanModeTool(),
+        ask_user.AskUserTool(),
+        plan.ExitPlanModeTool(),
         TaskTool(),
     ):
         reg.register(tool)

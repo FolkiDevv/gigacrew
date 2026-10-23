@@ -19,32 +19,33 @@ CORE_MODULES = ("__init__.py", "config.py", "errors.py", "permissions.py", "secu
 
 
 def _imports(path: Path) -> set[str]:
-    """Импортируемые модули; ``from X import y`` — и ``X``, и ``X.y`` (y может быть
-    модулем: ``from gigacrew import ui``).
+    """Импортируемые модули; ``from X import y`` — и ``X``, и ``X.y``.
+
+    ``y`` может быть модулем: ``from gigacrew import ui``.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names.update(a.name for a in node.names)
+            names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module)
-            names.update(f"{node.module}.{a.name}" for a in node.names)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
     return names
 
 
 def _core_files() -> list[Path]:
     files = [PKG / name for name in CORE_MODULES]
     for sub in CORE_PACKAGES:
-        files += sorted((PKG / sub).rglob("*.py"))
+        files.extend(sorted((PKG / sub).rglob("*.py")))
     return files
 
 
 def _forbidden(name: str) -> bool:
-    return any(name == f or name.startswith(f + ".") for f in FORBIDDEN_FOR_CORE)
+    return any(name == prefix or name.startswith(f"{prefix}.") for prefix in FORBIDDEN_FOR_CORE)
 
 
-def test_imports_sees_every_form(tmp_path):
+def test_imports_sees_every_form(tmp_path: Path) -> None:
     source = tmp_path / "m.py"
     source.write_text(
         "import rich.console\nfrom gigacrew import ui\nfrom gigacrew.cli.app import main\n"
@@ -53,21 +54,21 @@ def test_imports_sees_every_form(tmp_path):
     )
     names = _imports(source)
     assert {"rich.console", "gigacrew.ui", "gigacrew.cli.app", "prompt_toolkit"} <= names
-    assert all(_forbidden(n) for n in ("rich", "gigacrew.ui", "prompt_toolkit.shortcuts"))
+    assert all(_forbidden(name) for name in ("rich", "gigacrew.ui", "prompt_toolkit.shortcuts"))
     assert not _forbidden("richtext")
     assert not _forbidden("gigacrew.uix")
 
 
-def test_core_does_not_import_ui():
-    offenders = []
+def test_core_does_not_import_ui() -> None:
+    offenders: list[str] = []
     for path in _core_files():
         offenders.extend(
             f"{path.relative_to(PKG)}: {name}" for name in _imports(path) if _forbidden(name)
         )
-    assert offenders == []
+    assert not offenders
 
 
-def test_core_does_not_load_ui_transitively():
+def test_core_does_not_load_ui_transitively() -> None:
     """Импорт всего ядра не тянет UI и через сторонние модули."""
     modules = [f"gigacrew.{name.removesuffix('.py')}" for name in CORE_MODULES[1:]]
     for sub in CORE_PACKAGES:
@@ -94,10 +95,12 @@ def test_core_does_not_load_ui_transitively():
         env=env,
         check=True,
     )
-    assert json.loads(out.stdout) == []
+    reported = json.loads(out.stdout)
+    assert isinstance(reported, list)
+    assert not reported
 
 
-def test_every_module_imports_first():
+def test_every_module_imports_first() -> None:
     """Каждый модуль импортируется первым, без уже загруженных модулей gigacrew.
 
     Цикл импортов (был такой: ``safety.bash`` → ``project`` → ``project.index`` →
@@ -130,12 +133,14 @@ def test_every_module_imports_first():
         env=env,
         check=True,
     )
-    assert json.loads(out.stdout) == []
+    reported = json.loads(out.stdout)
+    assert isinstance(reported, list)
+    assert not reported
 
 
-def test_tree_sitter_is_imported_only_by_treesitter_module():
+def test_tree_sitter_is_imported_only_by_treesitter_module() -> None:
     """API tree-sitter ломается между версиями — он загружается в одном месте."""
-    offenders = []
+    offenders: list[str] = []
     for path in PKG.rglob("*.py"):
         if path.relative_to(PKG).as_posix() == "project/treesitter.py":
             continue
@@ -144,4 +149,4 @@ def test_tree_sitter_is_imported_only_by_treesitter_module():
             for name in _imports(path)
             if name.split(".")[0] in {"tree_sitter", "tree_sitter_bash"}
         )
-    assert offenders == []
+    assert not offenders

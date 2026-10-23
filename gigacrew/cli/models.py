@@ -11,9 +11,8 @@
 
 from __future__ import annotations
 
-import contextlib
 import threading
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 
 from gigacrew.agent.context_window import DEFAULT_CONTEXT_WINDOW
 from gigacrew.agent.loop import Agent
@@ -32,7 +31,8 @@ from gigacrew.ui.format import format_tokens, plural
 class ModelCatalog:
     """Чат-модели провайдера. Ошибка загрузки — пустой список (без вывода: это фон)."""
 
-    def __init__(self, provider: LLMProvider):
+    def __init__(self, provider: LLMProvider) -> None:
+        """Каталог моделей ``provider``; список загружают :meth:`start` или :meth:`load`."""
         self._provider = provider
         self._models: list[str] | None = None
         self._thread: threading.Thread | None = None
@@ -44,6 +44,7 @@ class ModelCatalog:
             self._thread.start()
 
     def load(self) -> list[str]:
+        """Загрузить список в текущем потоке; ошибка — пустой список."""
         try:
             models = self._provider.list_models()
         except Exception:  # сеть/авторизация: автодополнения просто не будет
@@ -62,6 +63,7 @@ class ModelCatalog:
 
 
 def describe_model(name: str, windows: ModelWindows, current: str = "") -> str:
+    """Пояснение к модели: окно контекста (или «не замерено») и отметка текущей."""
     window = windows.get(name)
     text = f"окно {format_tokens(window)}" if window else "окно не замерено"
     return f"текущая · {text}" if name == current else text
@@ -71,20 +73,41 @@ def describe_model(name: str, windows: ModelWindows, current: str = "") -> str:
 def _step_text(step: ProbeStep) -> str:
     if step.ok:
         return f"~{format_tokens(step.target)} — прошло ({step.prompt_tokens} ток.)"
-    code = step.status if step.status is not None else "нет ответа"
+    code = "нет ответа" if step.status is None else step.status
     return f"~{format_tokens(step.target)} — отказ ({code})"
 
 
-def describe_result(result: ProbeResult) -> str:
-    if result.capped:
-        bound = f"не меньше {format_tokens(result.window)} (максимум замера)"
+def describe_result(measurement: ProbeResult) -> str:
+    """Итог замера одной строкой: окно, число проб и потраченные токены."""
+    if measurement.capped:
+        bound = f"не меньше {format_tokens(measurement.window)} (максимум замера)"
     else:
-        bound = f"{result.window} токенов"
-    probes = f"{result.probes} {plural(result.probes, 'проба', 'пробы', 'проб')}"
+        bound = f"{measurement.window} токенов"
+    probes_word = plural(measurement.probes, "проба", "пробы", "проб")
+    probes = f"{measurement.probes} {probes_word}"
     return (
-        f"окно {result.model}: {bound} · {probes}, "
-        f"потрачено {format_tokens(result.billed_tokens)} токенов"
+        f"окно {measurement.model}: {bound} · {probes}, "
+        f"потрачено {format_tokens(measurement.billed_tokens)} токенов"
     )
+
+
+class _ProbeProgress:
+    """Ход замера: последняя проба для индикатора и (``verbose``) вывод каждой пробы."""
+
+    def __init__(self, ui: Console, *, verbose: bool) -> None:
+        self._ui = ui
+        self._verbose = verbose
+        self._last = "калибровка"
+
+    def on_step(self, step: ProbeStep) -> None:
+        """Обратный вызов замера: очередная проба."""
+        self._last = _step_text(step)
+        if self._verbose:
+            self._ui.system(f"  {self._last}")
+
+    def last(self) -> str:
+        """Строка индикатора: последняя проба («калибровка» — до первой)."""
+        return self._last
 
 
 def measure_context_window(
@@ -100,34 +123,33 @@ def measure_context_window(
     None — замер не удался (предупреждение выведено). ``KeyboardInterrupt``
     пробрасывается. ``verbose`` — печатать каждую пробу.
     """
-    last = "калибровка"
-
-    def on_step(step: ProbeStep) -> None:
-        nonlocal last
-        last = _step_text(step)
-        if verbose:
-            ui.system(f"  {last}")
-
-    guard = interrupt if interrupt is not None else contextlib.nullcontext()
+    progress = _ProbeProgress(ui, verbose=verbose)
+    guard: AbstractContextManager[object] = nullcontext() if interrupt is None else interrupt
     # Подробный режим печатает пробы строками — индикатор поверх них не нужен.
-    indicator = (
-        contextlib.nullcontext() if verbose else ui.progress(f"замеряю окно {model}", lambda: last)
+    indicator: AbstractContextManager[object] = (
+        nullcontext() if verbose else ui.progress(f"замеряю окно {model}", progress.last)
     )
     try:
         with guard, indicator:
-            result = probe_context_window(provider, model, on_step=on_step)
-    except LLMError as e:
-        ui.warn(f"не удалось замерить окно {model}: {e}")
+            measurement = probe_context_window(provider, model, on_step=progress.on_step)
+    except LLMError as error:
+        ui.warn(f"не удалось замерить окно {model}: {error}")
         return None
-    return result
+    return measurement
 
 
-def save_window(windows: ModelWindows, result: ProbeResult, ui: Console, *, base_url: str) -> bool:
+def save_window(
+    windows: ModelWindows,
+    measurement: ProbeResult,
+    ui: Console,
+    *,
+    base_url: str,
+) -> bool:
     """Запоминает замер; False — файл записать не удалось (в памяти замер остаётся)."""
     try:
-        windows.record(result, base_url=base_url)
-    except OSError as e:
-        ui.warn(f"замер окна не сохранён в {windows.path}: {e}")
+        windows.record(measurement, base_url=base_url)
+    except OSError as error:
+        ui.warn(f"замер окна не сохранён в {windows.path}: {error}")
         return False
     return True
 
@@ -179,12 +201,12 @@ def ensure_context_window(
             return
     ui.info(f"замеряю окно контекста модели {model} (несколько запросов)")
     try:
-        result = measure_context_window(agent.provider, model, ui, interrupt=interrupt)
+        measurement = measure_context_window(agent.provider, model, ui, interrupt=interrupt)
     except KeyboardInterrupt:
         ui.warn(f"замер окна прерван — пока считаем окно {fallback}")
         return
-    if result is None:
+    if measurement is None:
         ui.system(f"пока считаем окно {model} равным {fallback}")
         return
-    ui.system(describe_result(result))
-    save_window(agent.windows, result, ui, base_url=agent.config.base_url)
+    ui.system(describe_result(measurement))
+    save_window(agent.windows, measurement, ui, base_url=agent.config.base_url)

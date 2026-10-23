@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
+
 from rich.text import Text
 
 from gigacrew.ui.theme import MINT, Palette
@@ -40,57 +43,109 @@ _ART: tuple[str, ...] = (
     "                        ░░            ░░░░              ░░",
 )
 # Строки сетки, которые рисуются: без пустых сверху и снизу, звёзды — через одну пустую.
-_ROWS = (*range(1, 26), 28)
+_ROCKET_ROWS_END = 26
+_STARS_ROW = 28
+_ROWS = (*range(1, _ROCKET_ROWS_END), _STARS_ROW)
+# Выхлоп: со строки 15 — у левого края до колонки 7, с 18-й — шире, до колонки 10.
+_EXHAUST_FIRST_ROW = 15
+_EXHAUST_WIDE_ROW = 18
+_EXHAUST_NARROW_LAST_COL = 7
+_EXHAUST_WIDE_LAST_COL = 10
+# Иллюминатор: строки 7–8, колонки 18–19.
+_WINDOW_FIRST_ROW = 7
+_WINDOW_LAST_ROW = 8
+_WINDOW_FIRST_COL = 18
+_WINDOW_LAST_COL = 19
+_EMPTY = " "
 
 
 def _pixels() -> list[tuple[int, str]]:
     """(номер строки сетки, пиксели строки — по символу на пиксель)."""
-    return [(r, _ART[r][::2]) for r in _ROWS]
+    return [(row, _ART[row][::2]) for row in _ROWS]
 
 
-def _color(p: Palette, row: int, col: int, ch: str) -> str:
+def _is_exhaust(row: int, col: int) -> bool:
+    """Пиксель выхлопа: левый нижний угол сетки."""
+    wide = row >= _EXHAUST_WIDE_ROW and col <= _EXHAUST_WIDE_LAST_COL
+    narrow = _EXHAUST_FIRST_ROW <= row < _EXHAUST_WIDE_ROW and col <= _EXHAUST_NARROW_LAST_COL
+    return wide or narrow
+
+
+def _is_window(row: int, col: int) -> bool:
+    """Пиксель иллюминатора."""
+    in_rows = _WINDOW_FIRST_ROW <= row <= _WINDOW_LAST_ROW
+    return in_rows and _WINDOW_FIRST_COL <= col <= _WINDOW_LAST_COL
+
+
+def _color(palette: Palette, row: int, col: int, ch: str) -> str:
     """Цвет пикселя: корпус — знак палитры, выхлоп — тёплый, иллюминатор — светлый."""
     if ch == "█":
-        return p.brand
+        return palette.brand
     if ch == "▓":
-        return p.rocket_deep
-    exhaust = (row >= 18 and col <= 10) or (15 <= row <= 17 and col <= 7)
+        return palette.rocket_deep
+    exhaust = _is_exhaust(row, col)
     if ch == "▒":
-        return p.warn if exhaust else p.rocket_shade
-    if 7 <= row <= 8 and 18 <= col <= 19:  # иллюминатор
-        return p.soft if p.soft != p.brand else p.fg
-    return p.danger if exhaust else p.dim  # искры выхлопа и звёзды
+        return palette.warn if exhaust else palette.rocket_shade
+    if _is_window(row, col):
+        return palette.fg if palette.soft == palette.brand else palette.soft
+    return palette.danger if exhaust else palette.dim  # искры выхлопа и звёзды
+
+
+def _pixel_color(palette: Palette, row: int, col: int, ch: str) -> str | None:
+    """Цвет пикселя; None — пустой пиксель."""
+    return None if ch == _EMPTY else _color(palette, row, col, ch)
+
+
+def _half_block(upper: str | None, lower: str | None, *, mono: bool) -> tuple[str, str | None]:
+    """Символ клетки и его стиль по цветам верхнего и нижнего пикселя."""
+    if upper is None and lower is None:
+        return _EMPTY, None
+    if lower is None:
+        return "▀", upper
+    if upper is None:
+        return "▄", lower
+    if upper == lower or mono:
+        return "█", upper
+    return "▀", f"{upper} on {lower}"
+
+
+def _append_cells(
+    art: Text,
+    palette: Palette,
+    top_row: tuple[int, str],
+    bottom_row: tuple[int, str],
+    *,
+    mono: bool,
+) -> None:
+    """Дописывает в ``art`` строку клеток из двух строк пикселей."""
+    top_index, top = top_row
+    bottom_index, bottom = bottom_row
+    for col, (top_pixel, bottom_pixel) in enumerate(zip(top, bottom, strict=True)):
+        symbol, style = _half_block(
+            _pixel_color(palette, top_index, col, top_pixel),
+            _pixel_color(palette, bottom_index, col, bottom_pixel),
+            mono=mono,
+        )
+        art.append(symbol, style=style)
 
 
 def rocket(p: Palette = MINT, *, mono: bool = False) -> Text:
-    """Ракета полублоками ▀▄: в клетке терминала два пикселя друг над другом, поэтому
-    пиксели квадратные, а ракета — 29×13 клеток. ``mono`` — без цвета: два пикселя
-    разного цвета в одной клетке иначе слились бы в верхний.
+    """Ракета полублоками ▀▄: в клетке терминала два пикселя друг над другом.
+
+    Поэтому пиксели квадратные, а ракета — 29×13 клеток. ``mono`` — без цвета: два
+    пикселя разного цвета в одной клетке иначе слились бы в верхний.
     """
     rows = _pixels()
     art = Text()
-    for i in range(0, len(rows), 2):
-        if i:
+    for index in range(0, len(rows), 2):
+        if index:
             art.append("\n")
-        (r_top, top), (r_bottom, bottom) = rows[i], rows[i + 1]
-        for col, (a, b) in enumerate(zip(top, bottom, strict=True)):
-            upper = _color(p, r_top, col, a) if a != " " else None
-            lower = _color(p, r_bottom, col, b) if b != " " else None
-            if upper is None and lower is None:
-                art.append(" ")
-            elif lower is None:
-                art.append("▀", style=upper)
-            elif upper is None:
-                art.append("▄", style=lower)
-            elif upper == lower or mono:
-                art.append("█", style=upper)
-            else:
-                art.append("▀", style=f"{upper} on {lower}")
+        _append_cells(art, p, rows[index], rows[index + 1], mono=mono)
     return art
 
 
 # Контурный шрифт (в духе figlet «future»): три строки на букву.
-_FONT: dict[str, tuple[str, str, str]] = {
+_FONT: Mapping[str, tuple[str, str, str]] = MappingProxyType({
     "g": ("┏━╸", "┃╺┓", "┗━┛"),
     "i": ("╻", "┃", "╹"),
     "a": ("┏━┓", "┣━┫", "╹ ╹"),
@@ -98,7 +153,7 @@ _FONT: dict[str, tuple[str, str, str]] = {
     "r": ("┏━┓", "┣┳┛", "╹┗╸"),
     "e": ("┏━╸", "┣╸ ", "┗━╸"),
     "w": ("╻ ╻", "┃╻┃", "┗┻┛"),
-}
+})
 
 
 def title(p: Palette = MINT) -> Text:

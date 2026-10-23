@@ -6,10 +6,14 @@ import textwrap
 
 import pytest
 
+from gigacrew.project import treesitter
 from gigacrew.project.symbols import (
-    _RULES,
+    # Тест «белого ящика»: запасной путь на регэкспах проверяется напрямую, без грамматик.
+    _RULES,  # noqa: PLC2701
     MAX_SYMBOLS_PER_FILE,
-    _regex_symbols,
+    FileFacts,
+    # Тест «белого ящика»: запасной путь на регэкспах проверяется напрямую, без грамматик.
+    _regex_symbols,  # noqa: PLC2701
     extract,
     extract_symbols,
     language_of,
@@ -18,7 +22,8 @@ from gigacrew.project.symbols import (
 
 
 def _names(text: str, language: str) -> list[tuple[str, str]]:
-    return [(s.kind, s.qualname) for s in extract_symbols(textwrap.dedent(text), language)]
+    symbols = extract_symbols(textwrap.dedent(text), language)
+    return [(symbol.kind, symbol.qualname) for symbol in symbols]
 
 
 @pytest.mark.parametrize(
@@ -32,11 +37,11 @@ def _names(text: str, language: str) -> list[tuple[str, str]]:
         ("noext", None),
     ],
 )
-def test_language_of(path, expected):
+def test_language_of(path: str, expected: str | None) -> None:
     assert language_of(path) == expected
 
 
-def test_python_symbols_with_nesting_and_ranges():
+def test_python_symbols_with_nesting_and_ranges() -> None:
     src = textwrap.dedent(
         '''\
         """Модуль."""
@@ -74,7 +79,7 @@ def test_python_symbols_with_nesting_and_ranges():
         ''',
     )
     symbols = extract_symbols(src, "python")
-    got = [(s.kind, s.qualname, s.line, s.end_line, s.depth) for s in symbols]
+    got = [(sym.kind, sym.qualname, sym.line, sym.end_line, sym.depth) for sym in symbols]
     assert got == [
         ("constant", "MAX_SIZE", 4, 4, 0),
         ("class", "Agent", 8, 23, 0),
@@ -89,7 +94,7 @@ def test_python_symbols_with_nesting_and_ranges():
     assert symbols[1].signature == "class Agent(Base):"
 
 
-def test_python_syntax_error_falls_back_to_tree_sitter():
+def test_python_syntax_error_falls_back_to_tree_sitter() -> None:
     symbols = extract_symbols(
         textwrap.dedent(
             """\
@@ -102,26 +107,24 @@ def test_python_syntax_error_falls_back_to_tree_sitter():
         ),
         "python",
     )
-    assert [(s.kind, s.qualname) for s in symbols][:2] == [
+    assert [(sym.kind, sym.qualname) for sym in symbols][:2] == [
         ("class", "Broken"),
         ("method", "Broken.method"),
     ]
 
 
-def test_python_without_grammar_falls_back_to_regex(monkeypatch):
-    from gigacrew.project import treesitter
-
+def test_python_without_grammar_falls_back_to_regex(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(treesitter, "extract", lambda text, language, path="": None)
     got = _names("class Broken:\n    def method(self):\n        return (\n", "python")
     assert got == [("class", "Broken"), ("function", "method")]
 
 
-def test_markdown_headings_with_parents_skip_code_fences():
+def test_markdown_headings_with_parents_skip_code_fences() -> None:
     symbols = extract_symbols(
         "# Заголовок\n\n## Раздел 1\n```\n# не заголовок\n```\n### Подраздел\n## Раздел 2 ##\n",
         "markdown",
     )
-    got = [(s.name, s.parent, s.depth, s.line) for s in symbols]
+    got = [(sym.name, sym.parent, sym.depth, sym.line) for sym in symbols]
     assert got == [
         ("Заголовок", "", 0, 1),
         ("Раздел 1", "Заголовок", 1, 3),
@@ -267,23 +270,27 @@ def test_markdown_headings_with_parents_skip_code_fences():
         ),
     ],
 )
-def test_regex_fallback_languages(language, src, expected):
+def test_regex_fallback_languages(
+    language: str,
+    src: str,
+    expected: list[tuple[str, str]],
+) -> None:
     """Запасной путь без грамматики: построчные шаблоны (здесь — на обрывках кода)."""
     symbols = _regex_symbols(textwrap.dedent(src), _RULES[language])
-    assert [(s.kind, s.qualname) for s in symbols] == expected
+    assert [(sym.kind, sym.qualname) for sym in symbols] == expected
 
 
-def test_unknown_language_has_no_symbols():
+def test_unknown_language_has_no_symbols() -> None:
     assert extract_symbols("def x(): pass", None) == []
     assert extract_symbols("{}", "json") == []
 
 
-def test_symbols_limit_per_file():
-    src = "\n".join(f"def f{i}(): pass" for i in range(MAX_SYMBOLS_PER_FILE + 50))
+def test_symbols_limit_per_file() -> None:
+    src = "\n".join(f"def f{index}(): pass" for index in range(MAX_SYMBOLS_PER_FILE + 50))
     assert len(extract_symbols(src, "python")) == MAX_SYMBOLS_PER_FILE
 
 
-def test_markdown_commonmark_headings_and_fences():
+def test_markdown_commonmark_headings_and_fences() -> None:
     text = (
         " # С отступом\n"
         "# C#\n"
@@ -299,11 +306,11 @@ def test_markdown_commonmark_headings_and_fences():
         "```\n"
         "## Конец ##\n"
     )
-    names = [s.name for s in extract_symbols(text, "markdown")]
+    names = [sym.name for sym in extract_symbols(text, "markdown")]
     assert names == ["С отступом", "C#", "После блока", "Конец"]
 
 
-def test_python_methods_under_class_level_if_and_try():
+def test_python_methods_under_class_level_if_and_try() -> None:
     src = textwrap.dedent(
         """\
         class C:
@@ -318,7 +325,7 @@ def test_python_methods_under_class_level_if_and_try():
                     pass
         """,
     )
-    got = [(s.kind, s.qualname, s.depth) for s in extract_symbols(src, "python")]
+    got = [(sym.kind, sym.qualname, sym.depth) for sym in extract_symbols(src, "python")]
     assert got == [
         ("class", "C", 0),
         ("method", "C.run", 1),
@@ -327,7 +334,7 @@ def test_python_methods_under_class_level_if_and_try():
     ]
 
 
-def test_python_try_blocks_in_source_order():
+def test_python_try_blocks_in_source_order() -> None:
     src = textwrap.dedent(
         """\
         try:
@@ -340,15 +347,15 @@ def test_python_try_blocks_in_source_order():
             def d(): pass
         """,
     )
-    assert [s.name for s in extract_symbols(src, "python")] == ["a", "b", "c", "d"]
+    assert [sym.name for sym in extract_symbols(src, "python")] == ["a", "b", "c", "d"]
 
 
 # ------------------------- использования и импорты ------------------------- #
-def _facts(src: str, path: str = "pkg/mod.py"):
+def _facts(src: str, path: str = "pkg/mod.py") -> FileFacts:
     return extract(textwrap.dedent(src), "python", path)
 
 
-def test_python_refs_scopes_kinds_and_locals():
+def test_python_refs_scopes_kinds_and_locals() -> None:
     facts = _facts(
         """\
         LIMIT = 5
@@ -369,7 +376,7 @@ def test_python_refs_scopes_kinds_and_locals():
             return Agent().run(value)
         """,
     )
-    got = [(r.name, r.kind, r.line, r.scope) for r in facts.refs]
+    got = [(ref.name, ref.kind, ref.line, ref.scope) for ref in facts.refs]
     assert got == [
         ("Base", "name", 4, "Agent"),
         ("LIMIT", "name", 5, "Agent.run"),
@@ -383,17 +390,18 @@ def test_python_refs_scopes_kinds_and_locals():
         ("Agent", "call", 16, "helper"),
     ]
     # параметры, локальные переменные, переменные включений, self и builtins — не использования
-    names = {r.name for r in facts.refs}
+    names = {ref.name for ref in facts.refs}
     assert not names & {"text", "y", "local", "x", "value", "self", "print", "len", "inner"}
 
 
-def test_python_ref_columns_are_characters():
+def test_python_ref_columns_are_characters() -> None:
     facts = _facts("ё = 'ж'; obj.метод()\n")
-    (ref,) = [r for r in facts.refs if r.name == "метод"]
-    assert (ref.kind, ref.col) == ("call", 13)  # в символах: в байтах было бы 16
+    refs = [ref for ref in facts.refs if ref.name == "метод"]
+    assert len(refs) == 1
+    assert (refs[0].kind, refs[0].col) == ("call", 13)  # в символах: в байтах было бы 16
 
 
-def test_python_imports_absolute_relative_and_aliases():
+def test_python_imports_absolute_relative_and_aliases() -> None:
     facts = _facts(
         """\
         import os.path as osp
@@ -406,7 +414,7 @@ def test_python_imports_absolute_relative_and_aliases():
         """,
         path="pkg/sub/mod.py",
     )
-    got = [(i.module, i.name, i.alias) for i in facts.imports]
+    got = [(imp.module, imp.name, imp.alias) for imp in facts.imports]
     assert got == [
         ("os.path", "", "osp"),
         ("json", "", "json"),
@@ -418,10 +426,10 @@ def test_python_imports_absolute_relative_and_aliases():
         ("....beyond", "x", "x"),  # выше корня проекта — не разрешается
     ]
     init = _facts("from . import a\n", path="pkg/__init__.py")
-    assert [(i.module, i.name) for i in init.imports] == [("pkg", "a")]
+    assert [(imp.module, imp.name) for imp in init.imports] == [("pkg", "a")]
 
 
-def test_python_docstring_and_name_column():
+def test_python_docstring_and_name_column() -> None:
     symbols = extract_symbols(
         textwrap.dedent(
             '''\
@@ -438,21 +446,22 @@ def test_python_docstring_and_name_column():
         ),
         "python",
     )
-    by_name = {s.name: s for s in symbols}
+    by_name = {sym.name: sym for sym in symbols}
     assert (by_name["Ёж"].doc, by_name["Ёж"].col) == ("Первая строка.", 6)
     assert (by_name["бег"].doc, by_name["бег"].col) == ("", 15)  # не литерал — не докстринг
 
 
-def test_python_syntax_error_keeps_calls_but_not_imports():
+def test_python_syntax_error_keeps_calls_but_not_imports() -> None:
     facts = _facts("import os\n\ndef ok():\n    call_me()\n\ndef broken(:\n")
-    assert [s.name for s in facts.symbols] == ["ok", "broken"]
-    assert [(r.name, r.kind, r.scope) for r in facts.refs] == [("call_me", "call", "ok")]
+    assert [sym.name for sym in facts.symbols] == ["ok", "broken"]
+    assert [(ref.name, ref.kind, ref.scope) for ref in facts.refs] == [("call_me", "call", "ok")]
     assert facts.imports == []  # импорты — только из ast
 
 
-def test_regex_symbols_have_name_column():
-    (sym,) = extract_symbols("export function runTurn() {}\n", "typescript")
-    assert sym.col == len("export function ")
+def test_regex_symbols_have_name_column() -> None:
+    symbols = extract_symbols("export function runTurn() {}\n", "typescript")
+    assert len(symbols) == 1
+    assert symbols[0].col == len("export function ")
 
 
 @pytest.mark.parametrize(
@@ -465,17 +474,18 @@ def test_regex_symbols_have_name_column():
         ("README.md", None),
     ],
 )
-def test_module_parts(path, expected):
+def test_module_parts(path: str, expected: list[str] | None) -> None:
     assert module_parts(path) == expected
 
 
-def test_python_signature_skips_comment_lines_before_body():
+def test_python_signature_skips_comment_lines_before_body() -> None:
     src = "class Conversation:\n    # пояснение к полям\n    # ещё строка\n    items: list = []\n"
-    (sym,) = extract_symbols(src, "python")
-    assert sym.signature == "class Conversation:"
+    symbols = extract_symbols(src, "python")
+    assert len(symbols) == 1
+    assert symbols[0].signature == "class Conversation:"
 
 
-def test_python_scopes_of_comprehensions_imports_and_defaults():
+def test_python_scopes_of_comprehensions_imports_and_defaults() -> None:
     facts = _facts(
         """\
         values = [items for items in items]
@@ -493,7 +503,7 @@ def test_python_scopes_of_comprehensions_imports_and_defaults():
             return option
         """,
     )
-    got = {(r.name, r.kind, r.scope) for r in facts.refs}
+    got = {(ref.name, ref.kind, ref.scope) for ref in facts.refs}
     assert ("items", "name", "") in got  # первый итерируемый — в объемлющей области
     assert ("factory", "call", "run") in got
     assert ("MODE", "name", "run") in got
@@ -503,7 +513,7 @@ def test_python_scopes_of_comprehensions_imports_and_defaults():
     assert ("option", "name", "other") in got
 
 
-def test_python_annotations_globals_and_match_rest():
+def test_python_annotations_globals_and_match_rest() -> None:
     facts = _facts(
         """\
         def convert(Model: Model) -> Model:
@@ -523,22 +533,22 @@ def test_python_annotations_globals_and_match_rest():
                     return settings
         """,
     )
-    got = [(r.name, r.kind, r.line) for r in facts.refs]
+    got = [(ref.name, ref.kind, ref.line) for ref in facts.refs]
     assert ("Model", "name", 1) in got  # аннотации — в объемлющей области
     assert ("helper", "call", 8) in got  # global снимает локальное имя внешней функции
-    assert all(r.name not in {"settings", "kind"} for r in facts.refs)  # case {**rest}
+    assert all(ref.name not in {"settings", "kind"} for ref in facts.refs)  # case {**rest}
 
 
-def test_line_numbers_ignore_form_feed_and_unicode_separators():
+def test_line_numbers_ignore_form_feed_and_unicode_separators() -> None:
     src = "# \f заголовок\n\ndef after():\n    pass\n\u2028\nclass Later:\n    pass\n"
     symbols = extract_symbols(src, "python")
-    assert [(s.name, s.line, s.signature) for s in symbols] == [
+    assert [(sym.name, sym.line, sym.signature) for sym in symbols] == [
         ("after", 3, "def after():"),
         ("Later", 6, "class Later:"),
     ]
 
 
-def test_python_nonlocal_stays_local_and_same_line_refs_are_separate():
+def test_python_nonlocal_stays_local_and_same_line_refs_are_separate() -> None:
     facts = _facts(
         """\
         def outer(callback):
@@ -552,8 +562,8 @@ def test_python_nonlocal_stays_local_and_same_line_refs_are_separate():
             a.save(); b.save()
         """,
     )
-    assert all(r.name != "callback" for r in facts.refs)  # nonlocal — локальное внешней
-    assert [(r.name, r.line, r.col) for r in facts.refs if r.name == "save"] == [
+    assert all(ref.name != "callback" for ref in facts.refs)  # nonlocal — локальное внешней
+    assert [(ref.name, ref.line, ref.col) for ref in facts.refs if ref.name == "save"] == [
         ("save", 9, 6),
         ("save", 9, 16),
     ]
