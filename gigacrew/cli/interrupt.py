@@ -337,10 +337,10 @@ class EscInterrupt:
         # msvcrt есть только в Windows: импорт — на этой ветке.
         import msvcrt  # noqa: PLC0415
 
-        if msvcrt.kbhit():  # type: ignore[attr-defined]
+        if msvcrt.kbhit():  # type: ignore[attr-defined, unused-ignore]
             return True
         self._stop.wait(timeout)
-        return bool(msvcrt.kbhit())  # type: ignore[attr-defined]
+        return bool(msvcrt.kbhit())  # type: ignore[attr-defined, unused-ignore]
 
     def _read(self) -> bytes:
         if os.name == _POSIX:
@@ -352,11 +352,11 @@ class EscInterrupt:
         import msvcrt  # noqa: PLC0415
 
         chars: list[str] = []
-        while msvcrt.kbhit():  # type: ignore[attr-defined]
-            ch = msvcrt.getwch()  # type: ignore[attr-defined]
+        while msvcrt.kbhit():  # type: ignore[attr-defined, unused-ignore]
+            ch = msvcrt.getwch()  # type: ignore[attr-defined, unused-ignore]
             if ch in {"\x00", "\xe0"}:  # стрелки и F-клавиши: префикс + код
                 # Shift+Tab — как в POSIX-терминале
-                if msvcrt.getwch() == "\x0f":  # type: ignore[attr-defined]
+                if msvcrt.getwch() == "\x0f":  # type: ignore[attr-defined, unused-ignore]
                     chars.append("\x1b[Z")
                 continue
             chars.append(ch)
