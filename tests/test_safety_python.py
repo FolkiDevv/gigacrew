@@ -344,6 +344,7 @@ _DANGER_METHOD_NAMES = (
     "startfile",
     "run_module",
     "run_path",
+    "_evaluate",
 )
 
 
@@ -572,3 +573,119 @@ def test_project_venv_with_executable_pth_is_exec(root: Path) -> None:
     assert classify(".venv/bin/python -c 'print(1)'", root=root).level is READ
     (site / "evil.pth").write_text("import os; os.system('id')\n")
     assert classify(".venv/bin/python -c 'print(1)'", root=root).level is EXEC
+
+
+# Файл, открытый на чтение: его .raw — FileIO, а FileIO(путь, 'w') обнуляет файл.
+_RAW = "open('package.json', 'rb').raw"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        # описание объекта: имена, документация, иерархия классов
+        "import json; print(json.JSONDecoder.__init__.__doc__)",
+        "import json; print(json.JSONDecoder.__mro__)",
+        "import json; print([c.__name__ for c in json.JSONDecoder.__mro__])",
+        "import json\nfor i, c in enumerate(json.JSONDecoder.__mro__):\n    print(i, c.__name__)",
+        "import json; print(json.JSONDecoder.__module__, json.JSONDecoder.__qualname__)",
+        "import json; print(json.JSONDecoder.__bases__[0].__name__)",
+        "import json; print(json.JSONDecoder.mro())",
+        "import os; print(os.__file__)",
+        "x = 1; print(type(x).__name__, type(x) is int, isinstance(2, type(x)))",
+        "x = 1; print(x.__class__.__name__)",
+        # методы — только осмотр: напечатать, сравнить, описать
+        "import json; print(json.JSONDecoder.__init__)",
+        "import json; print(f'{json.JSONDecoder.__init__!r}')",
+        "import json; print(json.JSONDecoder.__init__ is object.__init__)",
+        "import json; print(json.dumps.__code__.co_varnames)",
+        # пространство имён — только имена
+        "import json; print(sorted(json.JSONDecoder.__dict__))",
+        "import json; print(json.JSONDecoder.__dict__.keys())",
+        "import json; print('decode' in json.JSONDecoder.__dict__)",
+        # dir и inspect
+        "import json; print(dir(json.JSONDecoder))",
+        "import inspect, json; print(inspect.signature(json.JSONDecoder.__init__))",
+        "from inspect import signature\nimport json\nprint(signature(json.JSONDecoder.__init__))",
+        "import inspect, json; print(inspect.getsource(json.dumps))",
+        "import inspect, json; print(inspect.getdoc(json.dumps), inspect.isclass(json.dumps))",
+        "import inspect, json; print([c.__name__ for c in inspect.getmro(json.JSONDecoder)])",
+        # свои классы и модуль
+        "class A:\n    __slots__ = ('a',)\n    __match_args__ = ('a',)",
+        "if __debug__:\n    print(__name__, __doc__)",
+        "class A(dict):\n    def __init__(self):\n        super().__init__()\n\nA()",
+    ],
+)
+def test_introspection_is_read_only(root: Path, code: str) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is READ, analysis.reason
+
+
+def test_introspection_of_third_party_package_is_exec(root: Path) -> None:
+    analysis = analyze("import numpy; print(numpy.ndarray.__mro__)", root=root)
+    assert analysis.level is EXEC, analysis.reason
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        # ступени побега и утечки окружения — даже просто показать
+        "import json; print(json.dumps.__globals__)",
+        "import json; print(json.dumps.__defaults__)",
+        "print(object.__subclasses__())",
+        "import json; print(len(json.dumps.__builtins__))",
+        # пространство имён: значения, а не имена (os.__dict__ — с os.environ)
+        "import os; print(os.__dict__)",
+        "import json; json.JSONDecoder.__dict__['decode']",
+        "import json; print(json.JSONDecoder.__dict__.items())",
+        # метод-dunder вызван или передан дальше — в обход проверок вызовов
+        f"{_RAW}.__init__('/home/u/.bashrc', 'w')",
+        "import os; os.remove.__call__('/home/u/.bashrc')",
+        "import json; print(list(map(json.JSONDecoder.__init__, [1])))",
+        "import json; init = json.JSONDecoder.__init__",
+        "class A:\n    def f(self):\n        super().__setattr__('__class__', int)",
+        # изменение
+        "x = 1\nx.__class__ = int",
+        "import json\ndel json.JSONDecoder.__doc__",
+        # eval_str: строки-аннотации исполняются
+        "import inspect, json; inspect.signature(json.dumps, eval_str=True)",
+        "import inspect, json; inspect.signature(json.dumps, **{'eval_str': True})",
+    ],
+)
+def test_interpreter_internals_are_dangerous(root: Path, code: str) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is DANGER, analysis.reason
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        # класс объекта как значение: его вызов не проверить (FileIO пишет файл)
+        f"f = type({_RAW})\nf('/home/u/.bashrc', 'w')",
+        f"for c in [type({_RAW})]:\n    c('/home/u/.bashrc', 'w')",
+        f"print(list(map(type({_RAW}), ['/home/u/.bashrc'], ['w'])))",
+        f"class A(type({_RAW})):\n    pass\n\nA('/home/u/.bashrc', 'w')",
+        f"for c in {_RAW}.__class__.__mro__:\n    c('/home/u/.bashrc', 'w')",
+        f"{_RAW}.__class__('/home/u/.bashrc', 'w')",
+        f"cs = type({_RAW}).mro()\nfor c in cs:\n    c('/home/u/.bashrc', 'w')",
+        f"import inspect\nfor c in inspect.getmro(type({_RAW})):\n    c('/home/u/.bashrc', 'w')",
+        # argparse.FileType открывает файлы по путям из аргументов
+        "import argparse; f = argparse.FileType('w'); f('/home/u/.bashrc')",
+        "from argparse import FileType",
+        # строки-аннотации исполняются как код
+        (
+            "import typing\nclass A:\n    x: \"__import__('os').system('id')\"\n\n"
+            "print(typing.get_type_hints(A))"
+        ),
+        "from typing import get_type_hints",
+        "import typing; typing.ForwardRef('x')",
+        "import functools\n\n@functools.singledispatch\ndef f(x):\n    pass",
+        "import typing; typing.List['x'].__args__[0].evaluate()",
+        "import inspect, json\nopts = {}\ninspect.signature(json.dumps, **opts)",
+        # inspect за пределами белого списка: значения, модули
+        "import inspect, glob; print(inspect.getmembers(glob))",
+        "import inspect, json; print(inspect.getmodule(json.dumps))",
+    ],
+)
+def test_hidden_callables_are_unknown(root: Path, code: str) -> None:
+    analysis = analyze(code, root=root)
+    assert analysis.level is None, analysis.reason
