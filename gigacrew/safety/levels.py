@@ -9,7 +9,7 @@ from types import MappingProxyType
 __all__ = ["CommandLevel", "Part", "Verdict", "worst"]
 
 # Версия правил: в журнале решений — чтобы переоценить старые записи после правок.
-RULES_VERSION = 3
+RULES_VERSION = 4
 
 
 class CommandLevel(IntEnum):

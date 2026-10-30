@@ -903,7 +903,7 @@ def test_child_environment_drops_shell_hooks_and_adds_git_safety(
         "echo ok\x1b[2K",  # управляющая последовательность терминала
         "python3 -c 'print(eval(\"1\"))'",
         "python3 -c 'import os; print(os.environ)'",
-        "python3 -c 'x = ().__class__'",
+        "python3 -c 'print(().__class__.__base__.__subclasses__())'",
     ],
 )
 def test_hidden_or_dynamic_code_is_marked_dangerous(root: Path, command: str) -> None:

@@ -14,9 +14,15 @@
 * EXEC — импорт модулей проекта или сторонних пакетов (их код исполнится), модуль
   стандартной библиотеки затенён файлом проекта (``json.py`` рядом);
 * WRITE — запись/удаление отдельных файлов внутри проекта;
-* DANGER — процессы, сеть, рекурсивное удаление, запись вне проекта, чтение чужих секретов;
-* None — динамический код (``eval``, ``getattr``, ``__dunder__``), пути, известные только
-  при выполнении, незнакомые модули стандартной библиотеки.
+* DANGER — процессы, сеть, рекурсивное удаление, запись вне проекта, чтение чужих секретов,
+  динамический код (``eval``, ``getattr``) и внутренности интерпретатора (``__globals__``,
+  вызов ``__init__``, ``__dict__`` модуля);
+* None — пути, известные только при выполнении, незнакомые модули стандартной библиотеки,
+  класс объекта как значение (``f = type(x)``: его вызов не проверить).
+
+Описание объектов — чтение: ``X.__doc__``, ``X.__mro__``, ``print(X.__init__)``,
+``dir(X)``, ``inspect.signature(X.__init__)``. Методы и пространства имён объектов
+(``__init__``, ``__dict__``) — только для осмотра: напечатать, сравнить, перечислить имена.
 
 Анализ потоконечувствительный: проверяется всё дерево, включая тела функций и классов,
 которые могут и не выполниться, — ложная тревога лучше пропуска.
@@ -30,7 +36,7 @@ import os
 import re
 import string
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -127,6 +133,7 @@ SAFE_MODULES = frozenset((
     "io",
     "codecs",
     "importlib.metadata",
+    "inspect",
 ))
 # Процессы, сеть, загрузка кода, низкоуровневый доступ.
 DANGER_MODULES = frozenset((
@@ -278,6 +285,45 @@ _MODULE_ATTRS: Mapping[str, frozenset[str]] = MappingProxyType({
         "PackageNotFoundError",
         "packages_distributions",
     )),
+    # Без getmembers (значения, как vars), getmodule (модуль), unwrap, кадров и
+    # get_annotations; eval_str проверяется отдельно.
+    "inspect": frozenset((
+        "signature",
+        "getdoc",
+        "cleandoc",
+        "getcomments",
+        "getfile",
+        "getsourcefile",
+        "getsource",
+        "getsourcelines",
+        "getmodulename",
+        "getfullargspec",
+        "getmro",
+        "Parameter",
+        "isabstract",
+        "isasyncgenfunction",
+        "isbuiltin",
+        "isclass",
+        "iscoroutinefunction",
+        "isdatadescriptor",
+        "isfunction",
+        "isgeneratorfunction",
+        "ismethod",
+        "ismethoddescriptor",
+        "ismodule",
+        "isroutine",
+    )),
+})
+# Функции inspect, которые только описывают переданный объект (позиция осмотра).
+_INSPECT_READERS = frozenset(f"inspect.{name}" for name in _MODULE_ATTRS["inspect"] - {"Parameter"})
+# Члены «безопасных» модулей, которые не только читают (причина — для пользователя).
+_UNCHECKED_MEMBERS: Mapping[str, str] = MappingProxyType({
+    "argparse.FileType": "открывает файлы (и на запись) по путям из аргументов",
+    "typing.get_type_hints": "вычисляет строки-аннотации как код",
+    "typing.ForwardRef": "вычисляет строку как код",
+    "typing.evaluate_forward_ref": "вычисляет строку как код",
+    "functools.singledispatch": "register вычисляет строки-аннотации как код",
+    "functools.singledispatchmethod": "register вычисляет строки-аннотации как код",
 })
 # Функции модулей, меняющие файлы (уровень — по пути) и опасные сами по себе.
 _FILE_WRITERS = frozenset((
@@ -331,6 +377,7 @@ _DANGER_METHODS = frozenset((
     "startfile",
     "run_module",
     "run_path",
+    "_evaluate",  # typing.ForwardRef: строка исполняется как код
 ))
 # Методы путей, меняющие файлы.
 _PATH_WRITERS = frozenset((
@@ -402,7 +449,86 @@ _INTERNALS = frozenset((
     "vformat",
     "get_field",
 ))
-_SAFE_DUNDERS = frozenset(("__name__", "__version__", "__file__", "__doc__", "__all__"))
+# Dunder-атрибуты, описывающие объект: читать можно где угодно.
+_SAFE_DUNDERS = frozenset((
+    "__name__",
+    "__qualname__",
+    "__module__",
+    "__doc__",
+    "__version__",
+    "__file__",
+    "__cached__",
+    "__all__",
+    "__package__",
+    "__path__",
+    "__debug__",
+    "__annotations__",
+    "__type_params__",
+    "__parameters__",
+    "__args__",
+    "__origin__",
+    "__orig_bases__",
+    "__mro__",
+    "__bases__",
+    "__base__",
+    "__class__",
+    "__slots__",
+    "__match_args__",
+    "__members__",
+    "__dataclass_fields__",
+    "__signature__",
+    "__text_signature__",
+    "__abstractmethods__",
+    "__firstlineno__",
+    "__static_attributes__",
+))
+# Из них дают классы: вызов класса не проверить (FileIO из open(…).raw пишет файл).
+_CLASS_DUNDERS = frozenset(("__class__", "__base__", "__bases__", "__mro__", "__orig_bases__"))
+# Ступени побега из разбора и утечки окружения: опасно даже просто показать.
+_ESCAPE_DUNDERS = frozenset((
+    "__globals__",
+    "__builtins__",
+    "__closure__",
+    "__defaults__",
+    "__kwdefaults__",
+    "__subclasses__",
+))
+# Пространство имён объекта: только имена (print(os.__dict__) покажет os.environ).
+_NAMESPACE_DUNDER = "__dict__"
+# Поля объекта кода, которые только описывают функцию (f.__code__.co_varnames).
+_CODE_FIELDS = frozenset((
+    "co_varnames",
+    "co_argcount",
+    "co_posonlyargcount",
+    "co_kwonlyargcount",
+    "co_filename",
+    "co_firstlineno",
+    "co_name",
+    "co_qualname",
+))
+# Методы базового класса, которые вызывает свой класс: super().__init__(…).
+_SUPER_DUNDERS = frozenset(("__init__", "__new__", "__init_subclass__", "__post_init__"))
+# Встроенные, которые только показывают или проверяют аргумент.
+_INSPECTORS = frozenset((
+    "print",
+    "repr",
+    "str",
+    "ascii",
+    "len",
+    "type",
+    "id",
+    "hash",
+    "callable",
+    "isinstance",
+    "issubclass",
+    "dir",
+    "bool",
+    "help",
+))
+# Встроенные, которые берут у словаря только ключи.
+_NAME_LISTERS = frozenset(("len", "sorted", "list", "tuple", "set", "frozenset", "dir"))
+# Функции, которые с eval_str вычисляют строки-аннотации.
+_ANNOTATION_READERS = frozenset(("signature", "from_callable", "get_annotations"))
 _SAFE_BUILTINS = frozenset((
     "print",
     "len",
@@ -449,6 +575,7 @@ _SAFE_BUILTINS = frozenset((
     "hash",
     "id",
     "callable",
+    "dir",
     "slice",
     "object",
     "property",
@@ -561,6 +688,7 @@ class _Ctx:
     star: bool = False  # был from X import *: незнакомое имя может прийти оттуда
     levels: list[tuple[Level | None, str]] = field(default_factory=list)
     hazard_cache: dict[tuple[Path, str | None], bool] = field(default_factory=dict)
+    parents: dict[int, ast.AST] = field(default_factory=dict)  # id(узел) → родитель
 
     def flag(self, level: Level | None, reason: str) -> None:
         self.levels.append((level, reason))
@@ -728,6 +856,7 @@ def _check_import_from(node: ast.ImportFrom, ctx: _Ctx) -> None:
             _check_star_import(module, ctx)
             continue
         resolved = _attr_of_module(module, alias.name)
+        _check_unchecked(f"{module}.{alias.name}", ctx)
         got = _from_import_level(module, alias.name, resolved, ctx)
         if got is not None:
             ctx.flag(*got)
@@ -767,7 +896,7 @@ def _check_module_attr(module: str, attr: str, ctx: _Ctx) -> None:
     ):
         reason = "окружение процесса (там ключи и токены)" if "env" in attr else "процессы"
         ctx.flag(Level.DANGER, f"{module}.{attr}: {reason}")
-    elif attr not in allowed:
+    elif attr not in allowed and attr not in _SAFE_DUNDERS:
         ctx.flag(None, f"{module}.{attr} не проверен классификатором")
 
 
@@ -1337,9 +1466,11 @@ def _check_format(func: ast.Attribute, ctx: _Ctx) -> None:
 
 
 def _check_other_method(attr: str, func: ast.Attribute, ctx: _Ctx) -> None:
-    """Прочие методы объектов: ``expanduser``, ``home``, ``format``."""
+    """Прочие методы объектов: ``expanduser``, ``home``, ``format``, ``evaluate``."""
     if attr in {"expanduser", "home"}:
         ctx.flag(None, f".{attr}() — путь вне проекта")
+    elif attr == "evaluate":  # typing.ForwardRef.evaluate() исполняет строку
+        ctx.flag(None, ".evaluate() — возможно, строка исполняется как код")
     elif attr == "format":
         _check_format(func, ctx)
 
@@ -1357,8 +1488,39 @@ def _check_method_call(func: ast.Attribute, node: ast.Call, ctx: _Ctx) -> None:
         _check_other_method(attr, func, ctx)
 
 
+def _unpacked_keys(node: ast.AST) -> frozenset[str] | None:
+    """Ключи в ``**{'a': …}``; None — не литерал или ключ известен только при выполнении."""
+    if not isinstance(node, ast.Dict):
+        return None
+    keys = [_const_str(key) for key in node.keys if key is not None]
+    if len(keys) != len(node.keys) or None in keys:
+        return None
+    return frozenset(key for key in keys if key is not None)
+
+
+def _callee_name(node: ast.Call, ctx: _Ctx) -> str | None:
+    """Последняя часть имени вызываемого: ``signature`` у ``inspect.signature`` и псевдонима."""
+    resolved = _resolve_module(node.func, ctx)
+    if resolved is not None:
+        return resolved.rpartition(".")[2]
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return node.func.id if isinstance(node.func, ast.Name) else None
+
+
+def _check_eval_str(node: ast.Call, ctx: _Ctx) -> None:
+    """``eval_str=True`` (``inspect.signature``, ``get_annotations``): аннотации — код."""
+    for keyword in node.keywords:
+        names = frozenset((keyword.arg,)) if keyword.arg else _unpacked_keys(keyword.value)
+        if names is not None and "eval_str" in names:
+            ctx.flag(Level.DANGER, "eval_str: строки-аннотации исполняются как код")
+        elif names is None and _callee_name(node, ctx) in _ANNOTATION_READERS:
+            ctx.flag(None, "аргументы ** известны только при выполнении (eval_str?)")
+
+
 def _check_call(node: ast.Call, ctx: _Ctx) -> None:
     """Вызов функции, функции модуля или метода."""
+    _check_eval_str(node, ctx)
     func = node.func
     if isinstance(func, ast.Name):
         _check_name_call(func.id, node, ctx)
@@ -1674,11 +1836,11 @@ def _is_callable_reference(
     ctx: _Ctx,
 ) -> bool:
     """Ссылку проверяем как вызов: функция модуля, ``open`` или метод из ``_REF_ATTRS``."""
-    if resolved is not None:
-        return True
     if isinstance(node, ast.Name):
-        return node.id == "open" and not _defined(node.id, ctx)
-    return node.attr in _REF_ATTRS
+        return resolved is not None or (node.id == "open" and not _defined(node.id, ctx))
+    if node.attr in _SAFE_DUNDERS:
+        return False  # os.__file__ — описание модуля, не функция
+    return resolved is not None or node.attr in _REF_ATTRS
 
 
 def _check_as_call(node: ast.Name | ast.Attribute, resolved: str | None, ctx: _Ctx) -> None:
@@ -1717,9 +1879,85 @@ def _check_reference(
         _check_as_call(node, resolved, ctx)
 
 
-def _private_dunder(name: str) -> bool:
-    """``__dunder__`` не из безопасных (``__name__``, ``__file__``…)."""
-    return name.startswith("__") and name.endswith("__") and name not in _SAFE_DUNDERS
+def _is_dunder(name: str) -> bool:
+    return len(name) > 4 and name.startswith("__") and name.endswith("__")
+
+
+def _builtin_call(call: ast.AST | None, names: Collection[str], ctx: _Ctx) -> bool:
+    """Вызов встроенной из ``names`` (имя не переопределено в коде)."""
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+        return False
+    name = call.func.id
+    return name in names and name not in ctx.modules and not _defined(name, ctx)
+
+
+def _inspector_call(node: ast.Call, ctx: _Ctx) -> bool:
+    """Вызов, который только показывает или проверяет аргумент: ``print``, ``inspect.signature``."""
+    resolved = _resolve_module(node.func, ctx)
+    if resolved is not None:
+        return resolved in _INSPECT_READERS
+    return _builtin_call(node, _INSPECTORS, ctx)
+
+
+def _inspected(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> bool:
+    """Значение только осматривают: печатают, сравнивают, передают в ``inspect.signature``."""
+    if isinstance(parent, ast.Call):
+        return node in parent.args and _inspector_call(parent, ctx)
+    return isinstance(parent, (ast.Compare, ast.FormattedValue, ast.Expr))
+
+
+def _names_only(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> bool:
+    """От пространства имён берут только имена: ``sorted(X.__dict__)``, ``X.__dict__.keys()``."""
+    if isinstance(parent, ast.Call):
+        return node in parent.args and _builtin_call(parent, _NAME_LISTERS, ctx)
+    if isinstance(parent, ast.Attribute):
+        return parent.attr == "keys"
+    return isinstance(parent, (ast.Compare, ast.Expr))
+
+
+def _super_call(node: ast.Attribute, parent: ast.AST | None, ctx: _Ctx) -> bool:
+    """``super().__init__(…)`` в своём классе — метод базового класса для своего объекта."""
+    if node.attr not in _SUPER_DUNDERS or not isinstance(parent, ast.Call):
+        return False
+    base = node.value
+    called = parent.func is node
+    return (
+        called
+        and isinstance(base, ast.Call)
+        and not base.args
+        and _builtin_call(base, ("super",), ctx)
+    )
+
+
+def _dunder_read(node: ast.Attribute, parent: ast.AST | None, ctx: _Ctx) -> bool:
+    """Чтение ``__dunder__`` безопасно: описание объекта или только осмотр."""
+    attr = node.attr
+    if attr in _SAFE_DUNDERS:
+        return True
+    if attr in _ESCAPE_DUNDERS:
+        return False
+    if attr == _NAMESPACE_DUNDER:
+        return _names_only(node, parent, ctx)
+    # основание атрибута-dunder проверяется вместе с ним: X.__init__.__doc__
+    described = isinstance(parent, ast.Attribute) and (
+        _is_dunder(parent.attr) or parent.attr in _CODE_FIELDS
+    )
+    return described or _inspected(node, parent, ctx) or _super_call(node, parent, ctx)
+
+
+def _check_dunder(node: ast.Attribute, parent: ast.AST | None, ctx: _Ctx) -> None:
+    """``__dunder__``: описание объекта — чтение; методы и пространства имён — только осмотр."""
+    if not isinstance(node.ctx, ast.Load):
+        ctx.flag(Level.DANGER, f"изменение {node.attr} — внутренности интерпретатора")
+    elif not _dunder_read(node, parent, ctx):
+        ctx.flag(Level.DANGER, f"доступ к {node.attr} — внутренности интерпретатора")
+
+
+def _check_unchecked(full: str, ctx: _Ctx) -> None:
+    """Член «безопасного» модуля, который не только читает (``argparse.FileType``)."""
+    reason = _UNCHECKED_MEMBERS.get(full)
+    if reason is not None:
+        ctx.flag(None, f"{full}: {reason}")
 
 
 def _check_module_member(module: str, attr: str, ctx: _Ctx) -> None:
@@ -1730,6 +1968,7 @@ def _check_module_member(module: str, attr: str, ctx: _Ctx) -> None:
         if got is not None:
             ctx.flag(*got)
     _check_module_attr(module, attr, ctx)
+    _check_unchecked(f"{module}.{attr}", ctx)
     if module in ctx.partial and attr not in ctx.partial[module]:
         if attr in {"import_module", "__import__", "reload", "util", "machinery"}:
             ctx.flag(Level.DANGER, f"{module}.{attr} — импорт при выполнении")
@@ -1737,10 +1976,12 @@ def _check_module_member(module: str, attr: str, ctx: _Ctx) -> None:
             ctx.flag(None, f"{module}.{attr} не проверен классификатором")
 
 
-def _check_attribute(node: ast.Attribute, ctx: _Ctx) -> None:
+def _check_attribute(node: ast.Attribute, parent: ast.AST | None, ctx: _Ctx) -> None:
     """Доступ к атрибуту: внутренности интерпретатора и атрибуты модулей."""
     attr = node.attr
-    if _private_dunder(attr) or attr in _INTERNALS:
+    if _is_dunder(attr):
+        _check_dunder(node, parent, ctx)
+    elif attr in _INTERNALS:
         ctx.flag(Level.DANGER, f"доступ к {attr} — внутренности интерпретатора")
     module = _resolve_module(node.value, ctx)
     if module is not None:
@@ -1753,11 +1994,75 @@ def _check_name(node: ast.Name, ctx: _Ctx) -> None:
     """Имя: динамические встроенные, ``__dunder__``, имена из ``from … import *``."""
     if node.id in _DYNAMIC_BUILTINS:
         _dynamic(node.id, ctx)
-    elif _private_dunder(node.id):
+    elif _is_dunder(node.id) and node.id not in _SAFE_DUNDERS:
         ctx.flag(Level.DANGER, f"доступ к {node.id} — внутренности интерпретатора")
     elif ctx.star and not _known_name(node.id, ctx):
         # from platform import * приносит и os: что за объект — не узнать
         ctx.flag(None, f"{node.id}: имя из from … import *, не проверено")
+
+
+# --------------------------------------------------------------------------- #
+# Класс объекта как значение
+# --------------------------------------------------------------------------- #
+def _type_of_object(node: ast.Call, ctx: _Ctx) -> bool:
+    """``type(x)`` с одним аргументом — класс объекта."""
+    return _builtin_call(node, ("type",), ctx) and len(node.args) == 1 and not node.keywords
+
+
+def _gives_classes(node: ast.Call, ctx: _Ctx) -> bool:
+    """Вызов возвращает класс или классы: ``type(x)``, ``X.mro()``, ``inspect.getmro(X)``."""
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "mro":
+        return True
+    return _type_of_object(node, ctx) or _resolve_module(node.func, ctx) == "inspect.getmro"
+
+
+def _class_value(expr: ast.AST, ctx: _Ctx, depth: int = 0) -> bool:
+    """Выражение — класс объекта или кортеж классов (``type(x)``, ``X.__mro__``).
+
+    Вызов такого класса не проверить: ``type(open('a', 'rb').raw)`` — FileIO, и
+    ``FileIO('/home/u/.bashrc', 'w')`` обнуляет файл. Имя — переменная обхода классов.
+    """
+    if depth > _MAX_DEPTH:
+        return True
+    if isinstance(expr, ast.Attribute):
+        return expr.attr in _CLASS_DUNDERS
+    if isinstance(expr, ast.Subscript):
+        return _class_value(expr.value, ctx, depth + 1)
+    if isinstance(expr, ast.Call):
+        return _gives_classes(expr, ctx)
+    if isinstance(expr, ast.Name):
+        for source, index in ctx.iterations.get(expr.id, ()):
+            element = _unwrap_iterable(source, index)
+            if element is not None and _class_value(element, ctx, depth + 1):
+                return True
+    return False
+
+
+def _loop_source(node: ast.AST, parent: ast.AST | None) -> bool:
+    """``node`` — то, что обходит ``for`` или включение."""
+    return isinstance(parent, (ast.For, ast.AsyncFor, ast.comprehension)) and parent.iter is node
+
+
+def _iteration_source(node: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> bool:
+    """``for c in X.__mro__``, ``enumerate(X.__mro__)``: элементы проверяются как имя цикла."""
+    if isinstance(parent, ast.Call) and node in parent.args:
+        wrapped = _builtin_call(parent, ("enumerate", "reversed"), ctx)
+        return wrapped and _loop_source(parent, ctx.parents.get(id(parent)))
+    return _loop_source(node, parent)
+
+
+def _check_class_use(expr: ast.AST, parent: ast.AST | None, ctx: _Ctx) -> None:
+    """Класс объекта — только для осмотра: атрибут, ``print``, ``isinstance``, сравнение."""
+    if isinstance(expr, (ast.Name, ast.Attribute, ast.Subscript)):
+        if not isinstance(expr.ctx, ast.Load):
+            return
+    elif not isinstance(expr, ast.Call):
+        return
+    if not _class_value(expr, ctx):
+        return
+    based = isinstance(parent, (ast.Attribute, ast.Subscript)) and parent.value is expr
+    if not (based or _inspected(expr, parent, ctx) or _iteration_source(expr, parent, ctx)):
+        ctx.flag(None, "класс объекта как значение: что с ним сделают, не видно")
 
 
 def _assigned_module(target: ast.AST, ctx: _Ctx) -> str | None:
@@ -1789,11 +2094,14 @@ def _check_store(node: ast.AST, ctx: _Ctx) -> None:
 def _check_attributes(tree: ast.AST, ctx: _Ctx) -> None:
     """Обход дерева: ссылки, атрибуты, имена, вызовы и изменения модулей."""
     parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    ctx.parents = parents
     for node in ast.walk(tree):
+        parent = parents.get(id(node))
         if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
-            _check_reference(node, parents.get(id(node)), ctx)
+            _check_reference(node, parent, ctx)
+        _check_class_use(node, parent, ctx)
         if isinstance(node, ast.Attribute):
-            _check_attribute(node, ctx)
+            _check_attribute(node, parent, ctx)
         elif isinstance(node, ast.Name):
             _check_name(node, ctx)
         elif isinstance(node, ast.Call):
