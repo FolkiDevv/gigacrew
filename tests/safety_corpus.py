@@ -237,6 +237,7 @@ EOF
 W	printf 'a\nb\n' > list.txt
 W	tee output.log < input.txt
 W	ls > files.txt
+W	ls -R src > .gigacode/tmp/files.txt
 W	git add -A
 W	git add src/main.py
 W	git commit -m "fix: typo"

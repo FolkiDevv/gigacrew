@@ -27,7 +27,7 @@ from gigacrew.project.instructions import (
     NestedInstructions,
     load_instructions,
 )
-from gigacrew.project.workspace import Workspace
+from gigacrew.project.workspace import TEMP_DIR_NAME, Workspace
 
 
 # ------------------------------ Workspace ------------------------------ #
@@ -60,6 +60,7 @@ def test_gitignore_covers_agent_data_but_not_skills(tmp_path: Path) -> None:
         ws.legacy_chats_dir,  # что не удалось перенести, тоже не коммитится
         ws.plans_dir,
         ws.index_dir,
+        ws.data_dir / TEMP_DIR_NAME,
         ws.history_file,
         ws.local_settings_file,
     ):
@@ -83,6 +84,7 @@ def test_gitignore_keeps_skills_in_git(tmp_path: Path) -> None:
         ".gigacode/plans/a.md",
         ".gigacode/history",
         ".gigacode/index/index.sqlite3",
+        ".gigacode/tmp/out.txt",
         ".gigacode/settings.local.json",
     ):
         assert ignored(rel), rel
@@ -105,7 +107,10 @@ def test_ensure_data_dir_creates_gitignore_idempotently(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="симлинки")
-@pytest.mark.parametrize("entry", ["", ".gitignore", "chats", "index", "plans", "history"])
+@pytest.mark.parametrize(
+    "entry",
+    ["", ".gitignore", "chats", "index", "plans", "tmp", "history"],
+)
 def test_ensure_data_dir_refuses_symlinks_out_of_it(tmp_path: Path, entry: str) -> None:
     """Симлинк на месте .gigacode или её служебной записи не уводит запись из проекта.
 
@@ -118,7 +123,7 @@ def test_ensure_data_dir_refuses_symlinks_out_of_it(tmp_path: Path, entry: str) 
     ws = Workspace(root)
     if entry:
         ws.data_dir.mkdir()
-        target = outside if entry in {"chats", "index", "plans"} else outside / "victim"
+        target = outside if entry in {"chats", "index", "plans", "tmp"} else outside / "victim"
         (ws.data_dir / entry).symlink_to(target)  # .gitignore — висячий симлинк
     else:
         ws.data_dir.symlink_to(outside, target_is_directory=True)
@@ -134,6 +139,46 @@ def test_ensure_data_dir_keeps_regular_entries(tmp_path: Path) -> None:
     ws.history_file.write_text("+a\n", encoding="utf-8")
     assert ws.ensure_data_dir() == ws.data_dir
     assert (ws.data_dir / ".gitignore").is_file()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="нужен git")
+def test_temp_dir_is_ignored_with_old_gitignore(tmp_path: Path) -> None:
+    """В прежнем проекте .gigacode/.gitignore без /tmp/: временные файлы не коммитятся всё равно."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    ws = Workspace(tmp_path)
+    ws.data_dir.mkdir()
+    (ws.data_dir / ".gitignore").write_text("/chats/\n", encoding="utf-8")
+    temp_dir = ws.ensure_temp_dir()
+    assert temp_dir == ws.data_dir / TEMP_DIR_NAME
+    assert ws.ensure_temp_dir() == temp_dir  # повторно — без ошибок
+    (temp_dir / "out.txt").write_text("x", encoding="utf-8")
+    run = subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "tmp/" not in run.stdout
+    assert (ws.data_dir / ".gitignore").read_text(encoding="utf-8") == "/chats/\n"
+
+
+@pytest.mark.parametrize(
+    ("rel", "expected"),
+    [
+        (".gigacode/tmp", True),
+        (".gigacode/tmp/a/b.txt", True),
+        (".GIGACODE/tmp/x", False),  # другая папка на ФС с учётом регистра: её git не игнорирует
+        (".gigacode/TMP/x", False),
+        (".gigacode/tmp/.gitignore", False),  # без него временные файлы попали бы в коммит
+        (".gigacode/tmpx", False),
+        (".gigacode/skills/tmp/x", False),
+        (".gigacode", False),
+        ("tmp/x", False),
+    ],
+)
+def test_is_temp_path(tmp_path: Path, rel: str, *, expected: bool) -> None:
+    ws = Workspace(tmp_path)
+    assert ws.is_temp_path(ws.root / rel) is expected
 
 
 # ------------------------------ glob_match ------------------------------ #

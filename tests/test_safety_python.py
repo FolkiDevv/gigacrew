@@ -276,6 +276,9 @@ def test_os_writers_keyword_arguments(root: Path, code: str, expected: CommandLe
         ("import os; os.remove('.gigacode/chats/c.json')", DANGER),
         ("import shutil; shutil.copy('a.txt', '.GIGACODE/skills/x.md')", DANGER),
         ("open('pkg/.gigacode', 'w').write('x')", WRITE),
+        # кроме tmp/ — временных файлов модели
+        ("open('.gigacode/tmp/x.txt', 'w').write('x')", WRITE),
+        ("open('.gigacode/tmp/../skills/x.md', 'w').write('x')", DANGER),
         ("print(open('.gigacode/plans/p.md').read())", READ),
     ],
 )

@@ -1,9 +1,9 @@
 """Рабочее пространство проекта и служебная папка ``.gigacode/``.
 
 ``.gigacode/`` в корне проекта — место для данных агента (индекс проекта, планы,
-история ввода), скиллов (``skills/``, см. :mod:`gigacrew.project.skills`) и
-настроек (``settings.json`` и личный ``settings.local.json``, см.
-:mod:`gigacrew.project.settings`).
+история ввода, временные файлы модели в ``tmp/``), скиллов (``skills/``, см.
+:mod:`gigacrew.project.skills`) и настроек (``settings.json`` и личный
+``settings.local.json``, см. :mod:`gigacrew.project.settings`).
 Папка создаётся лениво, первым компонентом, которому нужно туда писать
 (:meth:`Workspace.ensure_data_dir`), и сразу получает собственный ``.gitignore``:
 рабочие данные агента в репозиторий не попадают, а скиллы — коммитятся.
@@ -27,6 +27,9 @@ SKILLS_DIR_NAME = "skills"
 HISTORY_FILE_NAME = "history"
 SETTINGS_FILE_NAME = "settings.json"
 LOCAL_SETTINGS_FILE_NAME = "settings.local.json"
+# Временные файлы модели (черновые скрипты, сохранённый вывод команд) — вместо /tmp:
+# запись сюда — обычная правка, а запись вне проекта всегда подтверждает пользователь.
+TEMP_DIR_NAME = "tmp"
 # Игнорируются только рабочие данные агента и личные настройки — не вся папка: skills/ и
 # settings.json коммитятся. chats/ — прежнее место чатов: то, что не удалось перенести в
 # ~/.gigacode/projects/, тоже не должно попасть в коммит.
@@ -34,6 +37,7 @@ GITIGNORED_DATA: tuple[str, ...] = (
     "/chats/",
     "/plans/",
     "/index/",
+    f"/{TEMP_DIR_NAME}/",
     f"/{HISTORY_FILE_NAME}",
     f"/{LOCAL_SETTINGS_FILE_NAME}",
 )
@@ -42,6 +46,7 @@ _OWN_ENTRIES: tuple[str, ...] = (
     "chats",
     "plans",
     "index",
+    TEMP_DIR_NAME,
     HISTORY_FILE_NAME,
     ".gitignore",
     "ty.log",
@@ -51,6 +56,9 @@ _GITIGNORE_BODY = (
     "# скиллы (skills/) и settings.json — коммитятся.\n"
     + "".join(f"{pattern}\n" for pattern in GITIGNORED_DATA)
 )
+# Свой .gitignore у tmp/: в прежних проектах .gigacode/.gitignore без /tmp/ (его не
+# перезаписываем), а временные файлы не должны попасть в коммит.
+_TEMP_GITIGNORE_BODY = "# Создано gigacrew: временные файлы агента не коммитятся.\n*\n"
 _GITIGNORE_MODE = 0o644
 _PROJECT_KEY_LENGTH = 16  # символов hex-дайджеста sha256
 
@@ -186,6 +194,20 @@ class Workspace:
             return False
         return bool(parts) and parts[0].casefold() == DATA_DIR_NAME.casefold()
 
+    def is_temp_path(self, path: Path) -> bool:
+        """Лежит ли (уже разрешённый) путь в ``.gigacode/tmp/`` (или это она сама).
+
+        Единственная часть ``.gigacode/``, куда модель пишет как в обычные файлы проекта.
+        Сравнение точное, в отличие от :meth:`is_data_path`: на ФС с учётом регистра
+        ``.gigacode/TMP`` — другая папка, её не игнорирует git. Свой ``.gitignore`` папки
+        модели не принадлежит: без него временные файлы попали бы в коммит.
+        """
+        temp_dir = self.data_dir / TEMP_DIR_NAME
+        path = Path(path)
+        if path == temp_dir / ".gitignore":
+            return False
+        return path == temp_dir or temp_dir in path.parents
+
     def in_git_repo(self) -> bool:
         """Проект внутри git-репозитория: ``.git`` в корне или выше.
 
@@ -198,7 +220,7 @@ class Workspace:
 
         Существующий ``.gitignore`` не перезаписывается — пользователь мог его изменить.
         Через эту проверку проходит всё, что gigacrew пишет в папку сам (история ввода,
-        чаты, индекс, планы, журнал ty): если ``.gigacode`` или одна из этих записей —
+        чаты, индекс, планы, журнал ty, tmp/): если ``.gigacode`` или одна из этих записей —
         симлинк, — ``OSError``, и запись не идёт. Репозиторий может принести такой симлинк
         (git восстанавливает их при клоне), и запись ушла бы за пределы проекта — например,
         введённые запросы дописывались бы в чужой файл.
@@ -211,11 +233,31 @@ class Workspace:
             entry = data_dir / name
             if entry.is_symlink():
                 raise OSError(f"{entry} — симлинк: gigacrew не пишет по нему")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        try:
-            fd = os.open(data_dir / ".gitignore", flags, _GITIGNORE_MODE)
-        except FileExistsError:
-            return data_dir
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(_GITIGNORE_BODY)
+        _create_gitignore(data_dir, _GITIGNORE_BODY)
         return data_dir
+
+    def ensure_temp_dir(self) -> Path:
+        """Создаёт ``.gigacode/tmp/`` (временные файлы модели) со своим ``.gitignore``.
+
+        Идемпотентно; возвращает путь папки.
+
+        Симлинк на месте ``tmp`` — ``OSError`` (проверяет :meth:`ensure_data_dir`).
+        """
+        temp_dir = self.ensure_data_dir() / TEMP_DIR_NAME
+        temp_dir.mkdir(exist_ok=True)
+        _create_gitignore(temp_dir, _TEMP_GITIGNORE_BODY)
+        return temp_dir
+
+
+def _create_gitignore(directory: Path, body: str) -> None:
+    """Создаёт ``directory/.gitignore``, если его нет; существующий не трогает.
+
+    ``O_EXCL`` не идёт по симлинку, даже висячему: на его месте — отказ, как у готового файла.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(directory / ".gitignore", flags, _GITIGNORE_MODE)
+    except FileExistsError:
+        return
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(body)

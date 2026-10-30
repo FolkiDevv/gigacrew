@@ -1120,6 +1120,23 @@ def test_tool_levels(root: Path, command: str, expected: CommandLevel | None) ->
     assert verdict.level is expected, (command, verdict.reason)
 
 
+def test_scratch_writes_are_edits(root: Path) -> None:
+    """Временный файл в .gigacode/tmp/ — правка, как write_file: в «авто» без вопроса."""
+    verdict = classify("cat > .gigacode/tmp/check.py <<'EOF'\nprint(1)\nEOF", root=root)
+    assert verdict.level is WRITE
+    assert verdict.edits_only
+    assert level("cat a.txt > /tmp/check.txt", root) is DANGER  # /tmp — вне проекта
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_symlinked_scratch_dir_is_not_scratch(root: Path) -> None:
+    """Симлинк tmp → skills из репозитория не открывает запись в служебную папку."""
+    skills = root / ".gigacode" / "skills"
+    skills.mkdir(parents=True)
+    (root / ".gigacode" / "tmp").symlink_to(skills, target_is_directory=True)
+    assert level("echo x > .gigacode/tmp/SKILL.md", root) is DANGER
+
+
 def test_npm_format_script_edits_files(root: Path) -> None:
     (root / "package.json").write_text('{"scripts": {"format": "prettier -w .", "lint": "x"}}')
     verdict = classify("npm run format", root=root)
@@ -1173,6 +1190,14 @@ def test_npm_format_script_edits_files(root: Path) -> None:
         # служебная папка gigacrew и устройства
         ("cp a.txt .gigacode/settings.json", DANGER),
         ("echo {} > .gigacode/settings.local.json", DANGER),
+        # .gigacode/tmp/ — временные файлы модели: запись туда — правка
+        ("echo x > .gigacode/tmp/out.txt", WRITE),
+        ("cp a.txt .gigacode/tmp/a.txt", WRITE),
+        ("cp a.txt .gigacode/TMP/a.txt", DANGER),
+        ("echo x > .gigacode/tmp/.gitignore", DANGER),
+        ("mkdir -p .gigacode/tmp", WRITE),
+        ("echo {} > .gigacode/tmp/../settings.json", DANGER),
+        ("cp a.txt .gigacode/tmpfile", DANGER),
         ("mv src /dev/null", DANGER),
         ("cp a.txt /dev/null", DANGER),
         ("ls 2>/dev/null", READ),
