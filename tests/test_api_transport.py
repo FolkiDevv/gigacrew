@@ -263,6 +263,23 @@ def test_silent_model_is_retried_only_once(*, streaming: bool) -> None:
     provider.close()
 
 
+def test_call_timeout_replaces_read_timeout_without_retry() -> None:
+    """Ожидание вызова (рецензент) — вместо read_timeout, и молчание не повторяется."""
+    reads: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        reads.append(request.extensions["timeout"]["read"])
+        raise httpx.ReadTimeout("The read operation timed out", request=request)
+
+    provider = _provider(handler)
+    with pytest.raises(ApiError, match="не ответила за 30 с"):
+        provider.complete(_msgs(), timeout=30)
+    assert reads == [30]
+    provider.close()
+
+
 def test_stream_retries_connect_error_before_output() -> None:
     attempts = {"n": 0}
 

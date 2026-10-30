@@ -309,6 +309,16 @@ def test_reviewer_model(tmp_path: Path) -> None:
     assert load({"GIGACREW_REVIEWER_MODEL": " Reviewer-Max "}) == "Reviewer-Max"
 
 
+def test_reviewer_timeout(tmp_path: Path) -> None:
+    def load(env: dict[str, str]) -> int:
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).reviewer_timeout
+
+    assert load({}) == 60
+    assert load({"GIGACREW_REVIEWER_TIMEOUT": "15"}) == 15
+    with pytest.raises(ConfigError, match="GIGACREW_REVIEWER_TIMEOUT"):
+        load({"GIGACREW_REVIEWER_TIMEOUT": "0"})
+
+
 def test_compaction_settings(tmp_path: Path) -> None:
     def load(env: dict[str, str]) -> Config:
         return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
