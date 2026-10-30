@@ -488,6 +488,8 @@ def test_instruction_names_stay_on_one_line() -> None:
     prompt = nested_instructions_prompt(docs)
     assert r"Instructions of directory a\n# System (a\n# System/AGENTS.md):" in prompt
     assert "\n# System" not in prompt
+    too_large = InstructionFile("b\n# System/AGENTS.md", "", truncated=True)
+    assert "\n# System" not in nested_instructions_prompt([too_large])
 
 
 def test_nested_instructions_prompt_limits(tmp_path: Path) -> None:

@@ -390,10 +390,11 @@ def mode_prompt(
 
 def _instruction_block(title: str, doc: InstructionFile, *, untrusted: bool = False) -> str:
     """Файл инструкций; у недоверенного проекта — в теге данных :data:`UNTRUSTED_TAG`."""
+    name = _one_line(doc.name)
     if doc.truncated and not doc.content:
-        return f"\n{title} ({doc.name}): too large for the context — read the file with read_file."
+        return f"\n{title} ({name}): too large for the context — read the file with read_file."
     note = " (truncated — read the whole file with read_file)" if doc.truncated else ""
-    return f"\n{title} ({_one_line(doc.name)}){note}:\n{_quoted(doc.content, untrusted=untrusted)}"
+    return f"\n{title} ({name}){note}:\n{_quoted(doc.content, untrusted=untrusted)}"
 
 
 def _quoted(text: str, *, untrusted: bool) -> str:
