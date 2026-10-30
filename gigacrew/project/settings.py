@@ -173,16 +173,17 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
     disabled = False
     project_disabled = False
     for path, source in settings_files(workspace):
+        # Файлы недоверенного проекта не читаются: их разбор может уронить запуск.
+        if workspace.untrusted and source in PROJECT_SOURCES:
+            continue
         document = _read_settings_file(path, warnings)
         if document is None:
             continue
-        switch = document.get("disableAllHooks")
-        if switch is True and source in PROJECT_SOURCES:
-            project_disabled = True
-        elif switch is True:
-            disabled = True
-        elif switch not in {None, False}:  # "true" или 1 молча не выключили бы ничего
-            warnings.append(f"{path}: disableAllHooks — ожидается true или false, пропущено")
+        if document.get("disableAllHooks") is True:
+            if source in PROJECT_SOURCES:
+                project_disabled = True
+            else:
+                disabled = True
         groups.extend(_parse_hooks(document.get("hooks"), path, source, warnings))
     if project_disabled:
         groups = [group for group in groups if group.source not in PROJECT_SOURCES]
@@ -191,7 +192,11 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
 
 
 def _read_settings_file(path: Path, warnings: list[str]) -> dict[str, Any] | None:
-    """JSON-объект файла настроек; None — файла нет или он пропущен (с предупреждением)."""
+    """JSON-объект файла настроек; None — файла нет или он пропущен (с предупреждением).
+
+    ``disableAllHooks`` не true/false — предупреждение: "true" или 1 молча не выключили бы
+    ничего.
+    """
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -202,6 +207,10 @@ def _read_settings_file(path: Path, warnings: list[str]) -> dict[str, Any] | Non
     if not isinstance(document, dict):
         warnings.append(f"{path}: ожидается JSON-объект — файл пропущен")
         return None
+    switch = document.get("disableAllHooks")
+    # Сравнение по is, а не через множество: [] не хешируется.
+    if switch is not None and switch is not True and switch is not False:
+        warnings.append(f"{path}: disableAllHooks — ожидается true или false, пропущено")
     return document
 
 

@@ -371,6 +371,9 @@ class Config:
     compact_threshold: float = 0.8
     # Сохранять чаты в ~/.gigacode/projects/<ключ>/chats/ (продолжение — /resume, -c).
     save_chats: bool = True
+    # Проект недоверенный (--untrusted-project, ревью чужих изменений): его файлы и
+    # инструкции — данные, а не указания, для основного агента и суб-агентов.
+    untrusted_project: bool = False
     # Предлагать замер окна незамеренной модели (пробы оплачиваются); False — только
     # по --test-context.
     auto_measure: bool = True
@@ -399,6 +402,7 @@ class Config:
         mode: PermissionMode | None = None,
         stream: bool = True,
         save_chats: bool = True,
+        untrusted_project: bool = False,
         environ: Mapping[str, str] | None = None,
         cwd: Path | None = None,
         trusted_dotenv: bool = False,
@@ -477,6 +481,7 @@ class Config:
             )
             / _PERCENT,
             save_chats=save_chats and _env_bool(env, "GIGACREW_SAVE_CHATS", default=True),
+            untrusted_project=untrusted_project,
             auto_measure=_env_bool(env, "GIGACREW_AUTO_MEASURE", default=True),
             ty=_env_bool(env, "GIGACREW_TY", default=True),
             safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", default=True),

@@ -240,6 +240,27 @@ def test_disable_all_hooks_must_be_boolean(tmp_path: Path, flag: str | int) -> N
     assert "disableAllHooks" in warnings[0]
 
 
+def test_untrusted_project_hooks_are_skipped(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, untrusted=True)
+    _write(user_settings_file(), _hooks("Stop", "echo user"))
+    _write(ws.settings_file, _hooks("Stop", "echo project"))
+    _write(ws.local_settings_file, _hooks("Stop", "echo local"))
+    settings, _ = load_settings(ws)
+    assert [hook.command for hook in settings.commands(HookEvent.STOP)] == ["echo user"]
+    assert not settings.project_groups
+    # Файлы проекта даже не читаются: битый файл не даёт предупреждения.
+    ws.settings_file.write_text("{не JSON", encoding="utf-8")
+    assert not load_settings(ws)[1]
+
+
+def test_unhashable_disable_all_hooks_is_a_warning(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path)
+    _write(ws.settings_file, {"disableAllHooks": [], **_hooks("Stop", "echo")})
+    _, warnings = load_settings(ws)
+    assert len(warnings) == 1
+    assert "disableAllHooks" in warnings[0]
+
+
 def test_without_project_keeps_user_hooks(tmp_path: Path) -> None:
     ws = Workspace(tmp_path)
     _write(user_settings_file(), _hooks("Stop", "echo user"))
