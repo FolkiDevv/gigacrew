@@ -15,9 +15,9 @@ from gigacrew.project.files import (
     TREE_TRUNCATED,
     build_file_tree,
     glob_match,
-    is_git_internal,
     is_secret_file,
     is_secret_path,
+    is_vcs_internal,
     is_within,
     walk_files,
 )
@@ -206,8 +206,15 @@ def test_git_internal_by_path_as_given(tmp_path: Path) -> None:
     (root / "nested" / "plain").mkdir(parents=True)
     (root / "nested" / ".git").symlink_to(root / "nested" / "plain")
     resolved = (root / "nested" / ".git" / "config").resolve()
-    assert is_git_internal(root, resolved, "nested/.git/config")
-    assert not is_git_internal(root, resolved)
+    assert is_vcs_internal(root, resolved, "nested/.git/config")
+    assert not is_vcs_internal(root, resolved)
+
+
+def test_jj_dir_is_vcs_internal(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    assert is_vcs_internal(root, root / ".jj" / "repo" / "config.toml")
+    assert is_vcs_internal(root, root / "sub" / ".JJ" / "working_copy")
+    assert not is_vcs_internal(root, root / "src" / "jj.py")
 
 
 @pytest.mark.parametrize(

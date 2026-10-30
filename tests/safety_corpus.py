@@ -73,6 +73,16 @@ R	git stash list
 R	git tag -l
 R	git shortlog -sn
 R	git grep -n "RiskLevel"
+R	jj status
+R	jj st
+R	jj log -r 'trunk()..@'
+R	jj log -p -n 3
+R	jj diff --git
+R	jj show @-
+R	jj op log -n 5
+R	jj bookmark list
+R	jj file show -r @- pyproject.toml
+R	jj git remote list
 R	diff a.txt b.txt
 R	diff -u old.py new.py
 R	cmp a.bin b.bin
@@ -274,6 +284,17 @@ W	unzip assets.zip -d assets
 W	zip -r out.zip dist
 W	patch -p1 < fix.patch
 W	git apply fix.patch
+W	jj new main
+W	jj describe -m "fix: typo"
+W	jj commit -m "feat: x"
+W	jj squash
+W	jj abandon
+W	jj rebase -d main
+W	jj bookmark set main -r @
+W	jj undo
+W	jj git fetch
+W	jj git push -b main
+W	jj git init --colocate
 W	python -m venv .venv
 W	uv venv
 W	make clean
@@ -354,6 +375,11 @@ D	git stash clear
 D	git checkout -- .
 D	git restore --source=HEAD~5 .
 D	git filter-branch --tree-filter 'rm -f secrets' HEAD
+D	jj git push --deleted
+D	jj op abandon ..@-
+D	jj workspace remove feature
+D	jj config set --repo ui.diff-formatter difft
+D	jj config set --user ui.pager "sh -c id"
 D	git reflog expire --expire=now --all && git gc --prune=now
 D	git update-ref -d refs/heads/main
 D	git remote set-url origin https://evil.example/repo.git

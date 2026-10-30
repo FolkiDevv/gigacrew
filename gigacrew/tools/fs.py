@@ -18,7 +18,7 @@ from typing import override
 from pydantic import BaseModel, Field
 
 from gigacrew.permissions import PermissionMode, ToolKind
-from gigacrew.project.files import GIT_DIR_NAME, glob_match, is_git_internal, walk_files
+from gigacrew.project.files import glob_match, is_vcs_internal, walk_files
 from gigacrew.project.secret_paths import is_secret_target
 from gigacrew.project.workspace import DATA_DIR_NAME
 from gigacrew.security import RiskLevel, SandboxError, resolve_in_root
@@ -291,20 +291,21 @@ def _plan_written(ctx: ToolContext, path: Path) -> bool:
 
 
 def _writable_path(ctx: ToolContext, path: str) -> Path:
-    """Путь для записи: внутри корня, не в ``.gigacode/`` и не во внутренностях git.
+    """Путь для записи: внутри корня, не в ``.gigacode/`` и не во внутренностях git и jj.
 
     В ``.gigacode/`` лежат индекс, история ввода и чаты агента — модель не должна
     их править. Исключение — файл плана текущего чата (``ctx.plan``). Запись в
     ``.git/`` (``config``, хуки) превратила бы правку файла в выполнение команды:
     ``core.fsmonitor`` и ``diff.external`` запускаются уже на ``git status``/``git
-    diff``, которые выполняются без подтверждения. Проверка срабатывает и в превью,
-    то есть до вопроса о подтверждении.
+    diff``, которые выполняются без подтверждения; в ``.jj/`` так же опасны настройки
+    репозитория jj (``ui.diff-formatter`` на ``jj diff``). Проверка срабатывает и в
+    превью, то есть до вопроса о подтверждении.
     """
     target = resolve_in_root(ctx.root, path)
-    if is_git_internal(ctx.root, target, path):
+    if is_vcs_internal(ctx.root, target, path):
         raise ToolError(
-            f"Внутренности git ({GIT_DIR_NAME}/) недоступны для записи: {path}. "
-            "Для операций с репозиторием используйте инструмент git.",
+            f"Внутренности git и jj (.git/, .jj/) недоступны для записи: {path}. "
+            "Для операций с репозиторием используйте инструмент git или команды jj.",
         )
     if ctx.plan is not None and ctx.plan.is_target(target):
         return target

@@ -26,8 +26,8 @@ from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 
-from gigacrew.project.files import looks_like_git_dir
-from gigacrew.safety import gitconfig
+from gigacrew.project.files import JJ_DIR_NAME, looks_like_git_dir
+from gigacrew.safety import gitconfig, jjconfig
 from gigacrew.safety.bash import Command, Word
 from gigacrew.safety.levels import CommandLevel, Part, worst
 from gigacrew.safety.paths import (
@@ -35,7 +35,7 @@ from gigacrew.safety.paths import (
     has_escaping_links,
     has_secrets_under,
     is_data_path,
-    is_git_internal,
+    is_vcs_internal,
     scope,
 )
 from gigacrew.safety.python import analyze, shadowed_stdlib
@@ -346,9 +346,9 @@ def check_write(env: Env, words: list[Word], what: str, *, edits: bool = True) -
             parts.append(_unknown(f"{what}: путь известен только при выполнении ({word.raw})"))
             continue
         target = Path(word.text) if word.text.startswith("/") else (env.dir / word.text)
-        if is_git_internal(target.resolve(), env.root) or is_git_internal(target, env.root):
+        if is_vcs_internal(target.resolve(), env.root) or is_vcs_internal(target, env.root):
             return _danger(
-                f"{what}: служебные файлы git ({word.raw}) — оттуда запускаются программы",
+                f"{what}: служебные файлы git или jj ({word.raw}) — оттуда запускаются программы",
             )
         if is_data_path(target.resolve(), env.root):
             return _danger(f"{what}: служебная папка gigacrew ({word.raw})")
@@ -756,8 +756,8 @@ SAFE_VARS = frozenset((
 ))
 # Переменные окружения, меняющие, какой код запустится (подмена программ, хуки, пейджеры).
 _DANGER_ENV = re.compile(
-    r"^(LD_\w+|DYLD_\w+|PATH|IFS|CDPATH|PAGER|GIT_\w+|EDITOR|VISUAL|BASH_ENV|ENV|SHELLOPTS|"
-    r"BASHOPTS|PS4|PROMPT_COMMAND|HOME|XDG_CONFIG_HOME|NODE_OPTIONS|PERL5OPT|PERL5LIB|"
+    r"^(LD_\w+|DYLD_\w+|PATH|IFS|CDPATH|PAGER|GIT_\w+|JJ_\w+|EDITOR|VISUAL|BASH_ENV|ENV|"
+    r"SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|HOME|XDG_CONFIG_HOME|NODE_OPTIONS|PERL5OPT|PERL5LIB|"
     r"RUBYOPT|RUBYLIB|PYTHONSTARTUP|PYTHONHOME|PYTHONINSPECT|LESSOPEN|LESSCLOSE|LESSKEY|"
     r"JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|RIPGREP_CONFIG_PATH|RUSTC_WRAPPER|CC|CXX|LD|"
     r"MANPAGER|BROWSER|SSH_ASKPASS|SUDO_ASKPASS|GCONV_PATH|NODE_PATH|DENO_\w+|NPM_CONFIG_\w+|"
@@ -3638,6 +3638,435 @@ def _git_read_after_check(env: Env, reason: str) -> Part:
 
 
 # --------------------------------------------------------------------------- #
+# jj (Jujutsu): свои репозитории, колоцированные с git и подкоманды jj git
+# --------------------------------------------------------------------------- #
+# Псевдонимы подкоманд. st, b, ci, desc — из настроек jj по умолчанию (переопределение
+# в настройках репозитория ловит jjconfig), op и evolution-log — встроенные.
+_JJ_ALIASES = MappingProxyType({
+    "st": "status",
+    "b": "bookmark",
+    "ci": "commit",
+    "desc": "describe",
+    "op": "operation",
+    "evolution-log": "evolog",
+    "obslog": "evolog",
+})
+_JJ_ACTION_ALIASES: Mapping[str, Mapping[str, str]] = MappingProxyType({
+    "bookmark": MappingProxyType({
+        "a": "advance",
+        "c": "create",
+        "d": "delete",
+        "f": "forget",
+        "l": "list",
+        "m": "move",
+        "r": "rename",
+        "s": "set",
+        "t": "track",
+    }),
+    "tag": MappingProxyType({"d": "delete", "l": "list", "s": "set"}),
+    "config": MappingProxyType({
+        "e": "edit",
+        "g": "get",
+        "l": "list",
+        "p": "path",
+        "s": "set",
+        "u": "unset",
+    }),
+})
+# Глобальные флаги jj — принимаются и после подкоманды: без значения и со значением.
+_JJ_GLOBAL_FLAGS = frozenset((
+    "--ignore-working-copy",
+    "--no-integrate-operation",
+    "--ignore-immutable",
+    "--debug",
+    "--quiet",
+    "--no-pager",
+))
+_JJ_GLOBAL_VALUED = frozenset(("--color", "--at-operation", "--at-op"))
+_JJ_CONFIG_FLAGS = frozenset(("--config", "--config-file", "--config-toml"))
+# Только читают репозиторий. Снимок рабочей копии, который jj делает перед командой,
+# пишет лишь служебные данные (как git status — индекс), а в колоцированном репозитории —
+# ещё и ссылки git.
+_JJ_READ = frozenset(("log", "diff", "show", "status", "evolog", "interdiff"))
+_JJ_INFO = frozenset(("help", "version", "root"))  # без программ из настроек
+# Меняют репозиторий или рабочую копию; прежнее состояние возвращает jj undo.
+_JJ_WRITE = frozenset((
+    "abandon",
+    "absorb",
+    "commit",
+    "describe",
+    "duplicate",
+    "edit",
+    "metaedit",
+    "new",
+    "next",
+    "prev",
+    "parallelize",
+    "rebase",
+    "redo",
+    "undo",
+    "restore",
+    "revert",
+    "simplify-parents",
+    "split",
+    "squash",
+    "sign",
+    "unsign",
+    "converge",
+))
+# Умеют выбирать правки в редакторе разницы (ui.diff-editor или --tool).
+_JJ_INTERACTIVE = frozenset(("absorb", "commit", "restore", "split", "squash"))
+_JJ_SPLIT_VALUED = (
+    "-r",
+    "--revision",
+    "-o",
+    "--onto",
+    "-d",
+    "--destination",
+    "-A",
+    "--insert-after",
+    "--after",
+    "-B",
+    "--insert-before",
+    "--before",
+    "-m",
+    "--message",
+)
+_JJ_DIFF_VALUED = (
+    "-r",
+    "--revisions",
+    "--revision",
+    "-f",
+    "--from",
+    "-t",
+    "--to",
+    "-T",
+    "--template",
+    "--context",
+)
+_JJ_FILE_VALUED = ("-r", "--revision", "-T", "--template")
+# Запускают программы: команды пользователя (run, bisect run), инструменты из настроек
+# (fix, diffedit), интерактивный интерфейс (arrange); debug и bench — служебные.
+_JJ_RUNS = frozenset(("run", "bisect", "fix", "diffedit", "arrange", "debug", "bench"))
+# Группы подкоманд: действие — уровень.
+_JJ_GROUPS: Mapping[str, Mapping[str, CommandLevel]] = MappingProxyType({
+    "file": MappingProxyType({
+        "show": READ,
+        "list": READ,
+        "annotate": READ,
+        "search": READ,
+        "chmod": WRITE,
+        "track": WRITE,
+        "untrack": WRITE,
+        "delete": WRITE,
+        "edit": WRITE,
+    }),
+    "operation": MappingProxyType({
+        "log": READ,
+        "show": READ,
+        "diff": READ,
+        "restore": WRITE,
+        "revert": WRITE,
+        "integrate": WRITE,
+    }),
+    "bookmark": MappingProxyType({
+        "list": READ,
+        "advance": WRITE,
+        "create": WRITE,
+        "delete": WRITE,
+        "forget": WRITE,
+        "move": WRITE,
+        "rename": WRITE,
+        "set": WRITE,
+        "track": WRITE,
+        "untrack": WRITE,
+    }),
+    "tag": MappingProxyType({
+        "list": READ,
+        "set": WRITE,
+        "delete": WRITE,
+        "track": WRITE,
+        "untrack": WRITE,
+    }),
+    "workspace": MappingProxyType({
+        "list": READ,
+        "root": READ,
+        "forget": WRITE,
+        "rename": WRITE,
+        "update-stale": WRITE,
+    }),
+    "sparse": MappingProxyType({"list": READ, "set": WRITE, "reset": WRITE, "edit": WRITE}),
+})
+_JJ_DANGER = MappingProxyType({
+    ("operation", "abandon"): "удаление истории операций — jj undo её не вернёт",
+    ("workspace", "remove"): "удаление каталога рабочей копии с диска",
+})
+# Настройки jj, которые запускают программы: внешние инструменты сравнения и слияния,
+# редактор, пейджер, команда по умолчанию и псевдонимы (util exec), jj fix, подпись,
+# fsmonitor, git для обмена с удалёнными репозиториями.
+_JJ_PROGRAM_KEYS = (
+    "ui.diff-formatter",
+    "ui.diff-editor",
+    "ui.merge-editor",
+    "ui.editor",
+    "ui.pager",
+    "ui.default-command",
+    "ui.diff.tool",
+    "merge-tools",
+    "fix",
+    "signing",
+    "aliases",
+    "fsmonitor",
+    "core.fsmonitor",
+    "git.executable-path",
+)
+_JJ_UNDO = "изменение репозитория (отменяется jj undo)"
+
+
+def _jj(env: Env, args: list[Word]) -> Part:
+    if any(not arg.static for arg in args):
+        # слово из переменной может оказаться глобальным флагом (--config, -R)
+        return _unknown("jj: аргумент известен только при выполнении")
+    parsed = _jj_globals(env, args)
+    if isinstance(parsed, Part):
+        return parsed
+    rest, repo = parsed
+    if not rest:
+        return _unknown("jj без подкоманды: команда по умолчанию из настроек")
+    first = rest[0].text
+    if first in {"--version", "-V", "--help", "-h"}:
+        return _read("jj: справка")
+    if first.startswith("-"):
+        return _unknown(f"jj {first}: глобальный флаг не проверен")
+    return _jj_sub(env, repo, _JJ_ALIASES.get(first, first), rest[1:])
+
+
+def _jj_globals(env: Env, args: list[Word]) -> Part | tuple[list[Word], Env]:
+    """Глобальные флаги jj (в любом месте до ``--``): (остальные слова, окружение репозитория).
+
+    ``-R`` меняет только репозиторий: пути в аргументах jj считает от рабочего каталога.
+    Оценка вместо пары — флаг, после которого команду нельзя считать проверенной.
+    """
+    kept: list[Word] = []
+    repo = env
+    idx = 0
+    while idx < len(args):
+        text = args[idx].text
+        name, eq, attached = text.partition("=")
+        following = attached if eq else _word_after(args, idx)
+        if text == "--":
+            kept.extend(args[idx:])
+            break
+        if name in _JJ_CONFIG_FLAGS:
+            key = following.split("=", 1)[0]
+            if name == "--config" and _jj_runs_program_key(key):
+                return _danger(f"jj --config {key}: настройка запускает программы")
+            return _unknown(f"jj {name}: настройка на один запуск не проверена")
+        target = _jj_repository(text, _word_after(args, idx))
+        if target is None:
+            if name in _JJ_GLOBAL_VALUED:
+                idx += 1 if eq else 2
+                continue
+            if text not in _JJ_GLOBAL_FLAGS:
+                kept.append(args[idx])
+            idx += 1
+            continue
+        path, used = target
+        if not path or scope(Word(path), root=env.root, cwd=env.cwd) is not Scope.INSIDE:
+            return _unknown(f"jj -R {path}: репозиторий вне проекта")
+        repo = replace(env, cwd=os.path.relpath((env.dir / path).resolve(), env.root))
+        idx += used
+    return kept, repo
+
+
+def _jj_repository(text: str, following: str) -> tuple[str, int] | None:
+    """Каталог из ``-R``/``--repository`` в слове ``text``: (каталог, занято слов) или None.
+
+    Короткий флаг бывает в группе (``-sR ../x``) и со значением в том же слове (``-R../x``).
+    """
+    if text == "--repository":
+        return following, 2
+    if text.startswith("--repository="):
+        return text.split("=", 1)[1], 1
+    if re.match(r"-[A-Za-z]*R", text):
+        attached = text[text.index("R") + 1 :].removeprefix("=")
+        return (attached, 1) if attached else (following, 2)
+    return None
+
+
+def _jj_runs_program_key(key: str) -> bool:
+    """Ключ настроек jj запускает программы: сам, внутри такой таблицы или как таблица (``ui``)."""
+    name = re.sub(r"[\"'\s]", "", key).lower()
+    return bool(name) and any(
+        name == danger or name.startswith(f"{danger}.") or danger.startswith(f"{name}.")
+        for danger in _JJ_PROGRAM_KEYS
+    )
+
+
+def _jj_positional(args: list[Word], valued: Collection[str]) -> list[Word]:
+    """Позиционные аргументы без флагов и их значений."""
+    return _split(_without_values(args, *valued))[1]
+
+
+def _jj_paths(args: list[Word], valued: Collection[str]) -> list[Word]:
+    """Пути из позиционных аргументов; шаблоны с префиксом (``glob:``, ``root:``) не пути."""
+    return [word for word in _jj_positional(args, valued) if ":" not in word.text]
+
+
+def _jj_sub(env: Env, repo: Env, sub: str, rest: list[Word]) -> Part:
+    name = f"jj {sub}"
+    fl = _flagset(_split(rest)[0])
+    tool = next((word.text for word in _flag_values(rest, "--tool") if word.text[:1] != ":"), None)
+    if tool is not None:  # ":git", ":builtin"… — встроенные
+        return _unknown(f"{name} --tool {tool}: внешняя программа")
+    if sub in _JJ_INFO:
+        return _read(f"{name}: справка")
+    if sub in _JJ_READ:
+        # как git diff: явный путь к секретам или наружу — вопрос
+        bad = check_read(env, _jj_paths(rest, _JJ_DIFF_VALUED), name) if sub == "diff" else None
+        if bad is not None:
+            return bad
+        return _jj_read_after_check(repo, f"{name}: чтение репозитория")
+    if sub == "resolve":
+        if _has(fl, "-l", "--list"):
+            return _jj_read_after_check(repo, "jj resolve --list: список конфликтов")
+        return _unknown("jj resolve: запуск инструмента слияния")
+    if sub in _JJ_RUNS:
+        return _unknown(f"{name}: запуск программ или интерактивный интерфейс")
+    if sub in _JJ_WRITE:
+        if sub in _JJ_INTERACTIVE and (
+            _has(fl, "-i", "--interactive")
+            or (sub == "split" and not _jj_positional(rest, _JJ_SPLIT_VALUED))
+        ):
+            return _unknown(f"{name}: выбор правок в редакторе разницы")
+        return _write(f"{name}: {_JJ_UNDO}")
+    if sub == "config":
+        return _jj_config(rest)
+    if sub == "git":
+        return _jj_git(env, repo, rest)
+    if sub == "util":
+        return _jj_util(env, repo, rest)
+    if sub == "gerrit":
+        return _write("jj gerrit: публикация изменений на сервере Gerrit")
+    if sub in _JJ_GROUPS:
+        return _jj_group(env, repo, sub, rest)
+    return _unknown(f"{name}: подкоманда не проверена")
+
+
+def _jj_group(env: Env, repo: Env, sub: str, rest: list[Word]) -> Part:
+    action, after = _subcommand(rest)
+    action = _JJ_ACTION_ALIASES.get(sub, {}).get(action, action)
+    name = f"jj {sub} {action}"
+    danger = _JJ_DANGER.get((sub, action))
+    if danger is not None:
+        return _danger(f"{name}: {danger}")
+    if (sub, action) == ("workspace", "add"):
+        valued = ("--name", "-r", "--revision", "-m", "--message", "--sparse-patterns")
+        return check_write(env, _jj_positional(after, valued)[:1], name, edits=False)
+    level = _JJ_GROUPS[sub].get(action)
+    if level is READ:
+        if (sub, action) in {("file", "show"), ("file", "annotate")}:
+            bad = check_read(env, _jj_paths(after, _JJ_FILE_VALUED), name)
+            if bad is not None:
+                return bad
+        return _jj_read_after_check(repo, f"{name}: чтение репозитория")
+    if level is WRITE:
+        return _write(f"{name}: {_JJ_UNDO}")
+    return _unknown(f"{name}: подкоманда не проверена")
+
+
+def _jj_config(rest: list[Word]) -> Part:
+    action, after = _subcommand(rest)
+    action = _JJ_ACTION_ALIASES["config"].get(action, action)
+    flags, pos = _split(after)
+    if action in {"get", "list", "path"}:
+        return _read(f"jj config {action}: просмотр настроек")
+    if action == "gc":
+        return _danger("jj config gc: удаление настроек других репозиториев")
+    if action not in {"set", "unset", "edit"}:
+        return _unknown(f"jj config {action}: подкоманда не проверена")
+    if _has(_flagset(flags), "--user", "--file"):
+        return _danger(f"jj config {action} --user/--file: настройки вне репозитория")
+    key = pos[0].text if pos else ""
+    if action != "edit" and _jj_runs_program_key(key):
+        return _danger(f"jj config {key}: настройка запускает программы")
+    return _write(f"jj config {action}: настройки репозитория")
+
+
+def _jj_git(env: Env, repo: Env, rest: list[Word]) -> Part:
+    action, after = _subcommand(rest)
+    detail, _ = _subcommand(after)
+    if action == "root" or (action, detail) in {("remote", "list"), ("colocation", "status")}:
+        return _jj_read_after_check(repo, f"jj git {action}: чтение репозитория")
+    if action == "remote":
+        return _danger(f"jj git remote {detail}: изменение адресов репозитория")
+    if action == "colocation" and detail in {"enable", "disable"}:
+        return _write(f"jj git colocation {detail}: перенос репозитория git")
+    if action == "push":
+        if "--deleted" in _flagset(_split(after)[0]):
+            return _danger("jj git push --deleted: удаление на сервере")
+        return _write("jj git push: публикация коммитов в удалённый репозиторий")
+    if action in {"fetch", "export", "import"}:
+        return _write(f"jj git {action}: обмен с репозиторием git")
+    if action in {"clone", "init"}:
+        valued = ("--remote", "--depth", "-b", "--branch", "--bookmark", "-t", "--tag")
+        pos = _jj_positional(after, (*valued, "--object-hash", "--git-repo"))
+        git_repo = _flag_values(after, "--git-repo")  # init: репозиторий git, куда jj пишет
+        targets = pos[1:2] if action == "clone" else [*pos[:1], *git_repo]
+        bad = check_write(env, targets, f"jj git {action}", edits=False) if targets else None
+        if bad is not None and bad.level is not WRITE:
+            return bad
+        return _write(f"jj git {action}: новый репозиторий")
+    return _unknown(f"jj git {action}: подкоманда не проверена")
+
+
+def _jj_util(env: Env, repo: Env, rest: list[Word]) -> Part:
+    action, after = _subcommand(rest)
+    if action in {"completion", "config-schema", "markdown-help"}:
+        return _read(f"jj util {action}: справка")
+    if action in {"backend", "snapshot"}:
+        return _jj_read_after_check(repo, f"jj util {action}")
+    if action == "diff":  # сравнивает файлы на диске
+        bad = check_read(env, _jj_positional(after, ("--context",)), "jj util diff")
+        if bad is not None:
+            return bad
+        return _jj_read_after_check(repo, "jj util diff: сравнение файлов")
+    if action == "gc":
+        if any(word.text.startswith("--expire") for word in after):
+            return _danger("jj util gc --expire: удаление недостижимых объектов")
+        return _write("jj util gc")
+    if action == "install-man-pages":
+        pages = _jj_positional(after, ())[:1]
+        return check_write(env, pages, "jj util install-man-pages", edits=False)
+    if action == "exec":
+        return _unknown("jj util exec: запуск программы")
+    return _unknown(f"jj util {action}: подкоманда не проверена")
+
+
+def _jj_read_after_check(env: Env, reason: str) -> Part:
+    """Чтение jj — чтение, только для рабочей копии проекта без программ в настройках.
+
+    jj должен найти рабочую копию проекта (а не вложенную, со своим репозиторием и его
+    настройками), и в настройках репозитория не должно быть программ.
+    """
+    folder = env.dir.resolve()
+    while folder != env.root and env.root in folder.parents:
+        if (folder / JJ_DIR_NAME).exists():
+            nested = os.path.relpath(folder, env.root)
+            return _unknown(f"jj: вложенная рабочая копия ({nested}) со своими настройками")
+        folder = folder.parent
+    hazard = jjconfig.repo_config_runs_programs(env.dir)
+    if hazard is None:
+        return _unknown("jj: не удалось проверить настройки репозитория")
+    if hazard:
+        return _unknown(
+            "jj: в настройках репозитория есть программы (ui.diff-formatter, "
+            "merge-tools, подпись, псевдонимы) — чтение запустит их",
+        )
+    return _read(reason)
+
+
+# --------------------------------------------------------------------------- #
 # Интерпретаторы
 # --------------------------------------------------------------------------- #
 _PY_FLAGS_NOARG = set("IPEsSuBOqbdvxRih")
@@ -4870,6 +5299,8 @@ def _dispatch(
         return check_write(env, pos[-1:], "rsync", edits=False)
     if prog == "git":
         return _git(env, args)
+    if prog == "jj":
+        return _jj(env, args)
     if prog in {"python", "python3", "python2", "pypy", "pypy3", "ipython", "py"} or re.fullmatch(
         r"python3\.\d+t?|pypy3\.\d+",
         prog,

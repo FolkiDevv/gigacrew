@@ -1,12 +1,15 @@
-"""Тестовые двойники: провайдер с заготовленными ходами и записывающий UI."""
+"""Тестовые двойники: провайдер с заготовленными ходами, записывающий UI, поддельный jj."""
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import ExitStack
 from itertools import starmap
+from pathlib import Path
 from typing import Any, override
 
+import pytest
 from pydantic import BaseModel
 
 from gigacrew.agent import AgentEvents, ToolCallInfo, TurnStats
@@ -435,3 +438,29 @@ class FakeTool(Tool[FakeParams]):
     def run(self, params: FakeParams, ctx: ToolContext) -> ToolResult:
         self.runs += 1
         return self._run()
+
+
+class FakeJJ:
+    """Поддельный jj первым в PATH: на любой вызов печатает заданный ответ.
+
+    Классификатор спрашивает у jj настройки репозитория (``jj config list``): настоящего
+    jj в CI нет, а у разработчика он отвечал бы по своим настройкам.
+    """
+
+    def __init__(self, bin_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._bin_dir = bin_dir
+        path = os.environ.get("PATH", "")
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{path}")
+        self.answer()
+
+    def answer(self, output: str = "", code: int = 0) -> None:
+        """Что напечатает jj и с каким кодом завершится."""
+        (self._bin_dir / "jj.out").write_text(output, encoding="utf-8")
+        script = self._bin_dir / "jj"
+        body = f'#!/bin/sh\ncat "$(dirname "$0")/jj.out"\nexit {code}\n'
+        script.write_text(body, encoding="utf-8")
+        script.chmod(0o755)
+
+    def config(self, *records: tuple[str, str, str]) -> None:
+        """Ответ на ``jj config list``: записи (источник, имя, значение в записи TOML)."""
+        self.answer("".join(f"{source}\0{name}\0{setting}\0" for source, name, setting in records))

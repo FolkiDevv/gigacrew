@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from fakes import FakeJJ
 
 from gigacrew.project import treesitter
 from gigacrew.safety import CommandLevel, classify
@@ -637,6 +638,157 @@ def test_git_in_nested_repository_asks(repo: Path) -> None:
     assert level("cd pkg && git status", repo) is None
     assert level("git -C pkg status", repo) is None
     assert level("git status", repo) is READ
+
+
+# ------------------------------- jj -------------------------------- #
+@pytest.fixture
+def fake_jj(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> FakeJJ:
+    return FakeJJ(tmp_path_factory.mktemp("bin"), monkeypatch)
+
+
+@pytest.fixture
+def jj_repo(root: Path, fake_jj: FakeJJ) -> Path:
+    """Рабочая копия jj (служебная папка .jj); в настройках репозитория программ нет."""
+    (root / ".jj" / "repo").mkdir(parents=True)
+    return root
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("jj status", READ),
+        ("jj st", READ),
+        ("jj log -r 'trunk()..@' -n 5", READ),
+        ("jj log -p --git", READ),
+        ("jj diff --stat", READ),
+        ("jj diff --tool :git src/main.py", READ),
+        ("jj show @-", READ),
+        ("jj evolog -r @", READ),
+        ("jj op log -n 3", READ),
+        ("jj bookmark list --all", READ),
+        ("jj b l", READ),
+        ("jj file show -r @- src/main.py", READ),
+        ("jj file annotate src/main.py", READ),
+        ("jj config list", READ),
+        ("jj resolve --list", READ),
+        ("jj workspace list", READ),
+        ("jj root", READ),
+        ("jj --version", READ),
+        ("jj util diff a.txt b.txt", READ),
+        ("jj --no-pager --color=never log --ignore-working-copy", READ),
+        ("jj -R . log", READ),
+        # совместимость с git: подкоманды jj git
+        ("jj git root", READ),
+        ("jj git remote list", READ),
+        ("jj git colocation status", READ),
+        ("jj git init --colocate", WRITE),
+        ("jj git colocation enable", WRITE),
+        ("jj git fetch", WRITE),
+        ("jj git push -b main", WRITE),
+        ("jj git export", WRITE),
+        ("jj git clone https://example.com/r.git r", WRITE),
+        ("jj git push --deleted", DANGER),
+        ("jj git remote add origin https://example.com/r.git", DANGER),
+        ("jj git clone https://example.com/r.git /tmp/r", DANGER),
+        ("jj git init --git-repo /tmp/other", DANGER),
+        # изменения, которые отменяет jj undo
+        ("jj new main", WRITE),
+        ("jj describe -m fix", WRITE),
+        ("jj ci -m fix", WRITE),
+        ("jj squash", WRITE),
+        ("jj abandon @", WRITE),
+        ("jj restore src/main.py", WRITE),
+        ("jj split src/main.py", WRITE),
+        ("jj b c feature -r @", WRITE),
+        ("jj undo", WRITE),
+        ("jj workspace add ws", WRITE),
+        ("jj config set --repo user.name x", WRITE),
+        ("jj util gc", WRITE),
+        # необратимо, вне проекта или программы в настройках
+        ("jj op abandon ..@-", DANGER),
+        ("jj workspace remove ws", DANGER),
+        ("jj workspace add /tmp/ws", DANGER),
+        ("jj util gc --expire now", DANGER),
+        ("jj config gc", DANGER),
+        ("jj config set --user user.name x", DANGER),
+        ("jj config set --repo ui.diff-formatter difft", DANGER),
+        ("jj config set --repo 'merge-tools.x.program' sh", DANGER),
+        ("jj config set --repo ui '{pager=\"sh\"}'", DANGER),
+        ("jj --config ui.pager=sh log", DANGER),
+        ("jj log --config='aliases.x=[\"util\"]'", DANGER),
+        ("JJ_CONFIG=/tmp/x.toml jj log", DANGER),
+        ("echo x > .jj/repo/config.toml", DANGER),
+        ("cp a.txt .jj/repo/config-id", DANGER),
+        # программы, редакторы, непроверенное — «не знаю»
+        ("jj", None),
+        ("jj fix", None),
+        ("jj run make", None),
+        ("jj util exec -- sh -c id", None),
+        ("jj diffedit", None),
+        ("jj resolve", None),
+        ("jj split", None),
+        ("jj squash -i", None),
+        ("jj restore --tool meld", None),
+        ("jj diff --tool difft", None),
+        ("jj log -p --tool=difft", None),
+        ("jj --config ui.color=never log", None),
+        ("jj --config-file x.toml log", None),
+        ("jj -R /tmp/other log", None),
+        ("jj log -R ../other", None),
+        ("jj -R.. log", None),
+        ("jj log $REV", None),
+        ("jj file show .env", None),
+        ("jj diff .env", None),
+        ("jj util diff a.txt /etc/passwd", None),
+        ("jj debug snapshot", None),
+        ("jj frobnicate", None),
+    ],
+)
+def test_jj_levels(jj_repo: Path, command: str, expected: CommandLevel | None) -> None:
+    verdict = classify(command, root=jj_repo)
+    assert verdict.level is expected, (command, verdict.reason)
+
+
+def test_jj_read_with_program_in_repo_config_asks(jj_repo: Path, fake_jj: FakeJJ) -> None:
+    """Чтение jj — READ, только пока настройки репозитория не запускают программ."""
+    fake_jj.config(("repo", "ui.diff-formatter", '["sh", "-c", "id"]'))
+    assert level("jj diff", jj_repo) is None
+    assert level("jj st", jj_repo) is None
+    assert level("jj new", jj_repo) is WRITE
+    fake_jj.config(
+        ("user", "ui.diff-formatter", '"difft"'),
+        ("repo", "ui.diff-formatter", '":git"'),
+    )
+    assert level("jj diff", jj_repo) is READ
+
+
+def test_jj_read_when_repo_config_cannot_be_checked(
+    jj_repo: Path,
+    fake_jj: FakeJJ,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_jj.answer("Error: The repository appears broken\n", code=1)
+    assert level("jj log", jj_repo) is None
+    monkeypatch.setenv("PATH", str(jj_repo / "src"))  # jj не установлен — запускать нечего
+    assert level("jj log", jj_repo) is READ
+
+
+def test_jj_in_nested_workspace_asks(jj_repo: Path) -> None:
+    (jj_repo / "pkg" / ".jj").mkdir()
+    assert level("cd pkg && jj status", jj_repo) is None
+    assert level("jj -R pkg status", jj_repo) is None
+    assert level("jj status", jj_repo) is READ
+    assert level("cd src && jj status", jj_repo) is READ
+
+
+def test_jj_colocated_with_git(jj_repo: Path) -> None:
+    """Колоцированная рабочая копия: .jj и .git рядом, jj и git работают с одним репозиторием."""
+    subprocess.run(["git", "init", "-q"], cwd=jj_repo, check=True)
+    assert level("git status", jj_repo) is READ
+    assert level("jj status", jj_repo) is READ
+    assert level("jj git colocation status && git log --oneline -3", jj_repo) is READ
+    assert level("jj git push && git push", jj_repo) is WRITE
+    assert level("git push -f", jj_repo) is DANGER
 
 
 # --------------------------- выполнение кода -------------------------- #

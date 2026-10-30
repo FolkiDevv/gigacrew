@@ -17,6 +17,7 @@ from gigacrew.project.workspace import DATA_DIR_NAME
 
 IGNORE_DIRS: frozenset[str] = frozenset((
     ".git",
+    ".jj",
     ".hg",
     ".svn",
     "__pycache__",
@@ -37,6 +38,9 @@ IGNORE_DIRS: frozenset[str] = frozenset((
 
 TREE_TRUNCATED = "... (tree truncated)"
 GIT_DIR_NAME = ".git"
+JJ_DIR_NAME = ".jj"
+# Служебные каталоги систем контроля версий: настройки оттуда запускают программы.
+VCS_DIR_NAMES = frozenset((GIT_DIR_NAME, JJ_DIR_NAME))
 
 # Раскладка каталога git: обязательная запись и признак «это каталог».
 _GIT_LAYOUT = (("HEAD", False), ("objects", True), ("refs", True))
@@ -114,22 +118,23 @@ def looks_like_git_dir(directory: Path, adding: Path | None = None) -> bool:
     return True
 
 
-def is_git_internal(root: Path, path: Path, raw: str = "") -> bool:
-    """Путь внутри корня — сам ``.git`` или лежит в каталоге git.
+def is_vcs_internal(root: Path, path: Path, raw: str = "") -> bool:
+    """Путь внутри корня — сам ``.git``/``.jj`` или лежит в служебном каталоге git или jj.
 
     Проверяются и путь как его прислали (``raw``: ``nested/.git/config``, даже если
     ``nested/.git`` — симлинк, который раскрытие уберёт), и раскрытый: компонент
-    ``.git`` без учёта регистра (``.GIT`` на macOS/Windows) на любой глубине; каталоги
-    по пути от корня, устроенные как каталог git (цель симлинка или ``gitdir:``
-    вложенного репозитория), — в том числе если такими их сделает эта запись; каталог
-    git корня. ``.github``, ``.gitignore`` — обычные.
+    ``.git`` или ``.jj`` без учёта регистра (``.GIT`` на macOS/Windows) на любой глубине
+    (в ``.jj/`` лежат настройки репозитория jj старых версий и git-хранилище
+    неколоцированного репозитория); каталоги по пути от корня, устроенные как каталог git
+    (цель симлинка или ``gitdir:`` вложенного репозитория), — в том числе если такими их
+    сделает эта запись; каталог git корня. ``.github``, ``.gitignore`` — обычные.
     """
     try:
         parts = path.relative_to(root).parts
     except ValueError:
         return False
     raw_parts = Path(raw).parts if raw else ()
-    if any(part.casefold() == GIT_DIR_NAME for part in (*parts, *raw_parts)):
+    if any(part.casefold() in VCS_DIR_NAMES for part in (*parts, *raw_parts)):
         return True
     if any(path == git_dir or git_dir in path.parents for git_dir in git_dirs(root)):
         return True

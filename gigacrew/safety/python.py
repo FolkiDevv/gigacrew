@@ -48,7 +48,7 @@ from gigacrew.safety.paths import (
     has_escaping_links,
     has_secrets_under,
     is_data_path,
-    is_git_internal,
+    is_vcs_internal,
     scope_of_path,
 )
 
@@ -1359,8 +1359,8 @@ def _check_write(target: _Path, ctx: _Ctx, what: str, *, recursive: bool = False
     if not _inside(target.static, ctx):
         ctx.flag(Level.DANGER, f"{what}: запись вне проекта")
         return
-    if is_git_internal(target.static.resolve(), ctx.root):
-        ctx.flag(Level.DANGER, f"{what}: служебные файлы git")
+    if is_vcs_internal(target.static.resolve(), ctx.root):
+        ctx.flag(Level.DANGER, f"{what}: служебные файлы git или jj")
     elif is_data_path(target.static.resolve(), ctx.root):
         ctx.flag(Level.DANGER, f"{what}: служебная папка gigacrew")  # как запись из shell
     else:
