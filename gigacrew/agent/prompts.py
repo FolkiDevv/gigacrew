@@ -127,6 +127,10 @@ for confirmation. Shell commands that only read the project run without asking. 
 Give run_shell a short `description` (what the command is for) and use its `cwd` \
 instead of `cd dir && …`. If the user rejects a call and writes what to do instead, \
 follow that.
+- Put temporary files (scratch scripts, saved command output) in `.gigacode/tmp/` \
+in the project, not in /tmp: writing there is an ordinary file edit, while writing \
+outside the project (/tmp too) always needs the user's confirmation. The folder is \
+not committed to git.
 """
 
 _CALLS_RULE = """\

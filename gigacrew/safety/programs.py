@@ -36,6 +36,7 @@ from gigacrew.safety.paths import (
     has_secrets_under,
     is_data_path,
     is_git_internal,
+    is_temp_path,
     scope,
 )
 from gigacrew.safety.python import analyze, shadowed_stdlib
@@ -332,7 +333,10 @@ def check_read(env: Env, words: list[Word], what: str, *, content: bool = True) 
 
 
 def check_write(env: Env, words: list[Word], what: str, *, edits: bool = True) -> Part:
-    """Запись в файлы: WRITE внутри проекта, DANGER — снаружи или в служебные каталоги."""
+    """Запись в файлы: WRITE внутри проекта, DANGER — снаружи или в служебные каталоги.
+
+    Папка временных файлов модели ``.gigacode/tmp/`` — не служебная: запись туда — правка.
+    """
     parts: list[Part] = []
     for word in words:
         where = scope(word, root=env.root, cwd=env.cwd)
@@ -350,7 +354,8 @@ def check_write(env: Env, words: list[Word], what: str, *, edits: bool = True) -
             return _danger(
                 f"{what}: служебные файлы git ({word.raw}) — оттуда запускаются программы",
             )
-        if is_data_path(target.resolve(), env.root):
+        resolved = target.resolve()
+        if is_data_path(resolved, env.root) and not is_temp_path(resolved, env.root):
             return _danger(f"{what}: служебная папка gigacrew ({word.raw})")
         if where is Scope.SECRET:
             parts.append(_write(f"{what}: файл с секретами ({word.raw})"))

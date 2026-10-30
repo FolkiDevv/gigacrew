@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import override
 
@@ -124,7 +125,8 @@ class RunShellTool(Tool[RunShellParams]):
         "without asking the user; others are checked by a reviewer model or confirmed by "
         "the user. There is no keyboard "
         "input (stdin is empty) — use non-interactive flags. Network commands (curl/wget) "
-        "are forbidden by the security policy."
+        "are forbidden by the security policy. Put temporary files in .gigacode/tmp/, not "
+        "/tmp: writing outside the project always needs the user's confirmation."
     )
     # Модель параметров (класс pydantic), а не константа: имя — часть API инструментов.
     Params = RunShellParams  # noqa: WPS115
@@ -177,6 +179,10 @@ class RunShellTool(Tool[RunShellParams]):
         """Выполняет команду через /bin/sh и возвращает код возврата и вывод."""
         timeout = min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)
         cwd = ctx.root / _relative_cwd(params, ctx)
+        # Папка временных файлов модели есть к запуску команды: не нужен лишний шаг с mkdir.
+        # Не вышло (симлинк, нет прав) — команда всё равно выполняется.
+        with contextlib.suppress(OSError):
+            ctx.workspace.ensure_temp_dir()
         # Оболочка — суть инструмента: команду до запуска проверяют классификатор и права.
         res = run_process(params.command, cwd=cwd, timeout=timeout, shell=True)  # noqa: S604
 
