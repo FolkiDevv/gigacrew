@@ -250,6 +250,14 @@ def test_untrusted_project_hooks_are_skipped(tmp_path: Path) -> None:
     assert not settings.project_groups
 
 
+def test_unhashable_disable_all_hooks_is_a_warning(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path)
+    _write(ws.settings_file, {"disableAllHooks": [], **_hooks("Stop", "echo")})
+    _, warnings = load_settings(ws)
+    assert len(warnings) == 1
+    assert "disableAllHooks" in warnings[0]
+
+
 def test_without_project_keeps_user_hooks(tmp_path: Path) -> None:
     ws = Workspace(tmp_path)
     _write(user_settings_file(), _hooks("Stop", "echo user"))

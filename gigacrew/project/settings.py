@@ -176,13 +176,11 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
         document = _read_settings_file(path, warnings)
         if document is None:
             continue
-        switch = document.get("disableAllHooks")
-        if switch is True and source in PROJECT_SOURCES:
-            project_disabled = True
-        elif switch is True:
-            disabled = True
-        elif switch not in {None, False}:  # "true" или 1 молча не выключили бы ничего
-            warnings.append(f"{path}: disableAllHooks — ожидается true или false, пропущено")
+        if document.get("disableAllHooks") is True:
+            if source in PROJECT_SOURCES:
+                project_disabled = True
+            else:
+                disabled = True
         groups.extend(_parse_hooks(document.get("hooks"), path, source, warnings))
     # Хуки недоверенного проекта не запускаются ни с каким подтверждением.
     if project_disabled or workspace.untrusted:
@@ -192,7 +190,11 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
 
 
 def _read_settings_file(path: Path, warnings: list[str]) -> dict[str, Any] | None:
-    """JSON-объект файла настроек; None — файла нет или он пропущен (с предупреждением)."""
+    """JSON-объект файла настроек; None — файла нет или он пропущен (с предупреждением).
+
+    ``disableAllHooks`` не true/false — предупреждение: "true" или 1 молча не выключили бы
+    ничего.
+    """
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -203,6 +205,10 @@ def _read_settings_file(path: Path, warnings: list[str]) -> dict[str, Any] | Non
     if not isinstance(document, dict):
         warnings.append(f"{path}: ожидается JSON-объект — файл пропущен")
         return None
+    switch = document.get("disableAllHooks")
+    # Сравнение по is, а не через множество: [] не хешируется.
+    if switch is not None and switch is not True and switch is not False:
+        warnings.append(f"{path}: disableAllHooks — ожидается true или false, пропущено")
     return document
 
 
