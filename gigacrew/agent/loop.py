@@ -422,6 +422,7 @@ class Agent:
         # Может смениться посреди хода (Shift+Tab из потока клавиш) — читается при
         # каждом вызове инструмента и каждом обращении к модели.
         self._permission_mode = config.mode
+        self._untrusted_project = config.untrusted_project
         self._windows = ModelWindows() if windows is None else windows
         # Контекст проекта (дерево, инструкции, карта): строится лениво, сбрасывается в
         # reset(); суб-агент берёт контекст основного агента.
@@ -708,7 +709,10 @@ class Agent:
         if self._parent is not None:
             return self._parent.project_context()
         if self._project_context is None:
-            self._project_context = build_project_context(self._workspace)
+            self._project_context = build_project_context(
+                self._workspace,
+                untrusted=self._untrusted_project,
+            )
         return self._project_context
 
     def system_prompt(self) -> str:

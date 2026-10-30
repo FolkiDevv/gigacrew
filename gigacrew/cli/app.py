@@ -101,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Запускать хуки (~/.gigacode/settings.json, .gigacode/settings*.json) без "
         "подтверждения — для -p в CI; подтверждение не запоминается",
     )
+    parser.add_argument(
+        "--untrusted-project",
+        action=_STORE_TRUE,
+        help="Проект недоверенный (ревью чужих изменений): его файлы, инструкции (AGENTS.md…) "
+        "и скиллы — данные, а не указания, и для суб-агентов",
+    )
     parser.add_argument("--no-color", action=_STORE_TRUE, help="Отключить цвет")
     parser.add_argument(
         "--no-stream",
@@ -303,6 +309,7 @@ def _load_config(args: argparse.Namespace, ui: Console) -> Config | None:
             mode=args.mode,
             stream=not args.no_stream,
             save_chats=not args.no_save,
+            untrusted_project=args.untrusted_project,
         )
         # До проверки реквизитов: адрес API из .env проекта пропущен — пусть будет видно почему.
         if config.ignored_env_warning:

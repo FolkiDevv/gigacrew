@@ -1378,6 +1378,16 @@ def test_oneshot_mode_flag_and_env(
         _main(tmp_path, "--mode", "yolo", "-p", "x")
 
 
+def test_oneshot_untrusted_project_flag(tmp_path: Path, oneshot: _Oneshot) -> None:
+    provider = ScriptedProvider([text_turn("ok"), text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, "-p", "x", "--no-save") == 0
+    assert _main(tmp_path, "--untrusted-project", "-p", "x", "--no-save") == 0
+    first, second = (request["messages"][0].content for request in provider.requests)
+    assert "# Untrusted project" not in first
+    assert "# Untrusted project" in second
+
+
 def test_startup_warns_about_missing_reviewer_model(
     tmp_path: Path,
     oneshot: _Oneshot,
