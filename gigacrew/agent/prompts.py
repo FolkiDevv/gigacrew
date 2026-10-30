@@ -402,7 +402,7 @@ def _quoted(text: str, *, untrusted: bool) -> str:
     if not untrusted:
         return text
     # Свой тег в тексте закрыл бы блок данных раньше времени.
-    body = _UNTRUSTED_TAG_RE.sub("untrusted_data", text)
+    body = _UNTRUSTED_TAG_RE.sub(r"&lt;\1", text)
     return f"<{UNTRUSTED_TAG}>\n{body}\n</{UNTRUSTED_TAG}>"
 
 
@@ -413,7 +413,8 @@ def _one_line(name: str) -> str:
 
 #: Тег, в котором стоят инструкции недоверенного проекта: граница данных в системном промпте.
 UNTRUSTED_TAG = "untrusted-data"
-_UNTRUSTED_TAG_RE = re.compile(UNTRUSTED_TAG, re.IGNORECASE)
+# Только начало тега («<untrusted-data», «</ untrusted-data»), не имя вроде untrusted-data.json.
+_UNTRUSTED_TAG_RE = re.compile(rf"<(\s*/?\s*{UNTRUSTED_TAG})", re.IGNORECASE)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 #: Недоверенный проект (``--untrusted-project``, например ревью чужого PR): правило — в
