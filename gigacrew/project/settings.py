@@ -173,6 +173,9 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
     disabled = False
     project_disabled = False
     for path, source in settings_files(workspace):
+        # Файлы недоверенного проекта не читаются: их разбор может уронить запуск.
+        if workspace.untrusted and source in PROJECT_SOURCES:
+            continue
         document = _read_settings_file(path, warnings)
         if document is None:
             continue
@@ -182,8 +185,7 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
             else:
                 disabled = True
         groups.extend(_parse_hooks(document.get("hooks"), path, source, warnings))
-    # Хуки недоверенного проекта не запускаются ни с каким подтверждением.
-    if project_disabled or workspace.untrusted:
+    if project_disabled:
         groups = [group for group in groups if group.source not in PROJECT_SOURCES]
     settings = HookSettings(tuple(groups), disabled=disabled, project_disabled=project_disabled)
     return settings, warnings

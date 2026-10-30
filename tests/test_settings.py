@@ -248,6 +248,9 @@ def test_untrusted_project_hooks_are_skipped(tmp_path: Path) -> None:
     settings, _ = load_settings(ws)
     assert [hook.command for hook in settings.commands(HookEvent.STOP)] == ["echo user"]
     assert not settings.project_groups
+    # Файлы проекта даже не читаются: битый файл не даёт предупреждения.
+    ws.settings_file.write_text("{не JSON", encoding="utf-8")
+    assert not load_settings(ws)[1]
 
 
 def test_unhashable_disable_all_hooks_is_a_warning(tmp_path: Path) -> None:
