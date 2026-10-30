@@ -3938,7 +3938,8 @@ def _jj_paths(env: Env, args: list[Word], valued: Collection[str]) -> list[Word]
             return None
         if colon and _JJ_PATH_PREFIXES[prefix]:  # от корня рабочей копии
             text = os.path.relpath(env.root / text, env.dir)
-        paths.append(Word(text))
+        # шаблон оболочки (creden*) раскроется до jj — проверяются совпадения
+        paths.append(Word(text, word.raw, word.static, word.glob))
     return paths
 
 
@@ -3948,17 +3949,19 @@ def _jj_files_check(
     valued: Collection[str],
     what: str,
     *,
-    recursive: bool = False,
+    whole_tree_asks: bool = False,
 ) -> Part | None:
-    """Файлы, которые покажет jj: явные пути — как у cat, ``recursive`` — как у grep -r."""
+    """Файлы, которые покажет jj: пути и каталоги из файлсетов — как у grep -r.
+
+    ``whole_tree_asks`` — без путей команда читает все файлы рабочей копии (поиск), в том
+    числе секреты с обычными именами: вопрос.
+    """
     paths = _jj_paths(env, args, valued)
     if paths is None:
         return _unknown(f"{what}: файлсет не сводится к путям")
-    if recursive:
-        if not paths:  # все файлы рабочей копии, в том числе секреты с обычными именами
-            return _unknown(f"{what}: поиск по всем файлам рабочей копии")
-        return _check_recursive(env, paths, what)
-    return check_read(env, paths, what)
+    if not paths:
+        return _unknown(f"{what}: поиск по всем файлам рабочей копии") if whole_tree_asks else None
+    return _check_recursive(env, paths, what)
 
 
 def _jj_sub(env: Env, repo: Env, sub: str, rest: list[Word]) -> Part:
@@ -4016,7 +4019,7 @@ def _jj_group(env: Env, repo: Env, sub: str, rest: list[Word]) -> Part:
         if (sub, action) in {("file", "show"), ("file", "annotate"), ("file", "search")}:
             search = action == "search"
             options = _JJ_SEARCH_VALUED if search else _JJ_FILE_VALUED
-            bad = _jj_files_check(env, after, options, name, recursive=search)
+            bad = _jj_files_check(env, after, options, name, whole_tree_asks=search)
             if bad is not None:
                 return bad
         return _jj_read_after_check(repo, f"{name}: чтение репозитория")

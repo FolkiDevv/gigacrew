@@ -789,6 +789,16 @@ def test_jj_file_search_sees_secrets_in_tree(jj_repo: Path) -> None:
     assert level("jj file search -p TOKEN", jj_repo) is None
     assert level("jj file search -p TOKEN src", jj_repo) is None
     assert level("jj file search -p TOKEN tests", jj_repo) is READ
+    assert level("jj file show src", jj_repo) is None
+    assert level("jj diff src", jj_repo) is None
+    assert level("jj diff", jj_repo) is READ  # как git diff
+
+
+def test_jj_fileset_glob_checks_shell_matches(jj_repo: Path) -> None:
+    """Шаблон оболочки раскрывается до jj: проверяются совпадения, а не шаблон."""
+    (jj_repo / "credentials.json").write_text("{}")
+    assert level("jj file show creden*", jj_repo) is None
+    assert level("cat creden*", jj_repo) is None  # как у cat
     assert level("cd src && jj file show root:README.md", jj_repo) is READ
 
 
