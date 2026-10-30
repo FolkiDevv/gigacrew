@@ -427,7 +427,7 @@ def _run(args: argparse.Namespace, ui: Console, config: Config, provider: LLMPro
     # Хуки — до подключения: подтверждение спрашивается до начала работы, а хук
     # PreRequest идёт уже перед запросом конфигурации (может обновить токен).
     hooks = load_hooks(
-        Workspace(config.project_root),
+        Workspace(config.project_root, untrusted=config.untrusted_project),
         ui,
         interactive=args.prompt is None and ui.interactive(),
         trust=args.trust_hooks,

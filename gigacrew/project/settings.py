@@ -184,7 +184,8 @@ def load_settings(workspace: Workspace) -> tuple[HookSettings, list[str]]:
         elif switch not in {None, False}:  # "true" или 1 молча не выключили бы ничего
             warnings.append(f"{path}: disableAllHooks — ожидается true или false, пропущено")
         groups.extend(_parse_hooks(document.get("hooks"), path, source, warnings))
-    if project_disabled:
+    # Хуки недоверенного проекта не запускаются ни с каким подтверждением.
+    if project_disabled or workspace.untrusted:
         groups = [group for group in groups if group.source not in PROJECT_SOURCES]
     settings = HookSettings(tuple(groups), disabled=disabled, project_disabled=project_disabled)
     return settings, warnings

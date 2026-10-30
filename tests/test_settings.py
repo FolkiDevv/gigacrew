@@ -240,6 +240,16 @@ def test_disable_all_hooks_must_be_boolean(tmp_path: Path, flag: str | int) -> N
     assert "disableAllHooks" in warnings[0]
 
 
+def test_untrusted_project_hooks_are_skipped(tmp_path: Path) -> None:
+    ws = Workspace(tmp_path, untrusted=True)
+    _write(user_settings_file(), _hooks("Stop", "echo user"))
+    _write(ws.settings_file, _hooks("Stop", "echo project"))
+    _write(ws.local_settings_file, _hooks("Stop", "echo local"))
+    settings, _ = load_settings(ws)
+    assert [hook.command for hook in settings.commands(HookEvent.STOP)] == ["echo user"]
+    assert not settings.project_groups
+
+
 def test_without_project_keeps_user_hooks(tmp_path: Path) -> None:
     ws = Workspace(tmp_path)
     _write(user_settings_file(), _hooks("Stop", "echo user"))
