@@ -34,7 +34,14 @@ from gigacrew.llm import openai_chat
 from gigacrew.llm.base import ModelInfo
 from gigacrew.llm.gigacode_token import Token, load_token, login_hint, token_path
 from gigacrew.llm.transport import ApiError, HttpProvider, error_body
-from gigacrew.llm.types import AssistantTurn, Message, ToolChoice, ToolSpec, Usage
+from gigacrew.llm.types import (
+    AssistantTurn,
+    ChatOptions,
+    Message,
+    ToolChoice,
+    ToolSpec,
+    Usage,
+)
 
 # Окно модели, если каталог его не называет (так считает и официальный CLI).
 DEFAULT_CONTEXT_WINDOW = 262_144
@@ -325,19 +332,15 @@ class GigaCodeProvider(HttpProvider):
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
         on_notice: Callable[[str], None] | None = None,
+        timeout: float | None = None,
     ) -> AssistantTurn:
-        """Через поток.
+        """Через поток; каталог загружается, если ещё не загружен.
 
         Бэкенд рассчитан на поток, а ответ без потока разбирается тем же кодом.
         """
-        return self.stream(
-            messages,
-            tools,
-            model=model,
-            temperature=temperature,
-            tool_choice=tool_choice,
-            on_notice=on_notice,
-        )
+        self._ensure_catalogue()  # модель по умолчанию — из каталога
+        options = ChatOptions(model, temperature, tool_choice, on_notice=on_notice, timeout=timeout)
+        return self._stream_turn(messages, tools, options)
 
     # ------------------------------------------------------------------ #
     # Токен и конфигурация

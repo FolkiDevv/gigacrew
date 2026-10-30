@@ -20,7 +20,14 @@ import httpx
 
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMError, LLMProvider, PromptTooLongError
-from gigacrew.llm.types import AssistantTurn, Message, ToolChoice, ToolSpec, Usage
+from gigacrew.llm.types import (
+    AssistantTurn,
+    ChatOptions,
+    Message,
+    ToolChoice,
+    ToolSpec,
+    Usage,
+)
 
 
 class ApiError(LLMError):
@@ -341,11 +348,37 @@ class _Attempts:
         self._delay = min(self._delay * 2, _MAX_RETRY_DELAY)
 
 
+class _ChatWait:
+    """Ожидание ответа модели в запросе чата: таймауты, попытки при молчании, сообщение.
+
+    ``limit`` — ожидание вызова (с), заданное вызывающим (рецензент), вместо настроенного
+    ``chat``: модель молчит дольше — ошибка сразу, без повтора; None — настроенное ожидание
+    и до :data:`SILENT_ATTEMPTS` попыток.
+    """
+
+    def __init__(self, chat: httpx.Timeout, limit: float | None) -> None:
+        """Ожидание ``limit`` секунд или настроенное ``chat``."""
+        self.limit = limit
+        self.timeout = chat if limit is None else httpx.Timeout(limit)
+        self.silent_attempts = SILENT_ATTEMPTS if limit is None else 1
+
+    def silence_message(self) -> str:
+        """Ошибка, когда модель молчала дольше ожидания."""
+        if self.limit is not None:
+            return f"Модель не ответила за {int(self.limit)} с — запрос оборван."
+        seconds = int(self.timeout.read or 0)
+        return (
+            f"Модель не отвечала дольше {seconds} с — ответ оборван. Если она писала длинный "
+            "вызов (план, большой файл), увеличьте GIGACREW_READ_TIMEOUT."
+        )
+
+
 class _StreamCall:
     """Состояние потокового запроса между попытками: тело, авторизация, отданный текст.
 
     ``rebuild`` — тело запроса без рассуждений модели; ``reject`` — сообщить, что шлюз не
-    принял рассуждения (статус отказа); ``on_delta`` — куда отдавать куски текста.
+    принял рассуждения (статус отказа); ``on_delta`` — куда отдавать куски текста;
+    ``wait`` — сколько ждать ответа.
     """
 
     def __init__(
@@ -356,10 +389,12 @@ class _StreamCall:
         rebuild: Callable[[], dict[str, Any]],
         reject: Callable[[int], None],
         on_delta: Callable[[str], None] | None,
+        wait: _ChatWait,
     ) -> None:
-        """Запрос с телом ``payload`` и попытками ``tries``."""
+        """Запрос с телом ``payload``, попытками ``tries`` и ожиданием ответа ``wait``."""
         self.payload = payload
         self.tries = tries
+        self.wait = wait
         self.refresh = False  # обновить авторизацию перед этой попыткой (прошлая — 401)
         self.refreshed = False
         self.emitted = False  # пользователю отдан хотя бы один кусок текста
@@ -477,6 +512,7 @@ class HttpProvider(LLMProvider):
         temperature: float = 0.2,
         tool_choice: ToolChoice = "auto",
         on_notice: Callable[[str], None] | None = None,
+        timeout: float | None = None,
     ) -> AssistantTurn:
         """Один проход модели целым ответом.
 
@@ -491,8 +527,9 @@ class HttpProvider(LLMProvider):
             tool_choice=tool_choice,
             reasoning=name not in self._no_reasoning,
         )
-        send = partial(self._send_chat, on_notice=on_notice)
-        resp = self._post_chat(payload, send, timeout=self._chat_timeout)
+        wait = _ChatWait(self._chat_timeout, timeout)
+        send = partial(self._send_chat, wait=wait, on_notice=on_notice)
+        resp = self._post_chat(payload, send, timeout=wait.timeout)
         if resp.status_code in REJECTED_STATUS and self._has_reasoning(payload):
             plain = self._payload(
                 messages,
@@ -502,7 +539,7 @@ class HttpProvider(LLMProvider):
                 tool_choice=tool_choice,
                 reasoning=False,
             )
-            retry = self._post_chat(plain, send, timeout=self._chat_timeout)
+            retry = self._post_chat(plain, send, timeout=wait.timeout)
             if retry.status_code < _HTTP_CLIENT_ERROR:
                 self._reject_reasoning(name, resp.status_code, on_notice)
             resp = retry
@@ -546,24 +583,36 @@ class HttpProvider(LLMProvider):
         целиком — рецензент, сжатие) показывать некому, и обрыв повторяется всегда.
         Авторизация после 401 обновляется перед следующей попыткой, когда ответ уже закрыт.
         """
-        name = model or self.model
+        options = ChatOptions(model, temperature, tool_choice, on_delta, on_notice)
+        return self._stream_turn(messages, tools, options)
+
+    def _stream_turn(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None,
+        options: ChatOptions,
+    ) -> AssistantTurn:
+        """Потоковая генерация с параметрами ``options`` — см. :meth:`stream`."""
+        name = options.model or self.model
         build = partial(
             self._payload,
             messages,
             tools,
-            model=model,
-            temperature=temperature,
+            model=options.model,
+            temperature=options.temperature,
             stream=True,
-            tool_choice=tool_choice,
+            tool_choice=options.tool_choice,
         )
         payload = build(reasoning=name not in self._no_reasoning)
         url = self._chat_url()
+        on_notice = options.on_notice
         call = _StreamCall(
             payload,
             _Attempts(self._max_retries, RateLimitWait(self._rate_limit_wait, on_notice)),
             rebuild=partial(build, reasoning=False),
             reject=partial(self._reject_reasoning, name, on_notice=on_notice),
-            on_delta=on_delta,
+            on_delta=options.on_delta,
+            wait=_ChatWait(self._chat_timeout, options.timeout),
         )
 
         self._before_request("chat")
@@ -657,7 +706,7 @@ class HttpProvider(LLMProvider):
         do_request: Callable[[], httpx.Response],
         *,
         attempts: int | None = None,
-        silent_attempts: int | None = None,
+        wait: _ChatWait | None = None,
         on_notice: Callable[[str], None] | None = None,
     ) -> httpx.Response:
         """Выполняет HTTP-запрос, повторяя транзиентные сбои.
@@ -669,8 +718,8 @@ class HttpProvider(LLMProvider):
             попыток), о каждой паузе сообщает ``on_notice``.
         Прочие HTTP-ответы (включая 4xx) возвращаем как есть — их разбирает
         вызывающая сторона. Неповторяемые ошибки транспорта → ApiError.
-        ``attempts`` — число попыток вместо ``_max_retries``; ``silent_attempts`` —
-        сколько раз из них ответ может не прийти за время ожидания чтения.
+        ``attempts`` — число попыток вместо ``_max_retries``; ``wait`` — сколько раз из
+        них ответ может не прийти за время ожидания чтения (None — сколько угодно).
         """
         attempts = attempts or self._max_retries
         tries = _Attempts(attempts, RateLimitWait(self._rate_limit_wait, on_notice))
@@ -678,7 +727,7 @@ class HttpProvider(LLMProvider):
             try:
                 resp = do_request()
             except RETRYABLE_EXC as exc:
-                self._network_failure(exc, tries, silent_attempts)
+                self._network_failure(exc, tries, wait)
                 continue
             except httpx.HTTPError as exc:
                 raise ApiError(connection_error(exc)) from exc
@@ -695,17 +744,17 @@ class HttpProvider(LLMProvider):
         self,
         exc: httpx.TransportError,
         tries: _Attempts,
-        silent_attempts: int | None,
+        wait: _ChatWait | None,
     ) -> None:
         """Транзиентный сетевой сбой: пауза перед повтором или :class:`ApiError`.
 
         Ошибка — если сертификат сервера не прошёл проверку или модель молчала дольше
-        ожидания чтения ``silent_attempts`` раз (None — сколько угодно).
+        ожидания чтения ``wait.silent_attempts`` раз (без ``wait`` — сколько угодно).
         """
         raise_if_cert_rejected(exc)
         silent = tries.fail(exc)
-        if silent and silent_attempts is not None and tries.silences >= silent_attempts:
-            raise ApiError(self._silence_message()) from exc
+        if silent and wait is not None and tries.silences >= wait.silent_attempts:
+            raise ApiError(wait.silence_message()) from exc
         tries.back_off()
 
     def _repeat_status(self, resp: httpx.Response, tries: _Attempts) -> bool:
@@ -789,23 +838,17 @@ class HttpProvider(LLMProvider):
         self,
         do_request: Callable[[], httpx.Response],
         *,
+        wait: _ChatWait,
         on_notice: Callable[[str], None] | None = None,
     ) -> httpx.Response:
         """Отправка запроса чата.
 
-        Молчание модели дольше ожидания чтения — не больше :data:`SILENT_ATTEMPTS` попыток.
+        Молчание модели дольше ожидания ``wait`` — не больше ``wait.silent_attempts`` попыток.
         """
         return self._request_with_retry(
             do_request,
-            silent_attempts=SILENT_ATTEMPTS,
+            wait=wait,
             on_notice=on_notice,
-        )
-
-    def _silence_message(self) -> str:
-        seconds = int(self._chat_timeout.read or 0)
-        return (
-            f"Модель не отвечала дольше {seconds} с — ответ оборван. Если она писала длинный "
-            "вызов (план, большой файл), увеличьте GIGACREW_READ_TIMEOUT."
         )
 
     # ------------------------------------------------------------------ #
@@ -854,7 +897,7 @@ class HttpProvider(LLMProvider):
             url,
             json=call.payload,
             headers=headers,
-            timeout=self._chat_timeout,
+            timeout=call.wait.timeout,
         ) as resp:
             if self._stream_retry(resp, call):
                 return None
@@ -893,15 +936,15 @@ class HttpProvider(LLMProvider):
         """Сетевой сбой потокового запроса: пауза перед повтором или :class:`ApiError`.
 
         Повтор — только пока пользователю не отдано ни куска текста и модель молчала
-        дольше ожидания чтения меньше :data:`SILENT_ATTEMPTS` раз.
+        дольше ожидания чтения меньше ``call.wait.silent_attempts`` раз.
         """
         raise_if_cert_rejected(exc)
         silent = call.tries.fail(exc)
         if call.emitted:
             # часть текста уже отдана пользователю — повтор приведёт к дублю
             if silent:
-                raise ApiError(self._silence_message()) from exc
+                raise ApiError(call.wait.silence_message()) from exc
             raise ApiError(f"Сетевой сбой во время потоковой передачи: {exc}") from exc
-        if call.tries.silences >= SILENT_ATTEMPTS:
-            raise ApiError(self._silence_message()) from exc
+        if call.tries.silences >= call.wait.silent_attempts:
+            raise ApiError(call.wait.silence_message()) from exc
         call.tries.back_off()

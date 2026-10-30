@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -148,3 +149,18 @@ class AssistantTurn(BaseModel):
     def wants_tool(self) -> bool:
         """Модель просит вызвать инструменты."""
         return bool(self.message.function_calls)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatOptions:
+    """Параметры запроса чата, кроме истории и инструментов (см. ``LLMProvider.stream``).
+
+    ``timeout`` — сколько ждать ответа, с, вместо настроенного (None — настроенное).
+    """
+
+    model: str | None = None
+    temperature: float = 0.2
+    tool_choice: ToolChoice = "auto"
+    on_delta: Callable[[str], None] | None = None
+    on_notice: Callable[[str], None] | None = None
+    timeout: float | None = None

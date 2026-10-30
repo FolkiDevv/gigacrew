@@ -169,17 +169,25 @@ def review_command(
     verdict: Verdict,
     requests: Sequence[str],
     model: str,
+    timeout: float | None = None,
     on_usage: Callable[[Usage], None] | None = None,
 ) -> Review:
     """Спросить модель ``model``, можно ли выполнить команду без вопроса.
 
-    Ошибки обращения — :class:`LLMError`, непригодный ответ — :class:`ReviewError`.
+    ``timeout`` — сколько ждать ответа, с (None — ожидание провайдера). Ошибки
+    обращения — :class:`LLMError`, непригодный ответ — :class:`ReviewError`.
     """
     request = [
         Message(role="system", content=REVIEWER_PROMPT),
         Message(role="user", content=review_request(command, verdict, requests)),
     ]
-    turn = provider.complete(request, tools=None, model=model, temperature=float(0))
+    turn = provider.complete(
+        request,
+        tools=None,
+        model=model,
+        temperature=float(0),
+        timeout=timeout,
+    )
     if on_usage is not None:
         on_usage(turn.usage)
     if turn.finish_reason != "stop":

@@ -36,6 +36,7 @@ from gigacrew.project.workspace import user_data_dir
 # Значения по умолчанию и границы числовых настроек (время — в секундах, доли — в процентах).
 _DEFAULT_TIMEOUT = 120
 _DEFAULT_READ_TIMEOUT = 600
+_DEFAULT_REVIEWER_TIMEOUT = 60
 _DEFAULT_RATE_LIMIT_WAIT = 120
 _DEFAULT_TEMPERATURE = 0.2
 _MIN_TEMPERATURE = float(0)
@@ -347,6 +348,8 @@ class Config:
     # Модель-рецензент изменяющих команд в режиме «авто»; None — модель чата (та, что
     # выбрана сейчас, в том числе после /model).
     reviewer_model: str | None = None
+    # Сколько ждать ответа рецензента, с: не дождались — команду подтверждает пользователь.
+    reviewer_timeout: int = _DEFAULT_REVIEWER_TIMEOUT
     max_steps: int = 50  # предохранитель агентного цикла
     max_tool_failures: int = 4  # стоп при N неудачных вызовах подряд (анти-залипание)
     # Одинаковый вызов без изменений между повторами: на N-м — предупреждение
@@ -479,6 +482,11 @@ class Config:
             safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", default=True),
             remember_approvals=_env_bool(env, "GIGACREW_REMEMBER_APPROVALS", default=True),
             reviewer_model=(env.get("GIGACREW_REVIEWER_MODEL") or "").strip() or None,
+            reviewer_timeout=_env_int(
+                env,
+                "GIGACREW_REVIEWER_TIMEOUT",
+                _DEFAULT_REVIEWER_TIMEOUT,
+            ),
             subagent_max_steps=_env_int(
                 env,
                 "GIGACREW_SUBAGENT_MAX_STEPS",

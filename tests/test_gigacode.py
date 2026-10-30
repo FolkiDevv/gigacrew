@@ -597,6 +597,23 @@ def test_complete_is_retried_after_a_drop_mid_answer(tmp_path: Path) -> None:
     assert backend.count(CHAT) == 2
 
 
+def test_complete_timeout_reaches_the_stream(tmp_path: Path) -> None:
+    """Ожидание вызова (рецензент) доходит до потокового запроса вместо read_timeout."""
+    backend = Backend()
+    reads: list[float] = []
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        if request.url == CHAT:
+            reads.append(request.extensions["timeout"]["read"])
+        return backend.handler(request)
+
+    write_token(tmp_path, "tok-1")
+    provider = GigaCodeProvider(_config(tmp_path), transport=httpx.MockTransport(recording))
+    provider.complete(_msgs(), timeout=30)
+    provider.complete(_msgs())
+    assert reads == [30, 600]
+
+
 def test_stream_shown_text_is_not_retried_after_a_drop(tmp_path: Path) -> None:
     backend = Backend(chat=[_broken(), _text("второй раз")])
     provider = _provider(backend, tmp_path)
