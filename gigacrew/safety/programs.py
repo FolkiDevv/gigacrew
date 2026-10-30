@@ -3936,6 +3936,8 @@ def _jj_paths(env: Env, args: list[Word], valued: Collection[str]) -> list[Word]
             text = text[1:-1]
         if not text or _JJ_FILESET_SYNTAX.search(text):
             return None
+        if not word.glob and re.search(r"[*?\[]", text):  # шаблон раскроет сам jj
+            return None
         if colon and _JJ_PATH_PREFIXES[prefix]:  # от корня рабочей копии
             text = os.path.relpath(env.root / text, env.dir)
         # шаблон оболочки (creden*) раскроется до jj — проверяются совпадения

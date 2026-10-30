@@ -799,6 +799,8 @@ def test_jj_fileset_glob_checks_shell_matches(jj_repo: Path) -> None:
     (jj_repo / "credentials.json").write_text("{}")
     assert level("jj file show creden*", jj_repo) is None
     assert level("cat creden*", jj_repo) is None  # как у cat
+    assert level("jj file show 'creden*'", jj_repo) is None  # шаблон раскроет jj
+    assert level("jj diff 'src/*.py'", jj_repo) is None
     assert level("cd src && jj file show root:README.md", jj_repo) is READ
 
 
