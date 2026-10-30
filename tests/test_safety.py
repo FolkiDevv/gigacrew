@@ -671,7 +671,6 @@ def jj_repo(root: Path, fake_jj: FakeJJ) -> Path:
         ("jj file annotate src/main.py", READ),
         ("jj file show root:src/main.py", READ),
         ("jj file search -p hello src", READ),
-        ("jj file search --pattern hello", READ),
         ("jj config list", READ),
         ("jj resolve --list", READ),
         ("jj workspace list", READ),
@@ -747,6 +746,7 @@ def jj_repo(root: Path, fake_jj: FakeJJ) -> Path:
         ("jj file show 'glob:*.env'", None),
         ("jj diff 'src | .env'", None),
         ("jj file search -p TOKEN .env", None),
+        ("jj file search --pattern hello", None),
         ("jj diff .env", None),
         ("jj util diff a.txt /etc/passwd", None),
         ("jj debug snapshot", None),
@@ -783,7 +783,8 @@ def test_jj_read_when_repo_config_cannot_be_checked(
 
 
 def test_jj_file_search_sees_secrets_in_tree(jj_repo: Path) -> None:
-    """Jj file search без путей читает все файлы рабочей копии — как grep -r."""
+    """Поиск jj по каталогу — как grep -r: секреты в дереве — вопрос."""
+    assert level("jj file search -p TOKEN src", jj_repo) is READ
     (jj_repo / "src" / ".env").write_text("TOKEN=1\n")
     assert level("jj file search -p TOKEN", jj_repo) is None
     assert level("jj file search -p TOKEN src", jj_repo) is None

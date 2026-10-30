@@ -3954,7 +3954,9 @@ def _jj_files_check(
     paths = _jj_paths(env, args, valued)
     if paths is None:
         return _unknown(f"{what}: файлсет не сводится к путям")
-    if recursive:  # без путей — все файлы рабочей копии
+    if recursive:
+        if not paths:  # все файлы рабочей копии, в том числе секреты с обычными именами
+            return _unknown(f"{what}: поиск по всем файлам рабочей копии")
         return _check_recursive(env, paths, what)
     return check_read(env, paths, what)
 
