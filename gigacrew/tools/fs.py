@@ -294,7 +294,8 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
     """Путь для записи: внутри корня, не в ``.gigacode/`` и не во внутренностях git и jj.
 
     В ``.gigacode/`` лежат индекс, история ввода и чаты агента — модель не должна
-    их править. Исключение — файл плана текущего чата (``ctx.plan``). Запись в
+    их править. Исключения — файл плана текущего чата (``ctx.plan``) и папка временных
+    файлов модели ``.gigacode/tmp/``. Запись в
     ``.git/`` (``config``, хуки) превратила бы правку файла в выполнение команды:
     ``core.fsmonitor`` и ``diff.external`` запускаются уже на ``git status``/``git
     diff``, которые выполняются без подтверждения; в ``.jj/`` так же опасны настройки
@@ -308,6 +309,8 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
             "Для операций с репозиторием используйте инструмент git или команды jj.",
         )
     if ctx.plan is not None and ctx.plan.is_target(target):
+        return target
+    if ctx.workspace.is_temp_path(target):  # .gigacode/tmp/ — временные файлы модели
         return target
     data_dir = ctx.workspace.data_dir.resolve()  # .gigacode может быть симлинком
     # is_data_path — ещё и без учёта регистра: на macOS/Windows .GIGACODE — та же папка.
@@ -814,6 +817,8 @@ class WriteFileTool(Tool[WriteFileParams]):
         target, old, new, repaired = self._prepare(params, ctx)
         if ctx.plan is not None and ctx.plan.is_target(target):
             ctx.workspace.ensure_data_dir()  # .gitignore папки — до первого файла в ней
+        elif ctx.workspace.is_temp_path(target):
+            ctx.workspace.ensure_temp_dir()
         target.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(target, new.encode())
         verb = "создан" if old is None else "перезаписан"

@@ -485,6 +485,13 @@ def test_reviewer_model_follows_chat_or_env(tmp_path: Path) -> None:
     assert provider.summary_requests[0]["model"] == "R-env"
 
 
+def test_reviewer_waits_reviewer_timeout(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    provider = ScriptedProvider([_run(script), text_turn("ок")], summaries=[text_turn(ALLOW)])
+    _agent(provider, tmp_path, cfg={"reviewer_timeout": 15}).run_turn("x")
+    assert provider.summary_requests[0]["timeout"] == 15
+
+
 def test_disabled_reviewer_leaves_commands_to_user(tmp_path: Path) -> None:
     script = _script(tmp_path)
     provider = ScriptedProvider([_run(script), text_turn("ок")])

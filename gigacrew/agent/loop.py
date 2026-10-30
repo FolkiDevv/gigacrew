@@ -2169,6 +2169,7 @@ class Agent:
                 verdict=verdict,
                 requests=self._user_requests(),
                 model=model,
+                timeout=self._cfg.reviewer_timeout,
                 on_usage=self._bill_side,
             )
         except Exception as exc:  # сбой рецензента — решает пользователь

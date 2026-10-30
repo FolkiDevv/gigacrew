@@ -143,6 +143,22 @@ def test_shell_dangerous_classification(ctx: ToolContext) -> None:
     assert sh.risk(danger, ctx) == RiskLevel.DANGEROUS
 
 
+def test_shell_scratch_file_needs_no_confirmation(tmp_path: Path) -> None:
+    """Временный файл в .gigacode/tmp/ — правка: в режиме «авто» без вопроса и рецензента.
+
+    Папку run_shell создаёт сам (со своим .gitignore): модели не нужен лишний шаг с mkdir.
+    """
+    command = "cat > .gigacode/tmp/out.txt <<'EOF'\nhello\nEOF"
+    provider = ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")])
+    events = RecordingEvents()
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    Agent(provider, build_default_registry(), cfg, events).run_turn("сохрани вывод")
+    assert not events.confirms
+    temp_dir = Workspace(tmp_path).data_dir / "tmp"
+    assert (temp_dir / "out.txt").read_text(encoding="utf-8") == "hello\n"
+    assert (temp_dir / ".gitignore").is_file()
+
+
 def test_shell_runs_in_cwd_and_rejects_outside(ctx: ToolContext) -> None:
     (ctx.root / "sub").mkdir()
     sh = RunShellTool()

@@ -479,6 +479,31 @@ def test_plan_file_edit_does_not_mark_other_writes(ctx: ToolContext) -> None:
     assert not plan.dirty
 
 
+def test_temp_dir_is_writable(ctx: ToolContext) -> None:
+    """В .gigacode/tmp/ модель пишет и правит, как в проекте; папка — со своим .gitignore."""
+    writer, editor = WriteFileTool(), EditFileTool()
+    writer.run(writer.parse({"path": ".gigacode/tmp/notes.txt", "content": "old"}), ctx)
+    edit = {"path": ".gigacode/tmp/notes.txt", "old_string": "old", "new_string": "new"}
+    editor.run(editor.parse(edit), ctx)
+    temp_dir = ctx.workspace.data_dir / "tmp"
+    assert (temp_dir / "notes.txt").read_text(encoding="utf-8") == "new"
+    assert (temp_dir / ".gitignore").is_file()
+    with pytest.raises(ToolError, match="Служебная папка"):
+        writer.preview(writer.parse({"path": ".gigacode/tmp/../x.txt", "content": "x"}), ctx)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_symlinked_temp_dir_is_not_writable(ctx: ToolContext) -> None:
+    """Симлинк tmp → skills из репозитория не открывает запись в служебную папку."""
+    skills = ctx.workspace.data_dir / "skills"
+    skills.mkdir(parents=True)
+    (ctx.workspace.data_dir / "tmp").symlink_to(skills, target_is_directory=True)
+    writer = WriteFileTool()
+    with pytest.raises(ToolError, match="Служебная папка"):
+        writer.run(writer.parse({"path": ".gigacode/tmp/SKILL.md", "content": "x"}), ctx)
+    assert not any(skills.iterdir())
+
+
 def test_data_dir_write_rejected_before_confirmation(tmp_path: pathlib.Path) -> None:
     provider = ScriptedProvider(
         [

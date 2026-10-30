@@ -34,6 +34,7 @@ __all__ = [
     "has_secrets_under",
     "is_data_path",
     "is_secret_name",
+    "is_temp_path",
     "is_vcs_internal",
     "scope",
     "scope_of_path",
@@ -51,6 +52,11 @@ def is_vcs_internal(path: Path, root: Path) -> bool:
 def is_data_path(path: Path, root: Path) -> bool:
     """Путь в ``.gigacode/`` — служебные данные gigacrew (чаты, планы, скиллы)."""
     return Workspace(root).is_data_path(path)
+
+
+def is_temp_path(path: Path, root: Path) -> bool:
+    """Путь в ``.gigacode/tmp/`` — временные файлы модели: запись туда — обычная правка."""
+    return Workspace(root).is_temp_path(path)
 
 
 def _resolve(root: Path, cwd: str, path_text: str) -> Scope:
