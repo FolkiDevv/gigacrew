@@ -669,6 +669,9 @@ def jj_repo(root: Path, fake_jj: FakeJJ) -> Path:
         ("jj b l", READ),
         ("jj file show -r @- src/main.py", READ),
         ("jj file annotate src/main.py", READ),
+        ("jj file show root:src/main.py", READ),
+        ("jj file search -p hello src", READ),
+        ("jj file search --pattern hello", READ),
         ("jj config list", READ),
         ("jj resolve --list", READ),
         ("jj workspace list", READ),
@@ -738,6 +741,12 @@ def jj_repo(root: Path, fake_jj: FakeJJ) -> Path:
         ("jj -R.. log", None),
         ("jj log $REV", None),
         ("jj file show .env", None),
+        ("jj file show root:.env", None),
+        ("jj file annotate cwd:.env", None),
+        ("jj diff 'cwd:\".env\"'", None),
+        ("jj file show 'glob:*.env'", None),
+        ("jj diff 'src | .env'", None),
+        ("jj file search -p TOKEN .env", None),
         ("jj diff .env", None),
         ("jj util diff a.txt /etc/passwd", None),
         ("jj debug snapshot", None),
@@ -771,6 +780,15 @@ def test_jj_read_when_repo_config_cannot_be_checked(
     assert level("jj log", jj_repo) is None
     monkeypatch.setenv("PATH", str(jj_repo / "src"))  # jj не установлен — запускать нечего
     assert level("jj log", jj_repo) is READ
+
+
+def test_jj_file_search_sees_secrets_in_tree(jj_repo: Path) -> None:
+    """Jj file search без путей читает все файлы рабочей копии — как grep -r."""
+    (jj_repo / "src" / ".env").write_text("TOKEN=1\n")
+    assert level("jj file search -p TOKEN", jj_repo) is None
+    assert level("jj file search -p TOKEN src", jj_repo) is None
+    assert level("jj file search -p TOKEN tests", jj_repo) is READ
+    assert level("cd src && jj file show root:README.md", jj_repo) is READ
 
 
 def test_jj_in_nested_workspace_asks(jj_repo: Path) -> None:

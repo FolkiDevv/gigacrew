@@ -3742,9 +3742,21 @@ _JJ_DIFF_VALUED = (
     "--to",
     "-T",
     "--template",
+    "--tool",
     "--context",
 )
 _JJ_FILE_VALUED = ("-r", "--revision", "-T", "--template")
+_JJ_SEARCH_VALUED = ("-r", "--revision", "-p", "--pattern")
+# Префиксы файлсетов, которые сводятся к пути: от рабочего каталога или от корня (True).
+_JJ_PATH_PREFIXES = MappingProxyType({
+    "cwd": False,
+    "file": False,
+    "cwd-file": False,
+    "root": True,
+    "root-file": True,
+})
+# Операторы файлсетов и пробел: выражение, а не путь.
+_JJ_FILESET_SYNTAX = re.compile(r"[~|&()\s]")
 # Запускают программы: команды пользователя (run, bisect run), инструменты из настроек
 # (fix, diffedit), интерактивный интерфейс (arrange); debug и bench — служебные.
 _JJ_RUNS = frozenset(("run", "bisect", "fix", "diffedit", "arrange", "debug", "bench"))
@@ -3908,9 +3920,43 @@ def _jj_positional(args: list[Word], valued: Collection[str]) -> list[Word]:
     return _split(_without_values(args, *valued))[1]
 
 
-def _jj_paths(args: list[Word], valued: Collection[str]) -> list[Word]:
-    """Пути из позиционных аргументов; шаблоны с префиксом (``glob:``, ``root:``) не пути."""
-    return [word for word in _jj_positional(args, valued) if ":" not in word.text]
+def _jj_paths(env: Env, args: list[Word], valued: Collection[str]) -> list[Word] | None:
+    """Пути из файлсетов в позиционных аргументах (``src``, ``cwd:.env``, ``root:"a b"``).
+
+    None — файлсет не сводится к путям: шаблон (``glob:``), выражение (``a | b``).
+    """
+    paths: list[Word] = []
+    for word in _jj_positional(args, valued):
+        prefix, colon, text = word.text.partition(":")
+        if not colon:
+            text = word.text
+        elif prefix not in _JJ_PATH_PREFIXES:
+            return None
+        if len(text) > 1 and text[0] == text[-1] and text[0] in "\"'":
+            text = text[1:-1]
+        if not text or _JJ_FILESET_SYNTAX.search(text):
+            return None
+        if colon and _JJ_PATH_PREFIXES[prefix]:  # от корня рабочей копии
+            text = os.path.relpath(env.root / text, env.dir)
+        paths.append(Word(text))
+    return paths
+
+
+def _jj_files_check(
+    env: Env,
+    args: list[Word],
+    valued: Collection[str],
+    what: str,
+    *,
+    recursive: bool = False,
+) -> Part | None:
+    """Файлы, которые покажет jj: явные пути — как у cat, ``recursive`` — как у grep -r."""
+    paths = _jj_paths(env, args, valued)
+    if paths is None:
+        return _unknown(f"{what}: файлсет не сводится к путям")
+    if recursive:  # без путей — все файлы рабочей копии
+        return _check_recursive(env, paths, what)
+    return check_read(env, paths, what)
 
 
 def _jj_sub(env: Env, repo: Env, sub: str, rest: list[Word]) -> Part:
@@ -3923,7 +3969,7 @@ def _jj_sub(env: Env, repo: Env, sub: str, rest: list[Word]) -> Part:
         return _read(f"{name}: справка")
     if sub in _JJ_READ:
         # как git diff: явный путь к секретам или наружу — вопрос
-        bad = check_read(env, _jj_paths(rest, _JJ_DIFF_VALUED), name) if sub == "diff" else None
+        bad = _jj_files_check(env, rest, _JJ_DIFF_VALUED, name) if sub == "diff" else None
         if bad is not None:
             return bad
         return _jj_read_after_check(repo, f"{name}: чтение репозитория")
@@ -3965,8 +4011,10 @@ def _jj_group(env: Env, repo: Env, sub: str, rest: list[Word]) -> Part:
         return check_write(env, _jj_positional(after, valued)[:1], name, edits=False)
     level = _JJ_GROUPS[sub].get(action)
     if level is READ:
-        if (sub, action) in {("file", "show"), ("file", "annotate")}:
-            bad = check_read(env, _jj_paths(after, _JJ_FILE_VALUED), name)
+        if (sub, action) in {("file", "show"), ("file", "annotate"), ("file", "search")}:
+            search = action == "search"
+            options = _JJ_SEARCH_VALUED if search else _JJ_FILE_VALUED
+            bad = _jj_files_check(env, after, options, name, recursive=search)
             if bad is not None:
                 return bad
         return _jj_read_after_check(repo, f"{name}: чтение репозитория")
@@ -4027,7 +4075,7 @@ def _jj_util(env: Env, repo: Env, rest: list[Word]) -> Part:
     if action in {"backend", "snapshot"}:
         return _jj_read_after_check(repo, f"jj util {action}")
     if action == "diff":  # сравнивает файлы на диске
-        bad = check_read(env, _jj_positional(after, ("--context",)), "jj util diff")
+        bad = check_read(env, _jj_positional(after, ("--tool", "--context")), "jj util diff")
         if bad is not None:
             return bad
         return _jj_read_after_check(repo, "jj util diff: сравнение файлов")
