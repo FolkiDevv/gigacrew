@@ -167,7 +167,9 @@ def test_temp_dir_is_ignored_with_old_gitignore(tmp_path: Path) -> None:
     [
         (".gigacode/tmp", True),
         (".gigacode/tmp/a/b.txt", True),
-        (".GIGACODE/TMP/x", True),  # без учёта регистра, как is_data_path
+        (".GIGACODE/tmp/x", False),  # другая папка на ФС с учётом регистра: её git не игнорирует
+        (".gigacode/TMP/x", False),
+        (".gigacode/tmp/.gitignore", False),  # без него временные файлы попали бы в коммит
         (".gigacode/tmpx", False),
         (".gigacode/skills/tmp/x", False),
         (".gigacode", False),

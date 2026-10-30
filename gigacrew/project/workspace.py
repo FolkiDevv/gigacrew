@@ -198,12 +198,15 @@ class Workspace:
         """Лежит ли (уже разрешённый) путь в ``.gigacode/tmp/`` (или это она сама).
 
         Единственная часть ``.gigacode/``, куда модель пишет как в обычные файлы проекта.
-        Без учёта регистра, как :meth:`is_data_path`.
+        Сравнение точное, в отличие от :meth:`is_data_path`: на ФС с учётом регистра
+        ``.gigacode/TMP`` — другая папка, её не игнорирует git. Свой ``.gitignore`` папки
+        модели не принадлежит: без него временные файлы попали бы в коммит.
         """
-        if not self.is_data_path(path):
+        temp_dir = self.data_dir / TEMP_DIR_NAME
+        path = Path(path)
+        if path == temp_dir / ".gitignore":
             return False
-        parts = Path(path).relative_to(self.root).parts
-        return len(parts) > 1 and parts[1].casefold() == TEMP_DIR_NAME
+        return path == temp_dir or temp_dir in path.parents
 
     def in_git_repo(self) -> bool:
         """Проект внутри git-репозитория: ``.git`` в корне или выше.

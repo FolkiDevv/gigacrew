@@ -1192,7 +1192,9 @@ def test_npm_format_script_edits_files(root: Path) -> None:
         ("echo {} > .gigacode/settings.local.json", DANGER),
         # .gigacode/tmp/ — временные файлы модели: запись туда — правка
         ("echo x > .gigacode/tmp/out.txt", WRITE),
-        ("cp a.txt .GIGACODE/tmp/a.txt", WRITE),
+        ("cp a.txt .gigacode/tmp/a.txt", WRITE),
+        ("cp a.txt .gigacode/TMP/a.txt", DANGER),
+        ("echo x > .gigacode/tmp/.gitignore", DANGER),
         ("mkdir -p .gigacode/tmp", WRITE),
         ("echo {} > .gigacode/tmp/../settings.json", DANGER),
         ("cp a.txt .gigacode/tmpfile", DANGER),
