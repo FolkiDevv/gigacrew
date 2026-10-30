@@ -3936,12 +3936,13 @@ def _jj_paths(env: Env, args: list[Word], valued: Collection[str]) -> list[Word]
             text = text[1:-1]
         if not text or _JJ_FILESET_SYNTAX.search(text):
             return None
-        if not word.glob and re.search(r"[*?\[]", text):  # шаблон раскроет сам jj
+        # Шаблон не сводится к путям: без совпадений оболочка отдаст его jj, а тот раскроет
+        # его в выбранной ревизии (-r), где файлы другие.
+        if word.glob or re.search(r"[*?\[]", text):
             return None
         if colon and _JJ_PATH_PREFIXES[prefix]:  # от корня рабочей копии
             text = os.path.relpath(env.root / text, env.dir)
-        # шаблон оболочки (creden*) раскроется до jj — проверяются совпадения
-        paths.append(Word(text, word.raw, word.static, word.glob))
+        paths.append(Word(text))
     return paths
 
 

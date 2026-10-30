@@ -794,8 +794,9 @@ def test_jj_file_search_sees_secrets_in_tree(jj_repo: Path) -> None:
     assert level("jj diff", jj_repo) is READ  # как git diff
 
 
-def test_jj_fileset_glob_checks_shell_matches(jj_repo: Path) -> None:
-    """Шаблон оболочки раскрывается до jj: проверяются совпадения, а не шаблон."""
+def test_jj_fileset_glob_asks(jj_repo: Path) -> None:
+    """Шаблон в файлсете — вопрос: jj раскрывает его в выбранной ревизии."""
+    assert level("jj file show -r @- creden*", jj_repo) is None  # совпадений в дереве нет
     (jj_repo / "credentials.json").write_text("{}")
     assert level("jj file show creden*", jj_repo) is None
     assert level("cat creden*", jj_repo) is None  # как у cat
