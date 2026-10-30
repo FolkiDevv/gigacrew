@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fakes import FakeJJ
 
 from gigacrew.agent.decisions import DecisionMemory
 from gigacrew.safety import MAX_COMMAND, CommandLevel, bash, classify, invisible_chars
 from gigacrew.safety.gitconfig import repo_config_runs_programs
+from gigacrew.safety.jjconfig import repo_config_runs_programs as jj_runs_programs
 from gigacrew.safety.paths import has_escaping_links, has_secrets_under
 
 READ, EXEC, WRITE, DANGER = (
@@ -452,6 +454,17 @@ def test_recursive_read_sees_credentials_in_git_remote(repo: Path) -> None:
     assert level("grep -rn hello src", repo) is READ
 
 
+def test_recursive_read_sees_credentials_in_jj_git_store(root: Path) -> None:
+    """Неколоцированный репозиторий jj хранит адреса удалённых в .jj/repo/store/git/config."""
+    store = root / ".jj" / "repo" / "store" / "git"
+    store.mkdir(parents=True)
+    (store / "config").write_text('[remote "origin"]\n\turl = https://example.com/r.git\n')
+    assert level("grep -rn hello .", root) is READ
+    (store / "config").write_text('[remote "origin"]\n\turl = https://u:tok123@example.com/r\n')
+    assert level("grep -rn hello .", root) is None
+    assert level("grep -rn hello src", root) is READ
+
+
 def test_secret_walk_overflow_counts_as_secret(root: Path) -> None:
     """Дерево больше лимита — считаем, что секреты в нём есть (T1-S20)."""
     big = root / "big"
@@ -530,3 +543,51 @@ def test_ordinary_files_outside_project_stay_unknown(root: Path) -> None:
     assert level("cat /etc/hosts", root) is None
     assert level("cat ~/.config/gh/config.yml", root) is None
     assert level("cat /etc/ssh/ssh_host_ed25519_key.pub", root) is None
+
+
+# -------------------------------- jj --------------------------------- #
+@pytest.fixture
+def fake_jj(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> FakeJJ:
+    return FakeJJ(tmp_path_factory.mktemp("bin"), monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        (("repo", "ui.diff-formatter", '["sh", "-c", "id"]'), True),
+        (("workspace", "ui.diff-formatter", '"difft"'), True),
+        (("repo", "merge-tools.difft.program", '"sh"'), True),
+        (("repo", "merge-tools.difft.diff-args", '["-c", "id"]'), True),
+        (("repo", "signing.backends.ssh.program", '"./sign.sh"'), True),
+        (("repo", "aliases.st", '["util", "exec", "--", "sh"]'), True),
+        (("repo", "ui.diff-formatter", '":git"'), False),
+        (("user", "ui.diff-formatter", '"difft"'), False),
+        (("repo", "aliases.l", '["log"]'), False),
+        (("repo", "user.name", '"x"'), False),
+    ],
+)
+def test_jj_repo_config_programs(
+    root: Path,
+    fake_jj: FakeJJ,
+    record: tuple[str, str, str],
+    *,
+    expected: bool,
+) -> None:
+    """Программы ищутся в настройках репозитория и рабочей копии, не пользователя.
+
+    Встроенный формат разницы (":git") — не программа; свой псевдоним (не st, b, ci,
+    desc) классификатор не пропускает и так — подкоманда незнакома.
+    """
+    fake_jj.config(record)
+    assert jj_runs_programs(root) is expected
+
+
+def test_jj_config_that_cannot_be_read_is_unknown(
+    root: Path,
+    fake_jj: FakeJJ,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_jj.answer("Config error: expected a table\n", code=1)
+    assert jj_runs_programs(root) is None
+    monkeypatch.setenv("PATH", str(root / "src"))
+    assert jj_runs_programs(root) is False  # jj не установлен — запускать нечего

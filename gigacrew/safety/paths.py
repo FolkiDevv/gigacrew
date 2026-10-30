@@ -33,9 +33,9 @@ __all__ = [
     "has_escaping_links",
     "has_secrets_under",
     "is_data_path",
-    "is_git_internal",
     "is_secret_name",
     "is_temp_path",
+    "is_vcs_internal",
     "scope",
     "scope_of_path",
 ]
@@ -44,9 +44,9 @@ __all__ = [
 MAX_GLOB_MATCHES = 2000
 
 
-def is_git_internal(path: Path, root: Path) -> bool:
-    """Путь в служебном каталоге git: хуки и настройки оттуда запускают программы."""
-    return files.is_git_internal(root, path)
+def is_vcs_internal(path: Path, root: Path) -> bool:
+    """Путь в служебном каталоге git или jj: хуки и настройки оттуда запускают программы."""
+    return files.is_vcs_internal(root, path)
 
 
 def is_data_path(path: Path, root: Path) -> bool:
@@ -151,6 +151,9 @@ def has_secrets_under(  # noqa: WPS231
             return True
         if ".git" in dirs and _git_config_has_credentials(current / ".git" / "config"):
             return True
+        # git-хранилище неколоцированного репозитория jj — с теми же адресами удалённых
+        if ".jj" in dirs and _git_config_has_credentials(current / _JJ_GIT_CONFIG):
+            return True
         for name in names:
             if name_pattern is not None and not fnmatch.fnmatch(name, name_pattern):
                 continue
@@ -160,6 +163,7 @@ def has_secrets_under(  # noqa: WPS231
 
 
 _URL_CREDENTIALS = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
+_JJ_GIT_CONFIG = Path(".jj", "repo", "store", "git", "config")
 
 
 def _git_config_has_credentials(path: Path) -> bool:

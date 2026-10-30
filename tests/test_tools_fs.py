@@ -602,13 +602,24 @@ def _git_layout(root: pathlib.Path) -> None:
 
 @pytest.mark.parametrize(
     "path",
-    [".git/config", ".GIT/config", ".git/hooks/pre-commit", "sub/.git/config", ".git", "./.git/x"],
+    [
+        ".git/config",
+        ".GIT/config",
+        ".git/hooks/pre-commit",
+        "sub/.git/config",
+        ".git",
+        "./.git/x",
+        ".jj/repo/config.toml",
+        ".JJ/repo/config-id",
+        "sub/.jj/workspace-config.toml",
+    ],
 )
 def test_git_internals_are_not_writable(ctx: ToolContext, path: str) -> None:
-    """Внутренности git не пишутся: отказ ещё в превью.
+    """Внутренности git и jj не пишутся: отказ ещё в превью.
 
     Правка .git/config превратила бы `git status` (без подтверждения) в запуск
-    произвольной команды (core.fsmonitor, diff.external).
+    произвольной команды (core.fsmonitor, diff.external), настроек jj в .jj/ — `jj diff`
+    (ui.diff-formatter).
     """
     _git_layout(ctx.root)
     writer, editor = WriteFileTool(), EditFileTool()
