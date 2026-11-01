@@ -125,9 +125,14 @@ def _confirmed_main_worktree(root: Path, dot_git: Path, line: str) -> Path | Non
 
 @dataclass(frozen=True)
 class Workspace:
-    """Корень проекта и производные пути. Конструктор не трогает файловую систему."""
+    """Корень проекта и производные пути. Конструктор не трогает файловую систему.
+
+    ``untrusted`` — проект недоверенный (``--untrusted-project``, ревью чужих изменений):
+    его скиллы и хуки не загружаются, а инструкции — данные, а не указания.
+    """
 
     root: Path
+    untrusted: bool = False
 
     def __post_init__(self) -> None:
         """Приводит корень к абсолютному пути без симлинков."""

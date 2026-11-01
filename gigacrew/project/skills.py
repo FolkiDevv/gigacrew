@@ -175,10 +175,15 @@ def user_skills_dir() -> Path:
 
 
 def discover_skills(workspace: Workspace, user_dir: Path | None = None) -> list[Skill]:
-    """Скиллы пользователя и проекта (проектный важнее), по имени без учёта регистра."""
+    """Скиллы пользователя и проекта (проектный важнее), по имени без учёта регистра.
+
+    У недоверенного проекта (``workspace.untrusted``) — только скиллы пользователя.
+    """
     user_dir = user_skills_dir() if user_dir is None else user_dir
     found: dict[str, Skill] = {}
-    project = _scan(workspace.skills_dir, "project", within=workspace.root)
+    project = (
+        [] if workspace.untrusted else _scan(workspace.skills_dir, "project", within=workspace.root)
+    )
     for candidate in (*_scan(user_dir, "user"), *project):
         found[candidate.name.casefold()] = candidate
     return sorted(found.values(), key=lambda skill: skill.name.casefold())

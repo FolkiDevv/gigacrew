@@ -389,7 +389,9 @@ class Agent:
         self._cfg = config
         # `is None`, а не `or`: пустой Conversation ложен (__len__ == 0).
         self._events = AgentEvents() if events is None else events
-        self._workspace = Workspace(config.project_root) if workspace is None else workspace
+        if workspace is None:
+            workspace = Workspace(config.project_root, untrusted=config.untrusted_project)
+        self._workspace = workspace
         self._parent = parent
         self._subagent = subagent
         main = parent is None  # основной агент, а не суб-агент
@@ -1466,7 +1468,7 @@ class Agent:
         parts = [
             self.system_prompt(),
             session_context_prompt(self._session_context),
-            nested_instructions_prompt(self._nested.files),
+            nested_instructions_prompt(self._nested.files, untrusted=self._workspace.untrusted),
             mode_prompt(
                 self.mode,
                 subagent=self._is_subagent,

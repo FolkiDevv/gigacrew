@@ -160,6 +160,18 @@ def test_project_context_lists_skills(tmp_path: Path) -> None:
     assert "- deploy: выкатка на стенд" in context
 
 
+def test_untrusted_project_skills_are_not_loaded(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    user_dir = tmp_path / "user"
+    _project_skill(project, "review", "скилл проекта")
+    _project_skill(project, "deploy", "только в проекте")
+    _skill(user_dir, "review", "---\nname: review\ndescription: скилл пользователя\n---\nX\n")
+    workspace = Workspace(project, untrusted=True)
+    skills = discover_skills(workspace, user_dir)
+    assert [(skill.name, skill.source) for skill in skills] == [("review", "user")]
+    assert "deploy" not in build_project_context(workspace)
+
+
 def test_invocation_prompt_substitutes_arguments(tmp_path: Path) -> None:
     skill = parse_skill(_project_skill(tmp_path, "fix", "x"))
     assert skill is not None
