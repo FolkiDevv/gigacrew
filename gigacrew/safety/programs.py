@@ -392,7 +392,7 @@ def check_write(
         if where is Scope.SECRET:
             parts.append(Part(WRITE, f"{what}: файл с секретами ({word.raw})", writes=written))
             continue
-        if output and is_temp_path(resolved, env.root) and not _shared(resolved):
+        if output and _scratch_target(env, word, resolved):
             reason = f"{what}: {word.raw} — временная папка модели"
             parts.append(Part(WRITE, reason, edits=True, scratch=True, writes=written))
             continue
@@ -402,6 +402,21 @@ def check_write(
     if not parts:
         return _write(what, edits=edits)
     return _combine(*parts)
+
+
+def _scratch_target(env: Env, word: Word, resolved: Path) -> bool:
+    """Запись по ``word`` попадает только в файлы временной папки, которые ни с чем не делят.
+
+    У шаблона — каждое совпадение: ссылка или жёсткая ссылка среди них пишет в проект.
+    """
+    paths = [resolved]
+    if word.glob:
+        try:
+            matches = glob.glob(word.text, root_dir=env.dir)  # noqa: PTH207
+        except (OSError, ValueError):
+            return False
+        paths = [(env.dir / match).resolve() for match in matches] or paths
+    return all(is_temp_path(path, env.root) and not _shared(path) for path in paths)
 
 
 def _shared(path: Path) -> bool:

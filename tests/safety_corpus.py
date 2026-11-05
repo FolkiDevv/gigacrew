@@ -10,6 +10,8 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 CORPUS = r"""
+R	diff .gigacode/tmp/before.txt .gigacode/tmp/after.txt
+R	comm -3 .gigacode/tmp/before.txt .gigacode/tmp/after.txt
 R	ls
 R	ls -la
 R	ls -la src/
@@ -140,6 +142,10 @@ R	nl -ba main.go | sed -n '1,30p'
 R	less README.md
 R	more CHANGELOG.md
 R	ruff check . --diff
+X	pytest -q > .gigacode/tmp/before.txt 2>&1
+X	pytest -q -p no:randomly 2>&1 | tee .gigacode/tmp/after.txt
+X	cd tests && pytest -q 2>&1 | tail -20
+X	python -m pytest -q > .gigacode/tmp/before.txt 2>&1 && rm -f .gigacode/tmp/old.txt
 X	cargo check --message-format short
 R	go vet ./...
 R	terraform plan
@@ -248,6 +254,14 @@ W	printf 'a\nb\n' > list.txt
 W	tee output.log < input.txt
 W	ls > files.txt
 W	ls -R src > .gigacode/tmp/files.txt
+W	git diff > .gigacode/tmp/changes.patch
+W	rm -f .gigacode/tmp/before.txt .gigacode/tmp/after.txt
+W	rm -rf .gigacode/tmp/run1
+W	mkdir -p .gigacode/tmp && cat a.txt > .gigacode/tmp/a.txt
+W	mv src/main.py .gigacode/tmp/main.py
+W	git stash && pytest -q > .gigacode/tmp/after.txt 2>&1; git stash pop
+W	git stash && pytest -q 2>&1 | tail -5
+W	cd src && ls > ../files.txt
 W	git add -A
 W	git add src/main.py
 W	git commit -m "fix: typo"
@@ -273,6 +287,13 @@ W	prettier --write src
 W	npx eslint --fix src
 W	cargo fmt
 W	gofmt -w .
+D	echo x | cat > ~/.bashrc
+D	ls | sort > ../outside.txt
+D	true && echo x > ~/.bashrc
+D	[ -f a.txt ] > ~/.bashrc
+D	{ [ -f a.txt ]; } > .git/config
+D	(cd src && ls) > ../x
+D	ln -s ../../.git/hooks/pre-commit .gigacode/tmp/h
 D	go mod tidy
 D	uv lock
 D	uv sync

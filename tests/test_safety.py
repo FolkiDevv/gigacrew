@@ -1462,6 +1462,15 @@ def test_shared_file_in_scratch_is_not_scratch(root: Path) -> None:
     verdict = classify("pytest -q > .gigacode/tmp/hard", root=root)
     assert verdict.level is WRITE
     assert not verdict.composable
+    # по шаблону — каждое совпадение: и ссылка на файл проекта среди них
+    by_glob = classify("pytest -q | tee .gigacode/tmp/*", root=root)
+    assert by_glob.level is WRITE
+    memory = DecisionMemory()
+    assert memory.approve(classify("pytest -q", root=root))
+    assert memory.match(by_glob) is None  # tee — не черновик: нужно своё правило
+    (root / ".gigacode" / "tmp" / "hard").unlink()
+    (root / ".gigacode" / "tmp" / "link.txt").symlink_to(root / "a.txt")
+    assert classify("pytest -q | tee .gigacode/tmp/*.txt", root=root).level is WRITE
     mixed = classify("pytest -q > .gigacode/tmp/x 2> src/main.py", root=root)
     assert mixed.reason == "перенаправление в src/main.py"  # настоящая запись, а не черновик
 
