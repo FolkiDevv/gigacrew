@@ -1558,6 +1558,17 @@ def test_hard_link_to_service_file_is_dangerous(root: Path, command: str) -> Non
     assert level("ln a.txt .gigacode/tmp/a", root) is WRITE  # обычный файл проекта — правка
 
 
+@pytest.mark.parametrize(
+    "command",
+    ["git restore --staged --worktree a.txt", "git restore -SW a.txt", "git restore -S -W a.txt"],
+)
+def test_git_restore_worktree_discards_changes(root: Path, command: str) -> None:
+    """``--worktree`` вместе с ``--staged`` возвращает и файл: правки теряются."""
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    assert level(command, root) is DANGER
+    assert level("git restore --staged a.txt", root) is WRITE
+
+
 @pytest.mark.skipif(os.name == "nt", reason="симлинки")
 def test_symlinked_scratch_dir_is_not_scratch(root: Path) -> None:
     """Симлинк tmp → skills из репозитория не открывает запись в служебную папку."""

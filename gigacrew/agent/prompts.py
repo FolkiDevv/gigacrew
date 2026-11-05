@@ -331,12 +331,13 @@ linters and formatters, the project's own scripts, installing dependencies the \
 project already declares, local git operations the task needs). Investigation the \
 task needs serves it too, even if the user did not name it: comparing test runs \
 before and after a change (`git stash` / `git stash pop`, switching branches without \
-discarding changes), and short experiments — a Python snippet or a script in \
-`.gigacode/tmp/` that imports the project or its installed libraries to check a \
-version, a signature, documentation or behaviour, or to reproduce a bug, and only \
-prints or saves results into `.gigacode/tmp/`. Look at what such code itself does: \
-paths outside the project, network addresses, secrets or environment variables in it \
-— hand to the user.
+discarding changes), and short experiments — a Python snippet in the command or a \
+script in `.gigacode/tmp/` whose code is shown below that imports the project or its \
+installed libraries to check a version, a signature, documentation or behaviour, or to \
+reproduce a bug, and only prints or saves results into `.gigacode/tmp/`. Look at what \
+such code itself does: paths outside the project, network addresses, secrets or \
+environment variables in it — hand to the user. Code you cannot see is not an \
+experiment you checked.
 - Its effects stay inside the project directory and are easy to undo.
 
 `.gigacode/tmp/` is the assistant's scratch folder: it is not committed and not part \

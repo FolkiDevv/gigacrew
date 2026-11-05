@@ -393,6 +393,35 @@ def test_git_changes_that_keep_work_are_write(
     assert preview.text == f"$ git {git.describe(params)}"
 
 
+def test_git_tool_change_outside_project_root_asks(tmp_path: Path) -> None:
+    """Проект — подкаталог репозитория: stash/commit -a задели бы файлы вне проекта."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    project = tmp_path / "sub"
+    project.mkdir()
+    ctx = ToolContext(workspace=Workspace(project))
+    git = GitTool()
+    assessment = git.assess(git.parse({"subcommand": "stash"}), ctx)
+    assert assessment.risk is RiskLevel.WRITE
+    assert assessment.kind is None  # решает пользователь, а не рецензент
+    assert assessment.verdict is None
+
+
+def test_git_tool_with_project_git_program_asks(
+    stashed_repo: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``git`` из файлов проекта (``.venv/bin/git`` в PATH) — не тот git, что проверен."""
+    fake = stashed_repo.root / ".venv" / "bin"
+    fake.mkdir(parents=True)
+    (fake / "git").write_text('#!/bin/sh\nexec /usr/bin/git "$@"\n')
+    (fake / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    git = GitTool()
+    assessment = git.assess(git.parse({"subcommand": "stash"}), stashed_repo)
+    assert assessment.kind is None
+    assert assessment.verdict is None
+
+
 def test_git_restore_with_yes_flag_still_asks(stashed_repo: ToolContext) -> None:
     """Агент с -y: `restore .` спрашивает (как опасное), а правка остаётся при отказе."""
     root = stashed_repo.root

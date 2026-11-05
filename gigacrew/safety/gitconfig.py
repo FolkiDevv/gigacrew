@@ -11,13 +11,14 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
 
 from gigacrew.security import subprocess_env
 
-__all__ = ["repo_config_runs_programs", "repo_toplevel"]
+__all__ = ["git_in_project", "repo_config_runs_programs", "repo_toplevel"]
 
 _TIMEOUT = 5
 _MAX_DEPTH = 8  # вложенность подмодулей
@@ -56,6 +57,18 @@ def repo_toplevel(cwd: Path) -> Path | None:
         return None
     top = res.stdout.decode("utf-8", errors="replace").strip()
     return Path(top).resolve() if top else None
+
+
+def git_in_project(root: Path, path: str) -> bool:
+    """Первый ``git`` в PATH (как его найдёт запуск) — в файлах проекта (``.venv/bin/git``)."""
+    project = root.resolve()
+    for entry in path.split(os.pathsep):
+        folder = Path(entry) if entry and Path(entry).is_absolute() else root / (entry or ".")
+        candidate = folder / "git"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            places = (candidate.absolute(), candidate.resolve())
+            return any(place == project or project in place.parents for place in places)
+    return False
 
 
 def repo_config_runs_programs(cwd: Path) -> bool | None:

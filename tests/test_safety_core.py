@@ -305,8 +305,11 @@ def test_code_written_by_the_same_command_is_not_trusted(
     venv_bin = scripts_root / ".venv" / "bin"
     environ = {"PATH": f"{venv_bin}:/usr/bin:/bin"}
     verdict = classify(command, root=scripts_root, environ=environ)
-    assert verdict.level is None, verdict.reason
-    assert not verdict.edits_only
+    assert verdict.level is not READ, verdict.reason
+    assert not verdict.edits_only, verdict.reason
+    # код проекта (EXEC) и так исполняется: не годится только разрешение по содержимому
+    assert verdict.level is None or not any("#" in sig for sig in verdict.signatures)
+    assert verdict.level is None or verdict.level >= EXEC
 
 
 @pytest.fixture
@@ -346,6 +349,41 @@ def test_unrelated_writes_keep_the_verdict(
     (root / ".gigacode" / "tmp").mkdir(parents=True)
     verdict = classify(command, root=root)
     assert verdict.level is expected, verdict.reason
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("git stash; python3 -m pytest -q; git stash pop", WRITE),  # проверка — та же
+        ("python3 .gigacode/tmp/tool.py > .gigacode/tmp/result", WRITE),  # файл, не пакет
+        ("mkdir -p .gigacode/tmp/out; python3 .gigacode/tmp/tool.py", WRITE),
+        ("python3 .gigacode/tmp/tool.py | tee .gigacode/tmp/result", WRITE),
+    ],
+)
+def test_checks_next_to_unrelated_writes_keep_their_level(
+    root: Path,
+    command: str,
+    expected: CommandLevel,
+) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / ".gigacode" / "tmp").mkdir(parents=True)
+    (root / ".gigacode" / "tmp" / "tool.py").write_text("print(1)\n")
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, verdict.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ln -s . .x; cp src/main.py .x/json.py; python3 -c 'import json'",
+        "export PYTHONPATH=.h && python3 -m json.tool data.json",
+        "find . -name main.py -exec cp {} json.py ';' -exec python3 -c 'import json' ';'",
+    ],
+)
+def test_freshness_sees_links_exports_and_find_actions(root: Path, command: str) -> None:
+    """Ссылка той же командой, PYTHONPATH на уровне команды, действия find друг за другом."""
+    (root / "data.json").write_text("{}")
+    assert level(command, root) is None
 
 
 def test_rewritten_package_json_makes_format_script_unknown(root: Path) -> None:

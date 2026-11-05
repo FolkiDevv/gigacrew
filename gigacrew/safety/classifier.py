@@ -111,14 +111,7 @@ def _classify(  # noqa: WPS210
         for redirect in simple.redirects:
             writes.extend(_redirect_parts(env, redirect))
     # Присваивания вне команд (X=1; export X=1) действуют на всё дальше.
-    for name, assigned in script.assigns:
-        bad = programs.check_env(name, assigned, reading=True)
-        if bad is not None:
-            parts.append(
-                Part(None, f"присваивание {name}: меняет окружение следующих команд")
-                if bad.level is None
-                else bad,
-            )
+    parts.extend(_assignment_parts(script))
     problems = [Part(None, problem) for problem in script.problems]
     if script.compound:
         # Условия и циклы разобраны, но «только чтение» для них не выносим: решает человек.
@@ -160,6 +153,23 @@ def _classify(  # noqa: WPS210
         scratch=scratch,
         writes=tuple(write.reason for write in writes),
     )
+
+
+def _assignment_parts(script: bash.Script) -> list[Part]:
+    """Присваивания вне команд (``X=1; export X=1``): они действуют на всё дальше."""
+    found: list[Part] = []
+    for name, assigned in script.assigns:
+        if name == "PYTHONPATH":  # у интерпретатора проверяется только префикс `X=… python`
+            found.append(Part(None, "присваивание PYTHONPATH: меняет поиск модулей дальше"))
+            continue
+        bad = programs.check_env(name, assigned, reading=True)
+        if bad is not None:
+            found.append(
+                Part(None, f"присваивание {name}: меняет окружение следующих команд")
+                if bad.level is None
+                else bad,
+            )
+    return found
 
 
 def _scratch(parts: list[Part], writes: list[Part], root: Path) -> bool:

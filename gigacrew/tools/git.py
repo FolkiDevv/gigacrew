@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 from typing import override
@@ -11,7 +12,7 @@ from pydantic import BaseModel, Field
 from gigacrew.errors import SandboxError
 from gigacrew.permissions import ToolKind
 from gigacrew.safety import CommandLevel, classify
-from gigacrew.safety.gitconfig import repo_config_runs_programs, repo_toplevel
+from gigacrew.safety.gitconfig import git_in_project, repo_config_runs_programs, repo_toplevel
 from gigacrew.security import RiskLevel, resolve_in_root, subprocess_env
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.process import run_process, truncate_middle
@@ -168,6 +169,13 @@ def _changing(sub: str, args: list[str], ctx: ToolContext) -> Assessment:
     """
     if sub not in _ALLOWED or not ctx.classify_commands:
         return Assessment(RiskLevel.WRITE)
+    top = repo_toplevel(ctx.root)
+    if top is None or top != ctx.root.resolve():
+        # git stash/switch/commit -a изменили бы и файлы репозитория вне проекта
+        return Assessment(RiskLevel.WRITE, reason="git: проект — не корень репозитория")
+    env = subprocess_env()
+    if git_in_project(ctx.root, env.get("PATH", os.defpath)):
+        return Assessment(RiskLevel.WRITE, reason="git: программа git — из файлов проекта")
     verdict = classify(shlex.join(["git", sub, *args]), root=ctx.root, environ=subprocess_env())
     if verdict.level not in {CommandLevel.EXEC, CommandLevel.WRITE}:
         return Assessment(RiskLevel.WRITE)

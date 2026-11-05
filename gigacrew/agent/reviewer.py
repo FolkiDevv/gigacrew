@@ -19,12 +19,14 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from gigacrew.agent.compaction import clip_middle
 from gigacrew.agent.events import Review
 from gigacrew.agent.prompts import REVIEWER_PROMPT
 from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.llm.types import Message, Usage
+from gigacrew.project.workspace import DATA_DIR_NAME, TEMP_DIR_NAME, Workspace
 from gigacrew.safety import CommandLevel, Part, Verdict
 
 REVIEWER_ENV = "GIGACREW_REVIEWER_MODEL"
@@ -34,6 +36,9 @@ MAX_REVIEW_COMMAND = 4_000
 MAX_REQUESTS = 3
 REQUEST_CLIP = 1_500
 PART_CLIP = 200
+# Сколько символов чернового скрипта из .gigacode/tmp/ видит рецензент и сколько скриптов.
+SCRIPT_CLIP = 3_000
+MAX_SCRIPTS = 2
 # Столько сбоев подряд — и рецензент отключается до конца сессии.
 MAX_FAILURES = 3
 DISABLED_NOTE = (
@@ -87,7 +92,11 @@ def _part_line(part: Part) -> str:
 
 
 def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> str:
-    """Текст запроса рецензенту: запросы пользователя, команда, факты разбора."""
+    """Текст запроса рецензенту: запросы пользователя, команда, факты разбора.
+
+    Код черновых скриптов из ``.gigacode/tmp/``, которые команда запускает, — тоже: их
+    пишет модель, как и heredoc.
+    """
     lines = ["# The user's requests (oldest first)"]
     if requests:
         lines += [
@@ -114,6 +123,7 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
     if parts:
         lines.append("Parts that are not read-only:")
         lines += [_part_line(part) for part in parts]
+    lines += _scratch_scripts(verdict)
     if verdict.writes:
         lines.append("Redirects into files:")
         lines += [
@@ -127,6 +137,39 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
         "marks the scratch folder .gigacode/tmp/.",
     )
     return "\n".join(lines)
+
+
+def _scratch_scripts(verdict: Verdict) -> list[str]:
+    """Код черновых скриптов (``.gigacode/tmp/*.py``), которые запускает команда."""
+    found: dict[Path, Path] = {}  # скрипт → корень проекта
+    for part in verdict.parts:
+        if part.level is CommandLevel.READ:
+            continue
+        for path in map(Path, part.inputs):
+            root = _project_of(path)
+            if path.suffix == ".py" and root is not None:
+                found.setdefault(path, root)
+    lines: list[str] = []
+    for script, root in list(found.items())[:MAX_SCRIPTS]:
+        try:
+            code = script.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        shown = clip_middle(code, SCRIPT_CLIP)
+        fence = _fence(shown)
+        name = json.dumps(script.relative_to(root).as_posix(), ensure_ascii=False)
+        lines += [f"Script {name} (scratch file written by the assistant):", fence, shown, fence]
+    return lines
+
+
+def _project_of(path: Path) -> Path | None:
+    """Корень проекта, во временной папке которого лежит ``path`` (входы оценки — абсолютные)."""
+    segments = path.parts
+    for index in range(len(segments) - 2):
+        root = Path(*segments[:index])
+        if segments[index : index + 2] == (DATA_DIR_NAME, TEMP_DIR_NAME):
+            return root if Workspace(root).is_temp_path(path) else None
+    return None
 
 
 def _decision(candidate: object) -> tuple[bool, str] | None:

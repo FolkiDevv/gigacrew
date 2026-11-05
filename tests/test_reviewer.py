@@ -490,6 +490,25 @@ def test_request_lists_redirect_targets(tmp_path: Path) -> None:
     assert "перенаправление в files.txt" in other
 
 
+def test_request_shows_scratch_script_code(tmp_path: Path) -> None:
+    """Код чернового скрипта из .gigacode/tmp/ рецензент видит, как код heredoc."""
+    scratch = tmp_path / ".gigacode" / "tmp"
+    scratch.mkdir(parents=True)
+    (tmp_path / "mypkg").mkdir()
+    (tmp_path / "mypkg" / "__init__.py").write_text("def run(*args):\n    pass\n")
+    (scratch / "exp.py").write_text("import mypkg\nmypkg.run('/home/u/.ssh/id_rsa')\n")
+    command = "python3 .gigacode/tmp/exp.py"
+    verdict = classify(command, root=tmp_path)
+    text = review_api.review_request(command, verdict, ["почини"])
+    assert 'Script ".gigacode/tmp/exp.py"' in text
+    assert "mypkg.run('/home/u/.ssh/id_rsa')" in text
+    # скрипт проекта вне временной папки — без кода
+    (tmp_path / "exp.py").write_text("import mypkg\nmypkg.run('/home/u/.ssh/id_rsa')\n")
+    project_script = "python3 exp.py"
+    other = review_api.review_request(project_script, classify(project_script, root=tmp_path), [])
+    assert "id_rsa" not in other
+
+
 def test_saved_rule_wins_before_reviewer(tmp_path: Path) -> None:
     script = _script(tmp_path)
     provider = ScriptedProvider(

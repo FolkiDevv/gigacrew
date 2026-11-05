@@ -27,9 +27,9 @@ from pathlib import Path
 from types import MappingProxyType
 
 from gigacrew.project.files import JJ_DIR_NAME, looks_like_git_dir
-from gigacrew.project.workspace import DATA_DIR_NAME, TEMP_DIR_NAME
 from gigacrew.safety import gitconfig, jjconfig
 from gigacrew.safety.bash import Command, Word
+from gigacrew.safety.freshness import outdated
 from gigacrew.safety.levels import CommandLevel, Part, worst
 from gigacrew.safety.paths import (
     Scope,
@@ -39,6 +39,7 @@ from gigacrew.safety.paths import (
     is_temp_path,
     is_vcs_internal,
     scope,
+    temp_dir,
 )
 from gigacrew.safety.python import analyze, shadowed_stdlib
 
@@ -113,11 +114,16 @@ def _combine(*parts: Part | None) -> Part:
     level = worst(*(part.level for part in real))
     same = [part for part in real if part.level == level] or real[:1]
     chosen = min(same, key=lambda part: (part.edits, part.scratch))  # первая из строгих
-    writes = _union(part.writes for part in real)
+    # Часть уровня WRITE без путей пишет что угодно: и всё вместе — неизвестно куда.
+    anywhere = any(
+        part.level is CommandLevel.WRITE and not part.writes and not part.scratch for part in real
+    )
+    writes = () if anywhere else _union(part.writes for part in real)
     inputs = _union(part.inputs for part in real)
-    if writes == chosen.writes and inputs == chosen.inputs:
+    relinks = any(part.relinks for part in real)
+    if (writes, inputs, relinks) == (chosen.writes, chosen.inputs, chosen.relinks):
         return chosen
-    return replace(chosen, writes=writes, inputs=inputs)
+    return replace(chosen, writes=writes, inputs=inputs, relinks=relinks)
 
 
 def _union(groups: Iterable[tuple[str, ...]]) -> tuple[str, ...]:
@@ -1566,6 +1572,7 @@ def _find(env: Env, name: str, args: list[Word], classify: Callable[[Command], P
         rec = _check_recursive(env, starts, "find -exec")
         if rec is not None:
             return rec
+    parts, _ = outdated(parts, [])  # `-exec cp {} json.py \; -exec python3 …`: одно пишет
     if any(part.level is None for part in parts):
         return next(part for part in parts if part.level is None)
     return _combine(_read("find: поиск файлов"), *parts)
@@ -2115,11 +2122,11 @@ def _in_scratch(env: Env, word: Word) -> bool:
         candidates = [env.dir / match for match in matches] or [env.dir / word.text]
     else:
         candidates = [env.dir / word.text]
-    temp_dir = (env.root / DATA_DIR_NAME / TEMP_DIR_NAME).resolve()
+    scratch_dir = temp_dir(env.root).resolve()
     for candidate in candidates:
         resolved = candidate.resolve()
         lexical = Path(os.path.normpath(candidate))
-        if resolved == temp_dir or not is_temp_path(resolved, env.root):
+        if resolved == scratch_dir or not is_temp_path(resolved, env.root):
             return False
         if lexical != resolved and not is_temp_path(lexical, env.root):
             return False  # ссылка извне временной папки на файл в ней
@@ -2196,12 +2203,16 @@ def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
         moved = check_write(env, sources, name)
         if moved.level is not CommandLevel.WRITE:
             return moved
-        both = _combine(moved, check_write(env, dest, name))
+        both = replace(_combine(moved, check_write(env, dest, name)), relinks=True)
         if _into_scratch(env, dest) and not all(_in_scratch(env, word) for word in sources):
             # из проекта файлы исчезают (а `rm` во временной папке — правка): не правка
             return replace(both, reason="mv: файлы проекта — во временную папку", edits=False)
         return both
-    return check_write(env, dest, name)
+    copied = check_write(env, dest, name)
+    # -r/-a/-P/-d копируют ссылки как ссылки, -s/-l ставят новые
+    links = _has(_flagset(flags), "-r", "-R", "-a", "-P", "-d", "-s", "-l", "--recursive")
+    links = links or _has(_flagset(flags), "--archive", "--no-dereference", "--symbolic-link")
+    return replace(copied, relinks=links or _has(_flagset(flags), "--link"))
 
 
 # Флаги со значением у каждой программы: общий список сдвигал бы позиционные (у touch
@@ -2283,9 +2294,9 @@ def _ln(env: Env, args: list[Word]) -> Part:
         if where != Scope.INSIDE:
             return _danger(f"ln: ссылка на {target.raw} — вне проекта или секреты")
     if target_dir:  # ln -t КАТАЛОГ цели… — ссылки создаются в КАТАЛОГЕ
-        return check_write(env, target_dir, "ln", edits=True)
+        return replace(check_write(env, target_dir, "ln", edits=True), relinks=True)
     links = pos[1:] or [Word(Path(pos[0].text).name)]  # `ln цель` — ссылка в каталоге команды
-    return check_write(env, links, "ln", edits=True)
+    return replace(check_write(env, links, "ln", edits=True), relinks=True)
 
 
 def _chmod(env: Env, args: list[Word]) -> Part:
@@ -3682,6 +3693,8 @@ def _git_change(env: Env, sub: str, rest: list[Word], static_args: list[str], fl
                 "-p",
                 "--overlay",
                 "--no-overlay",
+                "--worktree",
+                "-W",
             ) or (not _has(fl, "--staged", "-S") and bool(positional))
         else:
             discards = "--" in static_args or _has(fl, "-f", "--force", "-B")
@@ -4494,7 +4507,7 @@ def _python_inputs(env: Env, cmd: Command, prog: str, args: list[Word]) -> tuple
         except (OSError, ValueError):  # код -c вместо пути: слишком длинное имя, NUL
             continue
         if is_file and _inside(env, candidate):
-            found += [candidate, candidate.parent]
+            found += [candidate, candidate.parent, candidate.resolve().parent]
     dirs, _ = _pythonpath_dirs(env, cmd)
     found += dirs
     path = env.program_path
