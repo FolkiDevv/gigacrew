@@ -2505,25 +2505,29 @@ def test_always_for_dangerous_command_is_never_remembered(tmp_path: Path) -> Non
 UNVERIFIED_TOUCH = "for f in made.txt; do touch $f; done"
 
 
-def test_yes_flag_does_not_vouch_for_unverified_commands(tmp_path: Path) -> None:
+def test_yes_flag_runs_unverified_commands_without_reviewer(tmp_path: Path) -> None:
     run = tool_turn("run_shell", {"command": UNVERIFIED_TOUCH})
     provider = ScriptedProvider([run, text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
     _agent(provider, tmp_path, events=events).run_turn("x")  # auto_approve=True
-    # как без -y: сначала рецензент (его ответ не разобран), затем пользователь
+    # -y подтверждает всё не опасное сам: ни рецензента, ни вопроса
+    assert provider.summary_requests == []
+    assert events.confirms == []
+    assert (tmp_path / "made.txt").exists()
+
+
+def test_without_yes_unverified_command_goes_to_reviewer(tmp_path: Path) -> None:
+    run = tool_turn("run_shell", {"command": UNVERIFIED_TOUCH})
+    provider = ScriptedProvider([run, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events, auto_approve=False).run_turn("x")
+    # без -y: сначала рецензент (его ответ не разобран), затем пользователь
     assert len(provider.summary_requests) == 1
     assert len(events.confirms) == 1
     call, _, dangerous = events.confirms[0]
     assert call.reason.startswith("не удалось проверить:")
     assert not dangerous
     assert not (tmp_path / "made.txt").exists()
-    # --yes-all — явное «выполнять всё»
-    provider = ScriptedProvider([run, text_turn("ок")])
-    events = RecordingEvents(confirm_answer=False)
-    _agent(provider, tmp_path, events=events, yes_all=True).run_turn("x")
-    assert events.confirms == []
-    assert provider.summary_requests == []
-    assert (tmp_path / "made.txt").exists()
 
 
 def _ask_hook_later() -> FakeHooks:

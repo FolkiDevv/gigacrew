@@ -93,8 +93,8 @@ def test_destructive_commands_are_dangerous(command: str) -> None:
 )
 def test_ordinary_commands_are_not_dangerous(command: str) -> None:
     # Регэксп — только список опасного: WRITE значит «опасного не узнал», а не «проверено».
-    # Поэтому -y и хук allow за непроверенную классификатором команду не ручаются
-    # (test_agent_loop.py::test_yes_flag_does_not_vouch_for_unverified_commands).
+    # Поэтому хук allow за непроверенную классификатором команду не ручается
+    # (test_agent_loop.py::test_hook_allow_does_not_vouch_for_unverified_commands).
     assert classify_shell_command(command) == RiskLevel.WRITE
 
 

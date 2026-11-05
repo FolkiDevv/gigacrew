@@ -1819,14 +1819,16 @@ class Agent:
             ):
                 decision = Decision.BLOCK  # план: изменяющая команда, а не проверка
             unverified = verdict is not None and level is None
-            if decision is Decision.ALLOW and source == "yes_flag" and unverified:
-                # -y не ручается за команду, которую классификатор не проверил: в плане
-                # решает пользователь, в «авто» — как без -y (рецензент, затем пользователь).
-                # Выполнять всё без вопроса обещает только --yes-all — и только в «авто».
-                if self.mode is PermissionMode.PLAN:
-                    decision = Decision.ASK
-                elif not self._cfg.yes_all:
-                    decision = Decision.REVIEW
+            if (
+                decision is Decision.ALLOW
+                and source == "yes_flag"
+                and unverified
+                and self.mode is PermissionMode.PLAN
+            ):
+                # В «авто» -y выполняет без вопроса и рецензента всё, что не опасно, — в том
+                # числе команду, которую классификатор не проверил. В плане такая команда
+                # может что-то изменить, а план изменений не допускает: решает пользователь.
+                decision = Decision.ASK
             # Хук — после уточнений по вердикту: allow не снимает запрет режима плана
             # и, как -y, не ручается за непроверенную команду.
             hooked = apply_hook(decision, risk, pre.decision)
