@@ -13,6 +13,7 @@ from gigacrew.project import treesitter
 from gigacrew.safety import bash, programs
 from gigacrew.safety.freshness import outdated
 from gigacrew.safety.levels import CommandLevel, Part, Verdict, worst
+from gigacrew.safety.paths import is_temp_path
 
 __all__ = ["MAX_COMMAND", "classify", "invisible_chars"]
 
@@ -132,7 +133,7 @@ def _classify(  # noqa: WPS210
             script.rest,
             composable=True,
         )
-    scratch = any(each.scratch for each in (*parts, *writes))
+    scratch = _scratch(parts, writes, root)
     # Вывод в черновик (`pytest > .gigacode/tmp/before.txt`, `| tee …`) не меняет уровень
     # проверки и не мешает сверке с разрешениями — если остальное только читает или
     # исполняет. Рядом с правками и git он — обычная запись: те могут, например,
@@ -159,6 +160,16 @@ def _classify(  # noqa: WPS210
         scratch=scratch,
         writes=tuple(write.reason for write in writes),
     )
+
+
+def _scratch(parts: list[Part], writes: list[Part], root: Path) -> bool:
+    """Команда пишет во временную папку модели: вывод туда или известный путь в ней.
+
+    ``pytest --basetemp=.gigacode/tmp/pt`` очищает каталог — в режиме плана это запись.
+    """
+    if any(each.scratch for each in (*parts, *writes)):
+        return True
+    return any(is_temp_path(Path(path), root) for part in parts for path in part.writes)
 
 
 def _level(everything: list[Part], *, neutral: bool) -> CommandLevel | None:

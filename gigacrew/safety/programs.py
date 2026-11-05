@@ -381,7 +381,8 @@ def check_write(
         resolved = target.resolve()
         if is_data_path(resolved, env.root) and not is_temp_path(resolved, env.root):
             return _danger(f"{what}: служебная папка gigacrew ({word.raw})")
-        written = (str(resolved),)
+        # Шаблон раскроется в любые файлы своего каталога: записанным считается каталог.
+        written = (str((_glob_base(target) if word.glob else target).resolve()),)
         if where is Scope.SECRET:
             parts.append(Part(WRITE, f"{what}: файл с секретами ({word.raw})", writes=written))
             continue
@@ -395,6 +396,16 @@ def check_write(
     if not parts:
         return _write(what, edits=edits)
     return _combine(*parts)
+
+
+def _glob_base(path: Path) -> Path:
+    """Каталог шаблона: путь до первого сегмента с ``*``, ``?`` или ``[``."""
+    base = Path(path.anchor)
+    for segment in path.parts[len(path.parts[:1]) if path.anchor else 0 :]:
+        if _GLOB_SEGMENT.search(segment):
+            break
+        base /= segment
+    return base
 
 
 def _check_recursive(
@@ -446,15 +457,31 @@ def _check_exec_args(env: Env, args: list[Word], what: str) -> Part | None:
 
 def _scratch_basetemp(env: Env, args: list[Word], arg: Word) -> bool:
     """``--basetemp`` — подкаталог временной папки модели: его очистка ничего не теряет."""
+    folder = _basetemp_value(args, arg)
+    return folder is not None and _in_scratch(env, Word(folder, folder))
+
+
+def _basetemp_value(args: list[Word], arg: Word) -> str | None:
+    """Значение ``--basetemp=DIR`` или ``--basetemp DIR``; None — не статичное или шаблон."""
     if "=" in arg.text:
         folder = arg.text.split("=", 1)[1]
     else:
         index = next((pos for pos, each in enumerate(args) if each is arg), len(args))
         following = args[index + 1 : index + 2]
         if not following or not following[0].static:
-            return False
+            return None
         folder = following[0].text
-    return not _GLOB_SEGMENT.search(folder) and _in_scratch(env, Word(folder, folder))
+    return None if _GLOB_SEGMENT.search(folder) else folder
+
+
+def _basetemp_writes(env: Env, args: list[Word]) -> tuple[str, ...]:
+    """Каталог ``--basetemp`` (pytest его очищает) — куда пишет инструмент."""
+    for arg in args:
+        if arg.static and arg.text.startswith("--basetemp"):
+            folder = _basetemp_value(args, arg)
+            if folder is not None:
+                return (str((env.dir / folder).resolve()),)
+    return ()
 
 
 def _exec_tool(env: Env, args: list[Word], what: str, signature: str | None) -> Part:
@@ -463,7 +490,7 @@ def _exec_tool(env: Env, args: list[Word], what: str, signature: str | None) -> 
         return bad
     if signature is not None and not _signature_args_ok(signature, args, env):
         signature = None  # аргументы вне проверенного набора — разрешать только точную команду
-    return _exec(what, signature)
+    return Part(EXEC, what, signature=signature, writes=_basetemp_writes(env, args))
 
 
 # Аргументы, с которыми разрешение «программа с любыми аргументами» остаётся безопасным:

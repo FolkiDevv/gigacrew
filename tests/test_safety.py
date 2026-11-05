@@ -1433,6 +1433,8 @@ def test_pytest_flags_for_comparable_runs(
     verdict = classify(command, root=root)
     assert verdict.level is EXEC, verdict.reason
     assert verdict.signatures == signatures
+    # pytest очищает --basetemp: в режиме плана это запись, правило «pytest» там не действует
+    assert verdict.scratch is ("--basetemp" in command)
 
 
 @pytest.mark.parametrize(

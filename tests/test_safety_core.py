@@ -289,31 +289,40 @@ def test_edits_only_requires_every_part_and_every_redirect_to_be_an_edit(root: P
         'sh -c "echo x > tool.py"; python3 tool.py',
         'sh -c "pytest -q; echo x > .gigacode/tmp/tool.py"; python3 .gigacode/tmp/tool.py',
         "echo 'echo x' > build.sh; ./build.sh",
+        "echo x | tee .gigacode/tmp/*.py; python3 .gigacode/tmp/tool.py",  # шаблон — весь каталог
+        "echo x | tee *.txt; python3 tool.txt",
     ],
 )
-def test_code_written_by_the_same_command_is_not_trusted(root: Path, command: str) -> None:
+def test_code_written_by_the_same_command_is_not_trusted(
+    scripts_root: Path,
+    command: str,
+) -> None:
     """Классификатор видит файлы до запуска: код, который пишет эта же команда, не проверен.
 
     Иначе запись (правка — в «авто» без вопроса) вместе с проверенным по старому
     содержимому запуском выполнила бы новый код без рецензента и без вопроса.
     """
+    venv_bin = scripts_root / ".venv" / "bin"
+    environ = {"PATH": f"{venv_bin}:/usr/bin:/bin"}
+    verdict = classify(command, root=scripts_root, environ=environ)
+    assert verdict.level is None, verdict.reason
+    assert not verdict.edits_only
+
+
+@pytest.fixture
+def scripts_root(root: Path) -> Path:
+    """Проект с безобидными скриптами, программой и окружением в .venv (python из PATH)."""
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-    (root / "tool.py").write_text("print(1)\n")
+    for name in ("tool.py", "tool.txt", "src/tool.py", ".gigacode/tmp/tool.py"):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("print(1)\n")
     (root / "build.sh").write_text("#!/bin/sh\necho built\n")
     (root / "build.sh").chmod(0o755)
-    (root / "src" / "tool.py").write_text("print(1)\n")
-    (root / ".gigacode" / "tmp").mkdir(parents=True)
-    (root / ".gigacode" / "tmp" / "tool.py").write_text("print(1)\n")
-    site = root / ".venv" / "lib" / "python3.13" / "site-packages"
-    site.mkdir(parents=True)
+    (root / ".venv" / "lib" / "python3.13" / "site-packages").mkdir(parents=True)
     (root / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
     (root / ".venv" / "bin").mkdir()
     (root / ".venv" / "bin" / "python3").symlink_to("/usr/bin/python3")
-    venv_bin = root / ".venv" / "bin"
-    environ = {"PATH": f"{venv_bin}:/usr/bin:/bin"}
-    verdict = classify(command, root=root, environ=environ)
-    assert verdict.level is None, verdict.reason
-    assert not verdict.edits_only
+    return root
 
 
 @pytest.mark.parametrize(
@@ -437,6 +446,8 @@ def test_descriptor_duplication_is_not_a_write(root: Path, command: str) -> None
         "cat a.txt | cat <<'EOF' > ~/.bashrc\nx\nEOF",
         "[ -f a.txt ] > ~/.bashrc",
         "export X=1 > ~/.bashrc",
+        "{ [ -f a.txt ]; } > ~/.bashrc",  # в блоке и подоболочке нет простых команд
+        "( [ -f a.txt ] ) > ~/.bashrc",
     ],
 )
 def test_redirect_of_pipeline_or_list_is_checked(root: Path, command: str) -> None:

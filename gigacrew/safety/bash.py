@@ -791,7 +791,10 @@ class _Walker:
         before = len(self.script.commands)
         inner = [child for child in node.children if child.type not in {"(", ")"}]
         self.statements(inner, cwd=cwd, substituted=substituted, leading_cd=True)
-        return _attach(self.script.commands[before:], redirects)
+        cmds = self.script.commands[before:]
+        if not cmds:  # `{ [ -f x ]; } > f`: своих команд нет, а запись выполнится
+            return self._bare(redirects or [], cwd=cwd, substituted=substituted)
+        return _attach(cmds, redirects)
 
     def _container(
         self,
@@ -817,7 +820,10 @@ class _Walker:
                 self.scan(child)
             else:
                 self.statements([child], cwd=cwd, substituted=substituted)
-        return _attach(self.script.commands[before:], redirects)
+        cmds = self.script.commands[before:]
+        if not cmds:  # `{ [ -f x ]; } > f`: своих команд нет, а запись выполнится
+            return self._bare(redirects or [], cwd=cwd, substituted=substituted)
+        return _attach(cmds, redirects)
 
     def _other_statement(self, node: _Node) -> None:
         """Оператор без простых команд: проверка, присваивание, объявление, функция."""
