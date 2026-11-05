@@ -11,6 +11,7 @@ from pathlib import Path
 
 from gigacrew.project import treesitter
 from gigacrew.safety import bash, programs
+from gigacrew.safety.freshness import outdated
 from gigacrew.safety.levels import CommandLevel, Part, Verdict, worst
 
 __all__ = ["MAX_COMMAND", "classify", "invisible_chars"]
@@ -24,6 +25,7 @@ _MAX_STDIN_DEPTH = 8
 _LINE_CONTINUATION = "\N{REVERSE SOLIDUS}\n"
 # Запись в эти устройства — не запись в файлы.
 _STD_STREAMS = frozenset(("/dev/null", "/dev/stdout", "/dev/stderr"))
+_REDIRECT = "перенаправление"
 
 
 def classify(
@@ -120,6 +122,7 @@ def _classify(  # noqa: WPS210
     if script.compound:
         # Условия и циклы разобраны, но «только чтение» для них не выносим: решает человек.
         problems.append(Part(None, "условия или циклы оболочки"))
+    parts = outdated(parts, writes)
     everything = [*parts, *writes, *problems]
     if not everything:
         return Verdict(
@@ -129,14 +132,43 @@ def _classify(  # noqa: WPS210
             script.rest,
             composable=True,
         )
-    level = worst(*(each.level for each in everything))
+    scratch = any(each.scratch for each in (*parts, *writes))
+    # Вывод в черновик (`pytest > .gigacode/tmp/before.txt`, `| tee …`) не меняет уровень
+    # проверки и не мешает сверке с разрешениями — если остальное только читает или
+    # исполняет. Рядом с правками и git он — обычная запись: те могут, например,
+    # восстановить на месте файла ссылку наружу.
+    neutral = scratch and not any(
+        each.level is CommandLevel.WRITE and not each.scratch for each in parts
+    )
+    level = _level(everything, neutral=neutral)
     reason = _reason(level, everything)
     # Часть, выполняемая не в script.cwd (`(cd X && make test)`), сверялась бы с
     # разрешениями другого каталога: память решений ищет их по Verdict.cwd.
     same_dir = all(each.cwd == script.cwd for each in script.commands)
-    composable = not writes and not problems and bool(parts) and same_dir
+    blocking = [write for write in writes if not (neutral and write.scratch)]
+    composable = not blocking and not problems and bool(parts) and same_dir
     redirects_edit = all(write.edits for write in writes if write.level is CommandLevel.WRITE)
-    return Verdict(level, reason, script.cwd, script.rest, tuple(parts), composable, redirects_edit)
+    return Verdict(
+        level,
+        reason,
+        script.cwd,
+        script.rest,
+        tuple(parts),
+        composable,
+        redirects_edit,
+        scratch=scratch,
+        writes=tuple(write.reason for write in writes),
+    )
+
+
+def _level(everything: list[Part], *, neutral: bool) -> CommandLevel | None:
+    """Уровень команды; ``neutral`` — вывод во временную папку не в счёт.
+
+    Без проверки рядом такой вывод — правка файла (WRITE), а не чтение.
+    """
+    counted = [each for each in everything if not (neutral and each.scratch)]
+    level = worst(*(each.level for each in counted)) if counted else CommandLevel.READ
+    return CommandLevel.WRITE if neutral and level is CommandLevel.READ else level
 
 
 def _redirect_parts(env: programs.Env, redirect: bash.Redirect) -> list[Part]:
@@ -158,12 +190,20 @@ def _redirect_parts(env: programs.Env, redirect: bash.Redirect) -> list[Part]:
         target = redirect.target
         if target.static and target.text in _STD_STREAMS:
             return found
-        found.append(programs.check_write(env, [target], "перенаправление"))
+        found.append(_redirect_write(env, target))
     elif redirect.reads and redirect.target is not None:
         bad = programs.check_read(env, [redirect.target], "чтение через <")
         if bad is not None:
             found.append(bad)
     return found
+
+
+def _redirect_write(env: programs.Env, target: bash.Word) -> Part:
+    """Запись через перенаправление; у обычной записи в причине — куда."""
+    write = programs.check_write(env, [target], _REDIRECT, output=True)
+    if write.level is CommandLevel.WRITE and write.reason == _REDIRECT:
+        return replace(write, reason=f"{_REDIRECT} в {target.raw}")
+    return write
 
 
 def _nested(
@@ -173,11 +213,22 @@ def _nested(
     root: Path,
     environ: Mapping[str, str],
 ) -> Part:
-    """Оценка вложенной команды оболочки (``sh -c "…"``, тело heredoc для bash)."""
+    """Оценка вложенной команды оболочки (``sh -c "…"``, тело heredoc для bash).
+
+    Входы оценки её частей — входы этой части. Если вложенная команда что-то пишет
+    (хотя бы вывод в черновик), для соседних частей она пишет куда угодно в проекте.
+    """
     inner = _classify(text, root=root, cwd=env.cwd, environ=environ, depth=env.depth)
     if inner.level is CommandLevel.READ and not inner.composable:
         return Part(None, inner.reason)
-    return Part(inner.level, f"вложенная команда: {inner.reason}")
+    inputs = tuple(dict.fromkeys(path for part in inner.parts for path in part.inputs))
+    writing = inner.writes or any(part.writes for part in inner.parts)
+    return Part(
+        inner.level,
+        f"вложенная команда: {inner.reason}",
+        writes=(str(root),) if writing else (),
+        inputs=inputs,
+    )
 
 
 def _text_of(cmd: bash.Command, depth: int = 0) -> str:

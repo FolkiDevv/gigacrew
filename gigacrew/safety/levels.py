@@ -9,7 +9,7 @@ from types import MappingProxyType
 __all__ = ["CommandLevel", "Part", "Verdict", "worst"]
 
 # Версия правил: в журнале решений — чтобы переоценить старые записи после правок.
-RULES_VERSION = 6
+RULES_VERSION = 7
 
 
 class CommandLevel(IntEnum):
@@ -48,6 +48,12 @@ class Part:
     только в обычные файлы проекта (как правка файла инструментом): в режиме «авто»
     не спрашивается. ``prelude`` — подготовка окружения (активация venv проекта), не
     мешает совпадению с разрешением.
+
+    ``scratch`` — часть только выводит в файлы временной папки модели (``tee
+    .gigacode/tmp/x``). ``writes`` — файлы и каталоги, куда часть пишет (разрешённые
+    пути; часть уровня WRITE без них пишет неизвестно куда). ``inputs`` — файлы и
+    каталоги, по содержимому которых часть оценена (скрипт Python, каталоги поиска
+    модулей, программа проекта): запись в них этой же командой делает оценку устаревшей.
     """
 
     level: CommandLevel | None
@@ -56,6 +62,9 @@ class Part:
     edits: bool = False
     prelude: bool = False
     text: str = ""  # простая команда как написана (для точного разрешения)
+    scratch: bool = False
+    writes: tuple[str, ...] = ()
+    inputs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -71,6 +80,12 @@ class Verdict:
     с ``cd``): такую можно сверять с сохранёнными разрешениями по частям.
     ``redirects_edit`` — запись через перенаправления (если есть) только в обычные файлы
     проекта: ``> .env`` — не правка, как и ``cp a.txt .env``.
+
+    ``scratch`` — команда выводит в файлы временной папки модели (``.gigacode/tmp/``:
+    ``pytest > .gigacode/tmp/before.txt``, ``| tee …``). Такой вывод не меняет уровень
+    проверки или сборки и не мешает сверке с разрешениями, но остаётся записью: в режиме
+    плана команда с ним заблокирована, а без других частей она — правка.
+    ``writes`` — куда пишут перенаправления команды (для рецензента).
     """
 
     level: CommandLevel | None
@@ -80,6 +95,8 @@ class Verdict:
     parts: tuple[Part, ...] = field(default_factory=tuple)
     composable: bool = False
     redirects_edit: bool = True
+    scratch: bool = False
+    writes: tuple[str, ...] = ()
 
     @property
     def known(self) -> bool:
@@ -94,6 +111,20 @@ class Verdict:
             and self.redirects_edit
             and bool(self.parts)
             and all(part.level is CommandLevel.READ or part.edits for part in self.parts)
+        )
+
+    @property
+    def asked_parts(self) -> tuple[Part, ...]:
+        """Части, о которых спрашивают и которые сверяют с разрешениями, — не чтение.
+
+        Вывод во временную папку (``| tee .gigacode/tmp/x``) своего правила не требует,
+        пока остальные части не пишут файлы: рядом с правками и git он — обычная запись.
+        """
+        changing = any(part.level is CommandLevel.WRITE and not part.scratch for part in self.parts)
+        return tuple(
+            part
+            for part in self.parts
+            if part.level is not CommandLevel.READ and (changing or not part.scratch)
         )
 
     @property

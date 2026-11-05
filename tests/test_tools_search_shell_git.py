@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -157,6 +158,18 @@ def test_shell_scratch_file_needs_no_confirmation(tmp_path: Path) -> None:
     temp_dir = Workspace(tmp_path).data_dir / "tmp"
     assert (temp_dir / "out.txt").read_text(encoding="utf-8") == "hello\n"
     assert (temp_dir / ".gitignore").is_file()
+
+
+def test_plan_mode_blocks_scratch_output(tmp_path: Path) -> None:
+    """В режиме плана вывод во временную папку — запись: команда заблокирована, как раньше."""
+    command = "pytest -q > .gigacode/tmp/before.txt 2>&1"
+    provider = ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")])
+    events = RecordingEvents()
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, mode=PermissionMode.PLAN)
+    Agent(provider, build_default_registry(), cfg, events).run_turn("сравни прогоны")
+    assert not events.confirms
+    assert "заблокировано" in events.tool_results[-1][1].content
+    assert not (Workspace(tmp_path).data_dir / "tmp" / "before.txt").exists()
 
 
 def test_shell_runs_in_cwd_and_rejects_outside(ctx: ToolContext) -> None:
@@ -367,7 +380,14 @@ def test_git_changes_that_keep_work_are_write(
     params = git.parse({"subcommand": sub, "args": args})
     assessment = git.assess(params, stashed_repo)
     assert assessment.risk is RiskLevel.WRITE
-    assert not assessment.reason
+    # Как та же команда в run_shell: оценка классификатора (в «авто» — рецензент), без
+    # пометки о потере работы; не проверенное классификатором решает пользователь.
+    if assessment.verdict is None:
+        assert not assessment.reason
+    else:
+        assert assessment.kind is ToolKind.COMMAND
+        assert assessment.reason == assessment.verdict.reason
+        assert assessment.verdict.command == shlex.join(["git", sub, *args])
     preview = git.preview(params, stashed_repo)
     assert preview is not None
     assert preview.text == f"$ git {git.describe(params)}"

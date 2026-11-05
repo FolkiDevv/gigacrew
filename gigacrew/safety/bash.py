@@ -97,6 +97,7 @@ _TOKENS = frozenset((
     "\n",
 ))
 _SEPARATORS = frozenset(("&&", "||", ";", "&", "\n", "|", "|&", ";;"))
+_REDIRECT_NODES = frozenset(("file_redirect", "herestring_redirect", "heredoc_redirect"))
 _OUTPUT_OPS = frozenset((">", ">>", ">|", "&>", "&>>", "&>|"))
 _GLOB_CHARS = re.compile(r"[*?\[]")
 # Экранированный символ: внутри него ни глоб, ни раскрытие {…} не действуют.
@@ -254,6 +255,20 @@ class Command:
         return found
 
 
+@dataclass(frozen=True)
+class _Entry:
+    """Оператор последовательности и разделитель после него.
+
+    ``wrappers`` — узлы ``redirected_statement``, чьи перенаправления на самом деле
+    относятся к этому оператору (изнутри наружу): ``a && b > f`` грамматика разбирает
+    как ``(a && b) > f``, а оболочка перенаправляет только вывод ``b``.
+    """
+
+    node: _Node
+    sep: str
+    wrappers: tuple[_Node, ...] = ()
+
+
 @dataclass
 class Script:
     """Разобранная команда: простые команды, проблемы разбора и рабочий каталог."""
@@ -265,7 +280,7 @@ class Script:
     assigns: list[tuple[str, Word]] = field(default_factory=list)
     cwd: str = "."  # рабочий каталог после ведущих ``cd X &&``
     rest: str = ""  # команда без ведущих ``cd X &&``
-    compound: bool = False  # есть условия, циклы или блоки { …; }
+    compound: bool = False  # есть условия или циклы
     consumed: int = 0  # сколько ведущих `cd X &&` превратилось в рабочий каталог
 
 
@@ -439,33 +454,33 @@ class _Walker:
         top: bool = False,
     ) -> str:
         """Последовательность операторов. Возвращает каталог после ведущих ``cd``."""
-        flat: list[tuple[_Node, str]] = []  # (узел, разделитель после него)
+        flat: list[_Entry] = []
         self._flatten(nodes, flat)
         leading = leading_cd
-        for index, (node, sep) in enumerate(flat):
+        for index, entry in enumerate(flat):
             if leading:
-                target = self._leading_cd(node, sep, cwd=cwd, last=index == len(flat) - 1)
+                target = self._leading_cd(entry, cwd=cwd, last=index == len(flat) - 1)
                 if target is not None:
                     cwd = target
                     self.script.consumed += 1
                     continue
             if leading and top:
-                self.rest_start = node.start_byte
+                self.rest_start = entry.node.start_byte
             leading = False
-            if sep == "&":
+            if entry.sep == "&":
                 self.problem("фоновый процесс (&)")
             saved = self._cwd
             self._cwd = cwd
             known = len(self.script.assigns)
-            self.statement(node, cwd=cwd, substituted=substituted)
+            self._wrapped(entry, cwd=cwd, substituted=substituted)
             self._cwd = saved
             # Присваивание запоминается, только если оно точно выполнено в этой оболочке:
             # на верхнем уровне, не после && или || и не в фоне.
             certain = (
                 top
-                and node.type in _ASSIGNMENTS
-                and (index == 0 or flat[index - 1][1] not in {"&&", "||"})
-                and sep != "&"
+                and entry.node.type in _ASSIGNMENTS
+                and (index == 0 or flat[index - 1].sep not in {"&&", "||"})
+                and entry.sep != "&"
             )
             self._track_assigned(self.script.assigns[known:], certain=certain)
         return cwd
@@ -485,13 +500,15 @@ class _Walker:
         if kind == "redirected_statement":
             return self.redirected(node, cwd=cwd, substituted=substituted, outer=redirects)
         if kind == "pipeline":
-            return self.pipeline(node, cwd=cwd, substituted=substituted)
+            return self.pipeline(node, cwd=cwd, substituted=substituted, redirects=redirects)
         if kind == "subshell":
             return self._subshell(node, cwd=cwd, substituted=substituted, redirects=redirects)
         if kind in _CONTAINERS:
             return self._container(node, cwd=cwd, substituted=substituted, redirects=redirects)
         self._other_statement(node)
-        return []
+        # У оператора нет своих простых команд (`[ -f x ] > f`, `X=1 > f`), но его
+        # перенаправления всё равно выполнятся: их проверяет команда без слов.
+        return self._bare(redirects or [], cwd=cwd, substituted=substituted)
 
     def assignment(self, node: _Node) -> tuple[str, Word]:
         name = node.child_by_field_name("name")
@@ -523,33 +540,12 @@ class _Walker:
         substituted: bool,
         outer: list[Redirect] | None,
     ) -> list[Command]:
-        body: _Node | None = None
-        redirects: list[Redirect] = []
-        # То, что грамматика поместила внутрь heredoc: `| python`, `&& ls`.
-        trailing: list[_Node] = []
-        for child in node.children:
-            if child.type in {"file_redirect", "herestring_redirect"}:
-                redirect, extra = self.redirect(child)
-                redirects.append(redirect)
-                if extra:
-                    self.problem("слова после перенаправления")
-            elif child.type == "heredoc_redirect":
-                redirect, extra = self.heredoc(child)
-                redirects.append(redirect)
-                trailing.extend(extra)
-            elif body is None:
-                body = child
-            else:
-                self.problem(f"конструкция оболочки {child.type}")
+        body, redirects, trailing = self._redirections(node)
+        redirects.extend(outer or [])
         if body is None:
             self.problem("перенаправление без команды")
-            return []
-        cmds = self.statement(
-            body,
-            cwd=cwd,
-            substituted=substituted,
-            redirects=redirects + list(outer or []),
-        )
+            return self._bare(redirects, cwd=cwd, substituted=substituted)
+        cmds = self.statement(body, cwd=cwd, substituted=substituted, redirects=redirects)
         if trailing:
             cmds = self._trailing(trailing, cmds, cwd=cwd, substituted=substituted)
         return cmds
@@ -635,13 +631,25 @@ class _Walker:
             self._assigned.clear()
         return cmd
 
-    def pipeline(self, node: _Node, *, cwd: str, substituted: bool) -> list[Command]:
+    def pipeline(
+        self,
+        node: _Node,
+        *,
+        cwd: str,
+        substituted: bool,
+        redirects: list[Redirect] | None = None,
+    ) -> list[Command]:
+        """Конвейер.
+
+        ``redirects`` грамматика навешивает на весь конвейер (``a | b > f`` — это
+        ``(a | b) > f``), а оболочка — только на последнее звено.
+        """
         prev: Command | None = None
         last: list[Command] = []
-        for child in node.children:
-            if child.type in {"|", "|&"}:
-                continue
-            got = self.statement(child, cwd=cwd, substituted=substituted)
+        stages = [child for child in node.children if child.type not in {"|", "|&"}]
+        for index, child in enumerate(stages):
+            extra = redirects if index == len(stages) - 1 else None
+            got = self.statement(child, cwd=cwd, substituted=substituted, redirects=extra)
             if got and prev is not None:
                 got[0].stdin = prev
             prev = got[-1] if got else None
@@ -649,6 +657,59 @@ class _Walker:
         return last
 
     # ------------------------- вспомогательные ------------------------ #
+    def _redirections(self, node: _Node) -> tuple[_Node | None, list[Redirect], list[_Node]]:
+        """Тело ``redirected_statement``, его перенаправления и продолжение команды.
+
+        Продолжение — то, что грамматика поместила внутрь heredoc: ``| python``, ``&& ls``.
+        """
+        body: _Node | None = None
+        redirects: list[Redirect] = []
+        trailing: list[_Node] = []
+        for child in node.children:
+            if child.type in {"file_redirect", "herestring_redirect"}:
+                redirect, extra = self.redirect(child)
+                redirects.append(redirect)
+                if extra:
+                    self.problem("слова после перенаправления")
+            elif child.type == "heredoc_redirect":
+                redirect, extra = self.heredoc(child)
+                redirects.append(redirect)
+                trailing.extend(extra)
+            elif body is None:
+                body = child
+            else:
+                self.problem(f"конструкция оболочки {child.type}")
+        return body, redirects, trailing
+
+    def _wrapped(self, entry: _Entry, *, cwd: str, substituted: bool) -> list[Command]:
+        """Оператор последовательности вместе с перенаправлениями обёрток (см. :class:`_Entry`)."""
+        if not entry.wrappers:
+            return self.statement(entry.node, cwd=cwd, substituted=substituted)
+        redirects: list[Redirect] = []
+        trailing: list[_Node] = []
+        for wrapper in entry.wrappers:
+            _, own, rest = self._redirections(wrapper)  # тело обёртки — список, он уже разобран
+            redirects.extend(own)
+            trailing.extend(rest)
+        cmds = self.statement(entry.node, cwd=cwd, substituted=substituted, redirects=redirects)
+        if trailing:
+            cmds = self._trailing(trailing, cmds, cwd=cwd, substituted=substituted)
+        return cmds
+
+    def _bare(self, redirects: list[Redirect], *, cwd: str, substituted: bool) -> list[Command]:
+        """Команда без слов с перенаправлениями ``redirects`` (их нет — команды нет)."""
+        if not redirects:
+            return []
+        cmd = Command(
+            argv=[],
+            redirects=list(redirects),
+            cwd=cwd,
+            substituted=substituted,
+            assigned=frozenset(self._assigned),
+        )
+        self.script.commands.append(cmd)
+        return [cmd]
+
     def _check_parsed(self, node: _Node) -> None:
         """Проблема, если грамматика не разобрала узел слова (или `…` в нём)."""
         if node.type == "ERROR" or node.is_missing:
@@ -658,13 +719,15 @@ class _Walker:
             # выполнит: команда в нём не проверена.
             self.problem("подстановка `…`, которую не удалось разобрать")
 
-    def _leading_cd(self, node: _Node, sep: str, *, cwd: str, last: bool) -> str | None:
+    def _leading_cd(self, entry: _Entry, *, cwd: str, last: bool) -> str | None:
         """Каталог после ведущего ``cd X``; None — оператор не такой ``cd``."""
         # Только «cd X && …» (или cd в конце): после «;» и перевода строки (у него
         # нет лексемы, разделитель пуст) команда выполнится и там, где cd не сработал.
-        if _is_cd(node) and (sep == "&&" or (not sep and last)):
-            return self._cd_target(node, cwd)
-        return None
+        # `a && cd x > f`: у cd своё перенаправление — это не ведущий cd, запись проверяется.
+        sep = entry.sep
+        if entry.wrappers or not _is_cd(entry.node) or not (sep == "&&" or (not sep and last)):
+            return None
+        return self._cd_target(entry.node, cwd)
 
     def _track_assigned(self, assigns: Iterable[tuple[str, Word]], *, certain: bool) -> None:
         """Запомнить постоянные значения присваиваний (см. Command.assigned) или забыть их."""
@@ -674,20 +737,30 @@ class _Walker:
             else:
                 self._assigned.discard(name)
 
-    def _flatten(self, nodes: Iterable[_Node], flat: list[tuple[_Node, str]]) -> None:
+    def _flatten(self, nodes: Iterable[_Node], flat: list[_Entry]) -> None:
+        """Операторы списков подряд; перенаправления списка — его последнему оператору."""
         significant = [child for child in nodes if child.type != "comment"]
         for index, node in enumerate(significant):
             if node.type == "ERROR" or node.is_missing:
                 self.problem("команда не разобрана")
-                continue
-            if node.type in _TOKENS:
-                continue
-            if node.type == "list":
-                self._flatten(node.children, flat)
-                if flat:
-                    flat[-1] = (flat[-1][0], _separator(significant, index))
-                continue
-            flat.append((node, _separator(significant, index)))
+            elif node.type not in _TOKENS:
+                self._flatten_one(node, _separator(significant, index), flat)
+
+    def _flatten_one(self, node: _Node, sep: str, flat: list[_Entry]) -> None:
+        """Оператор ``node`` (с разделителем ``sep`` после него) — в ``flat``."""
+        body = _list_body(node)
+        if node.type != "list" and body is None:
+            flat.append(_Entry(node, sep))
+            return
+        start = len(flat)
+        self._flatten((node if body is None else body).children, flat)
+        if len(flat) == start:
+            if body is not None:  # операторов нет, а перенаправления проверить нужно
+                flat.append(_Entry(node, sep))
+            return
+        last = flat[-1]
+        wrappers = last.wrappers if body is None else (*last.wrappers, node)
+        flat[-1] = _Entry(last.node, sep, wrappers)
 
     def _cd_target(self, node: _Node, cwd: str) -> str | None:
         """Каталог ``cd DIR`` внутри проекта (существующий); None — не ведущий cd."""
@@ -728,8 +801,11 @@ class _Walker:
         substituted: bool,
         redirects: list[Redirect] | None,
     ) -> list[Command]:
-        """Составной оператор: условие, цикл, блок ``{ …; }`` или отрицание ``!``."""
-        if node.type != "negated_command":
+        """Составной оператор: условие, цикл, блок ``{ …; }`` или отрицание ``!``.
+
+        Блок ``{ …; }`` и отрицание ход выполнения не меняют — это не «условия и циклы».
+        """
+        if node.type not in {"negated_command", "compound_statement"}:
             self.script.compound = True
         before = len(self.script.commands)
         for child in node.children:
@@ -805,7 +881,7 @@ class _Walker:
                 )
                 continue
             prev, last = self._follow(
-                node,
+                _Entry(node, ""),
                 prev,
                 cwd=cwd,
                 substituted=substituted,
@@ -870,11 +946,11 @@ class _Walker:
 
         Возвращает новые ``prev`` и команды последнего оператора (как :meth:`_trailing`).
         """
-        flat: list[tuple[_Node, str]] = []
+        flat: list[_Entry] = []
         self._flatten(node.children, flat)
-        for index, (child, _) in enumerate(flat):
+        for index, entry in enumerate(flat):
             prev, last = self._follow(
-                child,
+                entry,
                 prev,
                 cwd=cwd,
                 substituted=substituted,
@@ -884,7 +960,7 @@ class _Walker:
 
     def _follow(
         self,
-        node: _Node,
+        entry: _Entry,
         prev: Command | None,
         *,
         cwd: str,
@@ -896,7 +972,7 @@ class _Walker:
         Возвращает новый ``prev`` (последнюю команду оператора, если они есть) и команды
         оператора.
         """
-        got = self.statement(node, cwd=cwd, substituted=substituted)
+        got = self._wrapped(entry, cwd=cwd, substituted=substituted)
         if piped and got and prev is not None:
             got[0].stdin = prev
         return (got[-1] if got else prev), got
@@ -942,6 +1018,16 @@ def _attach(cmds: list[Command], redirects: list[Redirect] | None) -> list[Comma
         for cmd in cmds:
             cmd.redirects.extend(redirects)
     return cmds
+
+
+def _list_body(node: _Node) -> _Node | None:
+    """Список, на который грамматика навесила перенаправления (``a && b > f``); иначе None."""
+    if node.type != "redirected_statement":
+        return None
+    bodies = [child for child in node.children if child.type not in _REDIRECT_NODES]
+    if len(bodies) == 1 and bodies[0].type == "list":
+        return bodies[0]
+    return None
 
 
 def _separator(nodes: Sequence[_Node], index: int) -> str:

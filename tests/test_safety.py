@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from fakes import FakeJJ
 
+from gigacrew.agent.decisions import DecisionMemory
 from gigacrew.project import treesitter
 from gigacrew.safety import CommandLevel, classify
 from gigacrew.safety import bash as shell
@@ -1310,6 +1311,194 @@ def test_scratch_writes_are_edits(root: Path) -> None:
     assert verdict.level is WRITE
     assert verdict.edits_only
     assert level("cat a.txt > /tmp/check.txt", root) is DANGER  # /tmp — вне проекта
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest -q > .gigacode/tmp/before.txt 2>&1",
+        "pytest -q 2>&1 | tee .gigacode/tmp/before.txt",
+        "pytest -q 2>&1 | tee -a .gigacode/tmp/before.txt | tail -5",
+        "pytest -q 2>&1 | tail -20 > .gigacode/tmp/before.txt",
+        "mkdir -p .gigacode/tmp && uv run pytest -q &> .gigacode/tmp/before.txt",
+        "python -m pytest -q > .gigacode/tmp/a.txt; pytest -q > .gigacode/tmp/b.txt",
+        "pytest -q > .gigacode/tmp/after.txt 2>&1; diff .gigacode/tmp/a.txt .gigacode/tmp/b.txt",
+    ],
+)
+def test_scratch_output_keeps_check_level_and_rules(root: Path, command: str) -> None:
+    """Вывод проверки в .gigacode/tmp/ — как сама проверка: EXEC и разрешение «pytest»."""
+    memory = DecisionMemory()
+    assert memory.approve(classify("pytest -q", root=root))
+    verdict = classify(command, root=root)
+    assert verdict.level is EXEC, verdict.reason
+    assert verdict.composable, verdict.reason
+    assert verdict.scratch
+    assert verdict.signatures == ("pytest",)
+    assert memory.match(verdict) is not None
+    # в режиме плана вывод во временную папку — запись: правило не действует
+    assert memory.match(verdict, plan=True) is None
+    # «всегда» запоминает проверку, а не вывод
+    assert [rule.value for rule in DecisionMemory().approve(verdict)] == ["pytest"]
+
+
+def test_scratch_output_next_to_changes_is_a_write(root: Path) -> None:
+    """Рядом с правками и git вывод в черновик — обычная запись, как раньше."""
+    for command in (
+        "git stash && pytest -q > .gigacode/tmp/after.txt 2>&1; git stash pop",
+        "cp a.txt b.txt && pytest -q > .gigacode/tmp/after.txt",
+    ):
+        verdict = classify(command, root=root)
+        assert verdict.level is WRITE, (command, verdict.reason)
+        assert not verdict.composable, command
+        assert not verdict.edits_only, command
+    piped = classify("git stash && pytest -q | tee .gigacode/tmp/x", root=root)
+    assert piped.level is WRITE
+    memory = DecisionMemory()
+    assert memory.approve(classify("pytest -q", root=root))
+    assert memory.match(piped) is None  # нужно и своё правило для tee
+
+
+def test_scratch_output_alone_is_an_edit(root: Path) -> None:
+    """Без проверки рядом вывод в черновик — правка файла: в «авто» без вопроса."""
+    for command in (
+        "git diff > .gigacode/tmp/changes.patch",
+        "sort .gigacode/tmp/a.txt > .gigacode/tmp/a.sorted",
+        "echo x | tee .gigacode/tmp/x",
+    ):
+        verdict = classify(command, root=root)
+        assert verdict.level is WRITE, (command, verdict.reason)
+        assert verdict.edits_only, command
+        assert verdict.scratch, command
+    # tee и в черновик, и в .env — не правка (строгая часть из одного уровня)
+    (root / ".env").write_text("T=1\n")
+    assert not classify("ls | tee .gigacode/tmp/x .env", root=root).edits_only
+    assert not classify("ls | tee a.txt .env", root=root).edits_only
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm .gigacode/tmp/before.txt",
+        "rm -f .gigacode/tmp/before.txt .gigacode/tmp/after.txt",
+        "rm -rf .gigacode/tmp/run1",
+        "rm -f .gigacode/tmp/*.txt",
+        "rm -f .gigacode/tmp/missing*.zz",
+    ],
+)
+def test_removing_scratch_files_is_an_edit(root: Path, command: str) -> None:
+    temp_dir = root / ".gigacode" / "tmp"
+    (temp_dir / "run1").mkdir(parents=True)
+    for name in ("before.txt", "after.txt"):
+        (temp_dir / name).write_text("x\n")
+    verdict = classify(command, root=root)
+    assert verdict.level is WRITE, verdict.reason
+    assert verdict.edits_only, verdict.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm -rf .gigacode/tmp",  # сама папка — с её .gitignore
+        "rm -rf .gigacode/tmp/",
+        "rm -f .gigacode/tmp/.gitignore",
+        "rm -rf .gigacode/tmp/.*",  # в dash совпадает и с ..
+        "rm -rf .gigacode/tmp/../plans",
+        "rm -rf .gigacode/tmp/*/../../plans",
+        "rm -rf .gigacode/tmp/link/",
+        "rm -rf src",
+    ],
+)
+def test_removing_outside_scratch_stays_dangerous(root: Path, command: str) -> None:
+    temp_dir = root / ".gigacode" / "tmp"
+    temp_dir.mkdir(parents=True)
+    (temp_dir / "link").symlink_to(root / "src", target_is_directory=True)
+    assert level(command, root) is DANGER, command
+
+
+@pytest.mark.parametrize(
+    ("command", "signatures"),
+    [
+        ("pytest -q -p no:randomly", ("pytest",)),
+        ("pytest -q -pno:randomly -x", ("pytest",)),
+        ("pytest -q -p randomly", ()),  # загрузка плагина — только точная команда
+        ("pytest --basetemp=.gigacode/tmp/pt", ("pytest",)),
+        ("pytest --basetemp .gigacode/tmp/pt", ("pytest",)),
+    ],
+)
+def test_pytest_flags_for_comparable_runs(
+    root: Path,
+    command: str,
+    signatures: tuple[str, ...],
+) -> None:
+    verdict = classify(command, root=root)
+    assert verdict.level is EXEC, verdict.reason
+    assert verdict.signatures == signatures
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["pytest --basetemp=.gigacode/tmp", "pytest --basetemp=src", "pytest --basetemp=/tmp/x"],
+)
+def test_pytest_basetemp_outside_scratch_asks(root: Path, command: str) -> None:
+    """Каталог --basetemp pytest очищает: без вопроса — только подкаталог временной папки."""
+    assert level(command, root) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("uv run python - <<'EOF'\nprint(1)\nEOF", EXEC),
+        ("uv run python3 <<'EOF'\nimport json\nprint(json.dumps(1))\nEOF", EXEC),
+        ("uv run python - <<'EOF'\nimport os\nos.system('id')\nEOF", DANGER),
+        ("timeout 60 python3 - <<'EOF'\nprint(1)\nEOF", READ),
+    ],
+)
+def test_runner_passes_heredoc_to_interpreter(
+    root: Path,
+    command: str,
+    expected: CommandLevel,
+) -> None:
+    """``uv run python - <<EOF``: код из heredoc запуска uv проверяется, как у python."""
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, verdict.reason
+
+
+def test_braces_group_is_not_a_condition(root: Path) -> None:
+    """Блок ``{ …; }`` ход выполнения не меняет: части проверяются, как без него."""
+    verdict = classify('{ pytest -q; echo "exit=$?"; } > .gigacode/tmp/b.txt 2>&1', root=root)
+    assert verdict.level is EXEC, verdict.reason
+    assert level("{ ls; cat a.txt; }", root) is READ
+    assert level("if true; then ls; fi", root) is None
+
+
+def test_json_tool_with_shadowed_stdlib_is_exec(root: Path) -> None:
+    """``python -m json.tool`` импортирует json из каталога запуска, если он там есть."""
+    (root / "data.json").write_text("{}")
+    assert level("python3 -m json.tool data.json", root) is READ
+    (root / "json.py").write_text("print('evil')\n")
+    assert level("python3 -m json.tool data.json", root) is EXEC
+    assert level("python3 -m site", root) is EXEC
+    assert level("python3 -I -m json.tool data.json", root) is READ
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ln .git/hooks/pre-commit .gigacode/tmp/h",
+        "ln -f .git/config cfg",
+        "cp -l .git/hooks/pre-commit .gigacode/tmp/h",
+        "cp --link .gigacode/chats/x.json .gigacode/tmp/x",
+    ],
+)
+def test_hard_link_to_service_file_is_dangerous(root: Path, command: str) -> None:
+    """Запись по жёсткой ссылке меняет сам файл: так «правкой» переписали бы хук git."""
+    (root / ".git" / "hooks").mkdir(parents=True)
+    (root / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
+    (root / ".git" / "config").write_text("")
+    (root / ".gigacode" / "chats").mkdir(parents=True)
+    (root / ".gigacode" / "chats" / "x.json").write_text("{}")
+    assert level(command, root) is DANGER
+    assert level("ln a.txt .gigacode/tmp/a", root) is WRITE  # обычный файл проекта — правка
 
 
 @pytest.mark.skipif(os.name == "nt", reason="симлинки")

@@ -114,9 +114,17 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
     if parts:
         lines.append("Parts that are not read-only:")
         lines += [_part_line(part) for part in parts]
+    if verdict.writes:
+        lines.append("Redirects into files:")
+        lines += [
+            f"- {json.dumps(clip_middle(_one_line(write), PART_CLIP), ensure_ascii=False)}"
+            for write in verdict.writes
+        ]
     lines.append(
-        "Levels: EXEC runs project code or tools, WRITE changes files or the local "
-        "environment, UNVERIFIED — the analyzer could not check the command.",
+        "Levels: EXEC runs project code, tools or installed libraries (what that code does "
+        "inside was not analysed), WRITE changes files or the local environment, "
+        "UNVERIFIED — the analyzer could not check the command. «временная папка модели» "
+        "marks the scratch folder .gigacode/tmp/.",
     )
     return "\n".join(lines)
 

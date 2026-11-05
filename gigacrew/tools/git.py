@@ -9,8 +9,10 @@ from typing import override
 from pydantic import BaseModel, Field
 
 from gigacrew.errors import SandboxError
+from gigacrew.permissions import ToolKind
+from gigacrew.safety import CommandLevel, classify
 from gigacrew.safety.gitconfig import repo_config_runs_programs, repo_toplevel
-from gigacrew.security import RiskLevel, resolve_in_root
+from gigacrew.security import RiskLevel, resolve_in_root, subprocess_env
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.process import run_process, truncate_middle
 
@@ -152,6 +154,28 @@ def _has(flags: set[str], *names: str) -> bool:
         flag == name or (flag.startswith(_LONG_OPTION) and len(flag) >= 3 and name.startswith(flag))
         for flag in flags
         for name in names
+    )
+
+
+def _changing(sub: str, args: list[str], ctx: ToolContext) -> Assessment:
+    """Изменяющий вызов — как та же команда в run_shell.
+
+    Её оценивает классификатор: в режиме «авто» ``git stash``, ``git switch``, ``git
+    commit`` смотрит модель-рецензент, действуют сохранённые разрешения. Чего
+    классификатор не проверил или счёл опасным (он осторожнее: ``checkout -b f.txt``
+    при файле f.txt для него — путь), и при выключенной проверке команд — решает
+    пользователь, как раньше.
+    """
+    if sub not in _ALLOWED or not ctx.classify_commands:
+        return Assessment(RiskLevel.WRITE)
+    verdict = classify(shlex.join(["git", sub, *args]), root=ctx.root, environ=subprocess_env())
+    if verdict.level not in {CommandLevel.EXEC, CommandLevel.WRITE}:
+        return Assessment(RiskLevel.WRITE)
+    return Assessment(
+        RiskLevel.WRITE,
+        reason=verdict.reason,
+        kind=ToolKind.COMMAND,
+        verdict=verdict,
     )
 
 
@@ -323,7 +347,11 @@ class GitTool(Tool[GitParams]):
         sub, args = params.subcommand, params.args
         if not _reading(sub, args):
             reason = _discards_work(sub, args, ctx.root) if sub in _ALLOWED else ""
-            return Assessment(RiskLevel.DANGEROUS if reason else RiskLevel.WRITE, reason=reason)
+            if reason:
+                return Assessment(RiskLevel.DANGEROUS, reason=reason)
+            if sub in _ALLOWED:
+                self._check(params, ctx)  # недопустимый вызов — ошибка до рецензента и вопроса
+            return _changing(sub, args, ctx)
         # Чтение — только своего репозитория: вне репозитория `git diff a b` сравнивает любые
         # файлы, а в репозитории над проектом git покажет и то, что лежит вне проекта.
         top = repo_toplevel(ctx.root)

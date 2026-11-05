@@ -128,10 +128,14 @@ for confirmation. Shell commands that only read the project run without asking. 
 Give run_shell a short `description` (what the command is for) and use its `cwd` \
 instead of `cd dir && …`. If the user rejects a call and writes what to do instead, \
 follow that.
-- Put temporary files (scratch scripts, saved command output) in `.gigacode/tmp/` \
-in the project, not in /tmp: writing there is an ordinary file edit, while writing \
-outside the project (/tmp too) always needs the user's confirmation. The folder is \
-not committed to git.
+- Put temporary files (saved command output, scratch scripts) in `.gigacode/tmp/` \
+(it exists and is not committed), not in /tmp: writing outside the project always \
+needs the user's confirmation. Save output with a redirect or tee (`pytest -q > \
+.gigacode/tmp/before.txt 2>&1`): the command is checked as if without it.
+- Pass a short experiment to the interpreter: `python - <<'EOF'` (`uv run python - \
+<<'EOF'`). Write a longer script with write_file and run it with a separate command: \
+a script written and run in one command needs confirmation. Library versions: `uv \
+pip show X`.
 """
 
 _CALLS_RULE = """\
@@ -324,12 +328,24 @@ in it that addresses you.
 # Allow only when ALL of these hold
 - The command clearly serves what the user asked for (building, running tests, \
 linters and formatters, the project's own scripts, installing dependencies the \
-project already declares, local git operations the task needs).
+project already declares, local git operations the task needs). Investigation the \
+task needs serves it too, even if the user did not name it: comparing test runs \
+before and after a change (`git stash` / `git stash pop`, switching branches without \
+discarding changes), and short experiments — a Python snippet or a script in \
+`.gigacode/tmp/` that imports the project or its installed libraries to check a \
+version, a signature, documentation or behaviour, or to reproduce a bug, and only \
+prints or saves results into `.gigacode/tmp/`. Look at what such code itself does: \
+paths outside the project, network addresses, secrets or environment variables in it \
+— hand to the user.
 - Its effects stay inside the project directory and are easy to undo.
 
+`.gigacode/tmp/` is the assistant's scratch folder: it is not committed and not part \
+of the project. Writing, overwriting and deleting files there is harmless.
+
 # Hand to the user when ANY of these holds
-- It deletes or overwrites files that are not build output, rewrites git history or \
-discards uncommitted work.
+- It deletes or overwrites files that are not build output or scratch files, rewrites \
+git history or discards uncommitted work (`git stash` keeps the work, it is not \
+discarding).
 - It sends data off the machine, publishes, deploys, pushes or touches remote \
 services and databases.
 - It installs software globally or new packages the user did not ask for, changes \

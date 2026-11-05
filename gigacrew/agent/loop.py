@@ -1811,13 +1811,14 @@ class Agent:
             )
             source = _auto_source(risk, kind, self.mode, auto_approve=self._cfg.auto_approve)
             level = None if verdict is None else verdict.level
+            scratch = bool(verdict and verdict.scratch)  # вывод во временную папку
             if (
                 decision in {Decision.ASK, Decision.ALLOW}  # -y не снимает запрет плана
                 and self.mode is PermissionMode.PLAN
-                and level is not None
-                and level >= CommandLevel.WRITE
+                and ((level is not None and level >= CommandLevel.WRITE) or scratch)
             ):
-                decision = Decision.BLOCK  # план: изменяющая команда, а не проверка
+                # план: изменяющая команда, а не проверка; вывод во временную папку — тоже запись
+                decision = Decision.BLOCK
             unverified = verdict is not None and level is None
             if (
                 decision is Decision.ALLOW
@@ -1861,7 +1862,8 @@ class Agent:
             if decision is Decision.BLOCK:
                 journal = self._journal_start(call, params, verdict, risk, "blocked", "")
                 self._journal_end(journal, blocked=True)
-                if read_only and verdict is not None:
+                shell = isinstance(getattr(params, "command", None), str)  # run_shell, не git
+                if read_only and verdict is not None and shell:
                     # Непроверенная команда у исследователя: «нельзя здесь». В серию неудач
                     # идёт — иначе модель без конца перебирает варианты отклонённой команды.
                     return self._fail(
@@ -2148,7 +2150,6 @@ class Agent:
         вопрос пользователю; сбои подряд отключают рецензента. Ctrl+C/Esc прерывают ход.
         """
         reviewer = self._reviewer
-        command = str(getattr(params, "command", ""))
         if verdict is None or check.rejected_before:
             return Decision.ASK, None, ""  # повтор отклонённого — ответит ветка вопроса
         if not reviewer.enabled:
@@ -2157,6 +2158,10 @@ class Agent:
         allowed, rejected = self._decisions.history(key)
         if self._decisions.rejected_in_session(key) or rejected > allowed:
             return Decision.ASK, None, "рецензент не спрашивался: такую команду уже отклоняли"
+        # У инструмента git нет текста команды: её текст — в вердикте.
+        command = getattr(params, "command", None)
+        if not isinstance(command, str):
+            command = verdict.command
         if len(command) > MAX_REVIEW_COMMAND:
             return (
                 Decision.ASK,
