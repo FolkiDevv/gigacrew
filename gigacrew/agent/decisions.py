@@ -245,9 +245,9 @@ class DecisionMemory:
         """Правило, разрешающее команду, или None.
 
         Опасное (DANGER) не разрешается никогда. В режиме плана — только то, что не
-        меняет файлы (части уровня READ и EXEC).
+        меняет файлы (части уровня READ и EXEC, без вывода во временную папку).
         """
-        if verdict.level is CommandLevel.DANGER:
+        if verdict.level is CommandLevel.DANGER or (plan and verdict.scratch):
             return None
         if not verdict.composable:
             if plan or verdict.level is None:
@@ -436,9 +436,7 @@ def _match_parts(rules: list[Rule], verdict: Verdict, *, plan: bool) -> Rule | N
     """Правило для составной команды: каждая часть — чтение или совпадает с правилом."""
     found: list[Rule] = []
     pending_preludes = False
-    for part in verdict.parts:
-        if part.level is CommandLevel.READ:
-            continue
+    for part in verdict.asked_parts:
         if part.level is CommandLevel.DANGER or (plan and part.level is not CommandLevel.EXEC):
             return None
         if part.prelude:
@@ -464,10 +462,8 @@ def _part_specs(verdict: Verdict) -> list[_RuleSpec]:
     # Чтение не спрашивается, опасное не разрешается; активация venv идёт с программой.
     asked = [
         part
-        for part in verdict.parts
-        if part.level is not CommandLevel.READ
-        and part.level is not CommandLevel.DANGER
-        and not (part.prelude and has_program)
+        for part in verdict.asked_parts
+        if part.level is not CommandLevel.DANGER and not (part.prelude and has_program)
     ]
     # Одинаковые (вид, текст) — одно предложение, первое по порядку частей.
     specs: dict[tuple[str, str], _RuleSpec] = {}

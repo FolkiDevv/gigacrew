@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +15,8 @@ from gigacrew.agent.loop import Agent
 from gigacrew.config import Config
 from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide
 from gigacrew.project.workspace import Workspace
-from gigacrew.safety.gitconfig import repo_config_runs_programs
+from gigacrew.safety import classify
+from gigacrew.safety.gitconfig import git_in_project, repo_config_runs_programs
 from gigacrew.security import RiskLevel
 from gigacrew.tools import git as git_module
 from gigacrew.tools.base import ToolContext, ToolError, build_default_registry
@@ -157,6 +159,18 @@ def test_shell_scratch_file_needs_no_confirmation(tmp_path: Path) -> None:
     temp_dir = Workspace(tmp_path).data_dir / "tmp"
     assert (temp_dir / "out.txt").read_text(encoding="utf-8") == "hello\n"
     assert (temp_dir / ".gitignore").is_file()
+
+
+def test_plan_mode_blocks_scratch_output(tmp_path: Path) -> None:
+    """В режиме плана вывод во временную папку — запись: команда заблокирована, как раньше."""
+    command = "pytest -q > .gigacode/tmp/before.txt 2>&1"
+    provider = ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")])
+    events = RecordingEvents()
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, mode=PermissionMode.PLAN)
+    Agent(provider, build_default_registry(), cfg, events).run_turn("сравни прогоны")
+    assert not events.confirms
+    assert "заблокировано" in events.tool_results[-1][1].content
+    assert not (Workspace(tmp_path).data_dir / "tmp" / "before.txt").exists()
 
 
 def test_shell_runs_in_cwd_and_rejects_outside(ctx: ToolContext) -> None:
@@ -367,10 +381,69 @@ def test_git_changes_that_keep_work_are_write(
     params = git.parse({"subcommand": sub, "args": args})
     assessment = git.assess(params, stashed_repo)
     assert assessment.risk is RiskLevel.WRITE
-    assert not assessment.reason
+    # Как та же команда в run_shell: оценка классификатора (в «авто» — рецензент), без
+    # пометки о потере работы; не проверенное классификатором решает пользователь.
+    if assessment.verdict is None:
+        assert not assessment.reason
+    else:
+        assert assessment.kind is ToolKind.COMMAND
+        assert assessment.reason == assessment.verdict.reason
+        assert assessment.verdict.command == shlex.join(["git", sub, *args])
     preview = git.preview(params, stashed_repo)
     assert preview is not None
     assert preview.text == f"$ git {git.describe(params)}"
+
+
+def test_git_tool_change_outside_project_root_asks(tmp_path: Path) -> None:
+    """Проект — подкаталог репозитория: stash/commit -a задели бы файлы вне проекта."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    project = tmp_path / "sub"
+    project.mkdir()
+    ctx = ToolContext(workspace=Workspace(project))
+    git = GitTool()
+    assessment = git.assess(git.parse({"subcommand": "stash"}), ctx)
+    assert assessment.risk is RiskLevel.WRITE
+    assert assessment.kind is None  # решает пользователь, а не рецензент
+    assert assessment.verdict is None
+
+
+def test_service_git_lookup_follows_pathext(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Каталоги PATH проверяются через shutil.which: на Windows git — это git.exe."""
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    seen: list[str] = []
+
+    def fake_which(name: str, path: str | None = None) -> str | None:
+        seen.append(str(path))
+        return str(folder / "git.exe") if path == str(folder) else None
+
+    monkeypatch.setattr("gigacrew.safety.gitconfig.shutil.which", fake_which)
+    assert not git_in_project(tmp_path / "project", str(folder))
+    assert seen == [str(folder)]
+
+
+def test_git_tool_with_project_git_program_asks(
+    stashed_repo: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``git`` из файлов проекта (``.venv/bin/git`` в PATH) — не тот git, что проверен."""
+    fake = stashed_repo.root / ".venv" / "bin"
+    fake.mkdir(parents=True)
+    marker = stashed_repo.root / "ran"
+    (fake / "git").write_text(f'#!/bin/sh\ntouch {marker}\nexec /usr/bin/git "$@"\n')
+    (fake / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    git = GitTool()
+    assessment = git.assess(git.parse({"subcommand": "stash"}), stashed_repo)
+    assert assessment.kind is None
+    assert assessment.verdict is None
+    # оценка (служебные запуски git) программу из файлов проекта не запускает
+    git.assess(git.parse({"subcommand": "status"}), stashed_repo)
+    classify("git status", root=stashed_repo.root)
+    assert not marker.exists()
 
 
 def test_git_restore_with_yes_flag_still_asks(stashed_repo: ToolContext) -> None:

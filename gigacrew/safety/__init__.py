@@ -7,7 +7,9 @@
 2. политика программ — по имени, подкоманде, флагам и путям (:mod:`gigacrew.safety.programs`),
    отказ по умолчанию: незнакомое — «не знаю»;
 3. статический анализ Python-кода из ``python -c``, heredoc и скриптов
-   (:mod:`gigacrew.safety.python`).
+   (:mod:`gigacrew.safety.python`);
+4. оценки, устаревшие из-за записи этой же командой (``echo … > x.py; python x.py``), —
+   «не знаю» (:mod:`gigacrew.safety.freshness`).
 
 Итог — :class:`Verdict`: уровень (READ/EXEC/WRITE/DANGER) или «не знаю» с причиной,
 рабочий каталог и команда без ведущих ``cd`` (ключ для памяти решений), оценки частей.

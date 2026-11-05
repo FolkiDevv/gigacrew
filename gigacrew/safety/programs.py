@@ -20,7 +20,7 @@ import os
 import posixpath
 import re
 import shutil
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -29,6 +29,7 @@ from types import MappingProxyType
 from gigacrew.project.files import JJ_DIR_NAME, looks_like_git_dir
 from gigacrew.safety import gitconfig, jjconfig
 from gigacrew.safety.bash import Command, Word
+from gigacrew.safety.freshness import outdated
 from gigacrew.safety.levels import CommandLevel, Part, worst
 from gigacrew.safety.paths import (
     Scope,
@@ -38,6 +39,7 @@ from gigacrew.safety.paths import (
     is_temp_path,
     is_vcs_internal,
     scope,
+    temp_dir,
 )
 from gigacrew.safety.python import analyze, shadowed_stdlib
 
@@ -100,15 +102,33 @@ def _net(what: str) -> Part:
 
 
 def _combine(*parts: Part | None) -> Part:
-    """Худшая из оценок (None — пропускается)."""
+    """Худшая из оценок (None — пропускается).
+
+    Из частей одного уровня берётся самая строгая: не правка раньше правки, запись не во
+    временную папку раньше записи в неё (``tee a.txt .env`` — не правка). Файлы записи
+    и входы оценки — всех частей.
+    """
     real = [part for part in parts if part is not None]
     if not real:
         return _read("")
     level = worst(*(part.level for part in real))
-    for part in real:
-        if part.level == level:
-            return part
-    return real[0]
+    same = [part for part in real if part.level == level] or real[:1]
+    chosen = min(same, key=lambda part: (part.edits, part.scratch))  # первая из строгих
+    # Часть уровня WRITE без путей пишет что угодно: и всё вместе — неизвестно куда.
+    anywhere = any(
+        part.level is CommandLevel.WRITE and not part.writes and not part.scratch for part in real
+    )
+    writes = () if anywhere else _union(part.writes for part in real)
+    inputs = _union(part.inputs for part in real)
+    relinks = any(part.relinks for part in real)
+    if (writes, inputs, relinks) == (chosen.writes, chosen.inputs, chosen.relinks):
+        return chosen
+    return replace(chosen, writes=writes, inputs=inputs, relinks=relinks)
+
+
+def _union(groups: Iterable[tuple[str, ...]]) -> tuple[str, ...]:
+    """Пути всех групп без повторов, по порядку."""
+    return tuple(dict.fromkeys(path for group in groups for path in group))
 
 
 # --------------------------------------------------------------------------- #
@@ -332,10 +352,20 @@ def check_read(env: Env, words: list[Word], what: str, *, content: bool = True) 
     return found[0] if found else None
 
 
-def check_write(env: Env, words: list[Word], what: str, *, edits: bool = True) -> Part:
+def check_write(
+    env: Env,
+    words: list[Word],
+    what: str,
+    *,
+    edits: bool = True,
+    output: bool = False,
+) -> Part:
     """Запись в файлы: WRITE внутри проекта, DANGER — снаружи или в служебные каталоги.
 
     Папка временных файлов модели ``.gigacode/tmp/`` — не служебная: запись туда — правка.
+    ``output`` — пишется только поток вывода (перенаправление, ``tee``) или создаются
+    каталоги (``mkdir``): такая запись во временную папку — черновик
+    (:attr:`Part.scratch`). Пути записи — в :attr:`Part.writes`.
     """
     parts: list[Part] = []
     for word in words:
@@ -357,15 +387,54 @@ def check_write(env: Env, words: list[Word], what: str, *, edits: bool = True) -
         resolved = target.resolve()
         if is_data_path(resolved, env.root) and not is_temp_path(resolved, env.root):
             return _danger(f"{what}: служебная папка gigacrew ({word.raw})")
+        # Шаблон раскроется в любые файлы своего каталога: записанным считается каталог.
+        written = (str((_glob_base(target) if word.glob else target).resolve()),)
         if where is Scope.SECRET:
-            parts.append(_write(f"{what}: файл с секретами ({word.raw})"))
+            parts.append(Part(WRITE, f"{what}: файл с секретами ({word.raw})", writes=written))
             continue
-        parts.append(_write(what, edits=edits))
+        if output and _scratch_target(env, word, resolved):
+            reason = f"{what}: {word.raw} — временная папка модели"
+            parts.append(Part(WRITE, reason, edits=True, scratch=True, writes=written))
+            continue
+        parts.append(Part(WRITE, what, edits=edits, writes=written))
     if not words:  # куда пишет — не разобрали (`tree -o` без значения): не «правка»
         return _unknown(f"{what}: файл записи не найден в аргументах")
     if not parts:
         return _write(what, edits=edits)
     return _combine(*parts)
+
+
+def _scratch_target(env: Env, word: Word, resolved: Path) -> bool:
+    """Запись по ``word`` попадает только в файлы временной папки, которые ни с чем не делят.
+
+    У шаблона — каждое совпадение: ссылка или жёсткая ссылка среди них пишет в проект.
+    """
+    paths = [resolved]
+    if word.glob:
+        try:
+            matches = glob.glob(word.text, root_dir=env.dir)  # noqa: PTH207
+        except (OSError, ValueError):
+            return False
+        paths = [(env.dir / match).resolve() for match in matches] or paths
+    return all(is_temp_path(path, env.root) and not _shared(path) for path in paths)
+
+
+def _shared(path: Path) -> bool:
+    """Файл с другими жёсткими ссылками: запись в него меняет и файл где-то ещё."""
+    try:
+        return path.is_file() and path.stat().st_nlink > 1
+    except OSError:
+        return False
+
+
+def _glob_base(path: Path) -> Path:
+    """Каталог шаблона: путь до первого сегмента с ``*``, ``?`` или ``[``."""
+    base = Path(path.anchor)
+    for segment in path.parts[len(path.parts[:1]) if path.anchor else 0 :]:
+        if _GLOB_SEGMENT.search(segment):
+            break
+        base /= segment
+    return base
 
 
 def _check_recursive(
@@ -396,7 +465,7 @@ def _check_exec_args(env: Env, args: list[Word], what: str) -> Part | None:
         if not arg.static:
             return _unknown(f"{what}: аргумент известен только при выполнении ({arg.raw})")
         text = arg.text
-        if text.startswith("--basetemp"):
+        if text.startswith("--basetemp") and not _scratch_basetemp(env, args, arg):
             return _unknown(f"{what}: --basetemp очищает каталог")
         candidates = [text]
         if "=" in text:
@@ -415,13 +484,42 @@ def _check_exec_args(env: Env, args: list[Word], what: str) -> Part | None:
     return None
 
 
+def _scratch_basetemp(env: Env, args: list[Word], arg: Word) -> bool:
+    """``--basetemp`` — подкаталог временной папки модели: его очистка ничего не теряет."""
+    folder = _basetemp_value(args, arg)
+    return folder is not None and _in_scratch(env, Word(folder, folder))
+
+
+def _basetemp_value(args: list[Word], arg: Word) -> str | None:
+    """Значение ``--basetemp=DIR`` или ``--basetemp DIR``; None — не статичное или шаблон."""
+    if "=" in arg.text:
+        folder = arg.text.split("=", 1)[1]
+    else:
+        index = next((pos for pos, each in enumerate(args) if each is arg), len(args))
+        following = args[index + 1 : index + 2]
+        if not following or not following[0].static:
+            return None
+        folder = following[0].text
+    return None if _GLOB_SEGMENT.search(folder) else folder
+
+
+def _basetemp_writes(env: Env, args: list[Word]) -> tuple[str, ...]:
+    """Каталог ``--basetemp`` (pytest его очищает) — куда пишет инструмент."""
+    for arg in args:
+        if arg.static and arg.text.startswith("--basetemp"):
+            folder = _basetemp_value(args, arg)
+            if folder is not None:
+                return (str((env.dir / folder).resolve()),)
+    return ()
+
+
 def _exec_tool(env: Env, args: list[Word], what: str, signature: str | None) -> Part:
     bad = _check_exec_args(env, args, what)
     if bad is not None:
         return bad
     if signature is not None and not _signature_args_ok(signature, args, env):
         signature = None  # аргументы вне проверенного набора — разрешать только точную команду
-    return _exec(what, signature)
+    return Part(EXEC, what, signature=signature, writes=_basetemp_writes(env, args))
 
 
 # Аргументы, с которыми разрешение «программа с любыми аргументами» остаётся безопасным:
@@ -549,6 +647,7 @@ def _signature_args() -> Mapping[str, _ArgSpec]:
                 "--deselect",
                 "--color",
                 "-r",
+                "--basetemp",  # только подкаталог временной папки модели (_check_exec_args)
             )),
             None,
         ),
@@ -665,6 +764,32 @@ def _signature_args() -> Mapping[str, _ArgSpec]:
 _SIGNATURE_ARGS = _signature_args()
 
 
+def _without_disabled_plugins(args: list[Word]) -> list[Word]:
+    """Аргументы pytest без ``-p no:плагин``: отключение плагина ничего не загружает.
+
+    ``-p имя`` (загрузка плагина) остаётся — с ним разрешение «pytest с любыми
+    аргументами» не действует.
+    """
+    kept: list[Word] = []
+    skip = False
+    for index, arg in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if arg.static and arg.text.startswith("-pno:"):
+            continue
+        if arg.static and arg.text == "-p" and _disables(args[index + 1 : index + 2]):
+            skip = True
+            continue
+        kept.append(arg)
+    return kept
+
+
+def _disables(following: list[Word]) -> bool:
+    """Значение ``-p`` — отключение плагина (``no:имя``)."""
+    return bool(following) and following[0].static and following[0].text.startswith("no:")
+
+
 def _signature_args_ok(signature: str, args: list[Word], env: Env) -> bool:
     """Аргументы не выходят за проверенный набор для разрешения по сигнатуре."""
     spec = _SIGNATURE_ARGS.get(signature)
@@ -674,6 +799,8 @@ def _signature_args_ok(signature: str, args: list[Word], env: Env) -> bool:
     if spec is None:
         return not args
     plain, valued, after = spec
+    if signature == "pytest":
+        args = _without_disabled_plugins(args)
     idx = 0
     rest = False
     while idx < len(args):
@@ -1460,6 +1587,7 @@ def _find(env: Env, name: str, args: list[Word], classify: Callable[[Command], P
         rec = _check_recursive(env, starts, "find -exec")
         if rec is not None:
             return rec
+    parts, _ = outdated(parts, [])  # `-exec cp {} json.py \; -exec python3 …`: одно пишет
     if any(part.level is None for part in parts):
         return next(part for part in parts if part.level is None)
     return _combine(_read("find: поиск файлов"), *parts)
@@ -1941,7 +2069,7 @@ def _tee(env: Env, args: list[Word]) -> Part:
     _, pos = _split(args)
     if not pos:
         return _read("tee: только вывод")
-    return check_write(env, pos, "tee")
+    return check_write(env, pos, "tee", output=True)
 
 
 def _less(env: Env, name: str, args: list[Word]) -> Part:
@@ -1971,6 +2099,12 @@ def _less(env: Env, name: str, args: list[Word]) -> Part:
 def _rm(env: Env, args: list[Word]) -> Part:
     flags, pos = _split(args)
     fl = _flagset(flags)
+    if pos and all(_in_scratch(env, word) for word in pos):
+        # Черновики модели: удалить их (и с -rf) — правка, как их запись. Ссылка на место
+        # пути той же командой (`ln -s ~ .gigacode/tmp/x && rm -rf .gigacode/tmp/x/`) это
+        # меняет: пути — цели оценки.
+        removed = check_write(env, pos, "rm: удаление во временной папке")
+        return replace(removed, targets=removed.writes, scratch=True)
     if _has(fl, "-r", "-R", "-f", "--recursive", "--force", "-d", "--dir"):
         return _danger("rm с -r/-f: удаление без возврата")
     if not pos:
@@ -1981,13 +2115,95 @@ def _rm(env: Env, args: list[Word]) -> Part:
     return check_write(env, pos, "rm: удаление файла", edits=False)
 
 
+_GLOB_SEGMENT = re.compile(r"[*?\[]")
+
+
+def _in_scratch(env: Env, word: Word) -> bool:
+    """Путь — внутри временной папки модели (не она сама): и сам, и после раскрытия ссылок.
+
+    Шаблон — только в последнем сегменте и не с точки (``.*`` в dash совпадает с ``..``),
+    каждое совпадение — тоже внутри.
+    """
+    if not word.static or not word.text:
+        return False
+    head, _, last = word.text.rstrip("/").rpartition("/")
+    if word.glob and (_GLOB_SEGMENT.search(head) or last.startswith(".")):
+        return False
+    if word.glob:
+        try:
+            matches = glob.glob(word.text, root_dir=env.dir)  # noqa: PTH207
+        except (OSError, ValueError):
+            return False
+        candidates = [env.dir / match for match in matches] or [env.dir / word.text]
+    else:
+        candidates = [env.dir / word.text]
+    scratch_dir = temp_dir(env.root).resolve()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        lexical = Path(os.path.normpath(candidate))
+        if resolved == scratch_dir or not is_temp_path(resolved, env.root):
+            return False
+        if lexical != resolved and not is_temp_path(lexical, env.root):
+            return False  # ссылка извне временной папки на файл в ней
+    return True
+
+
+def _hard_link_bad(
+    env: Env,
+    targets: list[Word],
+    what: str,
+    *,
+    base: Path | None = None,
+) -> Part | None:
+    """Ссылка на служебный файл git, jj или gigacrew — опасно.
+
+    Запись по ней (``echo … > ссылка``) меняет сам файл, а путь ссылки этого не выдаёт:
+    так правкой «обычного» файла можно было бы переписать хук git. ``base`` — каталог
+    символической ссылки: от него считается её относительная цель (и от каталога команды).
+    """
+    for word in targets:
+        if not word.static:
+            continue  # путь при выполнении — его проверит scope ниже
+        for folder in (env.dir, *(() if base is None else (base,))):
+            target = Path(word.text) if word.text.startswith("/") else folder / word.text
+            if _service_file(env, target):
+                return _danger(f"{what}: ссылка на служебный файл ({word.raw})")
+    return None
+
+
+def _service_file(env: Env, target: Path) -> bool:
+    """Путь — во внутренностях git или jj или в служебной папке gigacrew (не в tmp/)."""
+    resolved = target.resolve()
+    service = is_data_path(resolved, env.root) and not is_temp_path(resolved, env.root)
+    return service or is_vcs_internal(resolved, env.root) or is_vcs_internal(target, env.root)
+
+
+def _link_dir(env: Env, links: list[Word]) -> Path:
+    """Каталог, где появится символическая ссылка: каталог-цель или каталог пути ссылки."""
+    if not links or not links[-1].static:
+        return env.dir
+    place = env.dir / links[-1].text
+    return place if place.is_dir() else place.parent
+
+
+def _into_scratch(env: Env, dest: list[Word]) -> bool:
+    """Цель переноса — во временной папке модели (или она сама)."""
+    return any(
+        word.static and is_temp_path((env.dir / word.text).resolve(), env.root) for word in dest
+    )
+
+
 def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
     rest, found = _options(args, ("-t", "--target-directory", "-S", "--suffix"))
     target_dir = [word for opt, word in found if opt in {"-t", "--target-directory"}]
-    _flags, pos = _split(rest)
+    flags, pos = _split(rest)
     if not pos:
         return _unknown(f"{name} без файлов")
     sources, dest = (pos, target_dir) if target_dir else (pos[:-1], pos[-1:])
+    if name == "cp" and _has(_flagset(flags), "-l", "--link"):
+        hard = _hard_link_bad(env, sources, "cp -l")
+        if hard is not None:
+            return hard
     if name == "cp":
         bad = check_read(env, sources, name)
         if bad is not None:
@@ -2002,7 +2218,16 @@ def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
         moved = check_write(env, sources, name)
         if moved.level is not CommandLevel.WRITE:
             return moved
-    return check_write(env, dest, name)
+        both = replace(_combine(moved, check_write(env, dest, name)), relinks=True)
+        if _into_scratch(env, dest) and not all(_in_scratch(env, word) for word in sources):
+            # из проекта файлы исчезают (а `rm` во временной папке — правка): не правка
+            return replace(both, reason="mv: файлы проекта — во временную папку", edits=False)
+        return both
+    copied = check_write(env, dest, name)
+    # -r/-a/-P/-d копируют ссылки как ссылки, -s/-l ставят новые
+    links = _has(_flagset(flags), "-r", "-R", "-a", "-P", "-d", "-s", "-l", "--recursive")
+    links = links or _has(_flagset(flags), "--archive", "--no-dereference", "--symbolic-link")
+    return replace(copied, relinks=links or _has(_flagset(flags), "--link"))
 
 
 # Флаги со значением у каждой программы: общий список сдвигал бы позиционные (у touch
@@ -2061,24 +2286,32 @@ def _simple_write(env: Env, name: str, args: list[Word]) -> Part:
         if bad is not None:
             return _unknown(f"install: {bad.reason}") if bad.level is None else bad
         return check_write(env, target_dir, name, edits=edits)
-    return check_write(env, pos, name, edits=edits)
+    # mkdir создаёт только каталоги: во временной папке это не повод считать проверку записью.
+    return check_write(env, pos, name, edits=edits, output=name == "mkdir")
 
 
 def _ln(env: Env, args: list[Word]) -> Part:
     rest, found = _options(args, ("-t", "--target-directory", "-S", "--suffix"))
-    _flags, pos = _split(rest)
+    flags, pos = _split(rest)
     if not pos:
         return _unknown("ln без аргументов")
     target_dir = [word for opt, word in found if opt in {"-t", "--target-directory"}]
+    targets = pos if target_dir else pos[:1]
+    symbolic = _has(_flagset(flags), "-s", "--symbolic")
+    # Относительная цель символической ссылки считается от каталога ссылки.
+    base = _link_dir(env, target_dir or pos[1:]) if symbolic else None
+    service = _hard_link_bad(env, targets, "ln", base=base)
+    if service is not None:
+        return service
     # Ссылка на файл вне проекта превратит его в «файл проекта» для следующих команд.
-    for target in pos if target_dir else pos[:1]:
+    for target in targets:
         where = scope(target, root=env.root, cwd=env.cwd)
         if where != Scope.INSIDE:
             return _danger(f"ln: ссылка на {target.raw} — вне проекта или секреты")
     if target_dir:  # ln -t КАТАЛОГ цели… — ссылки создаются в КАТАЛОГЕ
-        return check_write(env, target_dir, "ln", edits=True)
+        return replace(check_write(env, target_dir, "ln", edits=True), relinks=True)
     links = pos[1:] or [Word(Path(pos[0].text).name)]  # `ln цель` — ссылка в каталоге команды
-    return check_write(env, links, "ln", edits=True)
+    return replace(check_write(env, links, "ln", edits=True), relinks=True)
 
 
 def _chmod(env: Env, args: list[Word]) -> Part:
@@ -2633,7 +2866,8 @@ def _npm(env: Env, name: str, args: list[Word]) -> Part:
         if script not in _npm_scripts(env):
             return _unknown(f"{name} run {script}: скрипта нет в package.json")
         if re.search(r"format|fmt|fix|prettier|lint:fix", script):
-            return _write(f"{name} run {script}: правка файлов", edits=True)
+            manifest = (str((env.dir / "package.json").resolve()),)
+            return Part(WRITE, f"{name} run {script}: правка файлов", edits=True, inputs=manifest)
         return _exec_tool(
             env,
             [*pre, *script_args],
@@ -2657,7 +2891,8 @@ def _npm(env: Env, name: str, args: list[Word]) -> Part:
         if _DEPLOY.search(sub):
             return _danger(f"{name} {sub}: похоже на публикацию")
         if re.search(r"format|fmt|fix", sub):
-            return _write(f"{name} {sub}: правка файлов", edits=True)
+            manifest = (str((env.dir / "package.json").resolve()),)
+            return Part(WRITE, f"{name} {sub}: правка файлов", edits=True, inputs=manifest)
         return _exec_tool(env, [*pre, *rest], f"{name} {sub}: скрипт package.json", f"{name} {sub}")
     if name == "bun" and sub in {"test", "build"}:
         return _exec_tool(env, [*pre, *rest], f"bun {sub}", f"bun {sub}")
@@ -3029,7 +3264,7 @@ def _py_project_tool(
             return replace(
                 sub_part,
                 level=EXEC,
-                reason=f"{name} run: {sub_part.reason}",
+                reason=f"{name} run: может синхронизировать окружение проекта; {sub_part.reason}",
                 signature=None if flagged else (sub_part.signature or _first(inner)),
             )
         return sub_part
@@ -3473,6 +3708,8 @@ def _git_change(env: Env, sub: str, rest: list[Word], static_args: list[str], fl
                 "-p",
                 "--overlay",
                 "--no-overlay",
+                "--worktree",
+                "-W",
             ) or (not _has(fl, "--staged", "-S") and bool(positional))
         else:
             discards = "--" in static_args or _has(fl, "-f", "--force", "-B")
@@ -4210,7 +4447,9 @@ def _interpreter_ok(env: Env, prog: str) -> Part | None:
 
     None — интерпретатор вне проекта или venv без подозрительных .pth.
     """
-    path = env.program_path or _which(env, prog)
+    path = env.program_path
+    if path is None and _which(env, prog) is not None:
+        path = _located(env, prog)
     if path is None:
         return _unknown(f"{prog}: интерпретатор не найден")
     lexical = Path(path)
@@ -4235,6 +4474,22 @@ def _interpreter_ok(env: Env, prog: str) -> Part | None:
     return None
 
 
+_SHADOWS_STDLIB = "подменит модуль стандартной библиотеки"
+
+
+def _shadowed(env: Env, path_dirs: tuple[Path, ...], *, no_path0: bool) -> str | None:
+    """Файл, затеняющий модуль стандартной библиотеки в начале ``sys.path`` (``json.py``).
+
+    Каталог запуска стоит в ``sys.path`` первым, если нет ``-P``/``-I``; каталоги PYTHONPATH —
+    после него.
+    """
+    for folder in (*(() if no_path0 else (env.dir,)), *path_dirs):
+        shadow = shadowed_stdlib(folder)
+        if shadow is not None:
+            return shadow
+    return None
+
+
 def _venv_root(interpreter: Path) -> Path | None:
     for folder in interpreter.parents:
         if (folder / "pyvenv.cfg").is_file():
@@ -4243,6 +4498,43 @@ def _venv_root(interpreter: Path) -> Path | None:
 
 
 def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
+    """Запуск Python; входы оценки — с запасом (см. :func:`_python_inputs`)."""
+    part = _python_code(env, cmd, prog, args)
+    if part.level is CommandLevel.DANGER:
+        return part
+    return replace(part, inputs=_union((part.inputs, _python_inputs(env, cmd, prog, args))))
+
+
+def _python_inputs(env: Env, cmd: Command, prog: str, args: list[Word]) -> tuple[str, ...]:
+    """Файлы и каталоги, по которым оценён запуск Python (:attr:`Part.inputs`).
+
+    С запасом: каталог запуска, файлы проекта среди аргументов (скрипт) и их каталоги,
+    каталоги PYTHONPATH, интерпретатор окружения проекта, его ``pyvenv.cfg`` и
+    site-packages (там ``.pth`` исполняются при запуске).
+    """
+    found: list[Path] = [env.dir]
+    for arg in args:
+        if not arg.static or arg.text.startswith("-"):
+            continue
+        candidate = env.dir / arg.text
+        try:
+            is_file = candidate.is_file()
+        except (OSError, ValueError):  # код -c вместо пути: слишком длинное имя, NUL
+            continue
+        if is_file and _inside(env, candidate):
+            found += [candidate, candidate.parent, candidate.resolve().parent]
+    dirs, _ = _pythonpath_dirs(env, cmd)
+    found += dirs
+    path = env.program_path
+    if path is None and prog not in _DASH_BUILTINS:
+        path = _located(env, prog)
+    venv = None if path is None else _venv_root(Path(path))
+    if path is not None and venv is not None and _inside(env, venv):
+        found += [Path(path), venv / "pyvenv.cfg", *venv.glob("lib*/python*/site-packages")]
+    return _union([tuple(str(source.resolve()) for source in found)])
+
+
+def _python_code(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
     code: str | None = None
     script: Path | None = None
     module: str | None = None
@@ -4337,6 +4629,9 @@ def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
                 bad = check_read(env, operands, f"python -m {module}") if module_args else None
                 if bad is not None:
                     return bad
+                shadow = _shadowed(env, path_dirs, no_path0=no_path0)
+                if shadow is not None:
+                    return Part(EXEC, f"python -m {module}: {shadow} {_SHADOWS_STDLIB}")
                 return _combine(_read(f"python -m {module}"), trust)
             if level is None:
                 return _unknown(f"python -m {module}")
@@ -4346,6 +4641,9 @@ def _python(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
             bad = check_read(env, files[:1], "python -m json.tool")
             if bad is not None:
                 return bad
+            shadow = _shadowed(env, path_dirs, no_path0=no_path0)
+            if shadow is not None:
+                return Part(EXEC, f"python -m json.tool: {shadow} {_SHADOWS_STDLIB}")
             if len(files) > 1:
                 return check_write(env, files[1:2], "python -m json.tool: файл вывода")
             return _combine(_read("python -m json.tool"), trust)
@@ -4863,16 +5161,26 @@ def _which(env: Env, prog: str) -> str | None:
     key = (prog, path, str(env.dir))
     if key in _which_cache:  # None в кеше — программа не найдена
         return _which_cache.get(key)
-    entries = []
-    for entry in path.split(os.pathsep):
-        folder = Path(entry) if entry and Path(entry).is_absolute() else env.dir / (entry or ".")
-        entries.append(str(folder))
-    found = shutil.which(prog, path=os.pathsep.join(entries))
+    found = _located(env, prog)
     resolved = str(Path(found).resolve()) if found else None
     if len(_which_cache) > _WHICH_CACHE_SIZE:
         _which_cache.clear()
     _which_cache[key] = resolved
     return resolved
+
+
+def _located(env: Env, prog: str) -> str | None:
+    """Где оболочка найдёт программу — путь из PATH, ссылки не раскрыты; None — не найдена.
+
+    Интерпретатор окружения проекта (``.venv/bin/python``) — ссылка на системный: его
+    окружение видно только по этому пути.
+    """
+    path = env.environ.get("PATH", os.defpath)
+    entries = []
+    for entry in path.split(os.pathsep):
+        folder = Path(entry) if entry and Path(entry).is_absolute() else env.dir / (entry or ".")
+        entries.append(str(folder))
+    return shutil.which(prog, path=os.pathsep.join(entries))
 
 
 def _program(env: Env, word: Word) -> tuple[str, Part | None]:
@@ -4898,7 +5206,13 @@ def _program(env: Env, word: Word) -> tuple[str, Part | None]:
         if _DEPLOY.search(lexical.name):
             return text, _danger(f"{text}: похоже на развёртывание или публикацию")
         # Сигнатура — с хешем содержимого: изменённый скрипт снова спросит.
-        return text, _exec(f"{text}: программа из файлов проекта", _file_signature(lexical))
+        program = Part(
+            EXEC,
+            f"{text}: программа из файлов проекта",
+            signature=_file_signature(lexical),
+            inputs=(str(lexical.resolve()),),
+        )
+        return text, program
     return text, _unknown(f"{text}: программа вне проекта")
 
 
@@ -5029,13 +5343,24 @@ def classify_simple(cmd: Command, env: Env) -> Part:
 def _classify_nested(outer: Command, env: Env, inner: Command) -> Part:
     """Оценка вложенной команды (find -exec, xargs, обёртки) в контексте внешней.
 
-    Префиксные присваивания — внешней команды; stdin — свой или, если его нет, внешней.
+    Префиксные присваивания — внешней команды; stdin — свой или, если его нет, внешней
+    (конвейер, heredoc, ``<`` файл): ``uv run python - <<EOF`` читает код из heredoc ``uv``.
     """
+    own_input = inner.stdin is not None or any(
+        redirect.body is not None or redirect.reads for redirect in inner.redirects
+    )
+    inherited = (
+        []
+        if own_input
+        else [
+            redirect for redirect in outer.redirects if redirect.body is not None or redirect.reads
+        ]
+    )
     return classify_simple(
         Command(
             argv=inner.argv,
             assigns=outer.assigns,
-            redirects=inner.redirects,
+            redirects=[*inner.redirects, *inherited],
             cwd=inner.cwd,
             stdin=inner.stdin or outer.stdin,
         ),

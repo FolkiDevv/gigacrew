@@ -25,7 +25,7 @@ from gigacrew.project.secret_paths import (
     is_secret_name,
     scope_of_path,
 )
-from gigacrew.project.workspace import Workspace
+from gigacrew.project.workspace import TEMP_DIR_NAME, Workspace
 from gigacrew.safety.bash import Word
 
 __all__ = [
@@ -38,6 +38,7 @@ __all__ = [
     "is_vcs_internal",
     "scope",
     "scope_of_path",
+    "temp_dir",
 ]
 
 # Сколько совпадений шаблона проверять; больше — не знаем, что там.
@@ -57,6 +58,11 @@ def is_data_path(path: Path, root: Path) -> bool:
 def is_temp_path(path: Path, root: Path) -> bool:
     """Путь в ``.gigacode/tmp/`` — временные файлы модели: запись туда — обычная правка."""
     return Workspace(root).is_temp_path(path)
+
+
+def temp_dir(root: Path) -> Path:
+    """Папка временных файлов модели ``.gigacode/tmp/`` проекта ``root``."""
+    return Workspace(root).data_dir / TEMP_DIR_NAME
 
 
 def _resolve(root: Path, cwd: str, path_text: str) -> Scope:

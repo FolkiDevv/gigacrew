@@ -11,13 +11,16 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 from gigacrew.security import subprocess_env
 
-__all__ = ["repo_config_runs_programs", "repo_toplevel"]
+__all__ = ["git_in_project", "repo_config_runs_programs", "repo_toplevel"]
 
 _TIMEOUT = 5
 _MAX_DEPTH = 8  # вложенность подмодулей
@@ -31,10 +34,17 @@ _LOCAL_SCOPES = frozenset(("local", "worktree", "command"))
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes] | None:
-    """Служебный запуск git в ``cwd``; None — git не запустился."""
+    """Служебный запуск git в ``cwd``; None — git не запустился.
+
+    Служебный запуск идёт до любой проверки: ``git`` из файлов проекта (``.venv/bin/git``
+    активированного окружения) он не запускает — это был бы код проекта без вопроса.
+    """
+    program = _system_git(cwd)
+    if program is None:
+        return None
     try:
         return subprocess.run(
-            ["git", *args],
+            [program, *args],
             cwd=str(cwd),
             env=subprocess_env(),
             stdin=subprocess.DEVNULL,
@@ -56,6 +66,30 @@ def repo_toplevel(cwd: Path) -> Path | None:
         return None
     top = res.stdout.decode("utf-8", errors="replace").strip()
     return Path(top).resolve() if top else None
+
+
+def git_in_project(root: Path, path: str) -> bool:
+    """Первый ``git`` в PATH (как его найдёт запуск) — в файлах проекта (``.venv/bin/git``)."""
+    found = next(_git_programs(root, path), None)
+    return found is not None and found[1]
+
+
+def _system_git(cwd: Path) -> str | None:
+    """Первый ``git`` в PATH не из файлов проекта ``cwd``; None — такого нет."""
+    path = subprocess_env().get("PATH", os.defpath)
+    return next((str(program) for program, inside in _git_programs(cwd, path) if not inside), None)
+
+
+def _git_programs(root: Path, path: str) -> Iterator[tuple[Path, bool]]:
+    """Исполняемые ``git`` в каталогах ``path`` по порядку и лежит ли каждый в ``root``."""
+    project = root.resolve()
+    for entry in path.split(os.pathsep):
+        folder = Path(entry) if entry and Path(entry).is_absolute() else root / (entry or ".")
+        found = shutil.which("git", path=str(folder))  # на Windows — git.exe и др. из PATHEXT
+        if found is not None:
+            candidate = Path(found)
+            places = (candidate.absolute(), candidate.resolve())
+            yield candidate, any(place == project or project in place.parents for place in places)
 
 
 def repo_config_runs_programs(cwd: Path) -> bool | None:

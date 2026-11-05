@@ -1748,7 +1748,7 @@ def test_auto_compaction_summarizes_old_steps_and_keeps_task(tmp_path: Path) -> 
         events=events,
         registry=_registry_with(_big_tool()),
         # бюджет зависит от размера системного промпта: при его росте сжатий станет больше
-        context_budget_tokens=5_000,
+        context_budget_tokens=5_500,
     )
     assert agent.run_turn("ЗАДАЧА") == "готово"
 

@@ -125,8 +125,10 @@ class RunShellTool(Tool[RunShellParams]):
         "without asking the user; others are checked by a reviewer model or confirmed by "
         "the user. There is no keyboard "
         "input (stdin is empty) — use non-interactive flags. Network commands (curl/wget) "
-        "are forbidden by the security policy. Put temporary files in .gigacode/tmp/, not "
-        "/tmp: writing outside the project always needs the user's confirmation."
+        "are forbidden by the security policy. Put temporary files in .gigacode/tmp/ (it "
+        "exists), not /tmp: writing outside the project always needs the user's "
+        "confirmation; output saved there with > or tee does not change how the command "
+        "is checked."
     )
     # Модель параметров (класс pydantic), а не константа: имя — часть API инструментов.
     Params = RunShellParams  # noqa: WPS115

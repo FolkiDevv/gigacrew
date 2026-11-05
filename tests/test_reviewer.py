@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Iterable
 from itertools import repeat
 from pathlib import Path
@@ -452,6 +453,60 @@ def test_reviewer_success_resets_failure_count(tmp_path: Path) -> None:
         agent.run_turn(f"ход {turn_index}")
     assert agent.reviewer.enabled
     assert len(provider.summary_requests) == 5
+
+
+def test_git_tool_changes_go_to_reviewer(tmp_path: Path) -> None:
+    """``git stash`` инструментом git — как та же команда в run_shell: решает рецензент.
+
+    Раньше изменяющий вызов инструмента git в «авто» всегда спрашивал пользователя.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    for args in (["add", "."], ["-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "x"]):
+        (tmp_path / "f.txt").write_text("one\n")
+        subprocess.run(["git", *args], cwd=tmp_path, check=True)
+    (tmp_path / "f.txt").write_text("two\n")
+    provider = ScriptedProvider(
+        [tool_turn("git", {"subcommand": "stash"}), text_turn("ок")],
+        summaries=[text_turn(ALLOW)],
+    )
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events).run_turn("сравни прогоны до и после правки")
+    assert events.confirms == []
+    assert events.reviews == [Review("M-chat", allowed=True, reason=_ALLOW_REASON)]
+    _system, request = provider.summary_requests[0]["messages"]
+    assert "git stash" in request.content
+    assert (tmp_path / "f.txt").read_text() == "one\n"  # правка отложена
+
+
+def test_request_lists_redirect_targets(tmp_path: Path) -> None:
+    """Рецензент видит, куда пишет команда, и что это временная папка модели."""
+    command = "pytest -q > .gigacode/tmp/before.txt 2>&1"
+    text = review_api.review_request(command, classify(command, root=tmp_path), ["почини"])
+    assert "Overall: EXEC" in text
+    assert "Redirects into files:" in text
+    assert ".gigacode/tmp/before.txt — временная папка модели" in text
+    listing = "ls > files.txt"
+    other = review_api.review_request(listing, classify(listing, root=tmp_path), [])
+    assert "перенаправление в files.txt" in other
+
+
+def test_request_shows_scratch_script_code(tmp_path: Path) -> None:
+    """Код чернового скрипта из .gigacode/tmp/ рецензент видит, как код heredoc."""
+    scratch = tmp_path / ".gigacode" / "tmp"
+    scratch.mkdir(parents=True)
+    (tmp_path / "mypkg").mkdir()
+    (tmp_path / "mypkg" / "__init__.py").write_text("def run(*args):\n    pass\n")
+    (scratch / "exp.py").write_text("import mypkg\nmypkg.run('/home/u/.ssh/id_rsa')\n")
+    command = "python3 .gigacode/tmp/exp.py"
+    verdict = classify(command, root=tmp_path)
+    text = review_api.review_request(command, verdict, ["почини"])
+    assert 'Script ".gigacode/tmp/exp.py"' in text
+    assert "mypkg.run('/home/u/.ssh/id_rsa')" in text
+    # скрипт проекта вне временной папки — без кода
+    (tmp_path / "exp.py").write_text("import mypkg\nmypkg.run('/home/u/.ssh/id_rsa')\n")
+    project_script = "python3 exp.py"
+    other = review_api.review_request(project_script, classify(project_script, root=tmp_path), [])
+    assert "id_rsa" not in other
 
 
 def test_saved_rule_wins_before_reviewer(tmp_path: Path) -> None:

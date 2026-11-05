@@ -271,6 +271,129 @@ def test_edits_only_requires_every_part_and_every_redirect_to_be_an_edit(root: P
     assert not unknown.edits_only
 
 
+# ------------------- запись и запуск в одной команде ------------------- #
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo 'import os' > json.py; python3 -c 'import json'",
+        "cp src/main.py json.py && python3 -c 'import json'",
+        "echo 'import shutil' > tool.py; python3 tool.py",
+        "cat > tool.py <<'EOF'\nimport os\nEOF\npython3 tool.py | tail -5",
+        "sed -i 's/1/2/' tool.py && python3 tool.py",
+        "cp src/main.py tool.py && python3 tool.py",
+        "cp src/main.py src/ && python3 src/tool.py",
+        "echo x > .gigacode/tmp/tool.py; python3 .gigacode/tmp/tool.py",
+        "echo 'import os' > .venv/lib/python3.13/site-packages/x.pth; python3 -c 'print(1)'",
+        "git stash pop; python3 -c 'print(1)'",  # что вернёт stash — не известно
+        "echo x > tool.py; sh -c 'python3 tool.py'",
+        'sh -c "echo x > tool.py"; python3 tool.py',
+        'sh -c "pytest -q; echo x > .gigacode/tmp/tool.py"; python3 .gigacode/tmp/tool.py',
+        "echo 'echo x' > build.sh; ./build.sh",
+        "echo x | tee .gigacode/tmp/*.py; python3 .gigacode/tmp/tool.py",  # шаблон — весь каталог
+        "echo x | tee *.txt; python3 tool.txt",
+    ],
+)
+def test_code_written_by_the_same_command_is_not_trusted(
+    scripts_root: Path,
+    command: str,
+) -> None:
+    """Классификатор видит файлы до запуска: код, который пишет эта же команда, не проверен.
+
+    Иначе запись (правка — в «авто» без вопроса) вместе с проверенным по старому
+    содержимому запуском выполнила бы новый код без рецензента и без вопроса.
+    """
+    venv_bin = scripts_root / ".venv" / "bin"
+    environ = {"PATH": f"{venv_bin}:/usr/bin:/bin"}
+    verdict = classify(command, root=scripts_root, environ=environ)
+    assert verdict.level is not READ, verdict.reason
+    assert not verdict.edits_only, verdict.reason
+    # код проекта (EXEC) и так исполняется: не годится только разрешение по содержимому
+    assert verdict.level is None or not any("#" in sig for sig in verdict.signatures)
+    assert verdict.level is None or verdict.level >= EXEC
+
+
+@pytest.fixture
+def scripts_root(root: Path) -> Path:
+    """Проект с безобидными скриптами, программой и окружением в .venv (python из PATH)."""
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    for name in ("tool.py", "tool.txt", "src/tool.py", ".gigacode/tmp/tool.py"):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("print(1)\n")
+    (root / "build.sh").write_text("#!/bin/sh\necho built\n")
+    (root / "build.sh").chmod(0o755)
+    (root / ".venv" / "lib" / "python3.13" / "site-packages").mkdir(parents=True)
+    (root / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (root / ".venv" / "bin").mkdir()
+    (root / ".venv" / "bin" / "python3").symlink_to("/usr/bin/python3")
+    return root
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("python3 tool.py > .gigacode/tmp/out.txt", WRITE),  # вывод скрипта — не его код
+        ("python3 -c 'print(1)' > out.json", WRITE),
+        ("pytest -q > .gigacode/tmp/out.txt; python3 -c 'print(1)'", EXEC),
+        ("echo x > notes.txt; python3 tool.py", WRITE),
+        ("echo x > .gigacode/tmp/x.py; python3 -c 'print(1)'", WRITE),  # .gigacode не импортируется
+        ("npm run format", WRITE),
+    ],
+)
+def test_unrelated_writes_keep_the_verdict(
+    root: Path,
+    command: str,
+    expected: CommandLevel,
+) -> None:
+    (root / "tool.py").write_text("print(1)\n")
+    (root / "package.json").write_text('{"scripts": {"format": "prettier -w ."}}')
+    (root / ".gigacode" / "tmp").mkdir(parents=True)
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, verdict.reason
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("git stash; python3 -m pytest -q; git stash pop", WRITE),  # проверка — та же
+        ("python3 .gigacode/tmp/tool.py > .gigacode/tmp/result", WRITE),  # файл, не пакет
+        ("mkdir -p .gigacode/tmp/out; python3 .gigacode/tmp/tool.py", WRITE),
+        ("python3 .gigacode/tmp/tool.py | tee .gigacode/tmp/result", WRITE),
+    ],
+)
+def test_checks_next_to_unrelated_writes_keep_their_level(
+    root: Path,
+    command: str,
+    expected: CommandLevel,
+) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / ".gigacode" / "tmp").mkdir(parents=True)
+    (root / ".gigacode" / "tmp" / "tool.py").write_text("print(1)\n")
+    verdict = classify(command, root=root)
+    assert verdict.level is expected, verdict.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ln -s . .x; cp src/main.py .x/json.py; python3 -c 'import json'",
+        "export PYTHONPATH=.h && python3 -m json.tool data.json",
+        "find . -name main.py -exec cp {} json.py ';' -exec python3 -c 'import json' ';'",
+    ],
+)
+def test_freshness_sees_links_exports_and_find_actions(root: Path, command: str) -> None:
+    """Ссылка той же командой, PYTHONPATH на уровне команды, действия find друг за другом."""
+    (root / "data.json").write_text("{}")
+    assert level(command, root) is None
+
+
+def test_rewritten_package_json_makes_format_script_unknown(root: Path) -> None:
+    """``npm run format`` — правка по имени скрипта из package.json, который пишется тут же."""
+    (root / "package.json").write_text('{"scripts": {"format": "prettier -w ."}}')
+    manifest = '{"scripts": {"format": "x"}}'
+    command = f"echo '{manifest}' > package.json && npm run format"
+    assert level(command, root) is None
+
+
 def test_cd_followed_by_newline_is_not_a_working_directory(root: Path) -> None:
     """Перевод строки после cd — как «;».
 
@@ -345,6 +468,129 @@ def test_descriptor_duplication_is_not_a_write(root: Path, command: str) -> None
     verdict = classify(command, root=root)
     assert verdict.level is READ, verdict.reason
     assert verdict.composable, verdict.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo x | cat > ~/.bashrc",
+        "ls | sort | uniq > ../outside.txt",
+        "cat a.txt | tee b.txt > ~/.bashrc",
+        "ls && ls | sort > ~/.bashrc && ls",
+        "ls; ls | sort >> ~/.bashrc",
+        "true && echo x > ~/.bashrc",
+        "ls || echo x > ../outside.txt",
+        "true && cat <<'EOF' > ~/.bashrc\nx\nEOF",
+        "cat a.txt | cat <<'EOF' > ~/.bashrc\nx\nEOF",
+        "[ -f a.txt ] > ~/.bashrc",
+        "export X=1 > ~/.bashrc",
+        "{ [ -f a.txt ]; } > ~/.bashrc",  # в блоке и подоболочке нет простых команд
+        "( [ -f a.txt ] ) > ~/.bashrc",
+    ],
+)
+def test_redirect_of_pipeline_or_list_is_checked(root: Path, command: str) -> None:
+    """Грамматика навешивает перенаправление на весь конвейер или список.
+
+    ``a | b > f`` она разбирает как ``(a | b) > f``, ``a && b > f`` — как
+    ``(a && b) > f``; у ``[ … ] > f`` своих простых команд нет. Запись всё равно
+    проверяется — раньше она терялась, и команда считалась «только чтение».
+    """
+    verdict = classify(command, root=root)
+    assert verdict.level is DANGER, verdict.reason
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("ls | sort > out.txt", [0, 1]),
+        ("ls | sort | uniq > out.txt 2>&1", [0, 0, 2]),
+        ("ls && cat a.txt > out.txt", [0, 1]),
+        ("ls; cat a.txt > out.txt || ls", [0, 1, 0]),
+        ("ls && ls | sort > out.txt", [0, 0, 1]),
+        ("ls && cat <<'EOF' > out.txt\nx\nEOF", [0, 2]),
+        ("(ls && cat a.txt) > out.txt", [1, 1]),
+    ],
+)
+def test_redirect_of_pipeline_or_list_belongs_to_last_command(
+    root: Path,
+    command: str,
+    expected: list[int],
+) -> None:
+    """Перенаправление после конвейера или списка — у последней команды, как в оболочке.
+
+    В подоболочке ``( … ) > f`` — у каждой.
+    """
+    script = bash.parse(command, root=root)
+    assert script is not None
+    assert not script.problems, script.problems
+    assert [len(cmd.redirects) for cmd in script.commands] == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("(cd src && ls) > ../x", DANGER),  # файл открывает внешняя оболочка — из корня
+        ("ls | (cd src && cat) > ../x", DANGER),
+        ("(cd src && cat) < ../outside.txt", None),
+        ("(cd src && ls) > out.txt", WRITE),
+    ],
+)
+def test_subshell_redirects_are_opened_in_outer_directory(
+    root: Path,
+    command: str,
+    expected: CommandLevel | None,
+) -> None:
+    """``(cd X && …) > f``: каталог внутри подоболочки, а f открывается снаружи."""
+    assert level(command, root) is expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "{ read -r x; sh; } <<'EOF'\nskip\ntouch marker\nEOF",
+        "( read -r x; python3 - ) <<'EOF'\nskip\nprint(1)\nEOF",
+        "{ cat; cat; } < a.txt",
+    ],
+)
+def test_shared_group_input_is_unknown(root: Path, command: str) -> None:
+    """Ввод блока делят несколько команд: что прочтёт каждая — не известно."""
+    assert level(command, root) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd", "signatures"),
+    [
+        ("git stash && pytest -q 2>&1 | tail -5", ".", ("pytest",)),
+        ("cd src && pytest -q 2>&1 | tail -5", "src", ("pytest",)),
+        ("ls && pytest -q 2>&1 | tee .gigacode/tmp/b.txt", ".", ("pytest",)),
+    ],
+)
+def test_list_before_redirected_pipeline_head(
+    root: Path,
+    command: str,
+    cwd: str,
+    signatures: tuple[str, ...],
+) -> None:
+    """``a && b 2>&1 | c`` грамматика читает как ``(a && b) 2>&1 | c``; оболочка — иначе."""
+    verdict = classify(command, root=root)
+    assert verdict.level is not None, verdict.reason
+    assert verdict.cwd == cwd
+    assert verdict.signatures == signatures
+    assert level("ls && cat a.txt 2>&1 | sort > ~/.bashrc", root) is DANGER
+
+
+def test_list_redirect_keeps_leading_cd(root: Path) -> None:
+    """``cd src && ls > ../out.txt``: ведущий cd — каталог, запись — у ls."""
+    verdict = classify("cd src && ls > ../out.txt 2>&1", root=root)
+    assert verdict.cwd == "src"
+    assert verdict.command == "ls > ../out.txt 2>&1"
+    assert verdict.level is WRITE, verdict.reason
+    assert verdict.edits_only
+    # у cd своё перенаправление: это не ведущий cd, и запись проверяется
+    assert level("cd src && cd .. > ~/.bashrc", root) is DANGER
+    created = classify("mkdir -p d && cat > d/x.py <<'EOF'\nprint(1)\nEOF", root=root)
+    assert created.level is WRITE, created.reason
+    assert created.edits_only
 
 
 def test_read_redirect_paths_are_checked(root: Path) -> None:
