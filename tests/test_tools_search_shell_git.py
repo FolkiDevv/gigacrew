@@ -16,7 +16,7 @@ from gigacrew.config import Config
 from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety import classify
-from gigacrew.safety.gitconfig import repo_config_runs_programs
+from gigacrew.safety.gitconfig import git_in_project, repo_config_runs_programs
 from gigacrew.security import RiskLevel
 from gigacrew.tools import git as git_module
 from gigacrew.tools.base import ToolContext, ToolError, build_default_registry
@@ -405,6 +405,24 @@ def test_git_tool_change_outside_project_root_asks(tmp_path: Path) -> None:
     assert assessment.risk is RiskLevel.WRITE
     assert assessment.kind is None  # решает пользователь, а не рецензент
     assert assessment.verdict is None
+
+
+def test_service_git_lookup_follows_pathext(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Каталоги PATH проверяются через shutil.which: на Windows git — это git.exe."""
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    seen: list[str] = []
+
+    def fake_which(name: str, path: str | None = None) -> str | None:
+        seen.append(str(path))
+        return str(folder / "git.exe") if path == str(folder) else None
+
+    monkeypatch.setattr("gigacrew.safety.gitconfig.shutil.which", fake_which)
+    assert not git_in_project(tmp_path / "project", str(folder))
+    assert seen == [str(folder)]
 
 
 def test_git_tool_with_project_git_program_asks(

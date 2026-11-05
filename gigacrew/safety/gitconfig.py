@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -84,8 +85,9 @@ def _git_programs(root: Path, path: str) -> Iterator[tuple[Path, bool]]:
     project = root.resolve()
     for entry in path.split(os.pathsep):
         folder = Path(entry) if entry and Path(entry).is_absolute() else root / (entry or ".")
-        candidate = folder / "git"
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        found = shutil.which("git", path=str(folder))  # на Windows — git.exe и др. из PATHEXT
+        if found is not None:
+            candidate = Path(found)
             places = (candidate.absolute(), candidate.resolve())
             yield candidate, any(place == project or project in place.parents for place in places)
 
