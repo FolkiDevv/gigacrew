@@ -169,14 +169,14 @@ def _changing(sub: str, args: list[str], ctx: ToolContext) -> Assessment:
     """
     if sub not in _ALLOWED or not ctx.classify_commands:
         return Assessment(RiskLevel.WRITE)
+    env = subprocess_env()
+    if git_in_project(ctx.root, env.get("PATH", os.defpath)):
+        return Assessment(RiskLevel.WRITE, reason="git: программа git — из файлов проекта")
     top = repo_toplevel(ctx.root)
     if top is None or top != ctx.root.resolve():
         # git stash/switch/commit -a изменили бы и файлы репозитория вне проекта
         return Assessment(RiskLevel.WRITE, reason="git: проект — не корень репозитория")
-    env = subprocess_env()
-    if git_in_project(ctx.root, env.get("PATH", os.defpath)):
-        return Assessment(RiskLevel.WRITE, reason="git: программа git — из файлов проекта")
-    verdict = classify(shlex.join(["git", sub, *args]), root=ctx.root, environ=subprocess_env())
+    verdict = classify(shlex.join(["git", sub, *args]), root=ctx.root, environ=env)
     if verdict.level not in {CommandLevel.EXEC, CommandLevel.WRITE}:
         return Assessment(RiskLevel.WRITE)
     return Assessment(

@@ -15,6 +15,7 @@ from gigacrew.agent.loop import Agent
 from gigacrew.config import Config
 from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide
 from gigacrew.project.workspace import Workspace
+from gigacrew.safety import classify
 from gigacrew.safety.gitconfig import repo_config_runs_programs
 from gigacrew.security import RiskLevel
 from gigacrew.tools import git as git_module
@@ -413,13 +414,18 @@ def test_git_tool_with_project_git_program_asks(
     """``git`` из файлов проекта (``.venv/bin/git`` в PATH) — не тот git, что проверен."""
     fake = stashed_repo.root / ".venv" / "bin"
     fake.mkdir(parents=True)
-    (fake / "git").write_text('#!/bin/sh\nexec /usr/bin/git "$@"\n')
+    marker = stashed_repo.root / "ran"
+    (fake / "git").write_text(f'#!/bin/sh\ntouch {marker}\nexec /usr/bin/git "$@"\n')
     (fake / "git").chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
     git = GitTool()
     assessment = git.assess(git.parse({"subcommand": "stash"}), stashed_repo)
     assert assessment.kind is None
     assert assessment.verdict is None
+    # оценка (служебные запуски git) программу из файлов проекта не запускает
+    git.assess(git.parse({"subcommand": "status"}), stashed_repo)
+    classify("git status", root=stashed_repo.root)
+    assert not marker.exists()
 
 
 def test_git_restore_with_yes_flag_still_asks(stashed_repo: ToolContext) -> None:
