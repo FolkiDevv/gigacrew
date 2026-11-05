@@ -1416,6 +1416,57 @@ def test_removing_outside_scratch_stays_dangerous(root: Path, command: str) -> N
 
 
 @pytest.mark.parametrize(
+    "command",
+    [
+        "ln -s ROOT .gigacode/tmp/x && rm -rf .gigacode/tmp/x/",
+        "ln -s ROOT/src .gigacode/tmp/x && rm -rf .gigacode/tmp/x/*",
+        "mv src .gigacode/tmp/gone && rm -rf .gigacode/tmp/gone",
+    ],
+)
+def test_link_placed_by_the_same_command_is_not_scratch(root: Path, command: str) -> None:
+    """Временная папка проверена до запуска: ссылка или перенос туда той же командой."""
+    (root / ".gigacode" / "tmp").mkdir(parents=True)
+    assert level(command.replace("ROOT", str(root)), root) is None
+    # вывод по ссылке на файл проекта — запись рядом с правкой (ln): не черновик, не правка
+    linked = classify("ln -s src/main.py .gigacode/tmp/x && pytest -q > .gigacode/tmp/x", root=root)
+    assert linked.level is WRITE
+    assert not linked.edits_only
+
+
+def test_scratch_cleanup_next_to_check_is_neutral(root: Path) -> None:
+    """Удаление черновиков рядом с проверкой — как сама проверка."""
+    (root / ".gigacode" / "tmp").mkdir(parents=True)
+    for command in (
+        "rm -f .gigacode/tmp/*.txt && pytest -q > .gigacode/tmp/before.txt 2>&1",
+        "rm -rf .gigacode/tmp/run && mkdir .gigacode/tmp/run && pytest -q > .gigacode/tmp/run/x",
+    ):
+        verdict = classify(command, root=root)
+        assert verdict.level is EXEC, (command, verdict.reason)
+        assert verdict.signatures == ("pytest",)
+
+
+def test_moving_project_files_into_scratch_is_not_an_edit(root: Path) -> None:
+    """Перенос в .gigacode/tmp/ убирает файлы из проекта (а удалить их там — правка)."""
+    (root / ".gigacode" / "tmp").mkdir(parents=True)
+    (root / ".gigacode" / "tmp" / "a.txt").write_text("x\n")
+    moved = classify("mv src/main.py .gigacode/tmp/main.py", root=root)
+    assert moved.level is WRITE
+    assert not moved.edits_only
+    assert classify("mv .gigacode/tmp/a.txt .gigacode/tmp/b.txt", root=root).edits_only
+
+
+def test_shared_file_in_scratch_is_not_scratch(root: Path) -> None:
+    """Жёсткая ссылка во временной папке на файл проекта: запись туда — запись в проект."""
+    (root / ".gigacode" / "tmp").mkdir(parents=True)
+    os.link(root / "src" / "main.py", root / ".gigacode" / "tmp" / "hard")
+    verdict = classify("pytest -q > .gigacode/tmp/hard", root=root)
+    assert verdict.level is WRITE
+    assert not verdict.composable
+    mixed = classify("pytest -q > .gigacode/tmp/x 2> src/main.py", root=root)
+    assert mixed.reason == "перенаправление в src/main.py"  # настоящая запись, а не черновик
+
+
+@pytest.mark.parametrize(
     ("command", "signatures"),
     [
         ("pytest -q -p no:randomly", ("pytest",)),
@@ -1490,16 +1541,20 @@ def test_json_tool_with_shadowed_stdlib_is_exec(root: Path) -> None:
         "ln -f .git/config cfg",
         "cp -l .git/hooks/pre-commit .gigacode/tmp/h",
         "cp --link .gigacode/chats/x.json .gigacode/tmp/x",
+        "ln -s ../../.git/hooks/pre-commit .gigacode/tmp/h",  # от каталога ссылки — хук
+        "ln -s ROOT/.git/hooks/pre-commit .gigacode/tmp/h",
+        "ln -s ROOT/.gigacode/tmp/.gitignore .gigacode/tmp/g",
     ],
 )
 def test_hard_link_to_service_file_is_dangerous(root: Path, command: str) -> None:
-    """Запись по жёсткой ссылке меняет сам файл: так «правкой» переписали бы хук git."""
+    """Запись по ссылке меняет сам файл: так «правкой» переписали бы хук git."""
     (root / ".git" / "hooks").mkdir(parents=True)
     (root / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
     (root / ".git" / "config").write_text("")
     (root / ".gigacode" / "chats").mkdir(parents=True)
     (root / ".gigacode" / "chats" / "x.json").write_text("{}")
-    assert level(command, root) is DANGER
+    (root / ".gigacode" / "tmp").mkdir()
+    assert level(command.replace("ROOT", str(root)), root) is DANGER
     assert level("ln a.txt .gigacode/tmp/a", root) is WRITE  # обычный файл проекта — правка
 
 

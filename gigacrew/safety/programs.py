@@ -386,7 +386,7 @@ def check_write(
         if where is Scope.SECRET:
             parts.append(Part(WRITE, f"{what}: файл с секретами ({word.raw})", writes=written))
             continue
-        if output and is_temp_path(resolved, env.root):
+        if output and is_temp_path(resolved, env.root) and not _shared(resolved):
             reason = f"{what}: {word.raw} — временная папка модели"
             parts.append(Part(WRITE, reason, edits=True, scratch=True, writes=written))
             continue
@@ -396,6 +396,14 @@ def check_write(
     if not parts:
         return _write(what, edits=edits)
     return _combine(*parts)
+
+
+def _shared(path: Path) -> bool:
+    """Файл с другими жёсткими ссылками: запись в него меняет и файл где-то ещё."""
+    try:
+        return path.is_file() and path.stat().st_nlink > 1
+    except OSError:
+        return False
 
 
 def _glob_base(path: Path) -> Path:
@@ -2070,8 +2078,11 @@ def _rm(env: Env, args: list[Word]) -> Part:
     flags, pos = _split(args)
     fl = _flagset(flags)
     if pos and all(_in_scratch(env, word) for word in pos):
-        # Черновики модели: удалить их (и с -rf) — правка, как их запись.
-        return check_write(env, pos, "rm: удаление во временной папке")
+        # Черновики модели: удалить их (и с -rf) — правка, как их запись. Ссылка на место
+        # пути той же командой (`ln -s ~ .gigacode/tmp/x && rm -rf .gigacode/tmp/x/`) это
+        # меняет: пути — цели оценки.
+        removed = check_write(env, pos, "rm: удаление во временной папке")
+        return replace(removed, targets=removed.writes, scratch=True)
     if _has(fl, "-r", "-R", "-f", "--recursive", "--force", "-d", "--dir"):
         return _danger("rm с -r/-f: удаление без возврата")
     if not pos:
@@ -2115,21 +2126,49 @@ def _in_scratch(env: Env, word: Word) -> bool:
     return True
 
 
-def _hard_link_bad(env: Env, targets: list[Word], what: str) -> Part | None:
-    """Жёсткая ссылка на служебный файл git, jj или gigacrew — опасно.
+def _hard_link_bad(
+    env: Env,
+    targets: list[Word],
+    what: str,
+    *,
+    base: Path | None = None,
+) -> Part | None:
+    """Ссылка на служебный файл git, jj или gigacrew — опасно.
 
     Запись по ней (``echo … > ссылка``) меняет сам файл, а путь ссылки этого не выдаёт:
-    так правкой «обычного» файла можно было бы переписать хук git.
+    так правкой «обычного» файла можно было бы переписать хук git. ``base`` — каталог
+    символической ссылки: от него считается её относительная цель (и от каталога команды).
     """
     for word in targets:
         if not word.static:
             continue  # путь при выполнении — его проверит scope ниже
-        target = Path(word.text) if word.text.startswith("/") else env.dir / word.text
-        resolved = target.resolve()
-        service = is_data_path(resolved, env.root) and not is_temp_path(resolved, env.root)
-        if service or is_vcs_internal(resolved, env.root) or is_vcs_internal(target, env.root):
-            return _danger(f"{what}: жёсткая ссылка на служебный файл ({word.raw})")
+        for folder in (env.dir, *(() if base is None else (base,))):
+            target = Path(word.text) if word.text.startswith("/") else folder / word.text
+            if _service_file(env, target):
+                return _danger(f"{what}: ссылка на служебный файл ({word.raw})")
     return None
+
+
+def _service_file(env: Env, target: Path) -> bool:
+    """Путь — во внутренностях git или jj или в служебной папке gigacrew (не в tmp/)."""
+    resolved = target.resolve()
+    service = is_data_path(resolved, env.root) and not is_temp_path(resolved, env.root)
+    return service or is_vcs_internal(resolved, env.root) or is_vcs_internal(target, env.root)
+
+
+def _link_dir(env: Env, links: list[Word]) -> Path:
+    """Каталог, где появится символическая ссылка: каталог-цель или каталог пути ссылки."""
+    if not links or not links[-1].static:
+        return env.dir
+    place = env.dir / links[-1].text
+    return place if place.is_dir() else place.parent
+
+
+def _into_scratch(env: Env, dest: list[Word]) -> bool:
+    """Цель переноса — во временной папке модели (или она сама)."""
+    return any(
+        word.static and is_temp_path((env.dir / word.text).resolve(), env.root) for word in dest
+    )
 
 
 def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
@@ -2157,7 +2196,11 @@ def _cp_mv(env: Env, name: str, args: list[Word]) -> Part:
         moved = check_write(env, sources, name)
         if moved.level is not CommandLevel.WRITE:
             return moved
-        return _combine(moved, check_write(env, dest, name))
+        both = _combine(moved, check_write(env, dest, name))
+        if _into_scratch(env, dest) and not all(_in_scratch(env, word) for word in sources):
+            # из проекта файлы исчезают (а `rm` во временной папке — правка): не правка
+            return replace(both, reason="mv: файлы проекта — во временную папку", edits=False)
+        return both
     return check_write(env, dest, name)
 
 
@@ -2228,10 +2271,12 @@ def _ln(env: Env, args: list[Word]) -> Part:
         return _unknown("ln без аргументов")
     target_dir = [word for opt, word in found if opt in {"-t", "--target-directory"}]
     targets = pos if target_dir else pos[:1]
-    if not _has(_flagset(flags), "-s", "--symbolic"):
-        hard = _hard_link_bad(env, targets, "ln")
-        if hard is not None:
-            return hard
+    symbolic = _has(_flagset(flags), "-s", "--symbolic")
+    # Относительная цель символической ссылки считается от каталога ссылки.
+    base = _link_dir(env, target_dir or pos[1:]) if symbolic else None
+    service = _hard_link_bad(env, targets, "ln", base=base)
+    if service is not None:
+        return service
     # Ссылка на файл вне проекта превратит его в «файл проекта» для следующих команд.
     for target in targets:
         where = scope(target, root=env.root, cwd=env.cwd)

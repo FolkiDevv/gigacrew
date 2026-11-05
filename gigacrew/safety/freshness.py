@@ -18,22 +18,31 @@ __all__ = ["outdated"]
 _CODE_SUFFIXES = frozenset((".py", ".pyc", ".pyo", ".pyw", ".pyd", ".so", ".pth", ".zip", ".egg"))
 
 
-def outdated(parts: list[Part], writes: list[Part]) -> list[Part]:
-    """Части, оценка которых устарела: эта же команда пишет то, что они исполнят.
+def outdated(parts: list[Part], writes: list[Part]) -> tuple[list[Part], list[Part]]:
+    """Части и записи-перенаправления, оценка которых устарела из-за этой же команды.
 
     Классификатор смотрит на файлы до запуска команды, а ``echo … > x.py; python x.py``
     выполнит уже новый ``x.py`` (как и ``cp b.py json.py; python -c "import json"``).
     Такая часть — «не знаю». Запись частей уровня EXEC не в счёт: код проекта и так
     исполняется; часть уровня WRITE без известных путей могла записать что угодно. Своя
     запись части не в счёт: то, по чему она оценена, она читает до неё.
+
+    Так же — работа во временной папке (:attr:`Part.targets`), если другая часть ставит
+    на место её пути ссылку или переносит туда что-то: ``ln -s ~ .gigacode/tmp/x && rm -rf
+    .gigacode/tmp/x/``. Вывод через перенаправление и ``tee`` ссылок не создаёт.
     """
     writers = [*parts, *writes]
-    return [
-        _untrusted(part)
-        if _stale(part, [each for pos, each in enumerate(writers) if pos != index])
-        else part
-        for index, part in enumerate(parts)
-    ]
+    fresh: list[Part] = []
+    for index, each in enumerate(writers):
+        others = [other for pos, other in enumerate(writers) if pos != index]
+        relinkers = [other for pos, other in enumerate(parts) if pos != index]
+        checked = each
+        if _stale(each, others):
+            checked = _untrusted(each, "эта же команда меняет код, который он исполнит")
+        elif _relinked(each, relinkers):
+            checked = _untrusted(each, "эта же команда ставит на место пути ссылку или перенос")
+        fresh.append(checked)
+    return fresh[: len(parts)], fresh[len(parts) :]
 
 
 def _stale(part: Part, others: list[Part]) -> bool:
@@ -44,14 +53,32 @@ def _stale(part: Part, others: list[Part]) -> bool:
     return any(_changes(each, used) for each in others)
 
 
-def _untrusted(part: Part) -> Part:
-    """Часть, чей код меняет эта же команда: «не знаю»."""
+def _relinked(part: Part, others: list[Part]) -> bool:
+    """На место путей ``part.targets`` другая часть может поставить ссылку или каталог."""
+    targets = [Path(path) for path in part.targets]
+    if not targets or part.level is CommandLevel.DANGER:
+        return False
+    for other in others:
+        if other.scratch or other.level is not CommandLevel.WRITE:
+            continue  # вывод и mkdir во временной папке ссылок не создают; EXEC — доверен
+        if not other.writes:
+            return True
+        written = [Path(path) for path in other.writes]
+        if any(path == target or path in target.parents for path in written for target in targets):
+            return True
+    return False
+
+
+def _untrusted(part: Part, why: str) -> Part:
+    """Часть, чью оценку меняет эта же команда: «не знаю»."""
     head = part.reason.split(":", 1)[0]
     return replace(
         part,
         level=None,
-        reason=f"{head}: эта же команда меняет код, который он исполнит",
+        reason=f"{head}: {why}",
         signature=None,
+        edits=False,
+        scratch=False,
     )
 
 

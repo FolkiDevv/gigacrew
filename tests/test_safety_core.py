@@ -488,6 +488,59 @@ def test_redirect_of_pipeline_or_list_belongs_to_last_command(
     assert [len(cmd.redirects) for cmd in script.commands] == expected
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("(cd src && ls) > ../x", DANGER),  # файл открывает внешняя оболочка — из корня
+        ("ls | (cd src && cat) > ../x", DANGER),
+        ("(cd src && cat) < ../outside.txt", None),
+        ("(cd src && ls) > out.txt", WRITE),
+    ],
+)
+def test_subshell_redirects_are_opened_in_outer_directory(
+    root: Path,
+    command: str,
+    expected: CommandLevel | None,
+) -> None:
+    """``(cd X && …) > f``: каталог внутри подоболочки, а f открывается снаружи."""
+    assert level(command, root) is expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "{ read -r x; sh; } <<'EOF'\nskip\ntouch marker\nEOF",
+        "( read -r x; python3 - ) <<'EOF'\nskip\nprint(1)\nEOF",
+        "{ cat; cat; } < a.txt",
+    ],
+)
+def test_shared_group_input_is_unknown(root: Path, command: str) -> None:
+    """Ввод блока делят несколько команд: что прочтёт каждая — не известно."""
+    assert level(command, root) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "cwd", "signatures"),
+    [
+        ("git stash && pytest -q 2>&1 | tail -5", ".", ("pytest",)),
+        ("cd src && pytest -q 2>&1 | tail -5", "src", ("pytest",)),
+        ("ls && pytest -q 2>&1 | tee .gigacode/tmp/b.txt", ".", ("pytest",)),
+    ],
+)
+def test_list_before_redirected_pipeline_head(
+    root: Path,
+    command: str,
+    cwd: str,
+    signatures: tuple[str, ...],
+) -> None:
+    """``a && b 2>&1 | c`` грамматика читает как ``(a && b) 2>&1 | c``; оболочка — иначе."""
+    verdict = classify(command, root=root)
+    assert verdict.level is not None, verdict.reason
+    assert verdict.cwd == cwd
+    assert verdict.signatures == signatures
+    assert level("ls && cat a.txt 2>&1 | sort > ~/.bashrc", root) is DANGER
+
+
 def test_list_redirect_keeps_leading_cd(root: Path) -> None:
     """``cd src && ls > ../out.txt``: ведущий cd — каталог, запись — у ls."""
     verdict = classify("cd src && ls > ../out.txt 2>&1", root=root)

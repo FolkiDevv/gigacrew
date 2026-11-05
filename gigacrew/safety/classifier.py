@@ -123,7 +123,7 @@ def _classify(  # noqa: WPS210
     if script.compound:
         # Условия и циклы разобраны, но «только чтение» для них не выносим: решает человек.
         problems.append(Part(None, "условия или циклы оболочки"))
-    parts = outdated(parts, writes)
+    parts, writes = outdated(parts, writes)
     everything = [*parts, *writes, *problems]
     if not everything:
         return Verdict(
@@ -262,7 +262,8 @@ def _text_of(cmd: bash.Command, depth: int = 0) -> str:
 
 
 def _reason(level: CommandLevel | None, parts: list[Part]) -> str:
-    for part in parts:
+    # Вывод во временную папку — в последнюю очередь: рядом может быть настоящая запись.
+    for part in sorted(parts, key=lambda each: each.scratch):
         if part.level == level and part.reason:
             return part.reason
     return parts[0].reason if parts else ""
