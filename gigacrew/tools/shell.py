@@ -13,7 +13,6 @@ from gigacrew.safety import MAX_COMMAND, CommandLevel, Verdict, classify
 from gigacrew.security import (
     RiskLevel,
     classify_shell_command,
-    resolve_in_root,
     subprocess_env,
 )
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
@@ -40,8 +39,8 @@ class RunShellParams(BaseModel):  # noqa: D101
     cwd: str = Field(
         default="",
         description=(
-            "Working directory relative to the project root (default: the root). Prefer it "
-            "over `cd dir && …`"
+            "Working directory relative to the project root (default: the root) or an "
+            "absolute path in an additional directory. Prefer it over `cd dir && …`"
         ),
     )
     description: str = Field(
@@ -56,13 +55,19 @@ class RunShellParams(BaseModel):  # noqa: D101
 def command_verdict(params: RunShellParams, ctx: ToolContext) -> Verdict:
     """Вердикт классификатора для команды в её рабочем каталоге."""
     cwd = _relative_cwd(params, ctx)
-    return classify(params.command, root=ctx.root, cwd=cwd, environ=subprocess_env())
+    return classify(
+        params.command,
+        root=ctx.root,
+        cwd=cwd,
+        environ=subprocess_env(),
+        extra=ctx.workspace.extra_dirs,
+    )
 
 
 def _relative_cwd(params: RunShellParams, ctx: ToolContext) -> str:
     if not params.cwd.strip() or params.cwd.strip() == ".":
         return "."
-    target = resolve_in_root(ctx.root, params.cwd.strip())
+    target = ctx.resolve(params.cwd.strip())
     if not target.is_dir():
         raise ToolError(f"Каталог '{params.cwd}' не найден в проекте.")
     rel = os.path.relpath(target, ctx.root)
@@ -180,7 +185,7 @@ class RunShellTool(Tool[RunShellParams]):
     def run(self, params: RunShellParams, ctx: ToolContext) -> ToolResult:
         """Выполняет команду через /bin/sh и возвращает код возврата и вывод."""
         timeout = min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)
-        cwd = ctx.root / _relative_cwd(params, ctx)
+        cwd = (ctx.root / _relative_cwd(params, ctx)).resolve()
         # Папка временных файлов модели есть к запуску команды: не нужен лишний шаг с mkdir.
         # Не вышло (симлинк, нет прав) — команда всё равно выполняется.
         with contextlib.suppress(OSError):

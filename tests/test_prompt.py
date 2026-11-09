@@ -48,6 +48,7 @@ def test_completes_commands_with_descriptions() -> None:
         "/model",
         "/mode",
         "/permissions",
+        "/add-dir",
         "/clear",
         "/compact",
         "/resume",

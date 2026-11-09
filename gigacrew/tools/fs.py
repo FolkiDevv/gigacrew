@@ -20,8 +20,8 @@ from pydantic import BaseModel, Field
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.files import glob_match, is_vcs_internal, walk_files
 from gigacrew.project.secret_paths import is_secret_target
-from gigacrew.project.workspace import DATA_DIR_NAME
-from gigacrew.security import RiskLevel, SandboxError, resolve_in_root
+from gigacrew.project.workspace import DATA_DIR_NAME, Workspace
+from gigacrew.security import RiskLevel, SandboxError
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
 
 # Жёсткий предел размера читаемого файла (дальше — только search_content).
@@ -34,10 +34,7 @@ _BINARY_PROBE = 8192
 
 
 def _rel(ctx: ToolContext, path: Path) -> str:
-    try:
-        return str(path.relative_to(ctx.root))
-    except ValueError:
-        return str(path)
+    return ctx.display(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -65,7 +62,7 @@ def _write_assessment(ctx: ToolContext, path: str) -> Assessment:
     if _is_plan_file(ctx, path):
         return Assessment(RiskLevel.SAFE)  # план — данные агента: в любом режиме без вопроса
     try:
-        target = resolve_in_root(ctx.root, path)
+        target = ctx.resolve(path)
     except SandboxError:
         return Assessment(RiskLevel.WRITE)  # откажет сама запись
     if target.name.casefold() == CONFIG_FILE_NAME:
@@ -270,7 +267,7 @@ def _is_plan_file(ctx: ToolContext, path: str) -> bool:
     if ctx.plan is None:
         return False
     try:
-        return ctx.plan.is_target(resolve_in_root(ctx.root, path))
+        return ctx.plan.is_target(ctx.resolve(path))
     except Exception:  # путь вне корня — ошибку сообщит сама запись
         return False
 
@@ -300,9 +297,13 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
     ``core.fsmonitor`` и ``diff.external`` запускаются уже на ``git status``/``git
     diff``, которые выполняются без подтверждения; в ``.jj/`` так же опасны настройки
     репозитория jj (``ui.diff-formatter`` на ``jj diff``). Проверка срабатывает и в
-    превью, то есть до вопроса о подтверждении.
+    превью, то есть до вопроса о подтверждении. В подключённом каталоге (``--add-dir``)
+    те же правила считаются от его корня, а его ``.gigacode/`` закрыта целиком.
     """
-    target = resolve_in_root(ctx.root, path)
+    target = ctx.resolve(path)
+    owner = ctx.root_of(target)
+    if owner != ctx.root:
+        return _writable_extra(owner, target, path)
     if is_vcs_internal(ctx.root, target, path):
         raise ToolError(
             f"Внутренности git и jj (.git/, .jj/) недоступны для записи: {path}. "
@@ -321,6 +322,22 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
         raise ToolError(
             f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента, скиллы) "
             f"недоступна для записи: {path}{plan_hint}",
+        )
+    return target
+
+
+def _writable_extra(owner: Path, target: Path, path: str) -> Path:
+    """Путь для записи в подключённом каталоге ``owner``: не служебные папки VCS и gigacrew."""
+    if is_vcs_internal(owner, target, path):
+        raise ToolError(
+            f"Внутренности git и jj (.git/, .jj/) недоступны для записи: {path}. "
+            "Для операций с репозиторием используйте команды git или jj.",
+        )
+    data_dir = (owner / DATA_DIR_NAME).resolve()
+    if target == data_dir or data_dir in target.parents or Workspace(owner).is_data_path(target):
+        raise ToolError(
+            f"Служебная папка {DATA_DIR_NAME}/ подключённого каталога недоступна для записи: "
+            f"{path}",
         )
     return target
 
@@ -647,7 +664,7 @@ class ReadFileTool(Tool[ReadFileParams]):
     @override
     def run(self, params: ReadFileParams, ctx: ToolContext) -> ToolResult:
         """Читает файл и возвращает выбранные строки с номерами."""
-        path = resolve_in_root(ctx.root, params.path)
+        path = ctx.resolve(params.path)
         _check_readable(ctx, path, params.path)
         with path.open("rb") as fh:
             if b"\0" in fh.read(_BINARY_PROBE):
@@ -1065,7 +1082,7 @@ class ListDirTool(Tool[ListDirParams]):
     @override
     def run(self, params: ListDirParams, ctx: ToolContext) -> ToolResult:
         """Перечисляет файлы и подкаталоги: сначала каталоги, затем файлы."""
-        directory = resolve_in_root(ctx.root, params.path)
+        directory = ctx.resolve(params.path)
         if not directory.is_dir():
             raise ToolError(f"Не директория: {params.path}")
         entries = sorted(
@@ -1098,6 +1115,12 @@ class FindFilesParams(BaseModel):
     pattern: str = Field(
         description="Glob pattern: '*.py' — by name in any directory, 'src/**/*.ts' — by path "
         "from the root",
+    )
+    path: str = Field(
+        default=".",
+        description="Directory to search (the project root by default; an absolute path "
+        "for an additional directory). The pattern is matched against paths from the "
+        "root of the project or of the additional directory",
     )
     max_results: int = Field(
         default=_DEFAULT_FIND_RESULTS,
@@ -1134,9 +1157,15 @@ class FindFilesTool(Tool[FindFilesParams]):
         pattern = params.pattern.strip()
         _check_pattern(pattern)
         limit = min(max(params.max_results, 1), MAX_FIND_RESULTS)
-        root = ctx.root
-        relative = (path.relative_to(root).as_posix() for path in walk_files(root))
-        matches = sorted(rel for rel in relative if glob_match(rel, pattern))
+        base = ctx.resolve(params.path)
+        if not base.is_dir():
+            raise ToolError(f"Не директория: {params.path}")
+        root = ctx.root_of(base)
+        matches = sorted(
+            ctx.display(path)
+            for path in walk_files(root, base)
+            if glob_match(path.relative_to(root).as_posix(), pattern)
+        )
         shown = matches[:limit]
         body = "\n".join(shown) if shown else "(ничего не найдено)"
         if len(matches) > limit:

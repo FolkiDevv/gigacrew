@@ -198,6 +198,9 @@ def _show_banner(
         auto_approve=agent.config.auto_approve,
         mode=agent.mode,
     )
+    if agent.extra_dirs:
+        listed = ", ".join(str(folder) for folder in agent.extra_dirs)
+        ui.info(f"подключённые каталоги: {listed}")
     if resumed is not None:
         ui.chat_resumed(resumed, agent.conversation.messages, agent.call_info)
 

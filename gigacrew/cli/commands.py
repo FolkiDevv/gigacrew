@@ -263,6 +263,31 @@ def _mode(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+ADD_DIR_USAGE = "/add-dir [путь]"
+
+
+def _add_dir(ctx: CommandContext, arg: str) -> bool:
+    """Подключить каталог вне проекта; без аргумента — список подключённых."""
+    agent = ctx.agent
+    if not arg:
+        if not agent.extra_dirs:
+            ctx.ui.info(
+                f"подключённых каталогов нет (использование: {ADD_DIR_USAGE}; путь — "
+                "от корня проекта или абсолютный)",
+            )
+            return True
+        listed = "\n".join(f"  • {folder}" for folder in agent.extra_dirs)
+        ctx.ui.info(f"подключённые каталоги (чтение и правки):\n{listed}")
+        return True
+    try:
+        directory = agent.add_directory(arg.strip())
+    except ValueError as error:
+        ctx.ui.error(f"{error} (использование: {ADD_DIR_USAGE})")
+        return True
+    ctx.ui.info(f"подключён каталог {directory}: агент читает и правит его, как проект")
+    return True
+
+
 def _warn_reviewer(ctx: CommandContext) -> None:
     """В режиме «авто» с отключённым рецензентом — напомнить, что команды спрашиваются."""
     agent = ctx.agent
@@ -541,6 +566,14 @@ def default_commands() -> CommandRegistry:
             "разрешённые без вопросов команды и журнал решений",
             _permissions,
             usage=PERMISSIONS_USAGE,
+        ),
+    )
+    registry.register(
+        SlashCommand(
+            "/add-dir",
+            "подключить каталог вне проекта (чтение и правки)",
+            _add_dir,
+            usage=ADD_DIR_USAGE,
         ),
     )
     registry.register(SlashCommand("/clear", "новый чат", _clear))

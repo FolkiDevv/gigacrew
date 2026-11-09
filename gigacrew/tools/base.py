@@ -28,7 +28,7 @@ from gigacrew.llm.types import ToolSpec
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety.levels import Verdict
-from gigacrew.security import RiskLevel
+from gigacrew.security import RiskLevel, resolve_in_roots
 from gigacrew.tools.questions import AskUser
 
 __all__ = [
@@ -107,6 +107,33 @@ class ToolContext:
     def root(self) -> Path:
         """Корень проекта (``workspace.root``)."""
         return self.workspace.root
+
+    def resolve(self, path: str | Path) -> Path:
+        """Путь от модели — абсолютный, внутри проекта или подключённого каталога.
+
+        Относительный считается от корня проекта. Наружу — ``SandboxError``.
+        """
+        return resolve_in_roots((self.root, *self.workspace.extra_dirs), path)
+
+    def root_of(self, path: Path) -> Path:
+        """Корень (проекта или подключённого каталога), где лежит раскрытый ``path``.
+
+        Путь вне всех корней — корень проекта. Проект проверяется первым.
+        """
+        resolved = Path(path)
+        if resolved == self.root or self.root in resolved.parents:
+            return self.root
+        for folder in self.workspace.extra_dirs:
+            if resolved == folder or folder in resolved.parents:
+                return folder
+        return self.root
+
+    def display(self, path: Path) -> str:
+        """Путь для вывода: относительно корня проекта, снаружи — абсолютный."""
+        try:
+            return Path(path).relative_to(self.root).as_posix()
+        except ValueError:
+            return Path(path).as_posix()
 
 
 @dataclass(frozen=True)

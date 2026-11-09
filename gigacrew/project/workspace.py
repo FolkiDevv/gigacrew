@@ -129,14 +129,32 @@ class Workspace:
 
     ``untrusted`` — проект недоверенный (``--untrusted-project``, ревью чужих изменений):
     его скиллы и хуки не загружаются, а инструкции — данные, а не указания.
+    ``extra_dirs`` — подключённые каталоги (``--add-dir``, ``/add-dir``): файловые
+    инструменты читают и правят их, как проект (:meth:`gigacrew.tools.base.ToolContext.resolve`);
+    индекс и навигация — только по проекту.
     """
 
     root: Path
     untrusted: bool = False
+    extra_dirs: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
-        """Приводит корень к абсолютному пути без симлинков."""
-        object.__setattr__(self, "root", Path(self.root).resolve())
+        """Приводит корень и подключённые каталоги к абсолютным путям без симлинков.
+
+        Каталог внутри проекта или другого подключённого каталога лишний, а содержащий
+        проект — запрещён (его правила перекрыли бы правила проекта): такие отбрасываются.
+        """
+        root = Path(self.root).resolve()
+        object.__setattr__(self, "root", root)
+        kept: list[Path] = []
+        resolved = [Path(extra).resolve() for extra in self.extra_dirs]
+        for directory in resolved:
+            covered = any(_within(directory, other) for other in (root, *kept))
+            if covered or _within(root, directory):
+                continue
+            kept = [other for other in kept if not _within(other, directory)]
+            kept.append(directory)
+        object.__setattr__(self, "extra_dirs", tuple(kept))
 
     @property
     def data_dir(self) -> Path:
@@ -252,6 +270,10 @@ class Workspace:
         temp_dir.mkdir(exist_ok=True)
         _create_gitignore(temp_dir, _TEMP_GITIGNORE_BODY)
         return temp_dir
+
+
+def _within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
 
 
 def _create_gitignore(directory: Path, body: str) -> None:

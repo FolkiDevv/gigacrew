@@ -690,6 +690,8 @@ class _Ctx:
     levels: list[tuple[Level | None, str]] = field(default_factory=list)
     hazard_cache: dict[tuple[Path, str | None], bool] = field(default_factory=dict)
     parents: dict[int, ast.AST] = field(default_factory=dict)  # id(узел) → родитель
+    extra: tuple[Path, ...] = ()  # подключённые каталоги (``--add-dir``)
+    scratch_root: Path | None = None  # чья .gigacode/tmp/ — временная папка (None — root)
 
     def flag(self, level: Level | None, reason: str) -> None:
         self.levels.append((level, reason))
@@ -1300,12 +1302,20 @@ def _iterated(source: ast.AST, index: int | None, ctx: _Ctx, depth: int) -> _Pat
 # --------------------------------------------------------------------------- #
 # Проверки
 # --------------------------------------------------------------------------- #
-def _inside(path: Path, ctx: _Ctx) -> bool:
+def _owner(path: Path, ctx: _Ctx) -> Path | None:
+    """Корень (проекта или подключённого каталога), где лежит ``path``; None — снаружи."""
     try:
         resolved = path.resolve()
     except (OSError, RuntimeError):
-        return False
-    return resolved == ctx.root or ctx.root in resolved.parents
+        return None
+    for folder in (ctx.root, *ctx.extra):
+        if resolved == folder or folder in resolved.parents:
+            return folder
+    return None
+
+
+def _inside(path: Path, ctx: _Ctx) -> bool:
+    return _owner(path, ctx) is not None
 
 
 def _hazards(directory: Path, pattern: str | None, ctx: _Ctx) -> bool:
@@ -1317,7 +1327,7 @@ def _hazards(directory: Path, pattern: str | None, ctx: _Ctx) -> bool:
     found = (
         not _inside(directory, ctx)
         or has_secrets_under(directory, ctx.root, name_pattern=pattern)
-        or has_escaping_links(directory, ctx.root, name_pattern=pattern)
+        or has_escaping_links(directory, ctx.root, name_pattern=pattern, extra=ctx.extra)
     )
     ctx.hazard_cache[key] = found
     return found
@@ -1326,12 +1336,12 @@ def _hazards(directory: Path, pattern: str | None, ctx: _Ctx) -> bool:
 def _check_read(target: _Path, ctx: _Ctx, what: str) -> None:
     """Чтение пути: секреты и пути вне проекта — тревога или «не знаю»."""
     if target.static is not None:
-        scope = scope_of_path(target.static, ctx.root)
+        scope = scope_of_path(target.static, ctx.root, ctx.extra)
         if scope is Scope.SECRET_OUTSIDE:
             ctx.flag(Level.DANGER, f"{what}: секреты вне проекта")
         elif scope is Scope.SECRET:
             ctx.flag(None, f"{what}: файл с секретами")
-        elif scope is not Scope.INSIDE and scope is not Scope.SINK:
+        elif scope not in {Scope.INSIDE, Scope.EXTRA, Scope.SINK}:
             ctx.flag(None, f"{what}: путь вне проекта")
         return
     if target.under is not None:
@@ -1357,13 +1367,16 @@ def _check_write(target: _Path, ctx: _Ctx, what: str, *, recursive: bool = False
     if target.static is None:
         ctx.flag(None, f"{what}: путь известен только при выполнении")
         return
-    if not _inside(target.static, ctx):
+    owner = _owner(target.static, ctx)
+    if owner is None:
         ctx.flag(Level.DANGER, f"{what}: запись вне проекта")
         return
     resolved = target.static.resolve()
-    if is_vcs_internal(resolved, ctx.root):
+    temp_root = ctx.root if ctx.scratch_root is None else ctx.scratch_root
+    own_temp = owner == temp_root and is_temp_path(resolved, temp_root)
+    if is_vcs_internal(resolved, owner):
         ctx.flag(Level.DANGER, f"{what}: служебные файлы git или jj")
-    elif is_data_path(resolved, ctx.root) and not is_temp_path(resolved, ctx.root):
+    elif is_data_path(resolved, owner) and not own_temp:
         ctx.flag(Level.DANGER, f"{what}: служебная папка gigacrew")  # как запись из shell
     else:
         ctx.flag(Level.WRITE, what)
@@ -2155,6 +2168,8 @@ def analyze(
     cwd: str = ".",
     script: Path | None = None,
     path_dirs: tuple[Path, ...] = (),
+    extra: tuple[Path, ...] = (),
+    scratch_root: Path | None = None,
 ) -> PyResult:
     """Оценить Python-код.
 
@@ -2170,7 +2185,7 @@ def analyze(
         tree = ast.parse(code)
     except (SyntaxError, ValueError):
         return PyResult(None, "код не разобран (синтаксис)")
-    ctx = _Ctx(root=root, cwd=run_dir, script=script)
+    ctx = _Ctx(root=root, cwd=run_dir, script=script, extra=extra, scratch_root=scratch_root)
     _collect_bindings(tree, ctx)
     _check_imports(tree, ctx)
     _collect_aliases(ctx)

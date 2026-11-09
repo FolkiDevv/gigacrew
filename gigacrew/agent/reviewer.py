@@ -95,7 +95,8 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
     """Текст запроса рецензенту: запросы пользователя, команда, факты разбора.
 
     Код черновых скриптов из ``.gigacode/tmp/``, которые команда запускает, — тоже: их
-    пишет модель, как и heredoc.
+    пишет модель, как и heredoc. Подключённые пользователем каталоги
+    (``verdict.extra_dirs``) для рецензента — часть проекта.
     """
     lines = ["# The user's requests (oldest first)"]
     if requests:
@@ -112,6 +113,7 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
         "",
         "# Command",
         f"Working directory (relative to the project root): {verdict.cwd}",
+        *_extra_lines(verdict.extra_dirs),
         fence,
         command,
         fence,
@@ -160,6 +162,18 @@ def _scratch_scripts(verdict: Verdict) -> list[str]:
         name = json.dumps(script.relative_to(root).as_posix(), ensure_ascii=False)
         lines += [f"Script {name} (scratch file written by the assistant):", fence, shown, fence]
     return lines
+
+
+def _extra_lines(extra_dirs: Sequence[str]) -> list[str]:
+    """Подключённые каталоги: рецензент считает их частью проекта, а не «снаружи»."""
+    if not extra_dirs:
+        return []
+    listed = ", ".join(json.dumps(folder, ensure_ascii=False) for folder in extra_dirs)
+    note = (
+        f"Additional directories the user attached to the project: {listed}. Treat them "
+        "as part of the project, not as outside it."
+    )
+    return [note]
 
 
 def _project_of(path: Path) -> Path | None:

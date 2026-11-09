@@ -14,6 +14,7 @@ POSIX), а грамматика — bash. Поэтому разбор **конс
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -403,8 +404,9 @@ def _has_brace(node: _Node) -> bool:
 class _Walker:
     """Обход дерева команды: простые команды, присваивания и проблемы — в :class:`Script`."""
 
-    def __init__(self, root: Path, cwd: str) -> None:
+    def __init__(self, root: Path, cwd: str, extra: tuple[Path, ...] = ()) -> None:
         self.root = root
+        self.extra = extra  # подключённые каталоги: ведущий cd туда тоже отслеживается
         self.script = Script(cwd=cwd)
         self._cwd = cwd  # каталог оператора, который сейчас разбирается
         self._assigned: set[str] = set()  # см. Command.assigned
@@ -835,7 +837,10 @@ class _Walker:
         flat[-1] = _Entry(node, sep, head=head)
 
     def _cd_target(self, node: _Node, cwd: str) -> str | None:
-        """Каталог ``cd DIR`` внутри проекта (существующий); None — не ведущий cd."""
+        """Каталог ``cd DIR`` внутри проекта (существующий); None — не ведущий cd.
+
+        Каталог в подключённом каталоге — тоже: путь от корня проекта (``../other/src``).
+        """
         parts = [child for child in node.children if child.type != "command_name"]
         if len(parts) != 1 or parts[0].type not in _WORD_NODES:
             return None
@@ -843,12 +848,14 @@ class _Walker:
         if not word.static or word.glob or not word.text or word.text.startswith(("~", "-")):
             return None
         target = (self.root / cwd / word.text).resolve()
+        if not target.is_dir():
+            return None
         try:
             rel = target.relative_to(self.root)
         except ValueError:
-            return None
-        if not target.is_dir():
-            return None
+            if not any(target == folder or folder in target.parents for folder in self.extra):
+                return None
+            return os.path.relpath(target, self.root).replace(os.sep, "/")
         return rel.as_posix() or "."
 
     def _subshell(
@@ -1136,15 +1143,22 @@ def _is_cd(node: _Node) -> bool:
     return name is not None and _text(name) == "cd"
 
 
-def parse(command: str, *, root: Path, cwd: str = ".") -> Script | None:
+def parse(
+    command: str,
+    *,
+    root: Path,
+    cwd: str = ".",
+    extra: tuple[Path, ...] = (),
+) -> Script | None:
     """Разобрать команду; None — грамматика bash не загрузилась.
 
-    ``cwd`` — каталог запуска относительно ``root`` (параметр инструмента).
+    ``cwd`` — каталог запуска относительно ``root`` (параметр инструмента), ``extra`` —
+    подключённые каталоги (раскрытые).
     """
     tree = treesitter.parse_tree("shell", command)
     if tree is None:
         return None
-    walker = _Walker(Path(root).resolve(), cwd)
+    walker = _Walker(Path(root).resolve(), cwd, extra)
     if tree.has_error:
         walker.problem("команда не разобрана")
     final = walker.statements(list(tree.children), cwd=cwd, leading_cd=True, top=True)
