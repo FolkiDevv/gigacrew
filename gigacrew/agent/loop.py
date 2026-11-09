@@ -1842,6 +1842,7 @@ class Agent:
         verdict: Verdict | None = None
         review: Review | None = None
         review_note = ""
+        cause = ""  # почему рецензент оставил решение пользователю
         journal: _Journal | None = None
         hook_asks = pre.decision == "ask"
         # Шаги решения зависят друг от друга, а ошибка любого из них — отказ в вызове.
@@ -1905,7 +1906,7 @@ class Agent:
             ):
                 decision, source = Decision.ALLOW, "session"  # «всегда» до конца сессии
             if decision is Decision.REVIEW:
-                decision, review, review_note = self._review_command(
+                decision, review, review_note, cause = self._review_command(
                     call,
                     params,
                     verdict,
@@ -1985,17 +1986,17 @@ class Agent:
                     # «Всегда» не запомнить — значит, «да» один раз: хук спрашивает каждый
                     # раз, опасное не запоминается (интерфейс «всегда» для него не предлагает).
                     answer = replace(answer, approval=Approval.YES)
-                if verdict is not None:
-                    journal = self._journal_start(
-                        call,
-                        params,
-                        verdict,
-                        risk,
-                        _decision_name(answer),
-                        answer.feedback,
-                        source="user",
-                        review=review,
-                    )
+                journal = self._journal_start(
+                    call,
+                    params,
+                    verdict,
+                    risk,
+                    _decision_name(answer),
+                    answer.feedback,
+                    source="user",
+                    review=review,
+                    because=self._asked(cause, risk, verdict, hook_asks=hook_asks),
+                )
                 if answer.approval is Approval.ALWAYS:
                     self._allow_always(asked, key, verdict)
                 elif answer.approval is not Approval.YES:
@@ -2280,11 +2281,12 @@ class Agent:
         verdict: Verdict | None,
         check: CallCheck,
         key: str,
-    ) -> tuple[Decision, Review | None, str]:
+    ) -> tuple[Decision, Review | None, str, str]:
         """Режим «авто»: спросить модель-рецензента о команде.
 
         ALLOW — выполнить без вопроса; DENY — не выполнять, причина — модели; ASK —
-        решает пользователь, третье значение — пояснение для вопроса. Рецензент не
+        решает пользователь, третье значение — пояснение для вопроса, четвёртое — код
+        причины для журнала (``asked_because``). Рецензент не
         спрашивается, если пользователь уже отклонял такую команду, команда слишком длинная
         или рецензент отключён. Тот же вызов (``key``), уже получивший отказ в этом ходе, и
         серия отказов (:meth:`Reviewer.denied`) — вопрос пользователю. Сбой рецензента
@@ -2294,35 +2296,35 @@ class Agent:
         """
         reviewer = self._reviewer
         if verdict is None or check.rejected_before:
-            return Decision.ASK, None, ""  # повтор отклонённого — ответит ветка вопроса
+            return Decision.ASK, None, "", ""  # повтор отклонённого — ответит ветка вопроса
         # У инструмента git нет текста команды: её текст — в вердикте.
         command = getattr(params, "command", None)
         if not isinstance(command, str):
             command = verdict.command
-        skipped = self._review_skipped(verdict, command, key)
+        cause, skipped = self._review_skipped(verdict, command, key)
         if skipped:
-            return Decision.ASK, None, skipped
+            return Decision.ASK, None, skipped, cause
         model = reviewer.model_for(self._model_name)
         request_text = review_request(command, verdict, self._user_requests())
         review = reviewer.cached(model, request_text)
         if review is not None:
             reviewer.allowed()
-            return Decision.ALLOW, review, ""
+            return Decision.ALLOW, review, "", ""
         review = self._ask_reviewer(call, model, request_text)
         if review.failed:
             if reviewer.failed(review.reason):
                 self._events.on_notice(reviewer.warning, level=_WARN)
-            return Decision.ASK, review, f"рецензент не ответил: {review.reason}"
+            return Decision.ASK, review, f"рецензент не ответил: {review.reason}", "reviewer_failed"
         reviewer.succeeded()
         if review.allowed:
             reviewer.allowed()
             reviewer.remember(request_text, review)
-            return Decision.ALLOW, review, ""
+            return Decision.ALLOW, review, "", ""
         if reviewer.denied(key, review.reason):
             # Отказы подряд или их много за ход — агенту другой путь не найти: решает человек.
             reason = review.reason or "решать вам"
-            return Decision.ASK, review, f"рецензент ({model}): {reason}"
-        return Decision.DENY, review, ""
+            return Decision.ASK, review, f"рецензент ({model}): {reason}", "reviewer_limit"
+        return Decision.DENY, review, "", ""
 
     def _ask_reviewer(
         self,
@@ -2351,22 +2353,61 @@ class Agent:
             self._events.on_review_end(call, review)
         return review
 
-    def _review_skipped(self, verdict: Verdict, command: str, key: str) -> str:
-        """Почему команду решает пользователь без рецензента ("" — спросить рецензента)."""
+    def _review_skipped(self, verdict: Verdict, command: str, key: str) -> tuple[str, str]:
+        """Почему команду решает пользователь без рецензента: код для журнала и текст.
+
+        Пустые строки — спросить рецензента.
+        """
         reviewer = self._reviewer
-        if not reviewer.enabled:
-            return f"рецензент отключён: {reviewer.disabled}"
+        disabled = reviewer.disabled
+        if disabled:
+            return "reviewer_disabled", f"рецензент отключён: {disabled}"
         earlier = reviewer.denied_reason(key)
         if earlier is not None:
             # Модель повторила вызов без изменений после отказа: он ей и правда нужен.
-            return f"рецензент уже не разрешил эту команду: {earlier}"
+            return "reviewer_repeat", f"рецензент уже не разрешил эту команду: {earlier}"
         history = history_key(verdict)
         allowed, rejected = self._decisions.history(history)
         if self._decisions.rejected_in_session(history) or rejected > allowed:
-            return "рецензент не спрашивался: такую команду уже отклоняли"
+            return "rejected_before", "рецензент не спрашивался: такую команду уже отклоняли"
         if len(command) > MAX_REVIEW_COMMAND:
-            return f"рецензент не спрашивался: команда длиннее {MAX_REVIEW_COMMAND} символов"
-        return ""
+            text = f"рецензент не спрашивался: команда длиннее {MAX_REVIEW_COMMAND} символов"
+            return "too_long", text
+        return "", ""
+
+    def _count_question(self) -> None:
+        if self._parent is not None:
+            parent: Agent = self._parent
+            parent._count_question()
+        elif self._turn_stats is not None:
+            self._turn_stats.confirmations += 1
+
+    def _asked(
+        self,
+        cause: str,
+        risk: RiskLevel,
+        verdict: Verdict | None,
+        *,
+        hook_asks: bool,
+    ) -> str:
+        """Учесть вопрос пользователю в статистике хода; почему спросили — для журнала.
+
+        ``cause`` — причина от рецензента (:meth:`_review_command`), "" — рецензент ни при
+        чём. Вопросы суб-агентов считаются в ходе основного агента: отвечает на них
+        пользователь.
+        """
+        self._count_question()
+        if hook_asks:
+            return "hook"
+        if risk >= RiskLevel.DANGEROUS:
+            return "dangerous"
+        if verdict is None:
+            return "not_command"
+        if cause:
+            return cause
+        if self.mode is PermissionMode.PLAN:
+            return "plan"
+        return "unverified" if verdict.level is None else "other"
 
     def _user_requests(self) -> list[str]:
         """Последние запросы пользователя — из диалога основного агента.
@@ -2429,14 +2470,33 @@ class Agent:
         *,
         source: str = "",
         review: Review | None = None,
+        because: str = "",
     ) -> _Journal | None:
         """Записать решение о команде в журнал (что, где, почему, кто решил).
 
-        Не команда (``verdict`` None) — в журнал не пишется.
+        Не команда (``verdict`` None) в журнал пишется, только если о ней спросили
+        пользователя (``because`` — почему): короткой записью без ключа истории, для
+        сводки вопросов.
         """
-        if verdict is None:
-            return None
         extra: dict[str, object] = {}
+        if verdict is None:
+            if not because:
+                return None
+            # У записи не о команде поля «command» нет: журнал команд её не показывает.
+            extra["call"] = call.summary
+        else:
+            extra.update(
+                command=getattr(params, "command", call.summary),
+                cwd=verdict.cwd,
+                key=history_key(verdict)[1],
+                verdict={
+                    "level": None if verdict.level is None else verdict.level.name,
+                    "reason": verdict.reason,
+                    "signatures": list(verdict.signatures),
+                },
+            )
+        if because:
+            extra["asked_because"] = because
         if review is not None:
             extra["review"] = {
                 "model": review.model,
@@ -2448,15 +2508,7 @@ class Agent:
         try:
             entry_id = self._decisions.record({
                 "tool": call.name,
-                "command": getattr(params, "command", call.summary),
                 "description": getattr(params, "description", ""),
-                "cwd": verdict.cwd,
-                "key": history_key(verdict)[1],
-                "verdict": {
-                    "level": None if verdict.level is None else verdict.level.name,
-                    "reason": verdict.reason,
-                    "signatures": list(verdict.signatures),
-                },
                 "risk": risk.name,
                 "mode": self.mode.value,
                 "agent": "main" if self._subagent is None else self._subagent.name,

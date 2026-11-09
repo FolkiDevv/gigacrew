@@ -2496,6 +2496,28 @@ def test_always_for_dangerous_call_is_a_one_time_yes(tmp_path: Path) -> None:
     assert not any("подтверждения" in text for _, text in events.notices)
 
 
+def test_questions_are_counted_and_journaled_with_their_cause(tmp_path: Path) -> None:
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    provider = ScriptedProvider([
+        tool_turn("fake_write", {}),
+        tool_turn("run_shell", {"command": "rm -rf /"}),
+        text_turn("ок"),
+    ])
+    events = RecordingEvents(confirm_answer=True)
+    registry = build_default_registry()
+    registry.register(_DangerTool())
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    Agent(provider, registry, cfg, events, decisions=memory).run_turn("x")
+    assert events.stats[-1].confirmations == 2
+    asked = [json.loads(line) for line in _journal(memory) if '"asked_because"' in line]
+    assert [(entry["tool"], entry["asked_because"]) for entry in asked] == [
+        ("fake_write", "dangerous"),
+        ("run_shell", "dangerous"),
+    ]
+    assert "command" not in asked[0]  # не команда: в журнале команд её нет
+    assert [entry["tool"] for entry in memory.recent()] == ["run_shell"]
+
+
 def test_always_for_dangerous_command_is_never_remembered(tmp_path: Path) -> None:
     memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
     rm = tool_turn("run_shell", {"command": "rm -rf build"})

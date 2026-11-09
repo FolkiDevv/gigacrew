@@ -1318,6 +1318,8 @@ class Console(events.AgentEvents):  # noqa: WPS338
         parts = [_counted(stats.steps, "шаг", "шага", "шагов")]
         if stats.tool_calls:
             parts.append(_counted(stats.tool_calls, "инструмент", "инструмента", "инструментов"))
+        if stats.confirmations:
+            parts.append(_counted(stats.confirmations, "вопрос", "вопроса", "вопросов"))
         if stats.duration_s:
             parts.append(f"{stats.duration_s:.1f} с")
         if stats.context_tokens:

@@ -97,10 +97,12 @@ def test_turn_stats_line() -> None:
             completion_tokens=20,
             context_tokens=12_345,
             duration_s=3.21,
+            confirmations=3,
         ),
     )
     out = buf.getvalue()
     assert "2 шага" in out
+    assert "3 вопроса" in out
     assert "1 инструмент " in out
     assert "3.2 с" in out
     assert "контекст ~12.3k" in out

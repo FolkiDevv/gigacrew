@@ -227,7 +227,7 @@ class DecisionMemory:
         except (OSError, ValueError) as exc:
             warning = f"не удалось прочитать {approvals}: {exc}"
         if log:
-            for line in _read_journal(memory.journal_path):
+            for line in read_journal(memory.journal_path):
                 if line.get("event") != _DECISION_EVENT or line.get("source") != "user":
                     continue
                 key = (str(line.get("cwd", ".")), str(line.get("key", "")))
@@ -327,7 +327,7 @@ class DecisionMemory:
             "rules_version": RULES_VERSION,
             **entry,
         }
-        for name in ("command", "feedback", "description", "key"):
+        for name in ("command", "call", "feedback", "description", "key"):
             if isinstance(line.get(name), str):
                 line[name] = redact(line[name])
         for name in ("verdict", "review"):  # причины могут цитировать команду
@@ -359,11 +359,17 @@ class DecisionMemory:
         return key in self._rejected
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
-        """Последние решения пользователя и модели-рецензента из журнала (новые в конце)."""
+        """Последние решения пользователя и модели-рецензента из журнала (новые в конце).
+
+        Только о командах: вопросы о правках и других инструментах — в
+        :func:`gigacrew.agent.ask_stats.summarize`.
+        """
         decisions = [
             entry
-            for entry in _read_journal(self.journal_path)
-            if entry.get("event") == _DECISION_EVENT and entry.get("source") in {"user", "reviewer"}
+            for entry in read_journal(self.journal_path)
+            if entry.get("event") == _DECISION_EVENT
+            and entry.get("source") in {"user", "reviewer"}
+            and "command" in entry
         ]
         return decisions[-limit:]
 
@@ -552,7 +558,8 @@ def _append_journal(path: Path, line: dict[str, Any]) -> None:
             journal.write(f"{json.dumps(line, ensure_ascii=False)}\n")
 
 
-def _read_journal(path: Path | None) -> Iterator[dict[str, Any]]:
+def read_journal(path: Path | None) -> Iterator[dict[str, Any]]:
+    """Записи журнала решений ``path`` по порядку (None или нет файла — пусто)."""
     if path is None:
         return
     try:

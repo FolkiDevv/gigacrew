@@ -222,6 +222,30 @@ def test_permissions_command_lists_forgets_and_shows_log(
     assert "использование" in _out(capsys)
 
 
+def test_permissions_stats_shows_why_the_user_was_asked(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    ctx = _permissions_ctx(tmp_path, memory)
+    ctx.commands.dispatch("/permissions stats", ctx)
+    assert "журнал решений пуст" in _out(capsys)
+    asked = {"cwd": ".", "source": "user", "key": "make deploy"}
+    memory.record({**asked, "decision": "yes", "asked_because": "reviewer_failed"})
+    memory.record({**asked, "decision": "no", "asked_because": "dangerous"})
+    memory.record({"cwd": ".", "key": "ls", "decision": "auto", "source": "read"})
+    memory.record({"cwd": ".", "key": "x", "decision": "auto", "source": "reviewer"})
+    memory.record({"cwd": ".", "key": "rm", "decision": "denied", "source": "reviewer"})
+    ctx.commands.dispatch("/permissions stats", ctx)
+    out = _out(capsys)
+    assert "вопросов вам: 2 из 5 решений (40 %)" in out
+    assert "ответы: да 1 · нет 1" in out
+    assert "почему спросили: опасная операция 1 · сбой рецензента 1" in out
+    assert "• make deploy — 2" in out
+    assert "без вопроса: разрешил рецензент 1 · только чтение 1" in out
+    assert "рецензент не разрешил (агент искал другой путь): 1" in out
+
+
 def test_permissions_masks_secrets_in_rules_and_log(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
