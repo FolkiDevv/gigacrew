@@ -8,7 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from gigacrew.agent.decisions import DecisionMemory, Rule, history_key, project_key, redact
+from gigacrew.agent.ask_stats import summarize
+from gigacrew.agent.decisions import (
+    DecisionMemory,
+    Rule,
+    history_key,
+    project_key,
+    read_journal,
+    redact,
+)
 from gigacrew.safety import CommandLevel, Verdict, classify
 
 # Тело поддельного токена GitHub собирается при запуске, чтобы в исходнике не было
@@ -295,6 +303,37 @@ def test_journal_records_choice_context_and_outcome(root: Path, home: Path) -> N
     assert mem.history((".", "pytest")) == (1, 1)
     assert memory(root, home).history((".", "pytest")) == (1, 1)  # из журнала
     assert [logged["decision"] for logged in mem.recent()] == ["no", "yes"]
+
+
+def test_summary_counts_questions_causes_and_automatic_decisions(root: Path, home: Path) -> None:
+    mem = memory(root, home)
+    asked = {"cwd": ".", "source": "user", "command": "x"}
+    mem.record({**asked, "key": "pytest", "decision": "yes", "asked_because": "reviewer_failed"})
+    mem.record({**asked, "key": "pytest", "decision": "no", "asked_because": "dangerous"})
+    mem.record({**asked, "key": "make", "decision": "always"})  # запись прежней версии
+    # вопрос не о команде: в сводке есть, в истории команд и в журнале команд — нет
+    question = {"source": "user", "call": ".env", "decision": "yes"}
+    mem.record({**question, "asked_because": "not_command"})
+    command = {"cwd": ".", "command": "x", "decision": "auto"}
+    mem.record({**command, "key": "ls", "source": "read"})
+    mem.record({**command, "key": "make", "source": "rule:ab12"})
+    mem.record({**command, "key": "make", "source": "rule:cd34"})
+    mem.record({**command, "key": "rm", "decision": "denied", "source": "reviewer"})
+    mem.record({**command, "key": "rm", "decision": "blocked", "source": "auto"})
+    summary = summarize(read_journal(mem.journal_path))
+    assert summary.asked == 4
+    assert summary.decided == 8
+    assert summary.answers == {"yes": 2, "no": 1, "always": 1}
+    assert summary.causes == {
+        "reviewer_failed": 1,
+        "dangerous": 1,
+        "unknown": 1,
+        "not_command": 1,
+    }
+    assert summary.programs.most_common(1) == [("pytest", 2)]
+    assert summary.automatic == {"read": 1, "rule": 2}
+    assert summary.denied == 1
+    assert len(mem.recent()) == 4  # три вопроса о командах и отказ рецензента
 
 
 def test_journal_off(root: Path, home: Path) -> None:

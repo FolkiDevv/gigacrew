@@ -84,6 +84,7 @@ from gigacrew.agent.reviewer import (
     Reviewer,
     recent_requests,
     review_command,
+    review_request,
 )
 
 # Запуск суб-агента и его отчёты для основного агента — всё из одного модуля.
@@ -118,7 +119,7 @@ from gigacrew.project.instructions import NestedInstructions
 from gigacrew.project.settings import HookEvent
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety import CommandLevel, Verdict
-from gigacrew.security import RiskLevel
+from gigacrew.security import RiskLevel, SandboxError
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 from gigacrew.tools.fs import write_atomic
 from gigacrew.tools.plan import PlanReview, review_plan
@@ -132,9 +133,28 @@ REJECTED_NOTE = (
     "clarify the plan."
 )
 FEEDBACK_NOTE = "\nThe user said instead: {feedback}"
+NO_ANSWER_NOTE = (
+    "Not executed: the confirmation got NO ANSWER (the run is non-interactive or the prompt "
+    "was dismissed), so nobody can approve this operation now. Do not repeat it. Reach the "
+    "goal another way that needs no confirmation, or finish and tell the user what is left "
+    "for them to run."
+)
 REJECTED_AGAIN_NOTE = (
     "The user already REJECTED this operation in this turn, so it was not offered again. "
     "Do not repeat it; suggest an alternative or clarify the plan."
+)
+REVIEWER_DENIED_NOTE = (
+    "Not executed: the reviewer did not allow this command to run without the user: "
+    "{reason}. Do not repeat it in another form that has the same effect. Reach the goal "
+    "another way that avoids this reason; if this exact command is really needed, call it "
+    "again unchanged — then the user decides."
+)
+# Что покроет ответ «t» на вопрос о вызове (для пользователя).
+TURN_SCOPE_NOTE = "не спрашивать про этот файл до конца хода"
+STEPS_EXTENDED_NOTE = (
+    "The step limit of this turn was reached and extended once by {extra} steps because "
+    "the work is progressing. It will not be extended again: finish the task now, do not "
+    "start new directions, and say in the final answer what is left undone."
 )
 LOOP_STOP_NOTE = (
     "Not executed: the same call repeated without any changes. The turn was stopped as a loop."
@@ -232,6 +252,8 @@ _WARN: Final = "warn"
 _LOCK_FILE_MODE = 0o600
 # Сколько символов текста ошибки попадает в пояснение рецензента и в журнал решений.
 _MAX_ERROR_CHARS = 200
+# Столько разрешений пользователя без единого отказа — и команда запоминается («всегда»).
+AUTO_REMEMBER_AFTER = 3
 # Длительность в журнале решений для вызова, который не выполнялся (заблокирован).
 _NO_DURATION = float(0)
 
@@ -290,7 +312,8 @@ def _confirm_result(*, answer: bool | Approval | ConfirmResult) -> ConfirmResult
 def _decision_name(answer: ConfirmResult) -> str:
     if not answer.answered:
         return "no_answer"
-    return {Approval.YES: "yes", Approval.ALWAYS: "always", Approval.NO: "no"}[answer.approval]
+    names = {Approval.YES: "yes", Approval.TURN: "yes", Approval.ALWAYS: "always"}
+    return names.get(answer.approval, "no")
 
 
 def _auto_source(
@@ -440,6 +463,7 @@ class Agent:
             # Вызовы, которые пользователь разрешил «всегда» (до конца сессии; reset() не
             # сбрасывает — как и режим).
             self._session_allowed: set[str] = set()
+            self._turn_allowed: set[str] = set()  # «да до конца хода»: ключи целей
             self._decisions = DecisionMemory() if decisions is None else decisions
             self._reviewer = Reviewer(config.reviewer_model) if reviewer is None else reviewer
         else:
@@ -610,6 +634,7 @@ class Agent:
             self._release_plan()
             self._plan.path = self._plan_path(new_id)
             self._plan.dirty = False
+            self._plan.approved = ""  # одобрение относилось к плану прежнего чата
             self._plan_seen = self._read_plan_file()
 
     def continue_as(self, chat_id: str) -> None:
@@ -634,6 +659,11 @@ class Agent:
     def plan_path(self) -> Path | None:
         """Файл плана чата (None — у суб-агента)."""
         return None if self._plan is None else self._plan.path
+
+    @property
+    def approved_plan(self) -> str:
+        """Текст плана, который пользователь одобрил в этом чате ("" — не одобрял)."""
+        return "" if self._plan is None else self._plan.approved
 
     def set_mode(self, mode: PermissionMode) -> None:
         """Сменить режим разрешений (действует со следующего вызова инструмента).
@@ -778,6 +808,7 @@ class Agent:
         self._nested = parent._nested
         self._token_scale = parent._token_scale
         self._session_allowed = parent._session_allowed
+        self._turn_allowed = parent._turn_allowed
         self._decisions = parent._decisions
         self._reviewer = parent._reviewer
 
@@ -1017,6 +1048,8 @@ class Agent:
     def _run_turn(self, user_input: str) -> str:
         if self._parent is None:  # задачу суб-агента пишет модель, а не пользователь
             user_input = self._prompt_hooks(user_input)
+            self._reviewer.new_turn()  # отказы рецензента считаются за ход пользователя
+            self._turn_allowed.clear()  # «да до конца хода» — на один ход пользователя
         # Рассуждения прошлых ходов модели больше не нужны (GIGACREW_REASONING=turn).
         self._conversation.forget_reasoning()
         self._conversation.add_user(user_input)
@@ -1114,7 +1147,7 @@ class Agent:
         Возвращает финальный текст хода; None — ход продолжается следующим шагом.
         """
         context = self._subagent_context(specs, stats)
-        stop = guard.before_step(context)
+        stop = self._before_step(guard, context, state)
         if stop is not None:
             return self._stopped(specs, stop, stats)
         stats.steps = guard.steps
@@ -1152,6 +1185,37 @@ class Agent:
         if stop is not None:
             return self._stopped(specs, stop, stats)
         return None
+
+    def _before_step(
+        self,
+        guard: LoopGuard,
+        context: int,
+        state: _TurnLoop,
+    ) -> StopReason | None:
+        """Учесть шаг; None — можно обращаться к модели, иначе причина остановки хода."""
+        stop = guard.before_step(context)
+        if stop is not None and self._extend_steps(guard, stop, state):
+            return guard.before_step(context)
+        return stop
+
+    def _extend_steps(self, guard: LoopGuard, stop: StopReason, state: _TurnLoop) -> bool:
+        """Лимит шагов достигнут: продлить его один раз вместо остановки хода.
+
+        Только у основного агента в режиме «авто» и только пока ход идёт по делу
+        (:meth:`LoopGuard.extend_steps`): иначе пользователю пришлось бы повторять запрос
+        ради хода, которому не хватило нескольких шагов. Модель узнаёт, что продления
+        больше не будет.
+        """
+        extra = self._cfg.max_steps_extension
+        if stop.kind != "max_steps" or self._is_subagent or self.mode is not PermissionMode.AUTO:
+            return False
+        if not guard.extend_steps(extra):
+            return False
+        self._events.on_notice(
+            f"Лимит шагов ({guard.steps}) достигнут, но работа идёт: продлён один раз на {extra}.",
+        )
+        state.note = _join_notes(state.note, STEPS_EXTENDED_NOTE.format(extra=extra))
+        return True
 
     def _failures_note(self, guard: LoopGuard) -> str:
         """Предупреждение о серии неудач: пользователю — сразу, модели — заметка ("" — нет)."""
@@ -1826,6 +1890,7 @@ class Agent:
         verdict: Verdict | None = None
         review: Review | None = None
         review_note = ""
+        cause = ""  # почему рецензент оставил решение пользователю
         journal: _Journal | None = None
         hook_asks = pre.decision == "ask"
         # Шаги решения зависят друг от друга, а ошибка любого из них — отказ в вызове.
@@ -1888,10 +1953,22 @@ class Agent:
                 and not (self.mode is PermissionMode.PLAN and unverified)
             ):
                 decision, source = Decision.ALLOW, "session"  # «всегда» до конца сессии
+            # «Да до конца хода»: другой вызов того же инструмента с тем же файлом.
+            turn_key = self._turn_key(name, params, risk, verdict, hook_asks=hook_asks)
+            if decision in asking and turn_key in self._turn_allowed:
+                decision, source = Decision.ALLOW, "turn"
             if decision is Decision.REVIEW:
-                decision, review, review_note = self._review_command(call, params, verdict, check)
+                decision, review, review_note, cause = self._review_command(
+                    call,
+                    params,
+                    verdict,
+                    check,
+                    key,
+                )
                 if decision is Decision.ALLOW:
                     source = "reviewer"
+            if decision is Decision.DENY:
+                return self._deny(call, params, verdict, risk, review, note)
             if decision is Decision.BLOCK:
                 journal = self._journal_start(call, params, verdict, risk, "blocked", "")
                 self._journal_end(journal, blocked=True)
@@ -1936,14 +2013,20 @@ class Agent:
                 if hook_asks:
                     hook_reason = "хук PreToolUse требует подтверждения"
                     reason = f"{reason}; {hook_reason}" if reason else hook_reason
+                remember = "" if dangerous else self._remember_label(kind, verdict)
+                # Этот ответ «да» может запомнить команду (_remember_repeated).
+                auto_remember = (
+                    bool(remember) and not hook_asks and self.mode is PermissionMode.AUTO
+                )
                 asked = replace(
                     call,
                     kind=kind,
                     reason=reason,
-                    remember="" if dangerous else self._remember_label(kind, verdict),
-                    history=self._history_hint(verdict),
+                    remember=remember,
+                    history=self._history_hint(verdict, auto_remember=auto_remember),
                     purpose=assessment.purpose,
                     review=review_note,
+                    turn_scope=TURN_SCOPE_NOTE if turn_key else "",
                 )
                 self._notify(
                     "permission_prompt",
@@ -1956,25 +2039,25 @@ class Agent:
                     # «Всегда» не запомнить — значит, «да» один раз: хук спрашивает каждый
                     # раз, опасное не запоминается (интерфейс «всегда» для него не предлагает).
                     answer = replace(answer, approval=Approval.YES)
-                if verdict is not None:
-                    journal = self._journal_start(
-                        call,
-                        params,
-                        verdict,
-                        risk,
-                        _decision_name(answer),
-                        answer.feedback,
-                        source="user",
-                        review=review,
-                    )
+                answer = self._allow_for_turn(asked, answer, turn_key)
+                journal = self._journal_start(
+                    call,
+                    params,
+                    verdict,
+                    risk,
+                    _decision_name(answer),
+                    answer.feedback,
+                    source="user",
+                    review=review,
+                    because=self._asked(cause, risk, verdict, hook_asks=hook_asks),
+                )
                 if answer.approval is Approval.ALWAYS:
                     self._allow_always(asked, key, verdict)
                 elif answer.approval is not Approval.YES:
-                    model_text = REJECTED_NOTE
-                    if answer.feedback:
-                        model_text += FEEDBACK_NOTE.format(feedback=answer.feedback)
-                    self._fail(call, "отклонено пользователем", model_text=model_text, note=note)
-                    return ToolOutcome(ok=False, rejected=True)
+                    return self._refuse(call, answer, note)
+                elif auto_remember:
+                    # Разрешал не раз и ни разу не отклонял — «всегда» без вопроса (как «a»).
+                    self._remember_repeated(verdict)
                 previewed = preview is not None
             else:
                 journal = self._journal_start(
@@ -2155,18 +2238,145 @@ class Agent:
                 added = []
                 self._events.on_notice(f"не удалось сохранить разрешение: {exc}", level=_WARN)
             if added:
-                where = (
-                    "сохранено для проекта"
-                    if self._decisions.directory is not None and self._decisions.remember
-                    else "до конца сессии"
-                )
                 rules = "; ".join(rule.describe() for rule in added)
-                self._events.on_notice(f"разрешено без вопросов ({where}): {rules}")
+                self._events.on_notice(f"разрешено без вопросов ({self._saved_where()}): {rules}")
                 return
         self._session_allowed.add(key)
         self._events.on_notice(
             f"{call.name} с этими аргументами больше не требует подтверждения до конца сессии",
         )
+
+    def _turn_key(
+        self,
+        name: str,
+        params: BaseModel,
+        risk: RiskLevel,
+        verdict: Verdict | None,
+        *,
+        hook_asks: bool,
+    ) -> str:
+        """Ключ ответа «не спрашивать про этот файл до конца хода» ("" — так ответить нельзя).
+
+        Ключ — инструмент и раскрытый путь файла, тот же, по которому пойдёт запись
+        (``ctx.resolve``): два написания пути, которые через ссылку ведут в разные файлы,
+        не делят разрешение. Путь не раскрыть — так ответить нельзя.
+
+        Только для вызовов с файлом-целью, которые не команды: серия правок одного файла,
+        о котором спрашивают каждый раз (файл с секретами). Опасное (настройки gigacrew в
+        ``.env``) и то, о чём велел спрашивать хук, подтверждается каждый раз; у команд —
+        свои сохранённые разрешения.
+        """
+        path = getattr(params, "path", None)
+        if hook_asks or verdict is not None or risk >= RiskLevel.DANGEROUS:
+            return ""
+        if not isinstance(path, str) or not path.strip():
+            return ""
+        try:
+            target = self._ctx.resolve(path)
+        except (SandboxError, OSError):
+            return ""
+        return f"{name}:{target}"
+
+    def _allow_for_turn(
+        self,
+        call: ToolCallInfo,
+        answer: ConfirmResult,
+        turn_key: str,
+    ) -> ConfirmResult:
+        """Ответ «до конца хода» запоминается на ход и дальше считается обычным «да».
+
+        Ответ пришёл, хотя не предлагался (``turn_key`` пуст), — «да» один раз.
+        """
+        if answer.approval is not Approval.TURN:
+            return answer
+        if turn_key:
+            self._turn_allowed.add(turn_key)
+            self._events.on_notice(
+                f"{call.name} {call.summary}: до конца хода без подтверждения".strip(),
+            )
+        return replace(answer, approval=Approval.YES)
+
+    def _saved_where(self) -> str:
+        """Где сохраняются разрешения «всегда» (для уведомления)."""
+        if self._decisions.directory is not None and self._decisions.remember:
+            return "сохранено для проекта"
+        return "до конца сессии"
+
+    def _remember_repeated(self, verdict: Verdict | None) -> None:
+        """Команду разрешили :data:`AUTO_REMEMBER_AFTER` раз без отказов — запомнить её.
+
+        Считаются только ответы «да» в этой сессии на вопросы режима «авто», которые могут
+        запомнить команду (``DecisionMemory.auto_approvals``): отказ и удаление
+        разрешений обнуляют счёт. Сохраняются те же правила, что и при ответе «всегда».
+        """
+        if verdict is None:
+            return
+        key = history_key(verdict)
+        self._decisions.auto_approvals[key] += 1
+        approvals = self._decisions.auto_approvals[key]
+        if approvals < AUTO_REMEMBER_AFTER or self._decisions.history(key)[1]:
+            return
+        try:
+            added = self._decisions.approve(verdict)
+        except OSError as exc:
+            self._events.on_notice(f"не удалось сохранить разрешение: {exc}", level=_WARN)
+            return
+        if added:
+            rules = "; ".join(rule.describe() for rule in added)
+            self._events.on_notice(
+                f"вы разрешали это {approvals} раз(а) без отказов — дальше без вопросов "
+                f"({self._saved_where()}): {rules}; /permissions — список",
+            )
+
+    def _refuse(self, call: ToolCallInfo, answer: ConfirmResult, note: str | None) -> ToolOutcome:
+        """На вопрос не ответили «да»: вызов не выполняется, модель узнаёт почему.
+
+        Ответа не было (нет терминала, Ctrl+C на вопросе) — это не выбор пользователя:
+        модель не должна считать, что ей отказали по существу.
+        """
+        error, model_text = "отклонено пользователем", REJECTED_NOTE
+        if not answer.answered:
+            error, model_text = "нет ответа на подтверждение", NO_ANSWER_NOTE
+        elif answer.feedback:
+            model_text += FEEDBACK_NOTE.format(feedback=answer.feedback)
+        self._fail(call, error, model_text=model_text, note=note)
+        return ToolOutcome(ok=False, rejected=True)
+
+    def _deny(
+        self,
+        call: ToolCallInfo,
+        params: BaseModel,
+        verdict: Verdict | None,
+        risk: RiskLevel,
+        review: Review | None,
+        note: str | None,
+    ) -> ToolOutcome:
+        """Рецензент не разрешил команду: она не выполняется, модель получает причину.
+
+        Не ошибка модели и не отказ пользователя: серия ошибок ограничителя не растёт, а
+        повтор того же вызова рецензент передаст пользователю.
+        """
+        reason = "без пояснения"
+        if review is not None and review.reason:
+            reason = review.reason
+        journal = self._journal_start(
+            call,
+            params,
+            verdict,
+            risk,
+            "denied",
+            "",
+            source="reviewer",
+            review=review,
+        )
+        self._journal_end(journal, blocked=True)
+        self._fail(
+            call,
+            f"рецензент не разрешил: {reason}",
+            model_text=REVIEWER_DENIED_NOTE.format(reason=reason),
+            note=note,
+        )
+        return ToolOutcome(ok=False, soft=True)
 
     def _review_command(
         self,
@@ -2174,45 +2384,75 @@ class Agent:
         params: BaseModel,
         verdict: Verdict | None,
         check: CallCheck,
-    ) -> tuple[Decision, Review | None, str]:
+        key: str,
+    ) -> tuple[Decision, Review | None, str, str]:
         """Режим «авто»: спросить модель-рецензента о команде.
 
-        ALLOW — выполнить без вопроса; ASK — решает пользователь, третье значение —
-        пояснение для вопроса. Рецензент не спрашивается, если пользователь уже отклонял
-        такую команду, команда слишком длинная или рецензент отключён. Сбой рецензента —
-        вопрос пользователю; сбои подряд отключают рецензента. Ctrl+C/Esc прерывают ход.
+        ALLOW — выполнить без вопроса; DENY — не выполнять, причина — модели; ASK —
+        решает пользователь, третье значение — пояснение для вопроса, четвёртое — код
+        причины для журнала (``asked_because``). Рецензент не
+        спрашивается, если пользователь уже отклонял такую команду, команда слишком длинная
+        или рецензент отключён. Тот же вызов (``key``), уже получивший отказ в этом ходе, и
+        серия отказов (:meth:`Reviewer.denied`) — вопрос пользователю. Сбой рецензента
+        (после одного повтора) — вопрос пользователю; сбои подряд ставят рецензента на
+        паузу. На запрос, который рецензент уже разрешил в этой сессии, модель не
+        спрашивается. Ctrl+C/Esc прерывают ход.
         """
         reviewer = self._reviewer
         if verdict is None or check.rejected_before:
-            return Decision.ASK, None, ""  # повтор отклонённого — ответит ветка вопроса
-        if not reviewer.enabled:
-            return Decision.ASK, None, f"рецензент отключён: {reviewer.disabled}"
-        key = history_key(verdict)
-        allowed, rejected = self._decisions.history(key)
-        if self._decisions.rejected_in_session(key) or rejected > allowed:
-            return Decision.ASK, None, "рецензент не спрашивался: такую команду уже отклоняли"
+            return Decision.ASK, None, "", ""  # повтор отклонённого — ответит ветка вопроса
         # У инструмента git нет текста команды: её текст — в вердикте.
         command = getattr(params, "command", None)
         if not isinstance(command, str):
             command = verdict.command
-        if len(command) > MAX_REVIEW_COMMAND:
-            return (
-                Decision.ASK,
-                None,
-                f"рецензент не спрашивался: команда длиннее {MAX_REVIEW_COMMAND} символов",
-            )
+        cause, skipped = self._review_skipped(verdict, command, key)
+        if skipped:
+            return Decision.ASK, None, skipped, cause
         model = reviewer.model_for(self._model_name)
+        request_text = review_request(
+            command,
+            verdict,
+            self._user_requests(),
+            self._approved_plan(),
+        )
+        review = reviewer.cached(model, request_text)
+        if review is not None:
+            reviewer.allowed()
+            return Decision.ALLOW, review, "", ""
+        review = self._ask_reviewer(call, model, request_text)
+        if review.failed:
+            if reviewer.failed(review.reason):
+                self._events.on_notice(reviewer.warning, level=_WARN)
+            return Decision.ASK, review, f"рецензент не ответил: {review.reason}", "reviewer_failed"
+        reviewer.succeeded()
+        if review.allowed:
+            reviewer.allowed()
+            reviewer.remember(request_text, review)
+            return Decision.ALLOW, review, "", ""
+        if reviewer.denied(key, review.reason):
+            # Отказы подряд или их много за ход — агенту другой путь не найти: решает человек.
+            reason = review.reason or "решать вам"
+            return Decision.ASK, review, f"рецензент ({model}): {reason}", "reviewer_limit"
+        return Decision.DENY, review, "", ""
+
+    def _ask_reviewer(
+        self,
+        call: ToolCallInfo,
+        model: str,
+        request_text: str,
+    ) -> Review:
+        """Ответ рецензента на запрос ``request_text``; сбой — ``Review(failed=True)``."""
         review: Review | None = None
         self._events.on_review_start(call)
         try:
-            review = review_command(
-                self._provider,
-                command=command,
-                verdict=verdict,
-                requests=self._user_requests(),
-                model=model,
-                timeout=self._cfg.reviewer_timeout,
-                on_usage=self._bill_side,
+            review = self._reviewer.ask(
+                lambda: review_command(
+                    self._provider,
+                    request_text,
+                    model=model,
+                    timeout=self._cfg.reviewer_timeout,
+                    on_usage=self._bill_side,
+                ),
             )
         except Exception as exc:  # сбой рецензента — решает пользователь
             failure = str(exc) or type(exc).__name__
@@ -2220,15 +2460,63 @@ class Agent:
             review = Review(model, allowed=False, reason=error, failed=True)
         finally:
             self._events.on_review_end(call, review)
-        if review.failed:
-            if reviewer.failed(review.reason):
-                self._events.on_notice(reviewer.warning, level=_WARN)
-            return Decision.ASK, review, f"рецензент не ответил: {review.reason}"
-        reviewer.succeeded()
-        if review.allowed:
-            return Decision.ALLOW, review, ""
-        reason = review.reason or "решать вам"
-        return Decision.ASK, review, f"рецензент ({model}): {reason}"
+        return review
+
+    def _review_skipped(self, verdict: Verdict, command: str, key: str) -> tuple[str, str]:
+        """Почему команду решает пользователь без рецензента: код для журнала и текст.
+
+        Пустые строки — спросить рецензента.
+        """
+        reviewer = self._reviewer
+        disabled = reviewer.disabled
+        if disabled:
+            return "reviewer_disabled", f"рецензент отключён: {disabled}"
+        earlier = reviewer.denied_reason(key)
+        if earlier is not None:
+            # Модель повторила вызов без изменений после отказа: он ей и правда нужен.
+            return "reviewer_repeat", f"рецензент уже не разрешил эту команду: {earlier}"
+        history = history_key(verdict)
+        allowed, rejected = self._decisions.history(history)
+        if self._decisions.rejected_in_session(history) or rejected > allowed:
+            return "rejected_before", "рецензент не спрашивался: такую команду уже отклоняли"
+        if len(command) > MAX_REVIEW_COMMAND:
+            text = f"рецензент не спрашивался: команда длиннее {MAX_REVIEW_COMMAND} символов"
+            return "too_long", text
+        return "", ""
+
+    def _count_question(self) -> None:
+        if self._parent is not None:
+            parent: Agent = self._parent
+            parent._count_question()
+        elif self._turn_stats is not None:
+            self._turn_stats.confirmations += 1
+
+    def _asked(
+        self,
+        cause: str,
+        risk: RiskLevel,
+        verdict: Verdict | None,
+        *,
+        hook_asks: bool,
+    ) -> str:
+        """Учесть вопрос пользователю в статистике хода; почему спросили — для журнала.
+
+        ``cause`` — причина от рецензента (:meth:`_review_command`), "" — рецензент ни при
+        чём. Вопросы суб-агентов считаются в ходе основного агента: отвечает на них
+        пользователь.
+        """
+        self._count_question()
+        if hook_asks:
+            return "hook"
+        if risk >= RiskLevel.DANGEROUS:
+            return "dangerous"
+        if verdict is None:
+            return "not_command"
+        if cause:
+            return cause
+        if self.mode is PermissionMode.PLAN:
+            return "plan"
+        return "unverified" if verdict.level is None else "other"
 
     def _user_requests(self) -> list[str]:
         """Последние запросы пользователя — из диалога основного агента.
@@ -2239,6 +2527,16 @@ class Agent:
         while root._parent is not None:
             root = root._parent
         return recent_requests(root.conversation.messages)
+
+    def _approved_plan(self) -> str:
+        """План, который пользователь одобрил в этом чате ("" — не одобрял).
+
+        План ведёт основной агент; суб-агент выполняет его часть.
+        """
+        root = self
+        while root._parent is not None:
+            root = root._parent
+        return root.approved_plan
 
     def _bill_side(self, usage: Usage) -> None:
         """Расход побочного запроса (рецензент): в сессию и статистику хода, не в контекст."""
@@ -2252,7 +2550,12 @@ class Agent:
             return ""
         return self._decisions.offer(verdict)
 
-    def _history_hint(self, verdict: Verdict | None) -> str:
+    def _history_hint(self, verdict: Verdict | None, *, auto_remember: bool = False) -> str:
+        """Подсказка к вопросу: как раньше отвечали на эту команду.
+
+        ``auto_remember`` — этот ответ «да» может запомнить команду
+        (:meth:`_remember_repeated`): подсказка предупреждает об этом.
+        """
         if verdict is None:
             return ""
         allowed, rejected = self._decisions.history(history_key(verdict))
@@ -2265,7 +2568,12 @@ class Agent:
             parts.append(f"отклоняли {rejected}")
         counts = ", ".join(parts)
         hint = f"раньше: {counts}"
-        if allowed >= 2 and not rejected:
+        if rejected:
+            return hint
+        streak = self._decisions.auto_approvals[history_key(verdict)]
+        if auto_remember and streak == AUTO_REMEMBER_AFTER - 1:
+            return f"{hint} — после этого «да» разрешение запомнится"
+        if allowed >= 2:
             hint = f"{hint} — «a» запомнит выбор"
         return hint
 
@@ -2281,33 +2589,45 @@ class Agent:
         *,
         source: str = "",
         review: Review | None = None,
+        because: str = "",
     ) -> _Journal | None:
         """Записать решение о команде в журнал (что, где, почему, кто решил).
 
-        Не команда (``verdict`` None) — в журнал не пишется.
+        Не команда (``verdict`` None) в журнал пишется, только если о ней спросили
+        пользователя (``because`` — почему): короткой записью без ключа истории, для
+        сводки вопросов.
         """
-        if verdict is None:
-            return None
         extra: dict[str, object] = {}
+        if verdict is None:
+            if not because:
+                return None
+            # У записи не о команде поля «command» нет: журнал команд её не показывает.
+            extra["call"] = call.summary
+        else:
+            extra.update(
+                command=getattr(params, "command", call.summary),
+                cwd=verdict.cwd,
+                key=history_key(verdict)[1],
+                verdict={
+                    "level": None if verdict.level is None else verdict.level.name,
+                    "reason": verdict.reason,
+                    "signatures": list(verdict.signatures),
+                },
+            )
+        if because:
+            extra["asked_because"] = because
         if review is not None:
             extra["review"] = {
                 "model": review.model,
                 "allowed": review.allowed,
                 "reason": review.reason,
                 "failed": review.failed,
+                "cached": review.cached,
             }
         try:
             entry_id = self._decisions.record({
                 "tool": call.name,
-                "command": getattr(params, "command", call.summary),
                 "description": getattr(params, "description", ""),
-                "cwd": verdict.cwd,
-                "key": history_key(verdict)[1],
-                "verdict": {
-                    "level": None if verdict.level is None else verdict.level.name,
-                    "reason": verdict.reason,
-                    "signatures": list(verdict.signatures),
-                },
                 "risk": risk.name,
                 "mode": self.mode.value,
                 "agent": "main" if self._subagent is None else self._subagent.name,

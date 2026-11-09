@@ -882,7 +882,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
     def on_review_end(self, call: events.ToolCallInfo, review: events.Review | None) -> None:
         self.stop_live()
         if review is None or not review.allowed:
-            return  # отказ или сбой — дальше вопрос пользователю с подробностями
+            return  # отказ или сбой — строкой ошибки шага или в вопросе пользователю
         step = self._find(call)
         if step is None:
             self._emit(Text(f"  {sanitize(review.approval)}", style=self._palette.dim))
@@ -1318,6 +1318,8 @@ class Console(events.AgentEvents):  # noqa: WPS338
         parts = [_counted(stats.steps, "шаг", "шага", "шагов")]
         if stats.tool_calls:
             parts.append(_counted(stats.tool_calls, "инструмент", "инструмента", "инструментов"))
+        if stats.confirmations:
+            parts.append(_counted(stats.confirmations, "вопрос", "вопроса", "вопросов"))
         if stats.duration_s:
             parts.append(f"{stats.duration_s:.1f} с")
         if stats.context_tokens:
@@ -1379,16 +1381,19 @@ class Console(events.AgentEvents):  # noqa: WPS338
         self._confirm_details(call, preview, stripe, dangerous=dangerous)
         question = _confirm_question(call, dangerous=dangerous)
         always = _always_note(call, dangerous=dangerous)
+        # «До конца хода» — не для опасного: его подтверждают каждый раз.
+        turn = "" if dangerous else sanitize(call.turn_scope)
         raw = self._confirm_answer(
             question,
             preview,
             dangerous=dangerous,
             always=always,
             view=long_preview,
+            turn=turn,
         )
         if raw is None:
             return events.ConfirmResult(events.Approval.NO, answered=False)
-        return _confirm_result(raw, always)
+        return _confirm_result(raw, always, turn)
 
     def _detach_step(self, call: events.ToolCallInfo) -> None:
         """Спрошенный вызов — не часть группы: его строка — после ответа."""
@@ -1451,6 +1456,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         dangerous: bool,
         always: str | None,
         view: bool,
+        turn: str = "",
     ) -> str | None:
         """Ответ на вопрос о вызове как введён; «v» — превью в просмотрщике и вопрос снова."""
         while True:
@@ -1460,6 +1466,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
                 always=always,
                 feedback=True,
                 view=view,
+                turn=turn,
             )
             if raw is None or preview is None or raw.strip().lower() not in _VIEW_ANSWERS:
                 return raw
@@ -1534,6 +1541,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
         always: str | None = None,
         feedback: bool = False,
         view: bool = False,
+        turn: str = "",
     ) -> str | None:
         """Ответ как введён; None — ответа не было.
 
@@ -1558,7 +1566,13 @@ class Console(events.AgentEvents):  # noqa: WPS338
             )
             self._blank = False
             return None
-        notes = _question_notes(always, dangerous=dangerous, feedback=feedback, view=view)
+        notes = _question_notes(
+            always,
+            dangerous=dangerous,
+            feedback=feedback,
+            view=view,
+            turn=turn,
+        )
         joined = " · ".join(notes)
         if len(joined) + len(stripe[0]) < self._console.width:
             notes = [joined] if notes else []
@@ -1568,6 +1582,8 @@ class Console(events.AgentEvents):  # noqa: WPS338
         keys = "y/N"
         if always is not None:
             keys = f"{keys}/a"
+        if turn:
+            keys = f"{keys}/t"
         if view:
             keys = f"{keys}/v"
         prompt = Text.assemble(
@@ -1921,13 +1937,18 @@ def _always_note(call: events.ToolCallInfo, *, dangerous: bool) -> str | None:
     return "не спрашивать этот вызов до конца сессии"
 
 
-def _confirm_result(raw: str, always: str | None) -> events.ConfirmResult:
-    """Решение по ответу на вопрос о вызове (ответ — как введён)."""
+def _confirm_result(raw: str, always: str | None, turn: str = "") -> events.ConfirmResult:
+    """Решение по ответу на вопрос о вызове (ответ — как введён).
+
+    ``always`` и ``turn`` — что запомнят ответы «a» и «t» (None и "" — не предлагаются).
+    """
     answer = raw.strip().lower()
     if answer in _YES_ANSWERS:
         return events.ConfirmResult(events.Approval.YES)
     if always is not None and answer in _ALWAYS_ANSWERS:
         return events.ConfirmResult(events.Approval.ALWAYS)
+    if turn and answer in _TURN_ANSWERS:
+        return events.ConfirmResult(events.Approval.TURN)
     if not answer or answer in _NO_ANSWERS:
         return events.ConfirmResult(events.Approval.NO)
     # Свой ответ вместо y/n — отказ с объяснением: его получит модель.
@@ -1940,13 +1961,16 @@ def _question_notes(
     dangerous: bool,
     feedback: bool,
     view: bool,
+    turn: str = "",
 ) -> list[str]:
-    """Подсказки к вопросу: что запомнит «a», что откроет «v», можно ли ответить текстом."""
+    """Подсказки к вопросу: что запомнят «a» и «t», что откроет «v», можно ли ответить текстом."""
     notes = []
     if always is not None:
         notes.append(f"a — {always}")
     elif dangerous and feedback:
         notes.append("запомнить нельзя")
+    if turn:
+        notes.append(f"t — {turn}")
     if view:
         notes.append("v — открыть целиком в просмотрщике")
     if feedback:
@@ -2009,6 +2033,7 @@ _YES_ANSWERS = ("y", "yes", "д", "да")
 _NO_ANSWERS = ("n", "no", "н", "нет", "т")  # н, т — клавиши y и n в русской раскладке: не «да»
 _ALWAYS_ANSWERS = ("a", "always", "в", "всегда", "ф")  # ф — клавиша a в русской раскладке
 _VIEW_ANSWERS = ("v", "view", "м", "показать")  # м — клавиша v в русской раскладке
+_TURN_ANSWERS = ("t", "turn", "е", "ход")  # е — клавиша t в русской раскладке
 
 
 def _stdin_is_terminal() -> bool:

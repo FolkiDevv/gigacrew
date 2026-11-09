@@ -97,10 +97,12 @@ def test_turn_stats_line() -> None:
             completion_tokens=20,
             context_tokens=12_345,
             duration_s=3.21,
+            confirmations=3,
         ),
     )
     out = buf.getvalue()
     assert "2 шага" in out
+    assert "3 вопроса" in out
     assert "1 инструмент " in out
     assert "3.2 с" in out
     assert "контекст ~12.3k" in out
@@ -323,6 +325,26 @@ def test_reviewer_lines(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ui.confirm(asked, None, dangerous=False).approval is Approval.YES
     out = buf.getvalue()
     assert out.index("почему спрашиваю") < out.index("рецензент (R): не просили")
+
+
+def test_confirm_offers_turn_answer_only_when_the_agent_names_its_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ui, buf = _console()
+    answers = iter(["t", "е", "t", "t"])
+    monkeypatch.setattr(ui._console, "input", _echoing_input(ui, answers))
+    scope = "не спрашивать про этот файл до конца хода"
+    scoped = ToolCallInfo("write_file", "secrets.json", turn_scope=scope)
+    assert ui.confirm(scoped, None, dangerous=False).approval is Approval.TURN
+    assert ui.confirm(scoped, None, dangerous=False).approval is Approval.TURN  # раскладка
+    out = buf.getvalue()
+    assert "[y/N/a/t]" in out
+    assert f"t — {scope}" in out
+    # опасное и вызов без названной области: «t» — не ответ «да», а текст пользователя
+    refused = ui.confirm(scoped, None, dangerous=True)
+    assert (refused.approval, refused.feedback) == (Approval.NO, "t")
+    plain = ui.confirm(ToolCallInfo("write_file", "a.json"), None, dangerous=False)
+    assert (plain.approval, plain.feedback) == (Approval.NO, "t")
 
 
 def test_confirm_free_text_is_feedback_and_no_answer_is_marked(

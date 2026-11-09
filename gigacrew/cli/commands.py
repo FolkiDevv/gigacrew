@@ -13,14 +13,14 @@ from __future__ import annotations
 
 import difflib
 import re
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 
 from gigacrew.agent.chat_store import ChatInfo, ChatRecorder, ChatStoreError, SavedChat
-from gigacrew.agent.decisions import redact
 from gigacrew.agent.loop import Agent
 from gigacrew.agent.prompts import skill_invocation_prompt
+from gigacrew.cli.approvals import PERMISSIONS_USAGE, permissions_command
 from gigacrew.cli.hooks import (
     describe_hooks,
     install_request_hook,
@@ -295,109 +295,13 @@ def _warn_reviewer(ctx: CommandContext) -> None:
         ctx.ui.warn(agent.reviewer.warning)
 
 
-PERMISSIONS_USAGE = "/permissions [forget N | clear | log]"
 _MODE_NAMES = "|".join(mode.value for mode in MODE_CYCLE)
 MODE_USAGE = f"/mode [{_MODE_NAMES}]"
 
 
 def _permissions(ctx: CommandContext, arg: str) -> bool:
-    """Сохранённые разрешения «всегда» для команд и последние решения."""
-    words = arg.split()
-    action = words[0].lower() if words else ""
-    if action in {"forget", "rm", "удалить"}:
-        _forget_permission(ctx, words)
-    elif action in {"clear", "очистить"}:
-        _clear_permissions(ctx)
-    elif action in {"log", "журнал"}:
-        _show_decisions(ctx)
-    elif action:
-        ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
-    else:
-        _show_permissions(ctx)
-    return True
-
-
-def _forget_permission(ctx: CommandContext, words: list[str]) -> None:
-    """``/permissions forget N``: удалить разрешение с номером N из списка."""
-    # isdecimal, а не isdigit: «²» — цифра, но int() её не разберёт
-    if len(words) != 2 or not words[1].isdecimal():
-        ctx.ui.error(f"использование: {PERMISSIONS_USAGE}")
-        return
-    memory = ctx.agent.decisions
-    try:
-        rule = memory.forget(int(words[1]))
-    except IndexError:
-        ctx.ui.error(f"нет разрешения №{words[1]} (список — /permissions)")
-    except OSError as error:
-        ctx.ui.error(f"не удалось сохранить: {error}")
-    else:
-        ctx.ui.info(f"разрешение удалено: {redact(rule.describe())}")
-
-
-def _clear_permissions(ctx: CommandContext) -> None:
-    """``/permissions clear``: удалить все сохранённые разрешения."""
-    memory = ctx.agent.decisions
-    try:
-        removed = memory.clear()
-    except OSError as error:
-        ctx.ui.error(f"не удалось сохранить: {error}")
-    else:
-        ctx.ui.info(f"удалено разрешений: {removed}")
-
-
-def _show_decisions(ctx: CommandContext) -> None:
-    """``/permissions log``: последние решения из журнала."""
-    memory = ctx.agent.decisions
-    decisions = memory.recent()
-    if not decisions:
-        reason = "" if memory.log else " (не ведётся: --no-save)"
-        ctx.ui.info(f"журнал решений пуст{reason}")
-        return
-    lines = [_describe_decision(decision) for decision in decisions]
-    listing = "\n".join(lines)
-    ctx.ui.info(f"последние решения:\n{listing}")
-
-
-def _describe_decision(entry: Mapping[str, object]) -> str:
-    """Строка журнала решений для ``/permissions log`` (секреты вырезаны)."""
-    decision = str(entry.get("decision"))
-    mark = {"yes": "да", "always": "всегда", "no": "нет", "no_answer": "без ответа"}.get(
-        decision,
-        decision,
-    )
-    raw_review = entry.get("review")
-    review = raw_review if isinstance(raw_review, dict) else {}
-    if entry.get("source") == "reviewer":
-        mark = "разрешил рецензент"
-    cwd = entry.get("cwd")
-    where = "" if cwd in {None, "."} else f" [{cwd}]"
-    text = f"  • {mark}{where}: {entry.get('command', '')}"
-    if entry.get("feedback"):
-        text = f"{text} — «{entry['feedback']}»"
-    elif entry.get("source") == "reviewer" and review.get("reason"):
-        text = f"{text} — {review['reason']}"
-    # Журнал прежних версий вырезал меньше форм секретов, пояснение рецензента
-    # не вырезается вовсе — на экран не выводим ни то, ни другое.
-    return redact(text)
-
-
-def _show_permissions(ctx: CommandContext) -> None:
-    """``/permissions``: сохранённые разрешения и где они хранятся."""
-    memory = ctx.agent.decisions
-    if memory.rules:
-        lines = ["разрешено без вопросов:"]
-        for number, rule in enumerate(memory.rules, 1):
-            used = f", применялось {rule.hits}" if rule.hits else ""
-            # Правило — команда как есть: прежние версии сохраняли и команды с паролем.
-            lines.append(f"  {number}. {redact(rule.describe())}{used}")
-        lines.append("удалить — /permissions forget N, все — /permissions clear")
-    else:
-        lines = ["сохранённых разрешений нет: ответ «a» на вопрос о команде запомнит её"]
-    if memory.approvals_path is not None and memory.remember:
-        lines.append(f"файл: {memory.approvals_path}")
-    elif memory.directory is None or not memory.remember:
-        lines.append("разрешения хранятся до конца сессии (GIGACREW_REMEMBER_APPROVALS=0)")
-    ctx.ui.info("\n".join(lines))
+    """Сохранённые разрешения «всегда» для команд, последние решения и их сводка."""
+    return permissions_command(ctx.agent, ctx.ui, arg)
 
 
 def _start_new_chat(ctx: CommandContext) -> None:

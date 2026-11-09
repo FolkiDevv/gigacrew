@@ -44,7 +44,7 @@ from gigacrew.agent.loop import (
     SKIPPED_NOTE,
     Agent,
 )
-from gigacrew.agent.prompts import COMPACT_PROMPT, NESTED_HEADER, SUMMARY_HEADER
+from gigacrew.agent.prompts import COMPACT_PROMPT, NESTED_HEADER, SUMMARY_HEADER, mode_prompt
 from gigacrew.agent.reviewer import Reviewer
 from gigacrew.config import Config
 from gigacrew.errors import ToolError
@@ -951,6 +951,17 @@ def test_plan_rules_are_sent_only_in_plan_mode(tmp_path: Path) -> None:
     assert "# Plan mode" in planning
     assert "# Plan mode" in check
     assert "# Plan mode" not in auto
+    assert "# Auto mode" in auto
+    assert "# Auto mode" not in planning
+
+
+def test_auto_mode_rules_depend_on_agent_kind() -> None:
+    main = mode_prompt(PermissionMode.AUTO)
+    subagent = mode_prompt(PermissionMode.AUTO, subagent=True)
+    assert "ask_user" in main
+    assert "ask_user" not in subagent  # суб-агент пользователя не спрашивает
+    assert all("not allowed by the reviewer" in rules for rules in (main, subagent))
+    assert not mode_prompt(PermissionMode.AUTO, subagent=True, read_only=True)
 
 
 def test_mode_survives_reset_and_cycles(tmp_path: Path) -> None:
@@ -1971,6 +1982,56 @@ def test_max_steps_summary_and_no_tool_execution(tmp_path: Path) -> None:
     assert len(_function_results(agent)) == 1
 
 
+def _writes(count: int) -> list[AssistantTurn]:
+    return [
+        tool_turn("write_file", {"path": f"f{index}.txt", "content": "x"}) for index in range(count)
+    ]
+
+
+def test_step_limit_is_extended_once_while_the_turn_makes_changes(tmp_path: Path) -> None:
+    provider = ScriptedProvider([*_writes(3), text_turn("готово")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, max_steps=2, max_steps_extension=2)
+    assert agent.run_turn("x") == "готово"
+    last_turn = agent.last_turn
+    assert last_turn is not None
+    assert last_turn.stop_reason is None
+    assert last_turn.steps == 4
+    assert any("продлён один раз на 2" in text for _, text in events.notices)
+    # модель узнаёт о продлении в запросе третьего шага — и только в нём
+    noted = [
+        any("extended once" in message.content for message in request["messages"])
+        for request in provider.requests
+    ]
+    assert noted == [False, False, True, False]
+
+
+def test_step_limit_is_not_extended_twice_or_when_disabled(tmp_path: Path) -> None:
+    provider = ScriptedProvider([*_writes(5), text_turn("итог")])
+    agent = _agent(provider, tmp_path, max_steps=1, max_steps_extension=1)
+    agent.run_turn("x")
+    last_turn = agent.last_turn
+    assert last_turn is not None
+    assert (last_turn.stop_reason, last_turn.steps) == ("max_steps", 2)
+    provider = ScriptedProvider([*_writes(5), text_turn("итог")])
+    agent = _agent(provider, tmp_path, max_steps=1, max_steps_extension=0)
+    agent.run_turn("x")
+    last_turn = agent.last_turn
+    assert last_turn is not None
+    assert (last_turn.stop_reason, last_turn.steps) == ("max_steps", 1)
+
+
+def test_step_limit_is_not_extended_in_plan_mode(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    runs = [tool_turn("run_shell", {"command": f"{script} {index}"}) for index in range(3)]
+    provider = ScriptedProvider([*runs, text_turn("итог")])
+    agent = _agent(provider, tmp_path, max_steps=1, mode=PermissionMode.PLAN)
+    agent.run_turn("x")
+    last_turn = agent.last_turn
+    assert last_turn is not None
+    assert last_turn.stop_reason == "max_steps"
+
+
 def test_summary_failure_keeps_guard_message(tmp_path: Path) -> None:
     bad = [tool_turn("read_file", {"path": f"nope{attempt}.txt"}) for attempt in range(2)]
     provider = ScriptedProvider([*bad, LLMError("сеть")])
@@ -2362,7 +2423,10 @@ def test_unanswered_prompt_is_not_a_rejection(tmp_path: Path) -> None:
     events = RecordingEvents(confirm_answer=ConfirmResult(Approval.NO, answered=False))
     provider = ScriptedProvider([tool_turn("run_shell", {"command": script}), text_turn("ок")])
     cfg = Config(access_key="x", project_root=tmp_path, stream=False)
-    Agent(provider, build_default_registry(), cfg, events, decisions=memory).run_turn("x")
+    agent = Agent(provider, build_default_registry(), cfg, events, decisions=memory)
+    agent.run_turn("x")
+    # модель узнаёт, что спросить было некого, а не что пользователь отказал
+    assert "NO ANSWER" in _function_results(agent)[0]
     key = history_key(classify(script, root=tmp_path))
     assert memory.history(key) == (0, 0)
     assert not memory.rejected_in_session(key)
@@ -2482,6 +2546,88 @@ def test_always_for_dangerous_call_is_a_one_time_yes(tmp_path: Path) -> None:
     assert not any("подтверждения" in text for _, text in events.notices)
 
 
+def test_questions_are_counted_and_journaled_with_their_cause(tmp_path: Path) -> None:
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    provider = ScriptedProvider([
+        tool_turn("fake_write", {}),
+        tool_turn("run_shell", {"command": "rm -rf /"}),
+        text_turn("ок"),
+    ])
+    events = RecordingEvents(confirm_answer=True)
+    registry = build_default_registry()
+    registry.register(_DangerTool())
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    Agent(provider, registry, cfg, events, decisions=memory).run_turn("x")
+    assert events.stats[-1].confirmations == 2
+    asked = [json.loads(line) for line in _journal(memory) if '"asked_because"' in line]
+    assert [(entry["tool"], entry["asked_because"]) for entry in asked] == [
+        ("fake_write", "dangerous"),
+        ("run_shell", "dangerous"),
+    ]
+    assert "command" not in asked[0]  # не команда: в журнале команд её нет
+    assert [entry["tool"] for entry in memory.recent()] == ["run_shell"]
+
+
+def _write(path: str, content: str) -> AssistantTurn:
+    return tool_turn("write_file", {"path": path, "content": content})
+
+
+def test_turn_answer_covers_the_same_file_until_the_turn_ends(tmp_path: Path) -> None:
+    secret = "credentials.json"
+    provider = ScriptedProvider([
+        _write(secret, "a"),
+        _write(secret, "b"),
+        _write("other.pem", "c"),
+        text_turn("ок"),
+        _write(secret, "d"),
+        text_turn("ок"),
+    ])
+    events = RecordingEvents(confirm_answer=Approval.TURN)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("запиши")
+    # второй вызов с тем же файлом — без вопроса; другой файл спрашивается
+    asked = [call.summary for call, _, _ in events.confirms]
+    assert len(asked) == 2
+    assert all(call.turn_scope for call, _, _ in events.confirms)
+    assert (tmp_path / secret).read_text() == "b"
+    assert any("до конца хода без подтверждения" in text for _, text in events.notices)
+    agent.run_turn("ещё раз")  # новый ход — разрешение кончилось
+    assert len(events.confirms) == 3
+    assert (tmp_path / secret).read_text() == "d"
+
+
+def test_turn_answer_follows_the_resolved_file_not_the_spelling(tmp_path: Path) -> None:
+    # link → nested/dir: «link/../credentials.json» — это nested/credentials.json, а не файл
+    # в корне, хотя текст пути после упрощения совпадает.
+    (tmp_path / "nested" / "dir").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(tmp_path / "nested" / "dir")
+    provider = ScriptedProvider([
+        _write("credentials.json", "a"),
+        _write("./credentials.json", "b"),  # тот же файл другим написанием — без вопроса
+        _write("link/../credentials.json", "c"),  # другой файл — спрашивается
+        text_turn("ок"),
+    ])
+    events = RecordingEvents(confirm_answer=Approval.TURN)
+    _agent(provider, tmp_path, events=events, auto_approve=False).run_turn("запиши")
+    assert [call.summary for call, _, _ in events.confirms] == [
+        "credentials.json",
+        "link/../credentials.json",
+    ]
+    assert (tmp_path / "credentials.json").read_text() == "b"
+    assert (tmp_path / "nested" / "credentials.json").read_text() == "c"
+
+
+def test_turn_answer_is_not_offered_for_dangerous_calls(tmp_path: Path) -> None:
+    # Настройки gigacrew в .env — опасная правка: каждую подтверждают отдельно.
+    provider = ScriptedProvider([_write(".env", "A=1"), _write(".env", "A=2"), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=Approval.TURN)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("запиши")
+    assert [call.turn_scope for call, _, _ in events.confirms] == ["", ""]
+    assert [dangerous for _, _, dangerous in events.confirms] == [True, True]
+    assert (tmp_path / ".env").read_text() == "A=2"  # «t» без предложения — «да» один раз
+
+
 def test_always_for_dangerous_command_is_never_remembered(tmp_path: Path) -> None:
     memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
     rm = tool_turn("run_shell", {"command": "rm -rf build"})
@@ -2521,8 +2667,8 @@ def test_without_yes_unverified_command_goes_to_reviewer(tmp_path: Path) -> None
     provider = ScriptedProvider([run, text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
     _agent(provider, tmp_path, events=events, auto_approve=False).run_turn("x")
-    # без -y: сначала рецензент (его ответ не разобран), затем пользователь
-    assert len(provider.summary_requests) == 1
+    # без -y: сначала рецензент (его ответ не разобран и после повтора), затем пользователь
+    assert len(provider.summary_requests) == 2
     assert len(events.confirms) == 1
     call, _, dangerous = events.confirms[0]
     assert call.reason.startswith("не удалось проверить:")
