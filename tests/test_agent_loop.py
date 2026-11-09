@@ -44,7 +44,7 @@ from gigacrew.agent.loop import (
     SKIPPED_NOTE,
     Agent,
 )
-from gigacrew.agent.prompts import COMPACT_PROMPT, NESTED_HEADER, SUMMARY_HEADER
+from gigacrew.agent.prompts import COMPACT_PROMPT, NESTED_HEADER, SUMMARY_HEADER, mode_prompt
 from gigacrew.agent.reviewer import Reviewer
 from gigacrew.config import Config
 from gigacrew.errors import ToolError
@@ -951,6 +951,17 @@ def test_plan_rules_are_sent_only_in_plan_mode(tmp_path: Path) -> None:
     assert "# Plan mode" in planning
     assert "# Plan mode" in check
     assert "# Plan mode" not in auto
+    assert "# Auto mode" in auto
+    assert "# Auto mode" not in planning
+
+
+def test_auto_mode_rules_depend_on_agent_kind() -> None:
+    main = mode_prompt(PermissionMode.AUTO)
+    subagent = mode_prompt(PermissionMode.AUTO, subagent=True)
+    assert "ask_user" in main
+    assert "ask_user" not in subagent  # суб-агент пользователя не спрашивает
+    assert all("not allowed by the reviewer" in rules for rules in (main, subagent))
+    assert not mode_prompt(PermissionMode.AUTO, subagent=True, read_only=True)
 
 
 def test_mode_survives_reset_and_cycles(tmp_path: Path) -> None:

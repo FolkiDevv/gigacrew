@@ -2,15 +2,18 @@
 
 Команду, которую локальный классификатор (:mod:`gigacrew.safety`) не признал «только
 чтение» и не счёл опасной, в режиме «авто» сначала смотрит модель: она разрешает
-выполнить команду без вопроса или передаёт решение пользователю. Отказать агенту сама
-она не может — ошибка в осторожную сторону стоит одного вопроса.
+выполнить команду без вопроса или не разрешает — тогда команда не выполняется, а агент
+получает причину и ищет другой путь. Запасной путь — вопрос пользователю: если агент
+повторил ту же команду, если отказы идут подряд (:data:`MAX_DENIALS_IN_ROW`) или их много
+за ход (:data:`MAX_DENIALS_PER_TURN`). Запретить команду насовсем рецензент не может.
 
 Рецензент «слеп к рассуждениям»: видит запросы пользователя, саму команду и факты
 статического разбора, но не ответы агента, не его пояснение к команде и не вывод
 инструментов — содержимое файлов и страниц не может его уговорить.
 
 * :func:`review_command` — один запрос к модели;
-* :class:`Reviewer` — состояние на сессию: какая модель, включён ли, счётчик сбоев;
+* :class:`Reviewer` — состояние на сессию: какая модель, включён ли, счётчики сбоев и
+  отказов;
 * :func:`check_reviewer` — проверка модели из ``GIGACREW_REVIEWER_MODEL`` при старте.
 """
 
@@ -41,6 +44,10 @@ SCRIPT_CLIP = 3_000
 MAX_SCRIPTS = 2
 # Столько сбоев подряд — и рецензент отключается до конца сессии.
 MAX_FAILURES = 3
+# После стольких отказов подряд (без разрешений между ними) решает пользователь.
+MAX_DENIALS_IN_ROW = 3
+# После стольких отказов за ход пользователя решает пользователь — до конца хода.
+MAX_DENIALS_PER_TURN = 10
 DISABLED_NOTE = (
     "модель-рецензент отключена: в режиме «авто» больше команд будут требовать ручного "
     "подтверждения"
@@ -267,6 +274,10 @@ class Reviewer:
 
     ``model`` — явно заданная модель (``GIGACREW_REVIEWER_MODEL``); None — модель чата,
     какая выбрана в момент проверки. ``disabled`` — почему отключён ("" — работает).
+
+    Отказы считаются за ход пользователя (:meth:`new_turn`): вызов, который уже получил
+    отказ, отказы подряд и отказы за ход решают, вернуть ли следующий отказ агенту или
+    передать команду пользователю.
     """
 
     def __init__(self, model: str | None = None, *, disabled: str = ""):
@@ -274,6 +285,9 @@ class Reviewer:
         self.model = model
         self.disabled = disabled
         self._failures = 0
+        self._denials_in_row = 0
+        self._denials = 0
+        self._denied: dict[str, str] = {}  # ключ вызова → причина отказа
 
     @property
     def enabled(self) -> bool:
@@ -308,6 +322,35 @@ class Reviewer:
             return False
         self.disabled = f"{MAX_FAILURES} сбоя рецензента подряд (последний: {error})"
         return True
+
+    def allowed(self) -> None:
+        """Учесть разрешение: серия отказов подряд прервалась."""
+        self._denials_in_row = 0
+
+    def denied(self, key: str, reason: str) -> bool:
+        """Учесть отказ вызову ``key``; True — пора спросить пользователя, а не агента.
+
+        Пользователь решает после :data:`MAX_DENIALS_IN_ROW` отказов подряд — серия
+        начинается заново — и после :data:`MAX_DENIALS_PER_TURN` отказов за ход, до его
+        конца.
+        """
+        self._denied[key] = reason
+        self._denials += 1
+        self._denials_in_row += 1
+        if self._denials_in_row >= MAX_DENIALS_IN_ROW or self._denials >= MAX_DENIALS_PER_TURN:
+            self._denials_in_row = 0
+            return True
+        return False
+
+    def denied_reason(self, key: str) -> str | None:
+        """Причина отказа вызову ``key`` в этом ходе; None — отказа не было."""
+        return self._denied.get(key)
+
+    def new_turn(self) -> None:
+        """Новый ход пользователя: отказы прошлых ходов не учитываются."""
+        self._denials_in_row = 0
+        self._denials = 0
+        self._denied.clear()
 
 
 def check_reviewer(provider: LLMProvider, model: str | None) -> tuple[Reviewer, str | None]:

@@ -368,7 +368,7 @@ def _describe_decision(entry: Mapping[str, object]) -> str:
     raw_review = entry.get("review")
     review = raw_review if isinstance(raw_review, dict) else {}
     if entry.get("source") == "reviewer":
-        mark = "разрешил рецензент"
+        mark = "не разрешил рецензент" if decision == "denied" else "разрешил рецензент"
     cwd = entry.get("cwd")
     where = "" if cwd in {None, "."} else f" [{cwd}]"
     text = f"  • {mark}{where}: {entry.get('command', '')}"

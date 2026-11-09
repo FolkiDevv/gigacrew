@@ -882,7 +882,7 @@ class Console(events.AgentEvents):  # noqa: WPS338
     def on_review_end(self, call: events.ToolCallInfo, review: events.Review | None) -> None:
         self.stop_live()
         if review is None or not review.allowed:
-            return  # отказ или сбой — дальше вопрос пользователю с подробностями
+            return  # отказ или сбой — строкой ошибки шага или в вопросе пользователю
         step = self._find(call)
         if step is None:
             self._emit(Text(f"  {sanitize(review.approval)}", style=self._palette.dim))

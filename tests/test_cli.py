@@ -199,8 +199,20 @@ def test_permissions_command_lists_forgets_and_shows_log(
     out = _out(capsys)
     assert "1. «pytest» с проверенными аргументами" in out
     assert "approvals.json" in out
+    memory.record(
+        {
+            "command": "make deploy",
+            "cwd": ".",
+            "key": "make deploy",
+            "decision": "denied",
+            "source": "reviewer",
+            "review": {"model": "M", "allowed": False, "reason": "об этом не просили"},
+        },
+    )
     commands.dispatch("/permissions log", ctx)
-    assert "нет: pip install x — «не надо»" in _out(capsys)
+    log = _out(capsys)
+    assert "нет: pip install x — «не надо»" in log
+    assert "не разрешил рецензент: make deploy — об этом не просили" in log
     commands.dispatch("/permissions forget 1", ctx)
     assert "разрешение удалено" in _out(capsys)
     assert not memory.rules

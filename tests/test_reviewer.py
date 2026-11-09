@@ -18,7 +18,7 @@ from fakes import RecordingEvents, ScriptedProvider, cut_turn, text_turn, tool_t
 from gigacrew.agent import reviewer as review_api
 from gigacrew.agent.decisions import DecisionMemory, history_key
 from gigacrew.agent.events import AgentEvents, Approval, ConfirmResult, Review, ToolCallInfo
-from gigacrew.agent.loop import REJECTED_NOTE, Agent
+from gigacrew.agent.loop import AUTO_REMEMBER_AFTER, REJECTED_NOTE, REVIEWER_DENIED_NOTE, Agent
 from gigacrew.agent.prompts import REVIEWER_PROMPT
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMError, LLMProvider
@@ -34,6 +34,8 @@ _BARE_ALLOW = '{"allow": true}'
 _NOTE_OBJECT = '{"note": {"x": 1}}'
 _QUOTED_ALLOW = '{"allow": true, "reason": "ok"}'
 _ALREADY_REJECTED = "рецензент не спрашивался: такую команду уже отклоняли"
+_DENY_REASON = "об этом не просили"
+_ALREADY_DENIED = f"рецензент уже не разрешил эту команду: {_DENY_REASON}"
 
 
 def _script(tmp_path: Path, name: str = "build.sh") -> str:
@@ -303,16 +305,104 @@ def test_allowed_command_runs_without_asking(tmp_path: Path) -> None:
     assert memory.recent()[-1]["source"] == "reviewer"
 
 
-def test_doubtful_command_goes_to_user_with_reviewer_reason(tmp_path: Path) -> None:
+def _function_texts(agent: Agent) -> list[str]:
+    messages = agent.conversation.messages
+    return [message.content for message in messages if message.role == "function"]
+
+
+def test_denied_command_returns_to_model_with_reason(tmp_path: Path) -> None:
     script = _script(tmp_path)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
     provider = ScriptedProvider([_run(script), text_turn("ок")], summaries=[text_turn(DENY)])
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(provider, tmp_path, events=events, decisions=memory)
+    agent.run_turn("x")
+    assert events.confirms == []  # пользователя не спрашивают
+    assert events.reviews == [Review("M-chat", allowed=False, reason=_DENY_REASON)]
+    assert _function_texts(agent) == [REVIEWER_DENIED_NOTE.format(reason=_DENY_REASON)]
+    entry = memory.recent()[-1]
+    assert entry["decision"] == "denied"
+    assert entry["source"] == "reviewer"
+    assert entry["review"]["allowed"] is False
+    assert memory.history(history_key(classify(script, root=tmp_path))) == (0, 0)
+
+
+def test_repeated_denied_call_goes_to_user(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    provider = ScriptedProvider(
+        [_run(script), _run(script), text_turn("ок")],
+        summaries=[text_turn(DENY), text_turn(ALLOW)],
+    )
     events = RecordingEvents(confirm_answer=False)
     agent = _agent(provider, tmp_path, events=events)
     agent.run_turn("x")
+    assert len(provider.summary_requests) == 1  # повтор — без рецензента
     (call, _, dangerous) = events.confirms[0]
-    assert call.review == "рецензент (M-chat): об этом не просили"
+    assert call.review == _ALREADY_DENIED
     assert not dangerous
-    assert "REJECTED" in agent.conversation.messages[-2].content
+    assert _function_texts(agent) == [
+        REVIEWER_DENIED_NOTE.format(reason=_DENY_REASON),
+        REJECTED_NOTE,
+    ]
+
+
+def test_denials_in_a_row_go_to_user(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    count = review_api.MAX_DENIALS_IN_ROW + 1
+    runs = [_run(f"{script} {index}") for index in range(count)]
+    provider = ScriptedProvider(
+        [*runs, text_turn("ок")],
+        summaries=[text_turn(DENY) for _ in range(count)],
+    )
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(provider, tmp_path, events=events)
+    agent.run_turn("x")
+    assert len(provider.summary_requests) == count
+    # пользователю — только последний отказ серии; следующий отказ снова у модели
+    assert len(events.confirms) == 1
+    (call, _, _) = events.confirms[0]
+    last = review_api.MAX_DENIALS_IN_ROW - 1  # последний отказ серии
+    assert call.summary == f"{script} {last}"
+    assert call.review == f"рецензент (M-chat): {_DENY_REASON}"
+    texts = _function_texts(agent)
+    assert "built" in texts[last]
+    assert texts[-1] == REVIEWER_DENIED_NOTE.format(reason=_DENY_REASON)
+
+
+def test_denied_call_is_reviewed_again_next_turn(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    provider = ScriptedProvider(
+        [_run(script), text_turn("ок"), _run(script), text_turn("ок")],
+        summaries=[text_turn(DENY), text_turn(ALLOW)],
+    )
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(provider, tmp_path, events=events)
+    agent.run_turn("x")
+    agent.run_turn("собери всё-таки")
+    assert len(provider.summary_requests) == 2
+    assert events.confirms == []
+    assert "built" in _function_texts(agent)[-1]
+
+
+def test_reviewer_counts_denials() -> None:
+    reviewer = review_api.Reviewer()
+    in_row = review_api.MAX_DENIALS_IN_ROW
+    assert [reviewer.denied(f"k{index}", "r") for index in range(in_row)] == [
+        *(False for _ in range(in_row - 1)),
+        True,
+    ]
+    assert not reviewer.denied("again", "r")  # серия началась заново
+    reviewer.allowed()
+    assert not reviewer.denied("after", "r")
+    assert reviewer.denied_reason("k0") == "r"
+    reviewer.new_turn()
+    assert reviewer.denied_reason("k0") is None
+    for index in range(review_api.MAX_DENIALS_PER_TURN - 1):
+        assert not reviewer.denied(f"t{index}", "r")
+        reviewer.allowed()
+    assert reviewer.denied("last", "r")
+    reviewer.allowed()
+    assert reviewer.denied("more", "r")  # лимит хода исчерпан — до его конца
 
 
 def test_conflicting_review_goes_to_user(tmp_path: Path) -> None:
@@ -330,12 +420,7 @@ def test_conflicting_review_goes_to_user(tmp_path: Path) -> None:
     review = events.reviews[0]
     assert review is not None
     assert review.failed
-    function_messages = [
-        message.content for message in agent.conversation.messages if message.role == "function"
-    ]
-    assert function_messages == [
-        REJECTED_NOTE,
-    ]
+    assert _function_texts(agent) == [REJECTED_NOTE]
 
 
 def test_reviewer_failures_ask_user_and_disable_it(tmp_path: Path) -> None:
@@ -373,8 +458,9 @@ def test_dangerous_command_never_reaches_reviewer(tmp_path: Path) -> None:
 
 def test_rejected_command_is_not_reviewed_again(tmp_path: Path) -> None:
     script = _script(tmp_path)
+    # отказ рецензента, повтор — пользователю, он отклоняет
     provider = ScriptedProvider(
-        [_run(script), text_turn("ок"), _run(script), text_turn("ок")],
+        [_run(script), _run(script), text_turn("ок"), _run(script), text_turn("ок")],
         summaries=[text_turn(DENY), text_turn(ALLOW)],
     )
     events = RecordingEvents(confirm_answer=False)
@@ -382,6 +468,7 @@ def test_rejected_command_is_not_reviewed_again(tmp_path: Path) -> None:
     agent.run_turn("x")
     agent.run_turn("ещё раз")
     assert len(provider.summary_requests) == 1  # второй раз — сразу пользователю
+    assert events.confirms[0][0].review == _ALREADY_DENIED
     assert events.confirms[1][0].review == _ALREADY_REJECTED
 
 
@@ -424,11 +511,12 @@ def test_command_rejected_in_earlier_session_is_not_reviewed(tmp_path: Path) -> 
 
 def test_rejection_in_this_session_beats_earlier_approvals(tmp_path: Path) -> None:
     # Разрешали дважды, отклонили сейчас: (2, 1) — но до конца сессии рецензент не нужен.
+    # Каждый ход: отказ рецензента, повтор той же команды — вопрос пользователю.
     script = _script(tmp_path)
     run_turn, ok_turn = _run(script), text_turn("ок")
     deny_turn = text_turn(DENY)
     provider = ScriptedProvider(
-        [turn for _ in range(4) for turn in (run_turn, ok_turn)],
+        [turn for _ in range(4) for turn in (run_turn, run_turn, ok_turn)],
         summaries=[deny_turn, deny_turn, deny_turn, text_turn(ALLOW)],
     )
     events = _Answers([Approval.YES, Approval.YES, Approval.NO, Approval.NO])
@@ -512,7 +600,7 @@ def test_request_shows_scratch_script_code(tmp_path: Path) -> None:
 def test_saved_rule_wins_before_reviewer(tmp_path: Path) -> None:
     script = _script(tmp_path)
     provider = ScriptedProvider(
-        [_run(script), text_turn("ок"), _run(script), text_turn("ок")],
+        [_run(script), _run(script), text_turn("ок"), _run(script), text_turn("ок")],
         summaries=[text_turn(DENY)],
     )
     events = RecordingEvents(confirm_answer=Approval.ALWAYS)
@@ -623,7 +711,7 @@ def test_subagent_review_sees_user_request_not_the_brief(tmp_path: Path) -> None
 def test_rejection_with_feedback_is_remembered_for_session(tmp_path: Path) -> None:
     script = _script(tmp_path)
     provider = ScriptedProvider(
-        [_run(script), text_turn("ок"), _run(script), text_turn("ок")],
+        [_run(script), _run(script), text_turn("ок"), _run(script), text_turn("ок")],
         summaries=[text_turn(DENY)],
     )
 
@@ -644,3 +732,64 @@ def test_rejection_with_feedback_is_remembered_for_session(tmp_path: Path) -> No
     agent.run_turn("x")
     agent.run_turn("y")
     assert len(provider.summary_requests) == 1
+
+
+# ----------------------- повторные одобрения пользователя ----------------------- #
+def _no_reviewer() -> review_api.Reviewer:
+    return review_api.Reviewer(disabled="выключен в тесте")
+
+
+def _repeat_turns(script: str, count: int) -> list[AssistantTurn]:
+    return [turn for _ in range(count) for turn in (_run(script), text_turn("ок"))]
+
+
+def test_command_approved_repeatedly_is_remembered(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    provider = ScriptedProvider(_repeat_turns(script, AUTO_REMEMBER_AFTER + 1))
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(provider, tmp_path, events=events, decisions=memory, reviewer=_no_reviewer())
+    for index in range(AUTO_REMEMBER_AFTER + 1):
+        agent.run_turn(f"ход {index}")
+    assert len(events.confirms) == AUTO_REMEMBER_AFTER  # последний ход — без вопроса
+    last_asked = events.confirms[-1][0]
+    before = AUTO_REMEMBER_AFTER - 1
+    assert last_asked.history == (
+        f"раньше: разрешали {before} — после этого «да» разрешение запомнится"
+    )
+    assert len(memory.rules) == 1
+    assert any("без отказов — дальше без вопросов" in text for _, text in events.notices)
+    assert "built" in _function_texts(agent)[-1]
+
+
+def test_rejected_command_is_not_remembered_by_approvals(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    turns = AUTO_REMEMBER_AFTER + 2
+    answers = [Approval.YES, Approval.NO, *(Approval.YES for _ in range(AUTO_REMEMBER_AFTER))]
+    provider = ScriptedProvider(_repeat_turns(script, turns))
+    events = _Answers(answers)
+    agent = _agent(provider, tmp_path, events=events, decisions=memory, reviewer=_no_reviewer())
+    for index in range(turns):
+        agent.run_turn(f"ход {index}")
+    assert len(events.confirms) == turns
+    assert memory.rules == []
+
+
+def test_plan_mode_does_not_remember_approvals(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    provider = ScriptedProvider(_repeat_turns(script, AUTO_REMEMBER_AFTER))
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        decisions=memory,
+        cfg={"mode": PermissionMode.PLAN},
+    )
+    agent.chat_id = "c1"
+    for index in range(AUTO_REMEMBER_AFTER):
+        agent.run_turn(f"ход {index}")
+    assert len(events.confirms) == AUTO_REMEMBER_AFTER
+    assert memory.rules == []
