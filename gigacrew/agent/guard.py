@@ -195,6 +195,7 @@ class LoopGuard:
         self._seen: dict[str, int] = {}  # ключ → значение _changes сразу после вызова
         self._repeats: dict[str, int] = {}  # ключ → повторов подряд без изменений
         self._rejected: set[str] = set()
+        self._extended = False  # лимит шагов уже продлевался в этом ходе
         self._failures_warned = False  # предупреждение о серии неудач ушло модели в запросе
         self._failures_noticed = False  # ...и показано пользователю
 
@@ -207,6 +208,18 @@ class LoopGuard:
     def changes(self) -> int:
         """Успешных изменяющих операций за ход."""
         return self._changes
+
+    def extend_steps(self, extra: int) -> bool:
+        """Продлить лимит шагов на ``extra``; True — продлён.
+
+        Один раз за ход и только если ход идёт по делу: были успешные изменения и нет
+        серии неудачных вызовов. Иначе лимит — признак зацикливания, и его решает человек.
+        """
+        if self._extended or extra <= 0 or not self._changes or self._failures:
+            return False
+        self._extended = True
+        self._max_steps += extra
+        return True
 
     def before_step(self, context_tokens: int = 0) -> StopReason | None:
         """Вызывается перед обращением к модели; учитывает шаг.

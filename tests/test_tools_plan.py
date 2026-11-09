@@ -166,6 +166,8 @@ def test_review_outcomes(
     assert shown == [0]  # перед вопросом пользователю
     assert session.plan.reviews == 1
     assert not session.plan.dirty
+    # рецензент команд увидит только одобренный план
+    assert bool(session.plan.approved) is (outcome == "approved")
 
 
 @pytest.mark.parametrize("plan", [None, "  \n "])

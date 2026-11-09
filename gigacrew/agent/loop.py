@@ -149,6 +149,11 @@ REVIEWER_DENIED_NOTE = (
     "another way that avoids this reason; if this exact command is really needed, call it "
     "again unchanged — then the user decides."
 )
+STEPS_EXTENDED_NOTE = (
+    "The step limit of this turn was reached and extended once by {extra} steps because "
+    "the work is progressing. It will not be extended again: finish the task now, do not "
+    "start new directions, and say in the final answer what is left undone."
+)
 LOOP_STOP_NOTE = (
     "Not executed: the same call repeated without any changes. The turn was stopped as a loop."
 )
@@ -625,6 +630,7 @@ class Agent:
             self._release_plan()
             self._plan.path = self._plan_path(new_id)
             self._plan.dirty = False
+            self._plan.approved = ""  # одобрение относилось к плану прежнего чата
             self._plan_seen = self._read_plan_file()
 
     def continue_as(self, chat_id: str) -> None:
@@ -649,6 +655,11 @@ class Agent:
     def plan_path(self) -> Path | None:
         """Файл плана чата (None — у суб-агента)."""
         return None if self._plan is None else self._plan.path
+
+    @property
+    def approved_plan(self) -> str:
+        """Текст плана, который пользователь одобрил в этом чате ("" — не одобрял)."""
+        return "" if self._plan is None else self._plan.approved
 
     def set_mode(self, mode: PermissionMode) -> None:
         """Сменить режим разрешений (действует со следующего вызова инструмента).
@@ -1130,7 +1141,7 @@ class Agent:
         Возвращает финальный текст хода; None — ход продолжается следующим шагом.
         """
         context = self._subagent_context(specs, stats)
-        stop = guard.before_step(context)
+        stop = self._before_step(guard, context, state)
         if stop is not None:
             return self._stopped(specs, stop, stats)
         stats.steps = guard.steps
@@ -1168,6 +1179,37 @@ class Agent:
         if stop is not None:
             return self._stopped(specs, stop, stats)
         return None
+
+    def _before_step(
+        self,
+        guard: LoopGuard,
+        context: int,
+        state: _TurnLoop,
+    ) -> StopReason | None:
+        """Учесть шаг; None — можно обращаться к модели, иначе причина остановки хода."""
+        stop = guard.before_step(context)
+        if stop is not None and self._extend_steps(guard, stop, state):
+            return guard.before_step(context)
+        return stop
+
+    def _extend_steps(self, guard: LoopGuard, stop: StopReason, state: _TurnLoop) -> bool:
+        """Лимит шагов достигнут: продлить его один раз вместо остановки хода.
+
+        Только у основного агента в режиме «авто» и только пока ход идёт по делу
+        (:meth:`LoopGuard.extend_steps`): иначе пользователю пришлось бы повторять запрос
+        ради хода, которому не хватило нескольких шагов. Модель узнаёт, что продления
+        больше не будет.
+        """
+        extra = self._cfg.max_steps_extension
+        if stop.kind != "max_steps" or self._is_subagent or self.mode is not PermissionMode.AUTO:
+            return False
+        if not guard.extend_steps(extra):
+            return False
+        self._events.on_notice(
+            f"Лимит шагов ({guard.steps}) достигнут, но работа идёт: продлён один раз на {extra}.",
+        )
+        state.note = _join_notes(state.note, STEPS_EXTENDED_NOTE.format(extra=extra))
+        return True
 
     def _failures_note(self, guard: LoopGuard) -> str:
         """Предупреждение о серии неудач: пользователю — сразу, модели — заметка ("" — нет)."""
@@ -2305,7 +2347,12 @@ class Agent:
         if skipped:
             return Decision.ASK, None, skipped, cause
         model = reviewer.model_for(self._model_name)
-        request_text = review_request(command, verdict, self._user_requests())
+        request_text = review_request(
+            command,
+            verdict,
+            self._user_requests(),
+            self._approved_plan(),
+        )
         review = reviewer.cached(model, request_text)
         if review is not None:
             reviewer.allowed()
@@ -2418,6 +2465,16 @@ class Agent:
         while root._parent is not None:
             root = root._parent
         return recent_requests(root.conversation.messages)
+
+    def _approved_plan(self) -> str:
+        """План, который пользователь одобрил в этом чате ("" — не одобрял).
+
+        План ведёт основной агент; суб-агент выполняет его часть.
+        """
+        root = self
+        while root._parent is not None:
+            root = root._parent
+        return root.approved_plan
 
     def _bill_side(self, usage: Usage) -> None:
         """Расход побочного запроса (рецензент): в сессию и статистику хода, не в контекст."""

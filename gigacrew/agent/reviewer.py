@@ -7,9 +7,9 @@
 повторил ту же команду, если отказы идут подряд (:data:`MAX_DENIALS_IN_ROW`) или их много
 за ход (:data:`MAX_DENIALS_PER_TURN`). Запретить команду насовсем рецензент не может.
 
-Рецензент «слеп к рассуждениям»: видит запросы пользователя, саму команду и факты
-статического разбора, но не ответы агента, не его пояснение к команде и не вывод
-инструментов — содержимое файлов и страниц не может его уговорить.
+Рецензент «слеп к рассуждениям»: видит запросы пользователя, одобренный пользователем
+план, саму команду и факты статического разбора, но не ответы агента, не его пояснение к
+команде и не вывод инструментов — содержимое файлов и страниц не может его уговорить.
 
 Сбой рецензента — не повод звать пользователя сразу: быстрый сбой повторяется один раз
 (:meth:`Reviewer.ask`), сбои подряд ставят рецензента на паузу
@@ -46,6 +46,8 @@ MAX_REVIEW_COMMAND = 4_000
 MAX_REQUESTS = 3
 REQUEST_CLIP = 1_500
 PART_CLIP = 200
+# Сколько символов одобренного пользователем плана видит рецензент.
+PLAN_CLIP = 3_000
 # Сколько символов чернового скрипта из .gigacode/tmp/ видит рецензент и сколько скриптов.
 SCRIPT_CLIP = 3_000
 MAX_SCRIPTS = 2
@@ -121,8 +123,16 @@ def _part_line(part: Part) -> str:
     return f"- {text}: {_level(part.level)} — {_one_line(part.reason)}"
 
 
-def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> str:
+def review_request(
+    command: str,
+    verdict: Verdict,
+    requests: Sequence[str],
+    plan: str = "",
+) -> str:
     """Текст запроса рецензенту: запросы пользователя, команда, факты разбора.
+
+    ``plan`` — план, который пользователь одобрил ("" — не одобрял): на что он согласился.
+    Текст плана писала модель, поэтому он стоит в ограждении, как команда.
 
     Код черновых скриптов из ``.gigacode/tmp/``, которые команда запускает, — тоже: их
     пишет модель, как и heredoc. Подключённые пользователем каталоги
@@ -136,6 +146,10 @@ def review_request(command: str, verdict: Verdict, requests: Sequence[str]) -> s
         ]
     else:
         lines.append("(none)")
+    if plan.strip():
+        shown = clip_middle(plan.strip(), PLAN_CLIP)
+        plan_fence = _fence(shown)
+        lines += ["", "# Plan the user approved", plan_fence, shown, plan_fence]
     fence = _fence(command)
     overall_level = _level(verdict.level)
     overall_reason = _one_line(verdict.reason) or "no details"

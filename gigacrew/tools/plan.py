@@ -206,6 +206,7 @@ def review_plan(
             "план на доработку",
         )
     set_mode(mode)
+    plan_file.approved = plan
     return PlanReview(
         "approved",
         APPROVED_NOTE.format(label=mode.label, description=mode.description, path=path, plan=plan),

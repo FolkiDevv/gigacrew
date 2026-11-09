@@ -1982,6 +1982,56 @@ def test_max_steps_summary_and_no_tool_execution(tmp_path: Path) -> None:
     assert len(_function_results(agent)) == 1
 
 
+def _writes(count: int) -> list[AssistantTurn]:
+    return [
+        tool_turn("write_file", {"path": f"f{index}.txt", "content": "x"}) for index in range(count)
+    ]
+
+
+def test_step_limit_is_extended_once_while_the_turn_makes_changes(tmp_path: Path) -> None:
+    provider = ScriptedProvider([*_writes(3), text_turn("готово")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, max_steps=2, max_steps_extension=2)
+    assert agent.run_turn("x") == "готово"
+    last_turn = agent.last_turn
+    assert last_turn is not None
+    assert last_turn.stop_reason is None
+    assert last_turn.steps == 4
+    assert any("продлён один раз на 2" in text for _, text in events.notices)
+    # модель узнаёт о продлении в запросе третьего шага — и только в нём
+    noted = [
+        any("extended once" in message.content for message in request["messages"])
+        for request in provider.requests
+    ]
+    assert noted == [False, False, True, False]
+
+
+def test_step_limit_is_not_extended_twice_or_when_disabled(tmp_path: Path) -> None:
+    provider = ScriptedProvider([*_writes(5), text_turn("итог")])
+    agent = _agent(provider, tmp_path, max_steps=1, max_steps_extension=1)
+    agent.run_turn("x")
+    last_turn = agent.last_turn
+    assert last_turn is not None
+    assert (last_turn.stop_reason, last_turn.steps) == ("max_steps", 2)
+    provider = ScriptedProvider([*_writes(5), text_turn("итог")])
+    agent = _agent(provider, tmp_path, max_steps=1, max_steps_extension=0)
+    agent.run_turn("x")
+    last_turn = agent.last_turn
+    assert last_turn is not None
+    assert (last_turn.stop_reason, last_turn.steps) == ("max_steps", 1)
+
+
+def test_step_limit_is_not_extended_in_plan_mode(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    runs = [tool_turn("run_shell", {"command": f"{script} {index}"}) for index in range(3)]
+    provider = ScriptedProvider([*runs, text_turn("итог")])
+    agent = _agent(provider, tmp_path, max_steps=1, mode=PermissionMode.PLAN)
+    agent.run_turn("x")
+    last_turn = agent.last_turn
+    assert last_turn is not None
+    assert last_turn.stop_reason == "max_steps"
+
+
 def test_summary_failure_keeps_guard_message(tmp_path: Path) -> None:
     bad = [tool_turn("read_file", {"path": f"nope{attempt}.txt"}) for attempt in range(2)]
     provider = ScriptedProvider([*bad, LLMError("сеть")])
