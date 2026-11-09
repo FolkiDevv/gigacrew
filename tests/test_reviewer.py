@@ -793,3 +793,40 @@ def test_plan_mode_does_not_remember_approvals(tmp_path: Path) -> None:
         agent.run_turn(f"ход {index}")
     assert len(events.confirms) == AUTO_REMEMBER_AFTER
     assert memory.rules == []
+
+
+def test_plan_mode_approvals_do_not_count_for_auto_remember(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    provider = ScriptedProvider(_repeat_turns(script, AUTO_REMEMBER_AFTER + 1))
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        decisions=memory,
+        reviewer=_no_reviewer(),
+        cfg={"mode": PermissionMode.PLAN},
+    )
+    agent.chat_id = "c1"
+    for index in range(AUTO_REMEMBER_AFTER):
+        agent.run_turn(f"план {index}")
+    agent.set_mode(PermissionMode.AUTO)
+    agent.run_turn("делай")  # одно «да» в «авто» после трёх в плане — не запоминается
+    assert len(events.confirms) == AUTO_REMEMBER_AFTER + 1
+    assert memory.rules == []
+
+
+def test_forgotten_auto_rule_is_not_restored_by_next_approval(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    provider = ScriptedProvider(_repeat_turns(script, AUTO_REMEMBER_AFTER + 1))
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(provider, tmp_path, events=events, decisions=memory, reviewer=_no_reviewer())
+    for index in range(AUTO_REMEMBER_AFTER):
+        agent.run_turn(f"ход {index}")
+    assert len(memory.rules) == 1
+    memory.forget(1)
+    agent.run_turn("ещё")
+    assert len(events.confirms) == AUTO_REMEMBER_AFTER + 1
+    assert memory.rules == []

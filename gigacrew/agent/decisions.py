@@ -29,6 +29,7 @@ import os
 import re
 import secrets
 import tempfile
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -195,6 +196,9 @@ class DecisionMemory:
     _history: dict[tuple[str, str], _History] = field(default_factory=dict, repr=False)
     # Что пользователь отклонил в этой сессии (ключ истории): такое не отдаётся рецензенту.
     _rejected: set[tuple[str, str]] = field(default_factory=set, repr=False)
+    # Разрешения «да» в этой сессии, после которых команда может запомниться сама (режим
+    # «авто»): отказ и удаление разрешений обнуляют счёт, следующая сессия начинает с нуля.
+    auto_approvals: Counter[tuple[str, str]] = field(default_factory=Counter, repr=False)
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -289,6 +293,7 @@ class DecisionMemory:
         if index < 1 or index > len(self.rules):
             raise IndexError(index)
         rule = self.rules.pop(index - 1)
+        self.auto_approvals.clear()  # удалённое разрешение не возвращается само
         self._save(removed={rule.id})
         return rule
 
@@ -297,6 +302,7 @@ class DecisionMemory:
         count = len(self.rules)
         removed = {rule.id for rule in self.rules}
         self.rules = []
+        self.auto_approvals.clear()
         self._save(removed=removed)
         return count
 
@@ -310,6 +316,7 @@ class DecisionMemory:
             self._history.setdefault(key, _History()).count(decision)
             if decision == "no":
                 self._rejected.add(key)
+                self.auto_approvals.pop(key, None)
         path = self.journal_path
         if not self.log or path is None:
             return entry_id

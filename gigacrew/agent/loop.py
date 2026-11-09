@@ -2195,15 +2195,18 @@ class Agent:
         return "до конца сессии"
 
     def _remember_repeated(self, verdict: Verdict | None) -> None:
-        """Команду разрешали :data:`AUTO_REMEMBER_AFTER` раз без отказов — запомнить её.
+        """Команду разрешили :data:`AUTO_REMEMBER_AFTER` раз без отказов — запомнить её.
 
-        Ответ пользователя уже учтён в истории (запись журнала). Сохраняются те же правила,
-        что и при ответе «всегда».
+        Считаются только ответы «да» в этой сессии на вопросы режима «авто», которые могут
+        запомнить команду (``DecisionMemory.auto_approvals``): отказ и удаление
+        разрешений обнуляют счёт. Сохраняются те же правила, что и при ответе «всегда».
         """
         if verdict is None:
             return
-        allowed, rejected = self._decisions.history(history_key(verdict))
-        if allowed < AUTO_REMEMBER_AFTER or rejected:
+        key = history_key(verdict)
+        self._decisions.auto_approvals[key] += 1
+        approvals = self._decisions.auto_approvals[key]
+        if approvals < AUTO_REMEMBER_AFTER or self._decisions.history(key)[1]:
             return
         try:
             added = self._decisions.approve(verdict)
@@ -2213,7 +2216,7 @@ class Agent:
         if added:
             rules = "; ".join(rule.describe() for rule in added)
             self._events.on_notice(
-                f"вы разрешали это {allowed} раз(а) без отказов — дальше без вопросов "
+                f"вы разрешали это {approvals} раз(а) без отказов — дальше без вопросов "
                 f"({self._saved_where()}): {rules}; /permissions — список",
             )
 
@@ -2372,7 +2375,8 @@ class Agent:
         hint = f"раньше: {counts}"
         if rejected:
             return hint
-        if auto_remember and allowed == AUTO_REMEMBER_AFTER - 1:
+        streak = self._decisions.auto_approvals[history_key(verdict)]
+        if auto_remember and streak == AUTO_REMEMBER_AFTER - 1:
             return f"{hint} — после этого «да» разрешение запомнится"
         if allowed >= 2:
             hint = f"{hint} — «a» запомнит выбор"
