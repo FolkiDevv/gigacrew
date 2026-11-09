@@ -2568,6 +2568,45 @@ def test_questions_are_counted_and_journaled_with_their_cause(tmp_path: Path) ->
     assert [entry["tool"] for entry in memory.recent()] == ["run_shell"]
 
 
+def _write(path: str, content: str) -> AssistantTurn:
+    return tool_turn("write_file", {"path": path, "content": content})
+
+
+def test_turn_answer_covers_the_same_file_until_the_turn_ends(tmp_path: Path) -> None:
+    secret = "credentials.json"
+    provider = ScriptedProvider([
+        _write(secret, "a"),
+        _write(secret, "b"),
+        _write("other.pem", "c"),
+        text_turn("ок"),
+        _write(secret, "d"),
+        text_turn("ок"),
+    ])
+    events = RecordingEvents(confirm_answer=Approval.TURN)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("запиши")
+    # второй вызов с тем же файлом — без вопроса; другой файл спрашивается
+    asked = [call.summary for call, _, _ in events.confirms]
+    assert len(asked) == 2
+    assert all(call.turn_scope for call, _, _ in events.confirms)
+    assert (tmp_path / secret).read_text() == "b"
+    assert any("до конца хода без подтверждения" in text for _, text in events.notices)
+    agent.run_turn("ещё раз")  # новый ход — разрешение кончилось
+    assert len(events.confirms) == 3
+    assert (tmp_path / secret).read_text() == "d"
+
+
+def test_turn_answer_is_not_offered_for_dangerous_calls(tmp_path: Path) -> None:
+    # Настройки gigacrew в .env — опасная правка: каждую подтверждают отдельно.
+    provider = ScriptedProvider([_write(".env", "A=1"), _write(".env", "A=2"), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=Approval.TURN)
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("запиши")
+    assert [call.turn_scope for call, _, _ in events.confirms] == ["", ""]
+    assert [dangerous for _, _, dangerous in events.confirms] == [True, True]
+    assert (tmp_path / ".env").read_text() == "A=2"  # «t» без предложения — «да» один раз
+
+
 def test_always_for_dangerous_command_is_never_remembered(tmp_path: Path) -> None:
     memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
     rm = tool_turn("run_shell", {"command": "rm -rf build"})

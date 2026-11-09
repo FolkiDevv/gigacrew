@@ -67,6 +67,7 @@ from gigacrew.agent.guard import (
     StopReason,
     ToolOutcome,
     call_key,
+    target_key,
 )
 from gigacrew.agent.hooks import HookResult, HookRunner, PromptBlockedError
 from gigacrew.agent.prompts import (
@@ -149,6 +150,8 @@ REVIEWER_DENIED_NOTE = (
     "another way that avoids this reason; if this exact command is really needed, call it "
     "again unchanged — then the user decides."
 )
+# Что покроет ответ «t» на вопрос о вызове (для пользователя).
+TURN_SCOPE_NOTE = "не спрашивать про этот файл до конца хода"
 STEPS_EXTENDED_NOTE = (
     "The step limit of this turn was reached and extended once by {extra} steps because "
     "the work is progressing. It will not be extended again: finish the task now, do not "
@@ -310,7 +313,8 @@ def _confirm_result(*, answer: bool | Approval | ConfirmResult) -> ConfirmResult
 def _decision_name(answer: ConfirmResult) -> str:
     if not answer.answered:
         return "no_answer"
-    return {Approval.YES: "yes", Approval.ALWAYS: "always", Approval.NO: "no"}[answer.approval]
+    names = {Approval.YES: "yes", Approval.TURN: "yes", Approval.ALWAYS: "always"}
+    return names.get(answer.approval, "no")
 
 
 def _auto_source(
@@ -460,6 +464,7 @@ class Agent:
             # Вызовы, которые пользователь разрешил «всегда» (до конца сессии; reset() не
             # сбрасывает — как и режим).
             self._session_allowed: set[str] = set()
+            self._turn_allowed: set[str] = set()  # «да до конца хода»: ключи целей
             self._decisions = DecisionMemory() if decisions is None else decisions
             self._reviewer = Reviewer(config.reviewer_model) if reviewer is None else reviewer
         else:
@@ -804,6 +809,7 @@ class Agent:
         self._nested = parent._nested
         self._token_scale = parent._token_scale
         self._session_allowed = parent._session_allowed
+        self._turn_allowed = parent._turn_allowed
         self._decisions = parent._decisions
         self._reviewer = parent._reviewer
 
@@ -1044,6 +1050,7 @@ class Agent:
         if self._parent is None:  # задачу суб-агента пишет модель, а не пользователь
             user_input = self._prompt_hooks(user_input)
             self._reviewer.new_turn()  # отказы рецензента считаются за ход пользователя
+            self._turn_allowed.clear()  # «да до конца хода» — на один ход пользователя
         # Рассуждения прошлых ходов модели больше не нужны (GIGACREW_REASONING=turn).
         self._conversation.forget_reasoning()
         self._conversation.add_user(user_input)
@@ -1947,6 +1954,10 @@ class Agent:
                 and not (self.mode is PermissionMode.PLAN and unverified)
             ):
                 decision, source = Decision.ALLOW, "session"  # «всегда» до конца сессии
+            # «Да до конца хода»: другой вызов того же инструмента с тем же файлом.
+            turn_key = self._turn_key(function_call, risk, verdict, hook_asks=hook_asks)
+            if decision in asking and turn_key in self._turn_allowed:
+                decision, source = Decision.ALLOW, "turn"
             if decision is Decision.REVIEW:
                 decision, review, review_note, cause = self._review_command(
                     call,
@@ -2016,6 +2027,7 @@ class Agent:
                     history=self._history_hint(verdict, auto_remember=auto_remember),
                     purpose=assessment.purpose,
                     review=review_note,
+                    turn_scope=TURN_SCOPE_NOTE if turn_key else "",
                 )
                 self._notify(
                     "permission_prompt",
@@ -2028,6 +2040,7 @@ class Agent:
                     # «Всегда» не запомнить — значит, «да» один раз: хук спрашивает каждый
                     # раз, опасное не запоминается (интерфейс «всегда» для него не предлагает).
                     answer = replace(answer, approval=Approval.YES)
+                answer = self._allow_for_turn(asked, answer, turn_key)
                 journal = self._journal_start(
                     call,
                     params,
@@ -2233,6 +2246,45 @@ class Agent:
         self._events.on_notice(
             f"{call.name} с этими аргументами больше не требует подтверждения до конца сессии",
         )
+
+    def _turn_key(
+        self,
+        function_call: FunctionCall,
+        risk: RiskLevel,
+        verdict: Verdict | None,
+        *,
+        hook_asks: bool,
+    ) -> str:
+        """Ключ ответа «не спрашивать про этот файл до конца хода» ("" — так ответить нельзя).
+
+        Только для вызовов с файлом-целью, которые не команды: серия правок одного файла,
+        о котором спрашивают каждый раз (файл с секретами). Опасное (настройки gigacrew в
+        ``.env``) и то, о чём велел спрашивать хук, подтверждается каждый раз; у команд —
+        свои сохранённые разрешения.
+        """
+        if hook_asks or verdict is not None or risk >= RiskLevel.DANGEROUS:
+            return ""
+        key = target_key(function_call)
+        return key if ":path=" in key else ""
+
+    def _allow_for_turn(
+        self,
+        call: ToolCallInfo,
+        answer: ConfirmResult,
+        turn_key: str,
+    ) -> ConfirmResult:
+        """Ответ «до конца хода» запоминается на ход и дальше считается обычным «да».
+
+        Ответ пришёл, хотя не предлагался (``turn_key`` пуст), — «да» один раз.
+        """
+        if answer.approval is not Approval.TURN:
+            return answer
+        if turn_key:
+            self._turn_allowed.add(turn_key)
+            self._events.on_notice(
+                f"{call.name} {call.summary}: до конца хода без подтверждения".strip(),
+            )
+        return replace(answer, approval=Approval.YES)
 
     def _saved_where(self) -> str:
         """Где сохраняются разрешения «всегда» (для уведомления)."""
