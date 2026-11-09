@@ -691,6 +691,7 @@ class _Ctx:
     hazard_cache: dict[tuple[Path, str | None], bool] = field(default_factory=dict)
     parents: dict[int, ast.AST] = field(default_factory=dict)  # id(узел) → родитель
     extra: tuple[Path, ...] = ()  # подключённые каталоги (``--add-dir``)
+    scratch_root: Path | None = None  # чья .gigacode/tmp/ — временная папка (None — root)
 
     def flag(self, level: Level | None, reason: str) -> None:
         self.levels.append((level, reason))
@@ -1371,7 +1372,8 @@ def _check_write(target: _Path, ctx: _Ctx, what: str, *, recursive: bool = False
         ctx.flag(Level.DANGER, f"{what}: запись вне проекта")
         return
     resolved = target.static.resolve()
-    own_temp = owner == ctx.root and is_temp_path(resolved, ctx.root)
+    temp_root = ctx.root if ctx.scratch_root is None else ctx.scratch_root
+    own_temp = owner == temp_root and is_temp_path(resolved, temp_root)
     if is_vcs_internal(resolved, owner):
         ctx.flag(Level.DANGER, f"{what}: служебные файлы git или jj")
     elif is_data_path(resolved, owner) and not own_temp:
@@ -2167,6 +2169,7 @@ def analyze(
     script: Path | None = None,
     path_dirs: tuple[Path, ...] = (),
     extra: tuple[Path, ...] = (),
+    scratch_root: Path | None = None,
 ) -> PyResult:
     """Оценить Python-код.
 
@@ -2182,7 +2185,7 @@ def analyze(
         tree = ast.parse(code)
     except (SyntaxError, ValueError):
         return PyResult(None, "код не разобран (синтаксис)")
-    ctx = _Ctx(root=root, cwd=run_dir, script=script, extra=extra)
+    ctx = _Ctx(root=root, cwd=run_dir, script=script, extra=extra, scratch_root=scratch_root)
     _collect_bindings(tree, ctx)
     _check_imports(tree, ctx)
     _collect_aliases(ctx)

@@ -118,9 +118,11 @@ class ToolContext:
     def root_of(self, path: Path) -> Path:
         """Корень (проекта или подключённого каталога), где лежит раскрытый ``path``.
 
-        Путь вне всех корней — корень проекта.
+        Путь вне всех корней — корень проекта. Проект проверяется первым.
         """
         resolved = Path(path)
+        if resolved == self.root or self.root in resolved.parents:
+            return self.root
         for folder in self.workspace.extra_dirs:
             if resolved == folder or folder in resolved.parents:
                 return folder

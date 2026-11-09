@@ -69,11 +69,19 @@ class Env:
     program_path: str | None = None  # явный путь к программе (.venv/bin/python)
     # Подключённые каталоги (``--add-dir``, раскрытые): читать и писать — как в проект.
     extra: tuple[Path, ...] = ()
+    # Корень проекта сессии, когда оценка идёт от подключённого каталога (см. enter):
+    # временная папка модели — только его ``.gigacode/tmp/``. None — это сам ``root``.
+    project: Path | None = None
 
     @property
     def dir(self) -> Path:
         """Рабочий каталог команды: корень проекта и ``cwd`` от него."""
         return self.root / self.cwd
+
+    @property
+    def scratch_root(self) -> Path:
+        """Проект, чья ``.gigacode/tmp/`` — временная папка модели."""
+        return self.root if self.project is None else self.project
 
     def where(self, word: Word) -> Scope:
         """Область пути ``word`` для этой команды (с подключёнными каталогами)."""
@@ -82,7 +90,8 @@ class Env:
     def owner(self, path: Path) -> Path:
         """Корень (проекта или подключённого каталога), в котором лежит ``path``."""
         resolved = path.resolve()
-        for folder in self.extra:
+        # корень оценки — первым: подключённый каталог не «перехватывает» его пути
+        for folder in (self.root, *self.extra):
             if resolved == folder or folder in resolved.parents:
                 return folder
         return self.root
@@ -98,7 +107,13 @@ class Env:
             if resolved == folder or folder in resolved.parents:
                 others = tuple(other for other in (self.root, *self.extra) if other != folder)
                 rel = os.path.relpath(resolved, folder).replace(os.sep, "/")
-                return replace(self, root=folder, extra=others, cwd=rel)
+                return replace(
+                    self,
+                    root=folder,
+                    extra=others,
+                    cwd=rel,
+                    project=self.scratch_root,
+                )
         return None
 
 
@@ -415,7 +430,7 @@ def check_write(
                 f"{what}: служебные файлы git или jj ({word.raw}) — оттуда запускаются программы",
             )
         resolved = target.resolve()
-        own_temp = owner == env.root and is_temp_path(resolved, env.root)
+        own_temp = owner == env.scratch_root and is_temp_path(resolved, env.scratch_root)
         if is_data_path(resolved, owner) and not own_temp:
             return _danger(f"{what}: служебная папка gigacrew ({word.raw})")
         # Шаблон раскроется в любые файлы своего каталога: записанным считается каталог.
@@ -447,7 +462,7 @@ def _scratch_target(env: Env, word: Word, resolved: Path) -> bool:
         except (OSError, ValueError):
             return False
         paths = [(env.dir / match).resolve() for match in matches] or paths
-    return all(is_temp_path(path, env.root) and not _shared(path) for path in paths)
+    return all(is_temp_path(path, env.scratch_root) and not _shared(path) for path in paths)
 
 
 def _shared(path: Path) -> bool:
@@ -2170,13 +2185,13 @@ def _in_scratch(env: Env, word: Word) -> bool:
         candidates = [env.dir / match for match in matches] or [env.dir / word.text]
     else:
         candidates = [env.dir / word.text]
-    scratch_dir = temp_dir(env.root).resolve()
+    scratch_dir = temp_dir(env.scratch_root).resolve()
     for candidate in candidates:
         resolved = candidate.resolve()
         lexical = Path(os.path.normpath(candidate))
-        if resolved == scratch_dir or not is_temp_path(resolved, env.root):
+        if resolved == scratch_dir or not is_temp_path(resolved, env.scratch_root):
             return False
-        if lexical != resolved and not is_temp_path(lexical, env.root):
+        if lexical != resolved and not is_temp_path(lexical, env.scratch_root):
             return False  # ссылка извне временной папки на файл в ней
     return True
 
@@ -2207,8 +2222,9 @@ def _hard_link_bad(
 def _service_file(env: Env, target: Path) -> bool:
     """Путь — во внутренностях git или jj или в служебной папке gigacrew (не в tmp/)."""
     resolved = target.resolve()
-    service = is_data_path(resolved, env.root) and not is_temp_path(resolved, env.root)
-    return service or is_vcs_internal(resolved, env.root) or is_vcs_internal(target, env.root)
+    owner = env.owner(target)
+    service = is_data_path(resolved, owner) and not is_temp_path(resolved, env.scratch_root)
+    return service or is_vcs_internal(resolved, owner) or is_vcs_internal(target, owner)
 
 
 def _link_dir(env: Env, links: list[Word]) -> Path:
@@ -2222,7 +2238,8 @@ def _link_dir(env: Env, links: list[Word]) -> Path:
 def _into_scratch(env: Env, dest: list[Word]) -> bool:
     """Цель переноса — во временной папке модели (или она сама)."""
     return any(
-        word.static and is_temp_path((env.dir / word.text).resolve(), env.root) for word in dest
+        word.static and is_temp_path((env.dir / word.text).resolve(), env.scratch_root)
+        for word in dest
     )
 
 
@@ -4728,6 +4745,7 @@ def _python_code(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
         script=None if script is None else (env.dir / script).resolve(),
         path_dirs=path_dirs,
         extra=env.extra,
+        scratch_root=env.scratch_root,
     )
     part = Part(analysis.level, analysis.reason)
     # Без каталога запуска в sys.path затенение в нём не действует — но только если

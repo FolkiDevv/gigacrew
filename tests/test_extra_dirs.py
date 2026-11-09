@@ -65,6 +65,12 @@ def test_workspace_drops_nested_and_duplicate_dirs(project: Path, other: Path) -
     assert workspace.extra_dirs == (other.resolve(),)
 
 
+def test_workspace_drops_dir_containing_project(project: Path, other: Path) -> None:
+    """Родитель проекта перекрыл бы его защиту .gigacode/ и .git/ правилами каталога."""
+    workspace = Workspace(project, extra_dirs=(project.parent, other))
+    assert workspace.extra_dirs == (other.resolve(),)
+
+
 def test_resolve_in_roots(project: Path, other: Path) -> None:
     roots = (project, other)
     assert resolve_in_roots(roots, "src/main.py") == (project / "src/main.py").resolve()
@@ -83,8 +89,10 @@ def test_check_extra_dir(project: Path, other: Path, tmp_path: Path) -> None:
         check_extra_dir(tmp_path / "missing", project)
     with pytest.raises(ValueError, match="уже в проекте"):
         check_extra_dir(project / "src", project)
+    with pytest.raises(ValueError, match="содержит проект"):
+        check_extra_dir(project.parent, project, home=other)
     with pytest.raises(ValueError, match="слишком широко"):
-        check_extra_dir(tmp_path, project, home=other)
+        check_extra_dir(other, project, home=other / "src")
     secrets = tmp_path / ".ssh"
     secrets.mkdir()
     with pytest.raises(ValueError, match="секретами"):
@@ -175,6 +183,24 @@ def test_classifier_with_extra_dir(
     (other / ".env").write_text("KEY=1\n", encoding="utf-8")
     (other / "src" / ".gitkeep").write_text("", encoding="utf-8")
     assert classify(command, root=project, cwd=cwd, extra=(other,)).level is expected
+
+
+def test_link_into_extra_dir_is_not_walked_blindly(project: Path, other: Path) -> None:
+    """os.walk не заходит в ссылку на каталог: секреты за ней не проверены."""
+    (other / ".env").write_text("KEY=1\n", encoding="utf-8")
+    (project / "link").symlink_to(other)
+    assert classify("grep -R KEY link", root=project, extra=(other,)).level is not READ
+
+
+def test_attached_scratch_dir_is_not_session_scratch(project: Path, other: Path) -> None:
+    """Временная папка модели — только у проекта сессии, не у подключённого каталога."""
+    (other / ".gigacode" / "tmp" / "run1").mkdir(parents=True)
+    (project / ".gigacode" / "tmp" / "run1").mkdir(parents=True)
+    extra = (other,)
+    command = "cd ../other && rm -rf .gigacode/tmp/run1"
+    assert classify(command, root=project, extra=extra).level is DANGER
+    own = classify("cd ../other && rm -rf ../proj/.gigacode/tmp/run1", root=project, extra=extra)
+    assert own.level is classify("rm -rf .gigacode/tmp/run1", root=project).level
 
 
 def test_classifier_without_extra_dir_is_unchanged(project: Path, other: Path) -> None:

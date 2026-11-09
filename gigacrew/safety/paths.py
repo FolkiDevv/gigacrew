@@ -209,7 +209,8 @@ def has_escaping_links(  # noqa: WPS231
 ) -> bool:
     """Есть ли в дереве символические ссылки за пределы проекта (чтение по ним — наружу).
 
-    Ссылка в подключённый каталог (``extra``) — не наружу.
+    Ссылка в подключённый каталог (``extra``) — тоже: обход по ней не проверен на секреты
+    (``os.walk`` не заходит в ссылки на каталоги).
     """
     if not directory.is_dir():
         return False
@@ -231,6 +232,7 @@ def has_escaping_links(  # noqa: WPS231
                 Scope.OUTSIDE,
                 Scope.SECRET_OUTSIDE,
                 Scope.DYNAMIC,
+                Scope.EXTRA,
             }:
                 return True
     return False

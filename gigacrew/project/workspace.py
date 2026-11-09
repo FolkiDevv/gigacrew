@@ -141,14 +141,16 @@ class Workspace:
     def __post_init__(self) -> None:
         """Приводит корень и подключённые каталоги к абсолютным путям без симлинков.
 
-        Каталог внутри проекта или другого подключённого каталога лишний — он отбрасывается.
+        Каталог внутри проекта или другого подключённого каталога лишний, а содержащий
+        проект — запрещён (его правила перекрыли бы правила проекта): такие отбрасываются.
         """
         root = Path(self.root).resolve()
         object.__setattr__(self, "root", root)
         kept: list[Path] = []
         resolved = [Path(extra).resolve() for extra in self.extra_dirs]
         for directory in resolved:
-            if any(_within(directory, other) for other in (root, *kept)):
+            covered = any(_within(directory, other) for other in (root, *kept))
+            if covered or _within(root, directory):
                 continue
             kept = [other for other in kept if not _within(other, directory)]
             kept.append(directory)

@@ -20,7 +20,8 @@ def check_extra_dir(path: str | Path, root: Path, *, home: Path | None = None) -
     """Подключаемый каталог (``--add-dir``, ``/add-dir``) — раскрытый; ``ValueError`` — нельзя.
 
     Относительный путь — от текущего каталога. Нельзя: несуществующий, не каталог,
-    сам проект или каталог в нём, корень ФС, домашний каталог и всё, что его содержит,
+    сам проект, каталог в нём или содержащий его, корень ФС, домашний каталог и всё, что
+    его содержит,
     каталоги с секретами (``~/.ssh``…).
     """
     # Path.expanduser падает на «~неизвестный», os.path.expanduser оставляет как есть.
@@ -38,6 +39,8 @@ def _problem(raw: Path, directory: Path, project: Path, home: Path) -> str:
     """Почему существующий каталог нельзя подключить ("" — можно)."""
     if directory == project or project in directory.parents:
         return "уже в проекте"
+    if directory in project.parents:
+        return "содержит проект: подключите соседний каталог, а не родительский"
     user_home = home.resolve()
     if directory == user_home or directory in user_home.parents:
         return "слишком широко: подключите каталог конкретного проекта"
