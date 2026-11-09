@@ -113,11 +113,12 @@ from gigacrew.permissions import (
     decide,
     next_mode,
 )
+from gigacrew.project.extra_dirs import check_extra_dir
 from gigacrew.project.instructions import NestedInstructions
 from gigacrew.project.settings import HookEvent
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety import CommandLevel, Verdict
-from gigacrew.security import RiskLevel, resolve_in_root
+from gigacrew.security import RiskLevel
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 from gigacrew.tools.fs import write_atomic
 from gigacrew.tools.plan import PlanReview, review_plan
@@ -390,7 +391,11 @@ class Agent:
         # `is None`, а не `or`: пустой Conversation ложен (__len__ == 0).
         self._events = AgentEvents() if events is None else events
         if workspace is None:
-            workspace = Workspace(config.project_root, untrusted=config.untrusted_project)
+            workspace = Workspace(
+                config.project_root,
+                untrusted=config.untrusted_project,
+                extra_dirs=config.add_dirs,
+            )
         self._workspace = workspace
         self._parent = parent
         self._subagent = subagent
@@ -407,17 +412,7 @@ class Agent:
         self._hooks = HookRunner() if hooks is None else hooks
         # Контекст хуков SessionStart: в системном сообщении до reset().
         self._session_context = ""
-        self._ctx = ToolContext(
-            workspace=self._workspace,
-            # Вопрос пользователю — повод для хука Notification (суб-агент не спрашивает).
-            ask_user=self._ask_user if main else self._events.ask_user,
-            get_mode=lambda: self.mode,
-            set_mode=self.set_mode,
-            semantic=config.ty,
-            run_subagent=self._run_subagent if main else None,
-            plan=self._plan,
-            classify_commands=config.safe_commands,
-        )
+        self._ctx = self._tool_context()
         self._conversation = Conversation() if conversation is None else conversation
         self._model_name = config.model if parent is None else parent.model
         # Режим разрешений — состояние сессии, как модель: reset() его не меняет.
@@ -471,6 +466,31 @@ class Agent:
     def workspace(self) -> Workspace:
         """Рабочее пространство проекта (корень и служебные каталоги)."""
         return self._workspace
+
+    @property
+    def extra_dirs(self) -> tuple[Path, ...]:
+        """Подключённые каталоги (``--add-dir``, ``/add-dir``)."""
+        return self._workspace.extra_dirs
+
+    def add_directory(self, path: str | Path) -> Path:
+        """Подключить каталог вне проекта: инструменты читают и правят его, как проект.
+
+        Относительный путь — от корня проекта (``../other``). Возвращает раскрытый путь;
+        нельзя подключить — ``ValueError`` с причиной. Действует со следующего вызова
+        инструмента; модель узнаёт о каталоге из контекста проекта в системном сообщении.
+        Суб-агенты, запущенные позже, — тоже.
+        """
+        root = self._workspace.root
+        given = Path(path)
+        if not given.is_absolute() and not str(path).startswith("~"):
+            given = root / given
+        directory = check_extra_dir(given, root)
+        if directory not in self._workspace.extra_dirs:
+            extra = (*self._workspace.extra_dirs, directory)
+            self._workspace = replace(self._workspace, extra_dirs=extra)
+            self._ctx = self._tool_context()
+            self._project_context = None
+        return directory
 
     @property
     def model(self) -> str:
@@ -918,9 +938,7 @@ class Agent:
         # Тип элементов шире объявленного: инструмент может вернуть не только строки.
         paths: Sequence[object] = tool.paths(params)
         return any(
-            plan.is_target(resolve_in_root(self._workspace.root, path))
-            for path in paths
-            if isinstance(path, str)
+            plan.is_target(self._ctx.resolve(path)) for path in paths if isinstance(path, str)
         )
 
     @property
@@ -932,6 +950,21 @@ class Agent:
     def _is_subagent(self) -> bool:
         """Это суб-агент: у него есть основной агент."""
         return self._parent is not None
+
+    def _tool_context(self) -> ToolContext:
+        """Контекст инструментов для текущего рабочего пространства."""
+        main = self._parent is None
+        return ToolContext(
+            workspace=self._workspace,
+            # Вопрос пользователю — повод для хука Notification (суб-агент не спрашивает).
+            ask_user=self._ask_user if main else self._events.ask_user,
+            get_mode=lambda: self.mode,
+            set_mode=self.set_mode,
+            semantic=self._cfg.ty,
+            run_subagent=self._run_subagent if main else None,
+            plan=self._plan,
+            classify_commands=self._cfg.safe_commands,
+        )
 
     def _plan_path(self, chat_id: str) -> Path:
         return self._workspace.plans_dir / f"{chat_id}.md"

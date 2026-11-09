@@ -53,6 +53,7 @@ from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.llm.gigacode import GigaCodeProvider
 from gigacrew.llm.model_windows import ModelWindows
 from gigacrew.permissions import PermissionMode, parse_mode
+from gigacrew.project.extra_dirs import check_extra_dir
 from gigacrew.project.skills import SkillCatalog
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import build_default_registry
@@ -155,6 +156,15 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         "--yes-all",
         action=_STORE_TRUE,
         help="Авто-подтверждение всех операций, включая опасные, — используйте осознанно",
+    )
+    parser.add_argument(
+        "--add-dir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Подключить каталог вне проекта (например, другой проект, из которого "
+        "повторить решение): агент читает и правит его, как проект, в любом режиме. "
+        "Можно указать несколько раз; в REPL — /add-dir",
     )
     modes = ",".join(mode.value for mode in PermissionMode)
     parser.add_argument(
@@ -299,6 +309,13 @@ def _load_config(args: argparse.Namespace, ui: Console) -> Config | None:
     if not root.is_dir():
         ui.error(f"каталог проекта не найден: {root}")
         return None
+    add_dirs: list[Path] = []
+    for raw in args.add_dir:
+        try:
+            add_dirs.append(check_extra_dir(raw, root))
+        except ValueError as error:
+            ui.error(f"--add-dir: {error}")
+            return None
     try:
         config = Config.load(
             project_root=root,
@@ -309,6 +326,7 @@ def _load_config(args: argparse.Namespace, ui: Console) -> Config | None:
             stream=not args.no_stream,
             save_chats=not args.no_save,
             untrusted_project=args.untrusted_project,
+            add_dirs=tuple(add_dirs),
         )
         # До проверки реквизитов: адрес API из .env проекта пропущен — пусть будет видно почему.
         if config.ignored_env_warning:

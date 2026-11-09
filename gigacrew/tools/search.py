@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field
 
 from gigacrew.project.files import glob_match, walk_files
 from gigacrew.project.secret_paths import is_secret_target
-from gigacrew.security import resolve_in_root
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.fs import SECRET_READ_NOTE
 
@@ -27,7 +26,8 @@ class SearchContentParams(BaseModel):  # noqa: D101
     pattern: str = Field(description="Regular expression to search for in file contents")
     path: str = Field(
         default=".",
-        description="Directory or file to search in (relative to the project root)",
+        description="Directory or file to search in (relative to the project root, or an "
+        "absolute path in an additional directory)",
     )
     glob: str | None = Field(
         default=None,
@@ -148,7 +148,7 @@ class SearchContentTool(Tool[SearchContentParams]):
     @override
     def run(self, params: SearchContentParams, ctx: ToolContext) -> ToolResult:
         """Ищет строки, совпадающие с шаблоном, в файле или в файлах каталога."""
-        base = resolve_in_root(ctx.root, params.path)
+        base = ctx.resolve(params.path)
         if not base.exists():
             raise ToolError(f"Путь не найден: {params.path}")
         regex = _compile(params)
@@ -157,17 +157,19 @@ class SearchContentTool(Tool[SearchContentParams]):
         walking = base.is_dir()
         if not walking and is_secret_target(ctx.root, base):
             raise ToolError(SECRET_READ_NOTE.format(path=params.path))
-        files = walk_files(ctx.root, base) if walking else [base]
+        # .gitignore — того корня (проекта или подключённого каталога), где идёт поиск
+        owner = ctx.root_of(base)
+        files = walk_files(owner, base) if walking else [base]
         found = _Found(limit)
         for path in files:
-            rel = path.relative_to(ctx.root).as_posix()
+            rel = path.relative_to(owner).as_posix()
             if not _wanted(path, rel, params, ctx, walking=walking):
                 continue
             text = _read_text(path, found)
             if text is None:
                 continue
             found.scanned += 1
-            _collect(found, rel, text, regex)
+            _collect(found, ctx.display(path), text, regex)
             if found.more:
                 break
         return _report(found)

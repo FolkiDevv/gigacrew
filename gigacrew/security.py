@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import IntEnum
 from pathlib import Path
 
@@ -27,6 +27,7 @@ __all__ = [
     "SandboxError",
     "classify_shell_command",
     "resolve_in_root",
+    "resolve_in_roots",
     "subprocess_env",
 ]
 
@@ -44,17 +45,33 @@ def resolve_in_root(root: Path, path: str | Path) -> Path:
 
     Возвращает разрешённый Path. Бросает SandboxError, если путь ведёт наружу.
     """
-    root = root.resolve()
+    return resolve_in_roots((root,), path)
+
+
+def resolve_in_roots(roots: Sequence[Path], path: str | Path) -> Path:
+    """Как :func:`resolve_in_root`, но допустим любой из ``roots``.
+
+    Первый корень — проект: относительный путь считается от него. Остальные —
+    подключённые каталоги (``--add-dir``): путь в них — абсолютный или через ``..``.
+    """
+    resolved_roots = [Path(root).resolve() for root in roots]
+    project = resolved_roots[0]
     candidate = Path(path)
     if not candidate.is_absolute():
-        candidate = root / candidate
+        candidate = project / candidate
     # resolve() раскрывает .. и симлинки; strict=False — файла может ещё не быть.
     resolved = candidate.resolve()
-    if resolved != root and root not in resolved.parents:
+    if any(resolved == root or root in resolved.parents for root in resolved_roots):
+        return resolved
+    if len(resolved_roots) == 1:
         raise SandboxError(
-            f"Путь '{path}' выходит за пределы корня проекта ({root}). Операция запрещена.",
+            f"Путь '{path}' выходит за пределы корня проекта ({project}). Операция запрещена.",
         )
-    return resolved
+    listed = ", ".join(str(root) for root in resolved_roots[1:])
+    raise SandboxError(
+        f"Путь '{path}' выходит за пределы корня проекта ({project}) и подключённых "
+        f"каталогов ({listed}). Операция запрещена.",
+    )
 
 
 # Шаблоны заведомо опасных shell-конструкций.

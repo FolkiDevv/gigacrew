@@ -49,7 +49,8 @@ results at once. A call that needs the result of another one, and every change \
 (edits, commands), waits for the previous result.
 - Make minimal targeted changes with edit_file; rewrite a whole file (write_file) \
 only when it is justified.
-- Commands and paths are relative to the project root.
+- Commands and paths are relative to the project root (additional directories, if \
+any are listed in the project context, — by absolute path).
 - Never claim success you have not seen. If a command failed or a test did not \
 pass, say so and fix it.
 - Do not end a reply with a promise to act ("now I'll write the plan"): if an action \
@@ -203,7 +204,8 @@ SUBAGENT_PROMPT = _SUBAGENT_INTRO + _WORK_RULES + _PROJECT_RULES + _FINAL_REPORT
 EXPLORE_PROMPT = """\
 # Agent explore: codebase research
 You ONLY research: you change nothing (file edits and changing git commands are \
-blocked). run_shell runs only commands verified as read-only inside the project \
+blocked). run_shell runs only commands verified as read-only inside the project or its \
+additional directories \
 (ls, wc, grep, rg, git log/show/blame, Python one-liners that only read files); \
 anything else is refused, including the project's tests and builds, importing its \
 modules, shell loops and if/case blocks, and file paths computed at run time ($(…), \
@@ -462,6 +464,16 @@ def build_project_context(workspace: Workspace) -> str:
     root = workspace.root
     parts = [UNTRUSTED_PROJECT_RULES] if workspace.untrusted else []
     parts.append(f"Project root: {root}")
+    if workspace.extra_dirs:
+        listed = "\n".join(f"- {folder}" for folder in workspace.extra_dirs)
+        parts.append(
+            "Additional directories attached by the user (for example, another project to "
+            "take a solution from). Read and edit them like the project: absolute paths in "
+            "read_file, list_dir, find_files and search_content (`path`), edit_file and "
+            "write_file, run_shell `cwd`; commands that only read them run without asking. "
+            "The index and navigation tools (find_symbol, goto_definition, file_outline, "
+            f"repo_map) cover only the project.\n{listed}",
+        )
     parts.extend(
         _instruction_block("Project instructions", doc, untrusted=workspace.untrusted)
         for doc in load_instructions(root)

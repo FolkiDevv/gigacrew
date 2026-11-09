@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -35,13 +35,18 @@ def classify(
     root: Path,
     cwd: str = ".",
     environ: Mapping[str, str] | None = None,
+    extra: Sequence[Path] = (),
 ) -> Verdict:
     """Оценить команду, которую ``/bin/sh -c`` выполнит в ``root/cwd``.
 
     ``environ`` — окружение дочернего процесса (по умолчанию — текущее): из него берутся
-    PATH (где окажется программа) и PYTHONPATH.
+    PATH (где окажется программа) и PYTHONPATH. ``extra`` — подключённые каталоги
+    (``--add-dir``): чтение там — чтение, запись — правка, как в проекте. Часть команды,
+    которая выполняется в подключённом каталоге (``cwd`` или ведущий ``cd``), оценивается
+    так, будто корень — он: настройки git, venv, тестов берутся оттуда.
     """
     root = Path(root).resolve()
+    extra_dirs = tuple(Path(folder).resolve() for folder in extra)
     cwd = cwd or "."
     # Невидимые символы — до всех отказов «не знаю»: длинный хвост не должен их прятать.
     hidden = invisible_chars(command)
@@ -59,7 +64,10 @@ def classify(
     if len(command) > MAX_COMMAND:
         return Verdict(None, "слишком длинная команда", cwd, command.strip())
     env = os.environ if environ is None else environ
-    return _classify(command, root=root, cwd=cwd, environ=env, depth=0)
+    verdict = _classify(command, root=root, cwd=cwd, environ=env, depth=0, extra=extra_dirs)
+    if not extra_dirs:
+        return verdict
+    return replace(verdict, extra_dirs=tuple(str(folder) for folder in extra_dirs))
 
 
 # Управляющие символы (кроме табуляции и перевода строки), смена направления текста,
@@ -93,19 +101,27 @@ def _classify(  # noqa: WPS210
     cwd: str,
     environ: Mapping[str, str],
     depth: int,
+    extra: tuple[Path, ...] = (),
 ) -> Verdict:
-    script = bash.parse(command, root=root, cwd=cwd)
+    script = bash.parse(command, root=root, cwd=cwd, extra=extra)
     if script is None:
         return Verdict(None, "разбор команд оболочки недоступен", cwd, command.strip())
     if _LINE_CONTINUATION in _outside_heredocs(command):
         script.problems.append(r"перенос строки через \ (оболочки понимают по-разному)")
 
-    nested = partial(_nested, root=root, environ=environ)
-    base = programs.Env(root=root, cwd=script.cwd, environ=environ, depth=depth, nested=nested)
+    nested = partial(_nested, environ=environ)
+    base = programs.Env(
+        root=root,
+        cwd=script.cwd,
+        environ=environ,
+        depth=depth,
+        nested=nested,
+        extra=extra,
+    )
     parts: list[Part] = []
     writes: list[Part] = []
     for simple in script.commands:
-        env = replace(base, cwd=simple.cwd, assigned=simple.assigned)
+        env = _anchored(replace(base, cwd=simple.cwd, assigned=simple.assigned))
         part = replace(programs.classify_simple(simple, env), text=_text_of(simple))
         parts.append(part)
         for redirect in simple.redirects:
@@ -227,19 +243,37 @@ def _redirect_write(env: programs.Env, target: bash.Word) -> Part:
     return write
 
 
+def _anchored(env: programs.Env) -> programs.Env:
+    """Часть команды в подключённом каталоге оценивается от его корня (см. :func:`classify`).
+
+    Рабочий каталог вне всех корней разбор не выдаёт (``cd`` наружу не отслеживается).
+    """
+    if not env.extra or env.cwd == "." or not env.cwd.startswith(".."):
+        return env
+    entered = env.enter(env.dir)
+    return env if entered is None else entered
+
+
 def _nested(
     text: str,
     env: programs.Env,
     *,
-    root: Path,
     environ: Mapping[str, str],
 ) -> Part:
     """Оценка вложенной команды оболочки (``sh -c "…"``, тело heredoc для bash).
 
     Входы оценки её частей — входы этой части. Если вложенная команда что-то пишет
-    (хотя бы вывод в черновик), для соседних частей она пишет куда угодно в проекте.
+    (хотя бы вывод в черновик), для соседних частей она пишет куда угодно в проекте
+    и в подключённых каталогах.
     """
-    inner = _classify(text, root=root, cwd=env.cwd, environ=environ, depth=env.depth)
+    inner = _classify(
+        text,
+        root=env.root,
+        cwd=env.cwd,
+        environ=environ,
+        depth=env.depth,
+        extra=env.extra,
+    )
     if inner.level is CommandLevel.READ and not inner.composable:
         return Part(None, inner.reason)
     inputs = tuple(dict.fromkeys(path for part in inner.parts for path in part.inputs))
@@ -247,7 +281,7 @@ def _nested(
     return Part(
         inner.level,
         f"вложенная команда: {inner.reason}",
-        writes=(str(root),) if writing else (),
+        writes=tuple(str(folder) for folder in (env.root, *env.extra)) if writing else (),
         inputs=inputs,
     )
 

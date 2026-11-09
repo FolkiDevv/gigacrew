@@ -374,6 +374,9 @@ class Config:
     # Проект недоверенный (--untrusted-project, ревью чужих изменений): его файлы и
     # инструкции — данные, а не указания, для основного агента и суб-агентов.
     untrusted_project: bool = False
+    # Подключённые каталоги (--add-dir, раскрытые): читать и править, как проект.
+    # Только из командной строки — .env проекта не может выдать себе доступ наружу.
+    add_dirs: tuple[Path, ...] = ()
     # Предлагать замер окна незамеренной модели (пробы оплачиваются); False — только
     # по --test-context.
     auto_measure: bool = True
@@ -403,6 +406,7 @@ class Config:
         stream: bool = True,
         save_chats: bool = True,
         untrusted_project: bool = False,
+        add_dirs: tuple[Path, ...] = (),
         environ: Mapping[str, str] | None = None,
         cwd: Path | None = None,
         trusted_dotenv: bool = False,
@@ -482,6 +486,7 @@ class Config:
             / _PERCENT,
             save_chats=save_chats and _env_bool(env, "GIGACREW_SAVE_CHATS", default=True),
             untrusted_project=untrusted_project,
+            add_dirs=add_dirs,
             auto_measure=_env_bool(env, "GIGACREW_AUTO_MEASURE", default=True),
             ty=_env_bool(env, "GIGACREW_TY", default=True),
             safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", default=True),

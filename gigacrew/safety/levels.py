@@ -9,7 +9,7 @@ from types import MappingProxyType
 __all__ = ["CommandLevel", "Part", "Verdict", "worst"]
 
 # Версия правил: в журнале решений — чтобы переоценить старые записи после правок.
-RULES_VERSION = 7
+RULES_VERSION = 8
 
 
 class CommandLevel(IntEnum):
@@ -93,6 +93,8 @@ class Verdict:
     проверки или сборки и не мешает сверке с разрешениями, но остаётся записью: в режиме
     плана команда с ним заблокирована, а без других частей она — правка.
     ``writes`` — куда пишут перенаправления команды (для рецензента).
+    ``extra_dirs`` — подключённые каталоги, с которыми оценена команда (для рецензента:
+    они — часть проекта).
     """
 
     level: CommandLevel | None
@@ -104,6 +106,7 @@ class Verdict:
     redirects_edit: bool = True
     scratch: bool = False
     writes: tuple[str, ...] = ()
+    extra_dirs: tuple[str, ...] = ()
 
     @property
     def known(self) -> bool:

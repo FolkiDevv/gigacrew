@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
 
@@ -54,6 +55,9 @@ class Scope(Enum):
     SECRET = "secret"  # noqa: S105
     # ~/.ssh, ~/.aws, /proc/*/environ. S105 — то же ложное срабатывание на имя области.
     SECRET_OUTSIDE = "secret-outside"  # noqa: S105
+    # Вне проекта, но в подключённом каталоге (``--add-dir``) и не секрет: читать можно,
+    # писать — как в проект; запуск оттуда и прочее, что разрешено только внутри, — нет.
+    EXTRA = "extra"
     SINK = "sink"  # /dev/null и стандартные потоки
     DYNAMIC = "dynamic"  # значение известно только при выполнении
 
@@ -70,8 +74,11 @@ def is_secret_location(path: Path) -> bool:
     return any(part in SECRET_DIRS for part in path.parts)
 
 
-def scope_of_path(path: Path, root: Path) -> Scope:
-    """Область абсолютного пути (симлинки раскрываются)."""
+def scope_of_path(path: Path, root: Path, extra: Sequence[Path] = ()) -> Scope:
+    """Область абсолютного пути (симлинки раскрываются).
+
+    ``extra`` — подключённые каталоги (раскрытые): путь в них — :attr:`Scope.EXTRA`.
+    """
     text = path.as_posix()
     if text in SINKS:
         return Scope.SINK
@@ -82,11 +89,10 @@ def scope_of_path(path: Path, root: Path) -> Scope:
     except (OSError, RuntimeError):
         return Scope.DYNAMIC
     if resolved != root and root not in resolved.parents:
-        return (
-            Scope.SECRET_OUTSIDE
-            if is_secret_location(resolved) or is_secret_location(path)
-            else Scope.OUTSIDE
-        )
+        secret = is_secret_location(resolved) or is_secret_location(path)
+        if any(resolved == folder or folder in resolved.parents for folder in extra):
+            return Scope.SECRET if secret else Scope.EXTRA
+        return Scope.SECRET_OUTSIDE if secret else Scope.OUTSIDE
     if is_secret_location(path) or is_secret_location(resolved):
         return Scope.SECRET
     return Scope.INSIDE

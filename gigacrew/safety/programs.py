@@ -67,11 +67,39 @@ class Env:
     # Оценка вложенной команды оболочки (sh -c "…", тело heredoc для bash).
     nested: Callable[[str, Env], Part] | None = None
     program_path: str | None = None  # явный путь к программе (.venv/bin/python)
+    # Подключённые каталоги (``--add-dir``, раскрытые): читать и писать — как в проект.
+    extra: tuple[Path, ...] = ()
 
     @property
     def dir(self) -> Path:
         """Рабочий каталог команды: корень проекта и ``cwd`` от него."""
         return self.root / self.cwd
+
+    def where(self, word: Word) -> Scope:
+        """Область пути ``word`` для этой команды (с подключёнными каталогами)."""
+        return scope(word, root=self.root, cwd=self.cwd, extra=self.extra)
+
+    def owner(self, path: Path) -> Path:
+        """Корень (проекта или подключённого каталога), в котором лежит ``path``."""
+        resolved = path.resolve()
+        for folder in self.extra:
+            if resolved == folder or folder in resolved.parents:
+                return folder
+        return self.root
+
+    def enter(self, directory: Path) -> Env | None:
+        """Команда в каталоге ``directory``: в проекте или в подключённом каталоге.
+
+        Подключённый каталог становится корнем оценки (поиск настроек git, venv, pytest
+        идёт по нему), а проект — подключённым. None — каталог вне всех корней.
+        """
+        resolved = directory.resolve()
+        for folder in (self.root, *self.extra):
+            if resolved == folder or folder in resolved.parents:
+                others = tuple(other for other in (self.root, *self.extra) if other != folder)
+                rel = os.path.relpath(resolved, folder).replace(os.sep, "/")
+                return replace(self, root=folder, extra=others, cwd=rel)
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +365,7 @@ def check_read(env: Env, words: list[Word], what: str, *, content: bool = True) 
     for word in words:
         if word.static and not word.glob and word.text in _SYSTEM_INFO:
             continue
-        where = scope(word, root=env.root, cwd=env.cwd)
+        where = env.where(word)
         if where is Scope.SECRET_OUTSIDE:
             if not content:
                 found.append(_unknown(f"{what}: каталог с секретами вне проекта ({word.raw})"))
@@ -369,7 +397,7 @@ def check_write(
     """
     parts: list[Part] = []
     for word in words:
-        where = scope(word, root=env.root, cwd=env.cwd)
+        where = env.where(word)
         if where in {Scope.OUTSIDE, Scope.SECRET_OUTSIDE}:
             return _danger(f"{what}: запись вне проекта ({word.raw})")
         if where is Scope.SINK:
@@ -380,12 +408,15 @@ def check_write(
             parts.append(_unknown(f"{what}: путь известен только при выполнении ({word.raw})"))
             continue
         target = Path(word.text) if word.text.startswith("/") else (env.dir / word.text)
-        if is_vcs_internal(target.resolve(), env.root) or is_vcs_internal(target, env.root):
+        # служебные папки — того корня, где путь: проекта или подключённого каталога
+        owner = env.owner(target)
+        if is_vcs_internal(target.resolve(), owner) or is_vcs_internal(target, owner):
             return _danger(
                 f"{what}: служебные файлы git или jj ({word.raw}) — оттуда запускаются программы",
             )
         resolved = target.resolve()
-        if is_data_path(resolved, env.root) and not is_temp_path(resolved, env.root):
+        own_temp = owner == env.root and is_temp_path(resolved, env.root)
+        if is_data_path(resolved, owner) and not own_temp:
             return _danger(f"{what}: служебная папка gigacrew ({word.raw})")
         # Шаблон раскроется в любые файлы своего каталога: записанным считается каталог.
         written = (str((_glob_base(target) if word.glob else target).resolve()),)
@@ -454,7 +485,8 @@ def _check_recursive(
         folder = env.dir if word.glob else (env.dir / word.text).resolve()
         if hidden and has_secrets_under(folder, env.root, name_pattern=pattern):
             return _unknown(f"{what}: в каталоге есть файлы с секретами")
-        if has_escaping_links(folder, env.root, name_pattern=pattern) and (follow or hidden):
+        links = has_escaping_links(folder, env.root, name_pattern=pattern, extra=env.extra)
+        if links and (follow or hidden):
             return _unknown(f"{what}: в каталоге есть ссылки за пределы проекта")
     return None
 
@@ -476,10 +508,11 @@ def _check_exec_args(env: Env, args: list[Word], what: str) -> Part | None:
                 and _looks_like_path(candidate)
                 and not candidate.startswith(("--", "http://", "https://"))
             ):
-                where = scope(Word(candidate), root=env.root, cwd=env.cwd)
+                where = env.where(Word(candidate))
                 if where is Scope.SECRET_OUTSIDE:
                     return _danger(f"{what}: секреты вне проекта ({candidate})")
-                if where in {Scope.OUTSIDE, Scope.DYNAMIC, Scope.SECRET}:
+                # подключённый каталог — тоже «не знаю»: это запуск чужого кода
+                if where in {Scope.OUTSIDE, Scope.DYNAMIC, Scope.SECRET, Scope.EXTRA}:
                     return _unknown(f"{what}: путь вне проекта в аргументах ({candidate})")
     return None
 
@@ -833,7 +866,7 @@ def _signature_args_ok(signature: str, args: list[Word], env: Env) -> bool:
             return False
         # позиционный: путь внутри проекта (pytest: tests/test_x.py::test_y)
         path = text.split("::", 1)[0]
-        if scope(Word(path), root=env.root, cwd=env.cwd) != Scope.INSIDE:
+        if env.where(Word(path)) != Scope.INSIDE:
             return False
         idx += 1
     return True
@@ -2305,7 +2338,7 @@ def _ln(env: Env, args: list[Word]) -> Part:
         return service
     # Ссылка на файл вне проекта превратит его в «файл проекта» для следующих команд.
     for target in targets:
-        where = scope(target, root=env.root, cwd=env.cwd)
+        where = env.where(target)
         if where != Scope.INSIDE:
             return _danger(f"ln: ссылка на {target.raw} — вне проекта или секреты")
     if target_dir:  # ln -t КАТАЛОГ цели… — ссылки создаются в КАТАЛОГЕ
@@ -3482,9 +3515,14 @@ def _git(env: Env, args: list[Word]) -> Part:
             return _unknown(f"git -c {key}: настройка на один запуск не проверена")
         if text == "-C" and cursor + 1 < len(args):
             target = args[cursor + 1]
-            if scope(target, root=env.root, cwd=env.cwd) is not Scope.INSIDE:
+            entered = (
+                env.enter(env.dir / target.text)
+                if env.where(target) in {Scope.INSIDE, Scope.EXTRA}
+                else None
+            )
+            if entered is None:
                 return _unknown(f"git -C {target.raw}: каталог вне проекта")
-            env = replace(env, cwd=os.path.relpath((env.dir / target.text).resolve(), env.root))
+            env = entered
             cursor += 2
             continue
         if text in {"--no-pager", "-P", "--no-optional-locks", "--version"}:
@@ -4126,9 +4164,14 @@ def _jj_globals(env: Env, args: list[Word]) -> Part | tuple[list[Word], Env]:
             idx += 1
             continue
         path, used = target
-        if not path or scope(Word(path), root=env.root, cwd=env.cwd) is not Scope.INSIDE:
+        entered = (
+            env.enter(env.dir / path)
+            if path and env.where(Word(path)) in {Scope.INSIDE, Scope.EXTRA}
+            else None
+        )
+        if entered is None:
             return _unknown(f"jj -R {path}: репозиторий вне проекта")
-        repo = replace(env, cwd=os.path.relpath((env.dir / path).resolve(), env.root))
+        repo = entered
         idx += used
     return kept, repo
 
@@ -4665,7 +4708,7 @@ def _python_code(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
                 return _unknown(f"{prog}: код приходит со stdin (известен только при выполнении)")
         else:
             target = script if script.is_absolute() else env.dir / script
-            if scope(Word(str(script)), root=env.root, cwd=env.cwd) is not Scope.INSIDE:
+            if env.where(Word(str(script))) is not Scope.INSIDE:
                 return _unknown(f"{prog} {script}: скрипт вне проекта")
             try:
                 script_bytes = target.read_bytes()
@@ -4684,6 +4727,7 @@ def _python_code(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
         cwd=env.cwd,
         script=None if script is None else (env.dir / script).resolve(),
         path_dirs=path_dirs,
+        extra=env.extra,
     )
     part = Part(analysis.level, analysis.reason)
     # Без каталога запуска в sys.path затенение в нём не действует — но только если
@@ -4771,7 +4815,7 @@ def _shell(env: Env, cmd: Command, prog: str, args: list[Word]) -> Part:
         return env.nested(rest[0].text, replace(env, depth=env.depth + 1))
     if rest:
         script = rest[0]
-        if scope(script, root=env.root, cwd=env.cwd) is not Scope.INSIDE:
+        if env.where(script) is not Scope.INSIDE:
             return _unknown(f"{prog} {script.raw}: скрипт вне проекта")
         if _DEPLOY.search(script.text):
             return _danger(f"{prog} {script.raw}: похоже на развёртывание или публикацию")
@@ -4795,7 +4839,7 @@ def _source(env: Env, args: list[Word]) -> Part:
     if not args or not args[0].static:
         return _unknown("source: файл известен только при выполнении")
     target = env.dir / args[0].text
-    if scope(args[0], root=env.root, cwd=env.cwd) is not Scope.INSIDE:
+    if env.where(args[0]) is not Scope.INSIDE:
         return _unknown(f"source {args[0].raw}: файл вне проекта")
     if target.name in {"activate", "activate.sh"} and _venv_root(target) is not None:
         return Part(
@@ -5887,7 +5931,7 @@ def _dispatch(
         if prog in {"sqlite3", "duckdb"}:
             _, pos = _split(args)
             database = pos[0] if pos and pos[0].static else None
-            if database is not None and scope(database, root=env.root, cwd=env.cwd) is Scope.INSIDE:
+            if database is not None and env.where(database) is Scope.INSIDE:
                 sql = " ".join(word.text for word in pos[1:])
                 if (
                     sql
@@ -5991,7 +6035,7 @@ def _script_runner(
     script = pos[0]
     if prog == "java" and any(arg.text == "-jar" for arg in flags):
         script = _flag_values(args, "-jar")[0] if _flag_values(args, "-jar") else script
-    if scope(script, root=env.root, cwd=env.cwd) is not Scope.INSIDE:
+    if env.where(script) is not Scope.INSIDE:
         return _unknown(f"{prog} {script.raw}: скрипт вне проекта или неизвестен")
     if _DEPLOY.search(script.text):
         return _danger(f"{prog} {script.raw}: похоже на развёртывание")

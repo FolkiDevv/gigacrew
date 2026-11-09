@@ -13,7 +13,7 @@ import fnmatch
 import glob
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 from gigacrew.project import files
@@ -65,15 +65,20 @@ def temp_dir(root: Path) -> Path:
     return Workspace(root).data_dir / TEMP_DIR_NAME
 
 
-def _resolve(root: Path, cwd: str, path_text: str) -> Scope:
+def _resolve(root: Path, cwd: str, path_text: str, extra: Sequence[Path] = ()) -> Scope:
     if path_text.startswith("~"):
         # Path.expanduser падает на «~неизвестный», os.path.expanduser оставляет как есть.
         lexical = Path(os.path.expanduser(path_text))  # noqa: PTH111
-        return Scope.SECRET_OUTSIDE if is_secret_location(lexical) else Scope.OUTSIDE
+        if is_secret_location(lexical):
+            return Scope.SECRET_OUTSIDE
+        # раскрылся в подключённый каталог (~/work/other) — обычная проверка пути
+        if lexical.is_absolute() and scope_of_path(lexical, root, extra) is Scope.EXTRA:
+            return Scope.EXTRA
+        return Scope.OUTSIDE
     if path_text in SINKS:
         return Scope.SINK
     lexical_path = Path(path_text) if path_text.startswith("/") else root / cwd / path_text
-    return scope_of_path(lexical_path, root)
+    return scope_of_path(lexical_path, root, extra)
 
 
 def _worst(scopes: list[Scope]) -> Scope:
@@ -83,6 +88,7 @@ def _worst(scopes: list[Scope]) -> Scope:
         Scope.DYNAMIC,
         Scope.SECRET,
         Scope.SINK,
+        Scope.EXTRA,
         Scope.INSIDE,
     ]
     for candidate in order:
@@ -92,30 +98,42 @@ def _worst(scopes: list[Scope]) -> Scope:
 
 
 # Проверки пути идут подряд, от простых к раскрытию шаблона: так их легче сверять с оболочкой.
-def scope(word: Word, *, root: Path, cwd: str = ".") -> Scope:  # noqa: WPS212
-    """Область пути ``word`` для команды, запущенной в ``root/cwd``."""
+def scope(  # noqa: WPS212
+    word: Word,
+    *,
+    root: Path,
+    cwd: str = ".",
+    extra: Sequence[Path] = (),
+) -> Scope:
+    """Область пути ``word`` для команды, запущенной в ``root/cwd``.
+
+    ``extra`` — подключённые каталоги (раскрытые): пути в них — :attr:`Scope.EXTRA`.
+    """
     if not word.static:
         return Scope.DYNAMIC
     pattern = word.text
     if not word.glob:
-        return _resolve(root, cwd, pattern)
+        return _resolve(root, cwd, pattern, extra)
     # Шаблон: сегмент, начинающийся с точки, в dash совпадает с «..».
     if any(seg.startswith(".") and re.search(r"[*?\[]", seg) for seg in pattern.split("/")):
         return Scope.OUTSIDE
     if pattern.startswith(("~", "/")):
-        base_scope = _resolve(root, cwd, pattern.split("*")[0].rsplit("/", 1)[0] or "/")
-        if base_scope != Scope.INSIDE:
+        base_text = pattern.split("*")[0].rsplit("/", 1)[0] or "/"
+        base_scope = _resolve(root, cwd, base_text, extra)
+        if base_scope not in {Scope.INSIDE, Scope.EXTRA}:
             return base_scope if base_scope == Scope.SECRET_OUTSIDE else Scope.OUTSIDE
     try:
         # glob.glob, как оболочка, не находит скрытые файлы по «*», а Path.glob находит.
-        matches = glob.glob(pattern, root_dir=root / cwd)  # noqa: PTH207
+        # «~» оболочка раскрывает до шаблона (база в подключённом каталоге — см. выше)
+        expanded = os.path.expanduser(pattern)  # noqa: PTH111
+        matches = glob.glob(expanded, root_dir=root / cwd)  # noqa: PTH207
     except (OSError, ValueError):
         return Scope.DYNAMIC
     if len(matches) > MAX_GLOB_MATCHES:
         return Scope.DYNAMIC
     if not matches:  # без совпадений шаблон остаётся словом как есть
-        return _resolve(root, cwd, pattern)
-    return _worst([_resolve(root, cwd, match) for match in matches])
+        return _resolve(root, cwd, pattern, extra)
+    return _worst([_resolve(root, cwd, match, extra) for match in matches])
 
 
 def _walk(directory: Path, limit: int) -> Iterator[tuple[Path, list[str], list[str]] | None]:
@@ -187,8 +205,12 @@ def has_escaping_links(  # noqa: WPS231
     *,
     name_pattern: str | None = None,
     limit: int = 20000,
+    extra: Sequence[Path] = (),
 ) -> bool:
-    """Есть ли в дереве символические ссылки за пределы проекта (чтение по ним — наружу)."""
+    """Есть ли в дереве символические ссылки за пределы проекта (чтение по ним — наружу).
+
+    Ссылка в подключённый каталог (``extra``) — не наружу.
+    """
     if not directory.is_dir():
         return False
     for entry in _walk(directory, limit):
@@ -205,6 +227,10 @@ def has_escaping_links(  # noqa: WPS231
                 and not fnmatch.fnmatch(name, name_pattern)
             ):
                 continue
-            if scope_of_path(path, root) in {Scope.OUTSIDE, Scope.SECRET_OUTSIDE, Scope.DYNAMIC}:
+            if scope_of_path(path, root, extra) in {
+                Scope.OUTSIDE,
+                Scope.SECRET_OUTSIDE,
+                Scope.DYNAMIC,
+            }:
                 return True
     return False
