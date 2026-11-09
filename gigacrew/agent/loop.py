@@ -84,6 +84,7 @@ from gigacrew.agent.reviewer import (
     Reviewer,
     recent_requests,
     review_command,
+    review_request,
 )
 
 # Запуск суб-агента и его отчёты для основного агента — всё из одного модуля.
@@ -132,6 +133,12 @@ REJECTED_NOTE = (
     "clarify the plan."
 )
 FEEDBACK_NOTE = "\nThe user said instead: {feedback}"
+NO_ANSWER_NOTE = (
+    "Not executed: the confirmation got NO ANSWER (the run is non-interactive or the prompt "
+    "was dismissed), so nobody can approve this operation now. Do not repeat it. Reach the "
+    "goal another way that needs no confirmation, or finish and tell the user what is left "
+    "for them to run."
+)
 REJECTED_AGAIN_NOTE = (
     "The user already REJECTED this operation in this turn, so it was not offered again. "
     "Do not repeat it; suggest an alternative or clarify the plan."
@@ -1992,11 +1999,7 @@ class Agent:
                 if answer.approval is Approval.ALWAYS:
                     self._allow_always(asked, key, verdict)
                 elif answer.approval is not Approval.YES:
-                    model_text = REJECTED_NOTE
-                    if answer.feedback:
-                        model_text += FEEDBACK_NOTE.format(feedback=answer.feedback)
-                    self._fail(call, "отклонено пользователем", model_text=model_text, note=note)
-                    return ToolOutcome(ok=False, rejected=True)
+                    return self._refuse(call, answer, note)
                 elif auto_remember:
                     # Разрешал не раз и ни разу не отклонял — «всегда» без вопроса (как «a»).
                     self._remember_repeated(verdict)
@@ -2220,6 +2223,20 @@ class Agent:
                 f"({self._saved_where()}): {rules}; /permissions — список",
             )
 
+    def _refuse(self, call: ToolCallInfo, answer: ConfirmResult, note: str | None) -> ToolOutcome:
+        """На вопрос не ответили «да»: вызов не выполняется, модель узнаёт почему.
+
+        Ответа не было (нет терминала, Ctrl+C на вопросе) — это не выбор пользователя:
+        модель не должна считать, что ей отказали по существу.
+        """
+        error, model_text = "отклонено пользователем", REJECTED_NOTE
+        if not answer.answered:
+            error, model_text = "нет ответа на подтверждение", NO_ANSWER_NOTE
+        elif answer.feedback:
+            model_text += FEEDBACK_NOTE.format(feedback=answer.feedback)
+        self._fail(call, error, model_text=model_text, note=note)
+        return ToolOutcome(ok=False, rejected=True)
+
     def _deny(
         self,
         call: ToolCallInfo,
@@ -2270,8 +2287,10 @@ class Agent:
         решает пользователь, третье значение — пояснение для вопроса. Рецензент не
         спрашивается, если пользователь уже отклонял такую команду, команда слишком длинная
         или рецензент отключён. Тот же вызов (``key``), уже получивший отказ в этом ходе, и
-        серия отказов (:meth:`Reviewer.denied`) — вопрос пользователю. Сбой рецензента —
-        вопрос пользователю; сбои подряд отключают рецензента. Ctrl+C/Esc прерывают ход.
+        серия отказов (:meth:`Reviewer.denied`) — вопрос пользователю. Сбой рецензента
+        (после одного повтора) — вопрос пользователю; сбои подряд ставят рецензента на
+        паузу. На запрос, который рецензент уже разрешил в этой сессии, модель не
+        спрашивается. Ctrl+C/Esc прерывают ход.
         """
         reviewer = self._reviewer
         if verdict is None or check.rejected_before:
@@ -2284,24 +2303,12 @@ class Agent:
         if skipped:
             return Decision.ASK, None, skipped
         model = reviewer.model_for(self._model_name)
-        review: Review | None = None
-        self._events.on_review_start(call)
-        try:
-            review = review_command(
-                self._provider,
-                command=command,
-                verdict=verdict,
-                requests=self._user_requests(),
-                model=model,
-                timeout=self._cfg.reviewer_timeout,
-                on_usage=self._bill_side,
-            )
-        except Exception as exc:  # сбой рецензента — решает пользователь
-            failure = str(exc) or type(exc).__name__
-            error = " ".join(failure.split())[:_MAX_ERROR_CHARS]
-            review = Review(model, allowed=False, reason=error, failed=True)
-        finally:
-            self._events.on_review_end(call, review)
+        request_text = review_request(command, verdict, self._user_requests())
+        review = reviewer.cached(model, request_text)
+        if review is not None:
+            reviewer.allowed()
+            return Decision.ALLOW, review, ""
+        review = self._ask_reviewer(call, model, request_text)
         if review.failed:
             if reviewer.failed(review.reason):
                 self._events.on_notice(reviewer.warning, level=_WARN)
@@ -2309,12 +2316,40 @@ class Agent:
         reviewer.succeeded()
         if review.allowed:
             reviewer.allowed()
+            reviewer.remember(request_text, review)
             return Decision.ALLOW, review, ""
         if reviewer.denied(key, review.reason):
             # Отказы подряд или их много за ход — агенту другой путь не найти: решает человек.
             reason = review.reason or "решать вам"
             return Decision.ASK, review, f"рецензент ({model}): {reason}"
         return Decision.DENY, review, ""
+
+    def _ask_reviewer(
+        self,
+        call: ToolCallInfo,
+        model: str,
+        request_text: str,
+    ) -> Review:
+        """Ответ рецензента на запрос ``request_text``; сбой — ``Review(failed=True)``."""
+        review: Review | None = None
+        self._events.on_review_start(call)
+        try:
+            review = self._reviewer.ask(
+                lambda: review_command(
+                    self._provider,
+                    request_text,
+                    model=model,
+                    timeout=self._cfg.reviewer_timeout,
+                    on_usage=self._bill_side,
+                ),
+            )
+        except Exception as exc:  # сбой рецензента — решает пользователь
+            failure = str(exc) or type(exc).__name__
+            error = " ".join(failure.split())[:_MAX_ERROR_CHARS]
+            review = Review(model, allowed=False, reason=error, failed=True)
+        finally:
+            self._events.on_review_end(call, review)
+        return review
 
     def _review_skipped(self, verdict: Verdict, command: str, key: str) -> str:
         """Почему команду решает пользователь без рецензента ("" — спросить рецензента)."""
@@ -2408,6 +2443,7 @@ class Agent:
                 "allowed": review.allowed,
                 "reason": review.reason,
                 "failed": review.failed,
+                "cached": review.cached,
             }
         try:
             entry_id = self._decisions.record({

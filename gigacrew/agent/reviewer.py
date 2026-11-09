@@ -11,9 +11,14 @@
 статического разбора, но не ответы агента, не его пояснение к команде и не вывод
 инструментов — содержимое файлов и страниц не может его уговорить.
 
+Сбой рецензента — не повод звать пользователя сразу: быстрый сбой повторяется один раз
+(:meth:`Reviewer.ask`), сбои подряд ставят рецензента на паузу
+(:data:`REVIEWER_COOLDOWN`), а не отключают до конца сессии. Разрешение запоминается на
+сессию по тексту запроса (:meth:`Reviewer.cached`): тот же запрос второй раз не отправляется.
+
 * :func:`review_command` — один запрос к модели;
 * :class:`Reviewer` — состояние на сессию: какая модель, включён ли, счётчики сбоев и
-  отказов;
+  отказов, разрешённые запросы;
 * :func:`check_reviewer` — проверка модели из ``GIGACREW_REVIEWER_MODEL`` при старте.
 """
 
@@ -21,7 +26,9 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from gigacrew.agent.compaction import clip_middle
@@ -42,8 +49,15 @@ PART_CLIP = 200
 # Сколько символов чернового скрипта из .gigacode/tmp/ видит рецензент и сколько скриптов.
 SCRIPT_CLIP = 3_000
 MAX_SCRIPTS = 2
-# Столько сбоев подряд — и рецензент отключается до конца сессии.
+# Столько сбоев подряд — и рецензент отключается на REVIEWER_COOLDOWN секунд.
 MAX_FAILURES = 3
+# Пауза после сбоев подряд, с: потом одна проба, её сбой — снова пауза.
+REVIEWER_COOLDOWN = 300
+# Сбой повторяется один раз, если ответ не разобран или ошибка пришла быстрее, с:
+# ждать второй тайм-аут пользователю дороже, чем ответить на вопрос.
+RETRY_WITHIN = 10
+# Сколько разрешённых запросов помнит рецензент за сессию.
+MAX_CACHED_REVIEWS = 256
 # После стольких отказов подряд (без разрешений между ними) решает пользователь.
 MAX_DENIALS_IN_ROW = 3
 # После стольких отказов за ход пользователя решает пользователь — до конца хода.
@@ -52,6 +66,7 @@ DISABLED_NOTE = (
     "модель-рецензент отключена: в режиме «авто» больше команд будут требовать ручного "
     "подтверждения"
 )
+_SECONDS_IN_MINUTE = 60
 # Сколько символов причины из ответа рецензента сохраняется.
 _REASON_CLIP = 300
 # Сколько символов ответа рецензента цитирует ошибка разбора.
@@ -61,7 +76,15 @@ _ERROR_CLIP = 200
 
 
 class ReviewError(LLMError):
-    """Рецензент не дал пригодного ответа."""
+    """Рецензент не дал пригодного ответа.
+
+    ``retry`` — стоит ли спросить ещё раз: противоречивый ответ повтор не исправит.
+    """
+
+    def __init__(self, message: str, *, retry: bool = True):
+        """Ошибка с текстом ``message``."""
+        super().__init__(message)
+        self.retry = retry
 
 
 # ------------------------------- запрос ------------------------------- #
@@ -211,9 +234,9 @@ def parse_review(text: str) -> tuple[bool, str]:
 
     Модели нередко оборачивают JSON в блок кода или пишут текст вокруг — это не ошибка.
     Объекта нет — :class:`ReviewError`. Объектов с разными ``allow`` несколько (рецензент
-    процитировал объект из команды и ответил другим) — тоже: какой из них решение, не
-    понять, а ошибка — в осторожную сторону. Согласных объектов несколько — причина
-    последнего.
+    процитировал объект из команды и ответил другим) — тоже, без повтора: какой из них
+    решение, не понять, а ошибка — в осторожную сторону. Согласных объектов несколько —
+    причина последнего.
     """
     decoder = json.JSONDecoder()
     found: list[tuple[bool, str]] = []
@@ -230,28 +253,27 @@ def parse_review(text: str) -> tuple[bool, str]:
         shown = snippet or "(пусто)"
         raise ReviewError(f"ответ рецензента не разобран: {shown}")
     if len({allow for allow, _ in found}) > 1:
-        raise ReviewError(f"противоречивый ответ рецензента: {snippet}")
+        raise ReviewError(f"противоречивый ответ рецензента: {snippet}", retry=False)
     return found[-1]
 
 
 def review_command(
     provider: LLMProvider,
+    request_text: str,
     *,
-    command: str,
-    verdict: Verdict,
-    requests: Sequence[str],
     model: str,
     timeout: float | None = None,
     on_usage: Callable[[Usage], None] | None = None,
 ) -> Review:
     """Спросить модель ``model``, можно ли выполнить команду без вопроса.
 
-    ``timeout`` — сколько ждать ответа, с (None — ожидание провайдера). Ошибки
-    обращения — :class:`LLMError`, непригодный ответ — :class:`ReviewError`.
+    ``request_text`` — запрос о команде (:func:`review_request`). ``timeout`` — сколько
+    ждать ответа, с (None — ожидание провайдера). Ошибки обращения — :class:`LLMError`,
+    непригодный ответ — :class:`ReviewError`.
     """
     request = [
         Message(role="system", content=REVIEWER_PROMPT),
-        Message(role="user", content=review_request(command, verdict, requests)),
+        Message(role="user", content=request_text),
     ]
     turn = provider.complete(
         request,
@@ -269,25 +291,47 @@ def review_command(
 
 
 # ------------------------------ состояние ------------------------------ #
-class Reviewer:
+# Состояние сессии в одном месте: сбои, пауза, отказы и разрешённые запросы.
+class Reviewer:  # noqa: WPS214
     """Модель-рецензент сессии; общая у агента и его суб-агентов.
 
     ``model`` — явно заданная модель (``GIGACREW_REVIEWER_MODEL``); None — модель чата,
-    какая выбрана в момент проверки. ``disabled`` — почему отключён ("" — работает).
+    какая выбрана в момент проверки. ``disabled`` — почему отключён ("" — работает):
+    заданная при создании причина — до конца сессии, сбои подряд — на
+    :data:`REVIEWER_COOLDOWN` секунд.
 
     Отказы считаются за ход пользователя (:meth:`new_turn`): вызов, который уже получил
     отказ, отказы подряд и отказы за ход решают, вернуть ли следующий отказ агенту или
     передать команду пользователю.
     """
 
-    def __init__(self, model: str | None = None, *, disabled: str = ""):
+    def __init__(
+        self,
+        model: str | None = None,
+        *,
+        disabled: str = "",
+        clock: Callable[[], float] = time.monotonic,
+    ):
         """Рецензент с моделью ``model``; ``disabled`` — причина отключения ("" — работает)."""
         self.model = model
-        self.disabled = disabled
+        self._off = disabled  # отключён до конца сессии
+        self._clock = clock
+        self._paused = ""  # почему на паузе
+        self._paused_until = float(0)
         self._failures = 0
         self._denials_in_row = 0
         self._denials = 0
         self._denied: dict[str, str] = {}  # ключ вызова → причина отказа
+        self._allowed: dict[tuple[str, str], Review] = {}  # (модель, запрос) → разрешение
+
+    @property
+    def disabled(self) -> str:
+        """Почему рецензент отключён ("" — работает); пауза после сбоев кончается сама."""
+        if self._off:
+            return self._off
+        if self._paused and self._clock() < self._paused_until:
+            return self._paused
+        return ""
 
     @property
     def enabled(self) -> bool:
@@ -316,12 +360,54 @@ class Reviewer:
         self._failures = 0
 
     def failed(self, error: str) -> bool:
-        """Учесть сбой; True — рецензент только что отключён (сбои подряд)."""
+        """Учесть сбой; True — рецензент только что отключён (сбои подряд).
+
+        Отключение — пауза на :data:`REVIEWER_COOLDOWN` секунд. После неё хватит одного
+        сбоя, чтобы уйти на паузу снова; успех (:meth:`succeeded`) возвращает полный счёт.
+        """
         self._failures += 1
         if self._failures < MAX_FAILURES or self.disabled:
             return False
-        self.disabled = f"{MAX_FAILURES} сбоя рецензента подряд (последний: {error})"
+        minutes = REVIEWER_COOLDOWN // _SECONDS_IN_MINUTE
+        self._paused = (
+            f"{MAX_FAILURES} сбоя рецензента подряд (последний: {error}), пауза {minutes} мин"
+        )
+        self._paused_until = self._clock() + REVIEWER_COOLDOWN
+        self._failures = MAX_FAILURES - 1
         return True
+
+    def ask(self, question: Callable[[], Review]) -> Review:
+        """Ответ рецензента; сбой повторяется один раз, если повтор обойдётся недорого.
+
+        Повторяется неразобранный или оборванный ответ (модель ответила, но не по форме) и
+        ошибка, пришедшая быстрее :data:`RETRY_WITHIN` секунд (обрыв связи, перегрузка).
+        Противоречивый ответ и долгий сбой (тайм-аут) не повторяются.
+        """
+        started = self._clock()
+        try:
+            return question()
+        except ReviewError as error:
+            if not error.retry:
+                raise
+        except Exception:
+            if self._clock() - started > RETRY_WITHIN:
+                raise
+        return question()
+
+    def cached(self, model: str, request_text: str) -> Review | None:
+        """Разрешение, уже выданное в этой сессии моделью ``model`` на тот же запрос.
+
+        Ключ — модель и весь текст запроса: всё, что рецензент видел.
+        """
+        return self._allowed.get((model, request_text))
+
+    def remember(self, request_text: str, review: Review) -> None:
+        """Запомнить разрешение на запрос до конца сессии (отказы не хранятся)."""
+        if not review.allowed or review.failed:
+            return
+        if len(self._allowed) >= MAX_CACHED_REVIEWS:
+            self._allowed.pop(next(iter(self._allowed)))
+        self._allowed[review.model, request_text] = replace(review, cached=True)
 
     def allowed(self) -> None:
         """Учесть разрешение: серия отказов подряд прервалась."""

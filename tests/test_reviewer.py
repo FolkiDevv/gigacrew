@@ -172,9 +172,7 @@ def test_review_command_calls_model_without_tools(tmp_path: Path) -> None:
     verdict = classify("pip install requests", root=tmp_path)
     review = review_api.review_command(
         provider,
-        command="pip install requests",
-        verdict=verdict,
-        requests=["поставь requests"],
+        review_api.review_request("pip install requests", verdict, ["поставь requests"]),
         model="R",
         on_usage=used.append,
     )
@@ -195,9 +193,7 @@ def test_review_command_cut_answer_is_an_error(tmp_path: Path, reason: str) -> N
     with pytest.raises(review_api.ReviewError, match="не закончен"):
         review_api.review_command(
             provider,
-            command="ls",
-            verdict=classify("ls", root=tmp_path),
-            requests=[],
+            review_api.review_request("ls", classify("ls", root=tmp_path), []),
             model="R",
         )
 
@@ -264,6 +260,84 @@ def test_reviewer_disables_after_failures_in_a_row() -> None:
     assert not reviewer.enabled
     assert review_api.DISABLED_NOTE in reviewer.warning
     assert not reviewer.failed("ещё")  # отключение сообщается один раз
+
+
+def _enabled_at(reviewer: review_api.Reviewer, now: list[float], moment: float) -> bool:
+    now[0] = moment
+    return reviewer.enabled
+
+
+def test_reviewer_pause_ends_and_one_failure_pauses_again() -> None:
+    now = [float(0)]
+    cooldown = review_api.REVIEWER_COOLDOWN
+    reviewer = review_api.Reviewer(clock=lambda: now[0])
+    for _ in range(review_api.MAX_FAILURES):
+        reviewer.failed("e")
+    assert "пауза 5 мин" in reviewer.disabled
+    assert not _enabled_at(reviewer, now, cooldown - 1)
+    assert _enabled_at(reviewer, now, cooldown)  # пауза кончилась: одна проба
+    assert reviewer.failed("снова")  # проба не удалась — снова пауза
+    assert not _enabled_at(reviewer, now, cooldown + 1)
+    assert _enabled_at(reviewer, now, 2 * cooldown)
+    reviewer.succeeded()  # проба удалась — полный счёт сбоев
+    assert not reviewer.failed("e")
+    assert _enabled_at(reviewer, now, 2 * cooldown)
+
+
+def test_reviewer_disabled_at_start_stays_disabled() -> None:
+    now = [float(0)]
+    reviewer = review_api.Reviewer("nope", disabled="модели нет", clock=lambda: now[0])
+    now[0] = 10 * review_api.REVIEWER_COOLDOWN
+    assert reviewer.disabled == "модели нет"
+
+
+def _failing_then(review: Review, error: Exception, took: float, now: list[float]) -> Any:
+    answers: list[Review | Exception] = [error, review]
+
+    def ask() -> Review:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            now[0] += took
+            raise answer
+        return answer
+
+    return ask
+
+
+def test_quick_failure_and_garbage_are_retried_once() -> None:
+    allowed = Review("R", allowed=True)
+    now = [float(0)]
+    reviewer = review_api.Reviewer(clock=lambda: now[0])
+    assert reviewer.ask(_failing_then(allowed, LLMError("обрыв"), 1, now)) == allowed
+    # неразобранный ответ повторяется, сколько бы его ни ждали
+    slow = review_api.RETRY_WITHIN + 1
+    garbage = review_api.ReviewError("не разобран")
+    assert reviewer.ask(_failing_then(allowed, garbage, slow, now)) == allowed
+
+
+def test_slow_failure_and_conflict_are_not_retried() -> None:
+    allowed = Review("R", allowed=True)
+    now = [float(0)]
+    reviewer = review_api.Reviewer(clock=lambda: now[0])
+    slow = review_api.RETRY_WITHIN + 1
+    with pytest.raises(LLMError, match="тайм-аут"):
+        reviewer.ask(_failing_then(allowed, LLMError("тайм-аут"), slow, now))
+    conflict = review_api.ReviewError("противоречие", retry=False)
+    with pytest.raises(review_api.ReviewError, match="противоречие"):
+        reviewer.ask(_failing_then(allowed, conflict, 0, now))
+
+
+def test_reviewer_remembers_only_allowed_reviews() -> None:
+    reviewer = review_api.Reviewer()
+    reviewer.remember("d", Review("R", allowed=False, reason="нет"))
+    reviewer.remember("f", Review("R", allowed=False, failed=True))
+    assert reviewer.cached("R", "d") is None
+    assert reviewer.cached("R", "f") is None
+    for index in range(review_api.MAX_CACHED_REVIEWS + 1):
+        reviewer.remember(str(index), Review("R", allowed=True))
+    assert reviewer.cached("R", "0") is None  # самое старое вытеснено
+    assert reviewer.cached("R", "1") == Review("R", allowed=True, cached=True)
+    assert reviewer.cached("другая", "1") is None  # разрешала другая модель
 
 
 # ------------------------------ в агентном цикле ------------------------------ #
@@ -428,7 +502,8 @@ def test_reviewer_failures_ask_user_and_disable_it(tmp_path: Path) -> None:
     runs = [_run(f"{script} {index}") for index in range(review_api.MAX_FAILURES + 1)]
     provider = ScriptedProvider(
         [*runs, text_turn("ок")],
-        summaries=list(repeat(LLMError("шлюз недоступен"), review_api.MAX_FAILURES)),
+        # каждый сбой повторяется один раз
+        summaries=list(repeat(LLMError("шлюз недоступен"), 2 * review_api.MAX_FAILURES)),
     )
     events = RecordingEvents(confirm_answer=True)
     agent = _agent(provider, tmp_path, events=events)
@@ -436,9 +511,8 @@ def test_reviewer_failures_ask_user_and_disable_it(tmp_path: Path) -> None:
     reviews = [call.review for call, _, _ in events.confirms]
     assert reviews[0] == "рецензент не ответил: шлюз недоступен"
     assert reviews[-1].startswith("рецензент отключён: 3 сбоя рецензента подряд")
-    assert (
-        len(provider.summary_requests) == review_api.MAX_FAILURES
-    )  # после отключения не спрашиваем
+    # после отключения не спрашиваем
+    assert len(provider.summary_requests) == 2 * review_api.MAX_FAILURES
     warnings = [text for level, text in events.notices if level == "warn"]
     assert len(warnings) == 1
     assert review_api.DISABLED_NOTE in warnings[0]
@@ -532,15 +606,48 @@ def test_reviewer_success_resets_failure_count(tmp_path: Path) -> None:
     script = _script(tmp_path)
     turns = [turn for index in range(5) for turn in (_run(f"{script} {index}"), text_turn("ок"))]
     error = LLMError("шлюз недоступен")
+    failure = [error, error]  # сбой и его повтор
     provider = ScriptedProvider(
         turns,
-        summaries=[error, error, text_turn(ALLOW), error, text_turn(ALLOW)],
+        summaries=[*failure, *failure, text_turn(ALLOW), *failure, text_turn(ALLOW)],
     )
     agent = _agent(provider, tmp_path, events=RecordingEvents(confirm_answer=True))
     for turn_index in range(5):
         agent.run_turn(f"ход {turn_index}")
     assert agent.reviewer.enabled
-    assert len(provider.summary_requests) == 5
+    assert len(provider.summary_requests) == 8
+
+
+def test_failed_review_is_retried_before_asking(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    provider = ScriptedProvider(
+        [_run(script), text_turn("ок")],
+        summaries=[LLMError("обрыв связи"), text_turn(ALLOW)],
+    )
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events).run_turn("собери")
+    assert events.confirms == []
+    assert len(provider.summary_requests) == 2
+    assert events.reviews == [Review("M-chat", allowed=True, reason=_ALLOW_REASON)]
+
+
+def test_allowed_review_is_reused_for_the_same_request(tmp_path: Path) -> None:
+    script = _script(tmp_path)
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    provider = ScriptedProvider(
+        [_run(script), _run(script), text_turn("ок"), _run(script), text_turn("ок")],
+        summaries=[text_turn(ALLOW), text_turn(ALLOW)],
+    )
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(provider, tmp_path, events=events, decisions=memory)
+    agent.run_turn("собери")
+    assert events.confirms == []
+    assert len(provider.summary_requests) == 1  # второй запуск — по тому же разрешению
+    assert len(events.reviews) == 1
+    assert [entry["review"]["cached"] for entry in memory.recent()] == [False, True]
+    # Другой запрос пользователя — другой текст запроса рецензенту: спрашиваем снова.
+    agent.run_turn("а теперь ещё раз")
+    assert len(provider.summary_requests) == 2
 
 
 def test_git_tool_changes_go_to_reviewer(tmp_path: Path) -> None:

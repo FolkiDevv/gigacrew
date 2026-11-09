@@ -117,13 +117,15 @@ class Review:
 
     ``allowed`` — команду можно выполнить без вопроса; иначе решает пользователь.
     ``failed`` — рецензент не дал ответа (ошибка API, неразборчивый ответ): ``reason`` —
-    описание сбоя.
+    описание сбоя. ``cached`` — разрешение выдано раньше в этой сессии на такой же запрос,
+    модель не спрашивалась.
     """
 
     model: str
     allowed: bool
     reason: str = ""
     failed: bool = False
+    cached: bool = False
 
     @property
     def approval(self) -> str:

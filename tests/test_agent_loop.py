@@ -2373,7 +2373,10 @@ def test_unanswered_prompt_is_not_a_rejection(tmp_path: Path) -> None:
     events = RecordingEvents(confirm_answer=ConfirmResult(Approval.NO, answered=False))
     provider = ScriptedProvider([tool_turn("run_shell", {"command": script}), text_turn("ок")])
     cfg = Config(access_key="x", project_root=tmp_path, stream=False)
-    Agent(provider, build_default_registry(), cfg, events, decisions=memory).run_turn("x")
+    agent = Agent(provider, build_default_registry(), cfg, events, decisions=memory)
+    agent.run_turn("x")
+    # модель узнаёт, что спросить было некого, а не что пользователь отказал
+    assert "NO ANSWER" in _function_results(agent)[0]
     key = history_key(classify(script, root=tmp_path))
     assert memory.history(key) == (0, 0)
     assert not memory.rejected_in_session(key)
@@ -2532,8 +2535,8 @@ def test_without_yes_unverified_command_goes_to_reviewer(tmp_path: Path) -> None
     provider = ScriptedProvider([run, text_turn("ок")])
     events = RecordingEvents(confirm_answer=False)
     _agent(provider, tmp_path, events=events, auto_approve=False).run_turn("x")
-    # без -y: сначала рецензент (его ответ не разобран), затем пользователь
-    assert len(provider.summary_requests) == 1
+    # без -y: сначала рецензент (его ответ не разобран и после повтора), затем пользователь
+    assert len(provider.summary_requests) == 2
     assert len(events.confirms) == 1
     call, _, dangerous = events.confirms[0]
     assert call.reason.startswith("не удалось проверить:")
