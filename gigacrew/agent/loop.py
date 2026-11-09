@@ -67,7 +67,6 @@ from gigacrew.agent.guard import (
     StopReason,
     ToolOutcome,
     call_key,
-    target_key,
 )
 from gigacrew.agent.hooks import HookResult, HookRunner, PromptBlockedError
 from gigacrew.agent.prompts import (
@@ -120,7 +119,7 @@ from gigacrew.project.instructions import NestedInstructions
 from gigacrew.project.settings import HookEvent
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety import CommandLevel, Verdict
-from gigacrew.security import RiskLevel
+from gigacrew.security import RiskLevel, SandboxError
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 from gigacrew.tools.fs import write_atomic
 from gigacrew.tools.plan import PlanReview, review_plan
@@ -1955,7 +1954,7 @@ class Agent:
             ):
                 decision, source = Decision.ALLOW, "session"  # «всегда» до конца сессии
             # «Да до конца хода»: другой вызов того же инструмента с тем же файлом.
-            turn_key = self._turn_key(function_call, risk, verdict, hook_asks=hook_asks)
+            turn_key = self._turn_key(name, params, risk, verdict, hook_asks=hook_asks)
             if decision in asking and turn_key in self._turn_allowed:
                 decision, source = Decision.ALLOW, "turn"
             if decision is Decision.REVIEW:
@@ -2249,7 +2248,8 @@ class Agent:
 
     def _turn_key(
         self,
-        function_call: FunctionCall,
+        name: str,
+        params: BaseModel,
         risk: RiskLevel,
         verdict: Verdict | None,
         *,
@@ -2257,15 +2257,25 @@ class Agent:
     ) -> str:
         """Ключ ответа «не спрашивать про этот файл до конца хода» ("" — так ответить нельзя).
 
+        Ключ — инструмент и раскрытый путь файла, тот же, по которому пойдёт запись
+        (``ctx.resolve``): два написания пути, которые через ссылку ведут в разные файлы,
+        не делят разрешение. Путь не раскрыть — так ответить нельзя.
+
         Только для вызовов с файлом-целью, которые не команды: серия правок одного файла,
         о котором спрашивают каждый раз (файл с секретами). Опасное (настройки gigacrew в
         ``.env``) и то, о чём велел спрашивать хук, подтверждается каждый раз; у команд —
         свои сохранённые разрешения.
         """
+        path = getattr(params, "path", None)
         if hook_asks or verdict is not None or risk >= RiskLevel.DANGEROUS:
             return ""
-        key = target_key(function_call)
-        return key if ":path=" in key else ""
+        if not isinstance(path, str) or not path.strip():
+            return ""
+        try:
+            target = self._ctx.resolve(path)
+        except (SandboxError, OSError):
+            return ""
+        return f"{name}:{target}"
 
     def _allow_for_turn(
         self,

@@ -2596,6 +2596,27 @@ def test_turn_answer_covers_the_same_file_until_the_turn_ends(tmp_path: Path) ->
     assert (tmp_path / secret).read_text() == "d"
 
 
+def test_turn_answer_follows_the_resolved_file_not_the_spelling(tmp_path: Path) -> None:
+    # link → nested/dir: «link/../credentials.json» — это nested/credentials.json, а не файл
+    # в корне, хотя текст пути после упрощения совпадает.
+    (tmp_path / "nested" / "dir").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(tmp_path / "nested" / "dir")
+    provider = ScriptedProvider([
+        _write("credentials.json", "a"),
+        _write("./credentials.json", "b"),  # тот же файл другим написанием — без вопроса
+        _write("link/../credentials.json", "c"),  # другой файл — спрашивается
+        text_turn("ок"),
+    ])
+    events = RecordingEvents(confirm_answer=Approval.TURN)
+    _agent(provider, tmp_path, events=events, auto_approve=False).run_turn("запиши")
+    assert [call.summary for call, _, _ in events.confirms] == [
+        "credentials.json",
+        "link/../credentials.json",
+    ]
+    assert (tmp_path / "credentials.json").read_text() == "b"
+    assert (tmp_path / "nested" / "credentials.json").read_text() == "c"
+
+
 def test_turn_answer_is_not_offered_for_dangerous_calls(tmp_path: Path) -> None:
     # Настройки gigacrew в .env — опасная правка: каждую подтверждают отдельно.
     provider = ScriptedProvider([_write(".env", "A=1"), _write(".env", "A=2"), text_turn("ок")])
