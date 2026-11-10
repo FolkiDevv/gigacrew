@@ -450,6 +450,45 @@ def test_repeated_denied_call_goes_to_user(tmp_path: Path) -> None:
     ]
 
 
+def test_denial_is_final_when_nobody_can_confirm(tmp_path: Path) -> None:
+    # Запуск без клавиатуры (-p): повтор отказанной команды и серия отказов не становятся
+    # вопросом, на который некому ответить, — рецензент отказывает снова.
+    script = _script(tmp_path)
+    repeats = review_api.MAX_DENIALS_IN_ROW + 1
+    others = [_run(f"{script} {index}") for index in range(repeats)]
+    provider = ScriptedProvider(
+        [_run(script), _run(script), *others, text_turn("без этой проверки")],
+        summaries=list(repeat(text_turn(DENY), repeats + 1)),
+    )
+    events = RecordingEvents(confirm_answer=True, can_confirm=False)
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("x") == "без этой проверки"
+    assert events.confirms == []
+    assert events.stats[-1].stop_reason is None
+    assert events.stats[-1].confirmations == 0
+    texts = _function_texts(agent)
+    assert len(texts) == repeats + 2
+    assert all("nobody can approve it" in text for text in texts)
+    assert not any("then the user decides" in text for text in texts)
+    assert len(provider.summary_requests) == repeats + 1  # повтор рецензенту не уходит
+    assert "non-interactive" in agent._system_text()
+
+
+def test_unverifiable_call_is_not_asked_when_nobody_can_confirm(tmp_path: Path) -> None:
+    memory, _ = DecisionMemory.load(tmp_path, base=tmp_path / "home")
+    danger = _run("rm -rf /")
+    provider = ScriptedProvider([danger, danger, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=True, can_confirm=False)
+    agent = _agent(provider, tmp_path, events=events, decisions=memory)
+    agent.run_turn("x")
+    assert events.confirms == []
+    assert events.stats[-1].confirmations == 0
+    # и первый вызов, и его повтор: «ответа нет», а не «пользователь отклонил»
+    assert ["NO ANSWER" in text for text in _function_texts(agent)] == [True, True]
+    entry = memory.recent()[-1]
+    assert (entry["decision"], entry["asked_because"]) == ("no_answer", "dangerous")
+
+
 def test_denials_in_a_row_go_to_user(tmp_path: Path) -> None:
     script = _script(tmp_path)
     count = review_api.MAX_DENIALS_IN_ROW + 1

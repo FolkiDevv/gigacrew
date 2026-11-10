@@ -180,6 +180,43 @@ def test_assigned_variable_is_trusted_only_when_certainly_static(root: Path, com
     assert verdict.level is not READ, verdict.reason
 
 
+def test_grep_include_narrows_what_recursive_search_reads(root: Path) -> None:
+    """``grep -r --include='*.py'`` читает только такие файлы: ``.env`` рядом не мешает."""
+    (root / ".env.test").write_text("TOKEN=1\n")
+    (root / "src" / "credentials.json").write_text("{}\n")
+    assert level("grep -rn hello .", root) is None
+    assert level("grep -rn hello --include=*.py .", root) is READ
+    assert level("grep -rn hello . --include='*.py' --include=*.toml", root) is READ
+    assert level("grep -rn --include=*.py --exclude-dir=.venv -e hello src tests", root) is READ
+    # шаблон, под который попадает секрет, и шаблоны, по которым этого не видно
+    assert level("grep -rn hello --include=*.json .", root) is None
+    assert level("grep -rn hello --include=*.py --include=*.json .", root) is None
+    assert level("grep -rn hello --include='.env*' .", root) is None
+    assert level("grep -rn hello --include='*' .", root) is None
+    assert level("grep -rn hello --include=*.{py,test} .", root) is None
+    assert level('grep -rn hello --include=*.py "--include=$X" .', root) is None
+    assert level("grep -rn hello --include=*.py $EXTRA .", root) is None
+    assert level("grep -rn hello --include=*.py --include-from=globs.txt .", root) is None
+    # первым стоит --exclude: файлы вне шаблонов grep читает, .env.test тоже
+    assert level("grep -rn hello --exclude='*.txt' --include='*.py' .", root) is None
+    assert level("grep -rn hello --exclude-from=skip.txt --include=*.py .", root) is None
+    assert level("grep -rn hello --include='*.py' --exclude='*.txt' .", root) is READ
+    assert level("grep -rn hello --exclude-dir=.venv --include='*.py' .", root) is READ
+    # явно названный файл с секретами шаблон не прикрывает
+    assert level("grep -rn hello --include=*.py .env.test", root) is None
+    # каталог ключей в дереве — «не знаю» при любом шаблоне
+    (root / ".ssh").mkdir()
+    assert level("grep -rn hello --include=*.py .", root) is None
+
+
+def test_grep_include_does_not_hide_links_out_of_the_project(root: Path, tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("hello\n")
+    (root / "src" / "linked.py").symlink_to(outside)
+    assert level("grep -rn hello --include=*.py .", root) is None
+    assert level("grep -rn hello --include=*.toml .", root) is READ
+
+
 # ------------------------ рекурсивное чтение ------------------------ #
 @pytest.mark.parametrize(
     "secret",

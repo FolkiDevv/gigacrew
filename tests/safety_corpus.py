@@ -24,6 +24,7 @@ R	tail -n 100 logs/app.log
 R	wc -l gigacrew/*.py
 R	grep -rn "def decide" gigacrew/
 R	grep -rn TODO --include=*.py .
+R	grep -rn "retry" --include='*.py' --include=*.toml src tests
 R	rg "class Agent" -n
 R	rg -l "import httpx"
 R	find . -name "*.py" | wc -l

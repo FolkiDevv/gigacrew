@@ -1395,6 +1395,10 @@ class Console(events.AgentEvents):  # noqa: WPS338
             return events.ConfirmResult(events.Approval.NO, answered=False)
         return _confirm_result(raw, always, turn)
 
+    @override
+    def can_confirm(self) -> bool:
+        return not self._no_keyboard()
+
     def _detach_step(self, call: events.ToolCallInfo) -> None:
         """Спрошенный вызов — не часть группы: его строка — после ответа."""
         step = self._find(call)

@@ -124,6 +124,11 @@ def _function_results(agent: Agent) -> list[str]:
     return [message.content for message in _function_messages(agent)]
 
 
+def _repeat_skipped(text: str) -> bool:
+    """Результат — заметка о пропущенном повторе (REPEAT_SKIPPED_NOTE)."""
+    return text.startswith("Not executed: you already made this exact call")
+
+
 def test_loop_stops_on_repeated_identical_calls(tmp_path: Path) -> None:
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
     provider = ScriptedProvider(repeat(tool_turn("read_file", {"path": "f.txt"}), 10))
@@ -131,16 +136,34 @@ def test_loop_stops_on_repeated_identical_calls(tmp_path: Path) -> None:
     agent = _agent(provider, tmp_path, events=events)
     final = agent.run_turn("прочитай")
     assert "зациклился" in final
-    assert provider.calls == 5  # 4 шага + запрос итога (его вызов не выполняется)
+    # 3 чтения, 3 пропущенных повтора, остановка на 7-м + запрос итога
+    assert provider.calls == 8
     assert events.stats[-1].stop_reason == "tool_repeats"
-    assert events.stats[-1].tool_calls == 3  # 4-й вызов не выполнялся
-    assert [level for level, _ in events.notices] == ["warn", "error"]
+    assert events.stats[-1].tool_calls == 3  # с 4-го вызовы не выполнялись
+    assert [level for level, _ in events.notices] == ["warn", "warn", "warn", "warn", "error"]
     outputs = _function_results(agent)
-    assert len(outputs) == 4
-    assert ["WARNING" in output for output in outputs] == [False, False, True, False]
+    assert len(outputs) == 7
+    assert ["WARNING" in output for output in outputs[:3]] == [False, False, True]
     assert "hello" in outputs[2]  # предупреждение дописано к результату
-    assert outputs[3] == LOOP_STOP_NOTE
+    assert [_repeat_skipped(output) for output in outputs[3:]] == [True, True, True, False]
+    assert outputs[-1] == LOOP_STOP_NOTE
     assert agent.conversation.pending_calls() == []
+    _assert_well_formed(agent.conversation.messages)
+
+
+def test_repeated_read_is_skipped_and_the_turn_ends_with_an_answer(tmp_path: Path) -> None:
+    # Модель перечитала файл в 4-й раз: вызов не выполняется, ход не обрывается — получив
+    # «результат уже выше», модель отвечает сама.
+    (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
+    read = tool_turn("read_file", {"path": "f.txt"})
+    provider = ScriptedProvider([*repeat(read, 4), text_turn("готово")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("прочитай") == "готово"
+    assert events.stats[-1].stop_reason is None
+    assert events.stats[-1].tool_calls == 3
+    assert _repeat_skipped(_function_results(agent)[-1])
+    assert "вызов не выполнен" in events.notices[-1][1]
     _assert_well_formed(agent.conversation.messages)
 
 
@@ -470,7 +493,7 @@ def test_guard_stop_before_a_call_mid_batch_closes_remaining_calls(tmp_path: Pat
     (tmp_path / "a.txt").write_text("AAA", encoding="utf-8")
     (tmp_path / "b.txt").write_text("BBB", encoding="utf-8")
     read_a = ("read_file", {"path": "a.txt"})
-    batch = tools_turn([*repeat(read_a, 4), ("read_file", {"path": "b.txt"})])
+    batch = tools_turn([*repeat(read_a, 7), ("read_file", {"path": "b.txt"})])
     provider = ScriptedProvider([batch, text_turn("итог")])
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events)
@@ -478,8 +501,10 @@ def test_guard_stop_before_a_call_mid_batch_closes_remaining_calls(tmp_path: Pat
     assert agent.run_turn("x") == "итог"
     assert events.stats[-1].stop_reason == "tool_repeats"
     replies = _function_messages(agent)
-    assert [reply.call_id for reply in replies] == ["c1", "c2", "c3", "c4", "c5"]
-    assert [reply.content for reply in replies[3:]] == [LOOP_STOP_NOTE, SKIPPED_NOTE]
+    assert [reply.call_id for reply in replies] == [f"c{number}" for number in range(1, 9)]
+    # три повтора пропущены, 7-й останавливает ход, чтение b.txt закрыто заглушкой
+    assert all(_repeat_skipped(reply.content) for reply in replies[3:6])
+    assert [reply.content for reply in replies[6:]] == [LOOP_STOP_NOTE, SKIPPED_NOTE]
     _assert_well_formed(agent.conversation.messages)
     _assert_well_formed(provider.requests[-1]["messages"][1:])
 
@@ -1366,7 +1391,7 @@ def test_unchanged_plan_shown_again_and_again_is_a_loop(tmp_path: Path) -> None:
     provider = ScriptedProvider(
         [
             tool_turn("write_file", {"path": PLAN_REL, "content": "# План"}),
-            *[tool_turn("exit_plan_mode", {}) for _ in range(4)],
+            *[tool_turn("exit_plan_mode", {}) for _ in range(7)],
             text_turn("итог"),
         ],
     )

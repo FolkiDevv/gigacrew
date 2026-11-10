@@ -1213,9 +1213,20 @@ def test_failed_measurement_falls_back(
 
 
 def test_oneshot_exit_code_when_stopped_by_guard(tmp_path: Path, oneshot: _Oneshot) -> None:
-    missing = tool_turn("read_file", {"path": "нет.txt"})
-    oneshot(ScriptedProvider([missing, missing, missing, missing, text_turn("не вышло")]))
+    # три попытки, три пропущенных повтора, на седьмом сторож останавливает ход
+    missing = [tool_turn("read_file", {"path": "нет.txt"}) for _ in range(7)]
+    oneshot(ScriptedProvider([*missing, text_turn("не вышло")]))
     assert _main(tmp_path, "-p", "прочитай") == app.EXIT_STOPPED == 3
+
+
+def test_oneshot_exit_code_is_ok_when_model_answers_after_skipped_repeat(
+    tmp_path: Path,
+    oneshot: _Oneshot,
+) -> None:
+    # четвёртый одинаковый вызов не выполняется, но ход не обрывается: модель отвечает
+    missing = [tool_turn("read_file", {"path": "нет.txt"}) for _ in range(4)]
+    oneshot(ScriptedProvider([*missing, text_turn("файла нет")]))
+    assert _main(tmp_path, "-p", "прочитай") == app.EXIT_OK
 
 
 def test_oneshot_internal_error_is_reported(
@@ -1718,7 +1729,10 @@ def test_oneshot_does_not_take_approvals_from_piped_stdin(
     oneshot(ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")]))
     assert _main(tmp_path, "-p", "сделай") == 0
     assert not (tmp_path / "made").exists()
-    assert "ответить можно только с клавиатуры" in _flat(capsys)
+    # вопрос не рисуется: агент сразу узнаёт, что подтвердить некому
+    out = _flat(capsys)
+    assert "нет ответа на подтверждение" in out
+    assert "Выполнить команду?" not in out
     memory, _ = DecisionMemory.load(tmp_path)
     assert not memory.rules
     assert [entry["decision"] for entry in memory.recent()] == ["no_answer"]
