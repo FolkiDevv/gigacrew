@@ -197,6 +197,11 @@ def test_grep_include_narrows_what_recursive_search_reads(root: Path) -> None:
     assert level('grep -rn hello --include=*.py "--include=$X" .', root) is None
     assert level("grep -rn hello --include=*.py $EXTRA .", root) is None
     assert level("grep -rn hello --include=*.py --include-from=globs.txt .", root) is None
+    # первым стоит --exclude: файлы вне шаблонов grep читает, .env.test тоже
+    assert level("grep -rn hello --exclude='*.txt' --include='*.py' .", root) is None
+    assert level("grep -rn hello --exclude-from=skip.txt --include=*.py .", root) is None
+    assert level("grep -rn hello --include='*.py' --exclude='*.txt' .", root) is READ
+    assert level("grep -rn hello --exclude-dir=.venv --include='*.py' .", root) is READ
     # явно названный файл с секретами шаблон не прикрывает
     assert level("grep -rn hello --include=*.py .env.test", root) is None
     # каталог ключей в дереве — «не знаю» при любом шаблоне

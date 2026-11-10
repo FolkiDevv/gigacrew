@@ -1470,12 +1470,18 @@ def _grep_includes(args: list[Word], found: _FlagValues) -> tuple[str, ...]:
     """Шаблоны ``--include``, которыми grep ограничил чтение; пусто — ограничения нет.
 
     Ограничение принимается, только если видно целиком: все слова команды статичны (иначе
-    за переменной может стоять ещё один ``--include``), списка шаблонов из файла нет и
-    каждый шаблон — ``*.расширение``. ``--exclude`` чтение только сужает.
+    за переменной может стоять ещё один ``--include``), списков шаблонов из файла нет и
+    каждый шаблон — ``*.расширение``.
+
+    Порядок флагов важен: файл, не попавший ни под один шаблон, grep пропускает, только
+    если первым из ``--include``/``--exclude`` стоит ``--include``. При
+    ``--exclude='*.txt' --include='*.py'`` он прочитает и ``.env`` — это не ограничение.
+    После ``--include`` флаг ``--exclude`` чтение только сужает.
     """
     includes = [word.text for opt, word in found if opt == "--include"]
-    listed = any(opt == "--include-from" for opt, _ in found)
-    if listed or not all(arg.static for arg in args):
+    filters = [opt for opt, _ in found if opt in {"--include", "--exclude"}]
+    listed = any(opt in {"--include-from", "--exclude-from"} for opt, _ in found)
+    if listed or filters[:1] != ["--include"] or not all(arg.static for arg in args):
         return ()
     if not all(_INCLUDE_EXTENSION.fullmatch(pattern) for pattern in includes):
         return ()
