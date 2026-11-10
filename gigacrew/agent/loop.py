@@ -166,6 +166,12 @@ LOOP_STOP_NOTE = (
     "Not executed: the same call repeated without any changes. The turn was stopped as a loop."
 )
 SKIPPED_NOTE = "Not executed: the turn was stopped before this call."
+REPEAT_SKIPPED_NOTE = (
+    "Not executed: you already made this exact call several times in a row and nothing "
+    "changed in between, so its result is the same as above (a call that was refused stays "
+    "refused). Do not call it again: use what you already have and give the final answer, "
+    "or take a different step. More such repeats will stop the work."
+)
 STOP_SUMMARY_NOTE = (
     "# Turn stopped\nReason: {reason}.\nDo not call tools anymore. Briefly tell the user "
     "what has been done, what did not work and why, what remains and what you suggest next."
@@ -1455,6 +1461,10 @@ class Agent:
                 return check.stop
             if check.notice:
                 self._events.on_notice(check.notice, level=_WARN)
+            if check.skip:
+                # Повтор безвредного вызова: результат у модели уже есть, ход продолжается.
+                self._conversation.add_function_result(call.name, REPEAT_SKIPPED_NOTE)
+                continue
             stats.tool_calls += 1
             outcome = self._execute_tool_call(call, check)
             stop = guard.after_tool(call, outcome)

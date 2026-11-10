@@ -466,7 +466,7 @@ def test_call_key_ignores_description() -> None:
     guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
     checks = [_run(guard, call) for call in (described, rephrased, described, rephrased)]
     assert checks[2].warning is not None
-    assert checks[3].stop is not None
+    assert checks[3].skip  # четвёртый одинаковый вызов не выполняется
 
 
 def test_target_key_normalizes_paths() -> None:
@@ -482,14 +482,28 @@ def test_target_key_normalizes_paths() -> None:
 
 def _run(guard: LoopGuard, call: FunctionCall, outcome: ToolOutcome = OK) -> CallCheck:
     check = guard.before_tool(call)
-    if check.stop is None:
+    if check.stop is None and not check.skip:
         guard.after_tool(call, outcome)
     return check
 
 
-@pytest.mark.parametrize("outcome", [OK, CHANGED])
-def test_guard_repeats_warn_then_stop(outcome: ToolOutcome) -> None:
+def test_guard_skips_harmless_repeats_before_stopping() -> None:
+    # повтор вызова, который ничего не менял, сначала не выполняется, и только потом — стоп
+    guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
+    call = FunctionCall(name="read_file", arguments={"path": "a"})
+    checks = [_run(guard, call) for _ in range(7)]
+    assert [check.skip for check in checks] == [False, False, False, True, True, True, False]
+    assert all(check.stop is None for check in checks[:6])
+    assert checks[6].stop is not None
+    assert all(check.notice for check in checks[3:6])
+    # пропуски считаются за ход: другой вызов на пределе останавливает сразу
+    other = FunctionCall(name="read_file", arguments={"path": "b"})
+    assert [_run(guard, other).stop is not None for _ in range(4)] == [False, False, False, True]
+
+
+def test_guard_repeats_warn_then_stop() -> None:
     # собственное изменение вызова повтор не сбрасывает (pytest без правок)
+    outcome = CHANGED
     guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
     call = FunctionCall(name="read_file", arguments={"path": "a"})
     checks = [_run(guard, call, outcome) for _ in range(4)]
@@ -546,8 +560,8 @@ def test_guard_detects_alternating_calls() -> None:
     read = FunctionCall(name="read_file", arguments={"path": "a"})
     listing = FunctionCall(name="list_dir", arguments={})
     checks = [_run(guard, call) for call in (read, listing, read, listing, read, listing, read)]
-    assert checks[-1].stop is not None
-    assert checks[-1].stop.kind == "tool_repeats"
+    assert checks[-1].skip  # 4-е чтение: безвредный повтор сначала пропускается
+    assert checks[-1].stop is None
 
 
 def test_guard_rejection_is_neutral_and_remembered() -> None:

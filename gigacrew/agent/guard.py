@@ -57,6 +57,10 @@ StopKind = Literal[
 
 # Через сколько похожих вызовов после предупреждения ход останавливается.
 SIMILAR_GRACE = 2
+# Сколько повторов сверх предела за ход не выполняется, а возвращается модели заметкой,
+# прежде чем ход остановится: повтор вызова, который ничего не менял (чтение, отказ),
+# безвреден, и модели обычно хватает напоминания, что результат у неё уже есть.
+MAX_SKIPPED_REPEATS = 3
 # Причина остановки — для модели (запрос итога, отчёт суб-агента); пользователю
 # показывается ``StopReason.message``.
 MODEL_STOP_REASONS: Mapping[str, str] = MappingProxyType({
@@ -112,6 +116,7 @@ class CallCheck:
     repeats: int  # который раз подряд (без изменений между ними) делается этот вызов
     warning: str | None = None  # предупреждение для модели — дописывается к результату
     stop: StopReason | None = None  # вызов не выполнять, ход остановить
+    skip: bool = False  # вызов не выполнять, ход продолжить: результат у модели уже есть
     rejected_before: bool = False  # пользователь уже отклонил этот вызов в этом ходе
     notice: str | None = None  # то же предупреждение — строкой для пользователя
 
@@ -196,6 +201,8 @@ class LoopGuard:
         self._repeats: dict[str, int] = {}  # ключ → повторов подряд без изменений
         self._rejected: set[str] = set()
         self._extended = False  # лимит шагов уже продлевался в этом ходе
+        self._mutating: set[str] = set()  # ключи вызовов, чей последний запуск что-то изменил
+        self._skipped = 0  # повторов сверх предела пропущено за ход
         self._failures_warned = False  # предупреждение о серии неудач ушло модели в запросе
         self._failures_noticed = False  # ...и показано пользователю
 
@@ -282,6 +289,9 @@ class LoopGuard:
         rejected = key in self._rejected
         similar = self._count_similar(call)
 
+        skipped = self._skip_repeat(call, repeats, rejected=rejected)
+        if skipped is not None:
+            return skipped
         if repeats > self._max_repeats:
             return CallCheck(
                 repeats,
@@ -311,11 +321,12 @@ class LoopGuard:
                 f"WARNING: this is call #{repeats} of {call.name} with the same arguments, "
                 "and nothing changed in between — the result is the same. Do not repeat "
                 "this call: use the result you already have, change the approach or answer. "
-                "The next such repeat will stop the work."
+                "Further repeats will not be executed and will stop the work."
             )
+            ahead = "остановит ход" if key in self._mutating else "не будет выполнен"
             notice = (
                 f"Модель {repeats}-й раз повторяет вызов {call.name} без изменений — "
-                "предупреждена; следующий повтор остановит ход."
+                f"предупреждена; следующий повтор {ahead}."
             )
         elif self._max_similar is not None and similar >= self._max_similar:
             warning = (
@@ -367,6 +378,9 @@ class LoopGuard:
                 self._failures_noticed = False
         if outcome.changed:
             self._changes += 1
+            self._mutating.add(key)
+        else:
+            self._mutating.discard(key)
         self._seen[key] = self._changes
         if self._max_similar is not None:
             similar = target_key(call)
@@ -387,6 +401,23 @@ class LoopGuard:
                 "Похоже, агент застрял — уточните задачу или попробуйте другую модель.",
             )
         return None
+
+    def _skip_repeat(self, call: FunctionCall, repeats: int, *, rejected: bool) -> CallCheck | None:
+        """Повтор сверх предела вызова, который ничего не менял: не выполнять, но и не стоп.
+
+        Его результат уже у модели (чтение — то же, отказ — тот же). None — повтор не такой
+        или пропусков за ход уже :data:`MAX_SKIPPED_REPEATS`: тогда ход останавливается.
+        """
+        harmless = call_key(call) not in self._mutating
+        if repeats <= self._max_repeats or not harmless or self._skipped >= MAX_SKIPPED_REPEATS:
+            return None
+        self._skipped += 1
+        left = MAX_SKIPPED_REPEATS - self._skipped + 1
+        notice = (
+            f"Модель {repeats}-й раз повторяет вызов {call.name} без изменений — вызов не "
+            f"выполнен; ход остановится через {left} таких повторов."
+        )
+        return CallCheck(repeats, skip=True, rejected_before=rejected, notice=notice)
 
     def _elapsed(self) -> float:
         return self._clock() - self._started
