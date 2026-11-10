@@ -490,17 +490,27 @@ def _check_recursive(
     *,
     hidden: bool = True,
     follow: bool = False,
-    pattern: str | None = None,
+    patterns: tuple[str, ...] = (),
+    hint: str = "",
 ) -> Part | None:
-    """Рекурсивное чтение каталогов: секреты и ссылки наружу в дереве — «не знаю»."""
+    """Рекурсивное чтение каталогов: секреты и ссылки наружу в дереве — «не знаю».
+
+    ``patterns`` — шаблоны имён, которыми команда ограничила чтение (``grep --include``):
+    секреты и ссылки с другими именами не в счёт; пусто — читается всё. ``hint`` — как
+    сузить команду, чтобы её удалось проверить (дописывается к причине).
+    """
     bad = check_read(env, dirs, what)
     if bad is not None:
         return bad
+    names: tuple[str | None, ...] = patterns or (None,)
     for word in dirs or [Word(".")]:
         folder = env.dir if word.glob else (env.dir / word.text).resolve()
-        if hidden and has_secrets_under(folder, env.root, name_pattern=pattern):
-            return _unknown(f"{what}: в каталоге есть файлы с секретами")
-        links = has_escaping_links(folder, env.root, name_pattern=pattern, extra=env.extra)
+        if hidden and any(has_secrets_under(folder, env.root, name_pattern=name) for name in names):
+            return _unknown(f"{what}: в каталоге есть файлы с секретами{hint}")
+        links = any(
+            has_escaping_links(folder, env.root, name_pattern=name, extra=env.extra)
+            for name in names
+        )
         if links and (follow or hidden):
             return _unknown(f"{what}: в каталоге есть ссылки за пределы проекта")
     return None
@@ -1447,6 +1457,31 @@ _GREP_VALUED = (
 )
 
 
+# Шаблон ``--include``, по которому видно, какие файлы прочитает grep: ``*.расширение``.
+# GNU grep сверяет шаблон с именем файла, BSD grep — с путём: у такого шаблона оба дают
+# одни и те же файлы. Фигурные скобки оболочка раскроет в несколько шаблонов — не он.
+_INCLUDE_EXTENSION = re.compile(r"\*\.[\w+-]+")
+_GREP_NARROW_HINT = (
+    " — сузьте поиск: каталог без них, --include='*.py' (типы файлов) или search_content"
+)
+
+
+def _grep_includes(args: list[Word], found: _FlagValues) -> tuple[str, ...]:
+    """Шаблоны ``--include``, которыми grep ограничил чтение; пусто — ограничения нет.
+
+    Ограничение принимается, только если видно целиком: все слова команды статичны (иначе
+    за переменной может стоять ещё один ``--include``), списка шаблонов из файла нет и
+    каждый шаблон — ``*.расширение``. ``--exclude`` чтение только сужает.
+    """
+    includes = [word.text for opt, word in found if opt == "--include"]
+    listed = any(opt == "--include-from" for opt, _ in found)
+    if listed or not all(arg.static for arg in args):
+        return ()
+    if not all(_INCLUDE_EXTENSION.fullmatch(pattern) for pattern in includes):
+        return ()
+    return tuple(includes)
+
+
 def _grep(env: Env, name: str, args: list[Word]) -> Part:
     hit = _abbrev_only(
         args,
@@ -1486,6 +1521,8 @@ def _grep(env: Env, name: str, args: list[Word]) -> Part:
             paths,
             f"{name} -r",
             follow=_has(fl, "-R", "--dereference-recursive"),
+            patterns=_grep_includes(args, found),
+            hint=_GREP_NARROW_HINT,
         )
     else:
         bad = check_read(env, paths, name)
