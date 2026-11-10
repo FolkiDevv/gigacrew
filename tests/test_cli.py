@@ -1718,7 +1718,10 @@ def test_oneshot_does_not_take_approvals_from_piped_stdin(
     oneshot(ScriptedProvider([tool_turn("run_shell", {"command": command}), text_turn("ок")]))
     assert _main(tmp_path, "-p", "сделай") == 0
     assert not (tmp_path / "made").exists()
-    assert "ответить можно только с клавиатуры" in _flat(capsys)
+    # вопрос не рисуется: агент сразу узнаёт, что подтвердить некому
+    out = _flat(capsys)
+    assert "нет ответа на подтверждение" in out
+    assert "Выполнить команду?" not in out
     memory, _ = DecisionMemory.load(tmp_path)
     assert not memory.rules
     assert [entry["decision"] for entry in memory.recent()] == ["no_answer"]

@@ -391,8 +391,17 @@ the reason. If this exact command is really needed, call it again unchanged — 
 the user decides.
 """
 
-AUTO_MODE_PROMPT = (
-    """\
+# Запуск без клавиатуры (-p): подтвердить и ответить некому — отказ рецензента окончателен.
+_REVIEWER_DENIAL_FINAL_RULE = """\
+- This run is non-interactive: nobody answers questions or confirmations. An operation \
+that needs the user's confirmation is not executed, and ask_user is unavailable.
+- A command may come back "not allowed by the reviewer" with a reason. Nobody can \
+approve it in this run: never call it again, neither unchanged nor in another form \
+that has the same effect. Reach the goal another way that avoids the reason, or go on \
+without it and say in the final answer what you could not check or do.
+"""
+
+_AUTO_MODE_HEAD = """\
 # Auto mode
 The user turned on auto mode: they expect you to carry the task through to the end \
 on your own. File edits run without asking; changing commands are checked by a \
@@ -404,16 +413,13 @@ not ask for permission to continue or to confirm a step the user already asked f
 the code tells you, or before an action with consequences the user did not ask for \
 (deleting their work, changes outside the project).
 """
-    + _REVIEWER_DENIAL_RULE
-)
+AUTO_MODE_PROMPT = _AUTO_MODE_HEAD + _REVIEWER_DENIAL_RULE
 
-SUBAGENT_AUTO_MODE_PROMPT = (
-    """\
+_SUBAGENT_AUTO_MODE_HEAD = """\
 # Auto mode
 File edits run without asking; changing commands are checked by a reviewer model.
 """
-    + _REVIEWER_DENIAL_RULE
-)
+SUBAGENT_AUTO_MODE_PROMPT = _SUBAGENT_AUTO_MODE_HEAD + _REVIEWER_DENIAL_RULE
 
 
 SUBAGENT_PLAN_MODE_PROMPT = """\
@@ -432,8 +438,13 @@ def mode_prompt(
     subagent: bool = False,
     read_only: bool = False,
     plan_path: str = "",
+    interactive: bool = True,
 ) -> str:
     """Правила текущего режима для системного промпта ("" — особых правил нет).
+
+    ``interactive`` — есть ли кому подтверждать операции и отвечать на вопросы (False —
+    запуск без клавиатуры): тогда отказ рецензента окончателен, и правило не советует
+    повторить команду, «чтобы решил пользователь».
 
     В режиме «авто» — довести задачу до конца самому, ask_user — только по существу, и что
     делать с отказом рецензента. Суб-агенту — без ask_user и exit_plan_mode: вопросов
@@ -444,7 +455,10 @@ def mode_prompt(
     if subagent and read_only:
         return ""
     if mode is PermissionMode.AUTO:
-        return SUBAGENT_AUTO_MODE_PROMPT if subagent else AUTO_MODE_PROMPT
+        head = _SUBAGENT_AUTO_MODE_HEAD if subagent else _AUTO_MODE_HEAD
+        if interactive:
+            return head + _REVIEWER_DENIAL_RULE
+        return head + _REVIEWER_DENIAL_FINAL_RULE
     if subagent:
         return SUBAGENT_PLAN_MODE_PROMPT
     return PLAN_MODE_PROMPT.format(plan_path=plan_path or ".gigacode/plans/<chat>.md")

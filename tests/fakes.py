@@ -260,8 +260,10 @@ class RecordingEvents(AgentEvents):  # noqa: WPS214, WPS230
         *,
         confirm_answer: bool | Approval | ConfirmResult = True,
         answers: list[Answer] | None = None,
+        can_confirm: bool = True,
     ) -> None:
         self._confirm_answer = confirm_answer
+        self._can_confirm = can_confirm  # False — запуск без клавиатуры
         self._user_answers = answers  # ответы на ask_user (None — отказ)
         self.questions: list[list[Question]] = []
         self.events: list[tuple[str, Any]] = []
@@ -302,6 +304,10 @@ class RecordingEvents(AgentEvents):  # noqa: WPS214, WPS230
     ) -> bool | Approval | ConfirmResult:
         self.confirms.append((call, preview, dangerous))
         return self._confirm_answer
+
+    @override
+    def can_confirm(self) -> bool:
+        return self._can_confirm
 
     @override
     def on_review_start(self, call: ToolCallInfo) -> None:
