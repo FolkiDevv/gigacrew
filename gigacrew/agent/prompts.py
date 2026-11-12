@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from types import MappingProxyType
 
 from gigacrew.agent.conversation import clean_text
@@ -673,9 +673,24 @@ def nested_instructions_prompt(
     return clean_text("\n".join(parts))
 
 
-def compose_system_prompt(rules: str, project_context: str) -> str:
-    """Системный промпт из правил агента и готового контекста проекта."""
-    return clean_text(f"{rules}\n\n# Project context\n{project_context}")
+def tools_guidance_prompt(notes: Iterable[str]) -> str:
+    """Указания инструментов для системного промпта ("" — их нет); повторы — один раз."""
+    unique = list(dict.fromkeys(note.strip() for note in notes if note.strip()))
+    if not unique:
+        return ""
+    return "\n\n".join(("# Connected tools", *unique))
+
+
+def compose_system_prompt(rules: str, project_context: str, notes: Iterable[str] = ()) -> str:
+    """Системный промпт из правил агента, готового контекста проекта и указаний инструментов.
+
+    ``notes`` — :meth:`~gigacrew.tools.base.Tool.guidance` инструментов агента (MCP-серверы).
+    """
+    prompt = f"{rules}\n\n# Project context\n{project_context}"
+    guidance = tools_guidance_prompt(notes)
+    if guidance:
+        prompt = f"{prompt}\n\n{guidance}"
+    return clean_text(prompt)
 
 
 def build_system_prompt(workspace: Workspace) -> str:
@@ -683,6 +698,10 @@ def build_system_prompt(workspace: Workspace) -> str:
     return compose_system_prompt(SYSTEM_PROMPT, build_project_context(workspace))
 
 
-def subagent_system_prompt(name: str, project_context: str) -> str:
-    """Системный промпт суб-агента ``name``: общие правила, правила агента, контекст."""
-    return compose_system_prompt(f"{SUBAGENT_PROMPT}\n{SUBAGENT_PROMPTS[name]}", project_context)
+def subagent_system_prompt(name: str, project_context: str, notes: Iterable[str] = ()) -> str:
+    """Системный промпт суб-агента ``name``: общие правила, правила агента, контекст.
+
+    ``notes`` — указания доступных суб-агенту инструментов (см. :func:`compose_system_prompt`).
+    """
+    rules = f"{SUBAGENT_PROMPT}\n{SUBAGENT_PROMPTS[name]}"
+    return compose_system_prompt(rules, project_context, notes)

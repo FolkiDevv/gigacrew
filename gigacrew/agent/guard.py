@@ -43,6 +43,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from gigacrew.llm.types import FunctionCall
+from gigacrew.tools.mcp_schema import MCP_PREFIX
 
 StopKind = Literal[
     "max_steps",
@@ -133,12 +134,15 @@ def call_key(call: FunctionCall) -> str:
     """Канонический ключ вызова: имя + JSON аргументов с упорядоченными ключами.
 
     Без пояснения для пользователя (``description``): от него результат не зависит. Не
-    строка (``null``) — не пояснение, а ошибка аргументов: такой вызов — другой.
+    строка (``null``) — не пояснение, а ошибка аргументов: такой вызов — другой. У
+    инструментов MCP-серверов ``description`` — данные (описание задачи в трекере), а не
+    пояснение: остаётся в ключе.
     """
+    cosmetic = frozenset[str]() if call.name.startswith(MCP_PREFIX) else _COSMETIC_FIELDS
     arguments = {
         name: argument
         for name, argument in call.arguments.items()
-        if not (name in _COSMETIC_FIELDS and isinstance(argument, str))
+        if not (name in cosmetic and isinstance(argument, str))
     }
     args = json.dumps(
         arguments,

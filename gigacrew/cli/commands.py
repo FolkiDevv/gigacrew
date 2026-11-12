@@ -69,6 +69,8 @@ class CommandContext:
     declined_windows: set[str] = field(default_factory=set)
     skills: SkillCatalog | None = None  # для /help и подсказок (None — без скиллов)
     trust_hooks: bool = False  # --trust-hooks: /hooks reload не спрашивает подтверждение
+    # Текст /mcp о MCP-серверах сессии (gigacrew.cli.mcp.describe_hub); None — серверов нет.
+    mcp_status: Callable[[], str] | None = None
 
 
 # Обработчик получает контекст и аргумент (текст после имени команды).
@@ -453,6 +455,14 @@ def _hooks(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+def _mcp(ctx: CommandContext, arg: str) -> bool:
+    if arg:
+        ctx.ui.error("использование: /mcp")
+        return True
+    ctx.ui.info("MCP-серверов нет" if ctx.mcp_status is None else ctx.mcp_status())
+    return True
+
+
 def _exit(ctx: CommandContext, _arg: str) -> bool:
     ctx.ui.system("до встречи!")
     return False
@@ -461,35 +471,29 @@ def _exit(ctx: CommandContext, _arg: str) -> bool:
 def default_commands() -> CommandRegistry:
     """Реестр встроенных слеш-команд REPL."""
     registry = CommandRegistry()
-    registry.register(SlashCommand("/help", "справка", _help))
-    registry.register(SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"))
-    registry.register(SlashCommand("/mode", "режим: авто или план", _mode, usage=MODE_USAGE))
-    registry.register(
+    for command in (
+        SlashCommand("/help", "справка", _help),
+        SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"),
+        SlashCommand("/mode", "режим: авто или план", _mode, usage=MODE_USAGE),
         SlashCommand(
             "/permissions",
             "разрешённые без вопросов команды и журнал решений",
             _permissions,
             usage=PERMISSIONS_USAGE,
         ),
-    )
-    registry.register(
         SlashCommand(
             "/add-dir",
             "подключить каталог вне проекта (чтение и правки)",
             _add_dir,
             usage=ADD_DIR_USAGE,
         ),
-    )
-    registry.register(SlashCommand("/clear", "новый чат", _clear))
-    registry.register(
+        SlashCommand("/clear", "новый чат", _clear),
         SlashCommand(
             "/compact",
             "сжать историю в краткое содержание",
             _compact,
             usage="/compact [пожелания]",
         ),
-    )
-    registry.register(
         SlashCommand(
             "/resume",
             "открыть сохранённый чат",
@@ -497,10 +501,10 @@ def default_commands() -> CommandRegistry:
             usage="/resume [id]",
             aliases=("/chats",),
         ),
-    )
-    registry.register(
         SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]"),
-    )
-    registry.register(SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"))
-    registry.register(SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")))
+        SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"),
+        SlashCommand("/mcp", "MCP-серверы и их инструменты", _mcp),
+        SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")),
+    ):
+        registry.register(command)
     return registry
