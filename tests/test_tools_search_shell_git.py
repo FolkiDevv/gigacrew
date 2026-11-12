@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ from gigacrew.agent.loop import Agent
 from gigacrew.config import Config
 from gigacrew.permissions import Decision, PermissionMode, ToolKind, decide
 from gigacrew.project.workspace import Workspace
-from gigacrew.safety import classify
+from gigacrew.safety import CommandLevel, classify
 from gigacrew.safety.gitconfig import git_in_project, repo_config_runs_programs
 from gigacrew.security import RiskLevel
 from gigacrew.tools import git as git_module
@@ -185,6 +186,96 @@ def test_shell_runs_in_cwd_and_rejects_outside(ctx: ToolContext) -> None:
     assert verdict is not None
     assert verdict.cwd == "sub"
     assert verdict.command == "ls"
+
+
+@pytest.fixture
+def secrets_project(ctx: ToolContext) -> ToolContext:
+    """Проект, где grep -r по корню прочитал бы .env."""
+    _write(ctx, "src/app.py", "needle = 1\n")
+    (ctx.root / ".env").write_text("TOKEN=needle\n", encoding="utf-8")
+    return ctx
+
+
+def test_unverified_recursive_grep_runs_as_search(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle . | head -5"})
+    assert classify(params.command, root=secrets_project.root).level is None
+    assessment = sh.assess(params, secrets_project)
+    assert assessment.risk is RiskLevel.SAFE
+    assert assessment.verdict is not None
+    assert assessment.verdict.level is CommandLevel.READ
+    res = sh.run(params, secrets_project)
+    assert res.ok
+    assert "src/app.py:1:needle = 1" in res.content
+    assert "TOKEN" not in res.content
+    assert "search_content" in res.content.splitlines()[0]
+
+
+def test_assessed_search_never_becomes_a_command(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle src ."})
+    assert sh.assess(params, secrets_project).risk is RiskLevel.SAFE
+    # между оценкой и запуском пропал путь поиска: заново команда уже не переводится,
+    # но разрешён был поиск — настоящий grep по дереву с .env не запускается
+    shutil.rmtree(secrets_project.root / "src")
+    res = sh.run(params, secrets_project)
+    assert "search_content" in res.content.splitlines()[0]
+    assert "TOKEN" not in res.content
+
+
+def test_assessed_command_stays_a_command(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle src"})
+    sh.assess(params, secrets_project)
+    res = sh.run(params, secrets_project)
+    assert res.content.startswith("exit code: 0")
+
+
+def test_assessed_command_is_rechecked_before_run(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle src"})
+    assessment = sh.assess(params, secrets_project)
+    assert assessment.verdict is not None
+    assert assessment.verdict.command == "grep -rn needle src"
+    # после оценки в src появился файл с секретами: настоящий grep прочитал бы его
+    (secrets_project.root / "src" / ".env").write_text("TOKEN=needle\n", encoding="utf-8")
+    res = sh.run(params, secrets_project)
+    assert "search_content" in res.content.splitlines()[0]
+    assert "TOKEN" not in res.content
+
+
+def test_search_output_is_capped(secrets_project: ToolContext) -> None:
+    line = "needle ".ljust(200, "x")
+    _write(secrets_project, "src/big.py", "\n".join(line for _ in range(500)))
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle . | head -500"})
+    sh.assess(params, secrets_project)
+    res = sh.run(params, secrets_project)
+    assert "search_content" in res.content.splitlines()[0]
+    assert len(res.content) < 32_000
+
+
+def test_unverified_grep_files_only(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    res = sh.run(sh.parse({"command": "grep -rl needle ."}), secrets_project)
+    assert res.content.splitlines()[1:] == ["src/app.py"]
+
+
+def test_verified_recursive_grep_runs_as_command(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle src"})
+    assert sh.assess(params, secrets_project).risk is RiskLevel.SAFE
+    res = sh.run(params, secrets_project)
+    assert res.content.startswith("exit code: 0")
+    assert "src/app.py:1:needle = 1" in res.content
+
+
+def test_untranslatable_grep_stays_unverified(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    assessment = sh.assess(sh.parse({"command": "grep -rn -C2 needle ."}), secrets_project)
+    assert assessment.verdict is not None
+    assert assessment.verdict.level is None
+    assert "search_content" in assessment.reason
 
 
 # -------------------------------- git --------------------------------- #

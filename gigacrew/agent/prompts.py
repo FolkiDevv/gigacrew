@@ -39,8 +39,8 @@ old_string is copied verbatim — exact indentation, spaces and line breaks.
 find_references; who calls a function and what it calls — call_hierarchy; what a \
 name on a specific line refers to (and its type) — goto_definition;
   - the structure of a file or directory (and its imports) — file_outline;
-  - arbitrary text (strings, messages, config keys) — search_content; files by \
-name — find_files;
+  - arbitrary text (strings, messages, config keys) — search_content, not grep -r or \
+rg in run_shell; files by name — find_files;
   - then read_file only the line ranges you need. Do not read large files whole \
 and do not walk the project file by file.
 - Independent calls go in one response: reading several files, several searches or \
@@ -206,11 +206,12 @@ EXPLORE_PROMPT = """\
 You ONLY research: you change nothing (file edits and changing git commands are \
 blocked). run_shell runs only commands verified as read-only inside the project or its \
 additional directories \
-(ls, wc, grep, rg, git log/show/blame, Python one-liners that only read files); \
+(ls, wc, git log/show/blame, Python one-liners that only read files); \
 anything else is refused, including the project's tests and builds, importing its \
 modules, shell loops and if/case blocks, and file paths computed at run time ($(…), \
-$VAR) — prefer the dedicated tools. A refused command is not worth rephrasing: switch \
-to read_file, search_content or the navigation tools.
+$VAR) — prefer the dedicated tools. Search file contents with search_content, not \
+grep -r or rg. A refused command is not worth rephrasing: switch to read_file, \
+search_content or the navigation tools.
 
 Strategy — search, do not browse:
 1. Start from the question, not from the file tree. Turn it into concrete \

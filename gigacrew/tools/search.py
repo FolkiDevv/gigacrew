@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import fnmatch
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import override
@@ -14,7 +16,15 @@ from gigacrew.project.secret_paths import is_secret_target
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.fs import SECRET_READ_NOTE
 
-_MAX_MATCHES = 500  # потолок max_results, который может запросить модель
+__all__ = [
+    "MAX_MATCHES",
+    "SearchContentParams",
+    "SearchContentTool",
+    "SearchFilter",
+    "search_paths",
+]
+
+MAX_MATCHES = 500  # потолок max_results, который может запросить модель
 _MAX_FILE_BYTES = 1_000_000  # файлы крупнее не читаем (сгенерированное, дампы)
 _BYTES_IN_MB = 1_000_000
 _BINARY_PROBE = 8192  # NUL в первых байтах — бинарный файл
@@ -37,11 +47,41 @@ class SearchContentParams(BaseModel):  # noqa: D101
     max_results: int = Field(default=100, description="Maximum number of matches")
 
 
+@dataclass(frozen=True)
+class SearchFilter:
+    """Какие файлы смотреть при поиске.
+
+    ``include`` — шаблоны (как ``glob`` у search_content): файл подходит хотя бы под один,
+    пусто — под любой. ``exclude`` — шаблоны имён файлов, ``exclude_dirs`` — имён
+    каталогов на пути к файлу: такие файлы пропускаются (как ``grep --exclude``,
+    ``--exclude-dir``).
+    """
+
+    include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+    exclude_dirs: tuple[str, ...] = ()
+
+    def admits(self, rel: str) -> bool:
+        """Подходит ли файл с путём ``rel`` (POSIX, от корня поиска) под фильтр."""
+        if self.include and not any(glob_match(rel, pattern) for pattern in self.include):
+            return False
+        *dirs, name = rel.split("/")
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in self.exclude):
+            return False
+        return not any(
+            fnmatch.fnmatchcase(folder, pattern) for folder in dirs for pattern in self.exclude_dirs
+        )
+
+
 @dataclass
 class _Found:
-    """Совпадения поиска и счётчики файлов."""
+    """Совпадения поиска и счётчики файлов.
+
+    ``files_only`` — вместо строк записываются пути файлов с совпадениями (как ``grep -l``).
+    """
 
     limit: int
+    files_only: bool = False
     matches: list[str] = field(default_factory=list)
     scanned: int = 0  # файлов просмотрено
     skipped: int = 0  # больших файлов пропущено
@@ -60,13 +100,13 @@ def _compile(params: SearchContentParams) -> re.Pattern[str]:
 def _wanted(
     path: Path,
     rel: str,
-    params: SearchContentParams,
+    search_filter: SearchFilter,
     ctx: ToolContext,
     *,
     walking: bool,
 ) -> bool:
-    """Искать ли в файле: он подходит под ``glob`` и (при обходе каталога) без секретов."""
-    if params.glob and not glob_match(rel, params.glob):
+    """Искать ли в файле: он подходит под фильтр и (при обходе каталога) без секретов."""
+    if not search_filter.admits(rel):
         return False
     # секреты не ищем — то же правило, что у read_file и классификатора команд
     return not (walking and is_secret_target(ctx.root, path))
@@ -103,8 +143,62 @@ def _collect(found: _Found, rel: str, text: str, regex: re.Pattern[str]) -> None
         if len(found.matches) >= found.limit:
             found.more = True
             return
+        if found.files_only:
+            found.matches.append(rel)
+            return
         snippet = line.strip()[:_MAX_SNIPPET]
         found.matches.append(f"{rel}:{line_no}:{snippet}")
+
+
+def _search_base(
+    found: _Found,
+    base: Path,
+    regex: re.Pattern[str],
+    search_filter: SearchFilter,
+    ctx: ToolContext,
+) -> None:
+    """Добавляет в ``found`` совпадения из файла или каталога ``base`` (раскрытого)."""
+    walking = base.is_dir()
+    if not walking and is_secret_target(ctx.root, base):
+        raise ToolError(SECRET_READ_NOTE.format(path=ctx.display(base)))
+    # .gitignore — того корня (проекта или подключённого каталога), где идёт поиск
+    owner = ctx.root_of(base)
+    files = walk_files(owner, base) if walking else [base]
+    for path in files:
+        rel = path.relative_to(owner).as_posix()
+        if not _wanted(path, rel, search_filter, ctx, walking=walking):
+            continue
+        text = _read_text(path, found)
+        if text is None:
+            continue
+        found.scanned += 1
+        _collect(found, ctx.display(path), text, regex)
+        if found.more:
+            return
+
+
+def search_paths(
+    ctx: ToolContext,
+    bases: Sequence[Path],
+    regex: re.Pattern[str],
+    *,
+    limit: int,
+    search_filter: SearchFilter | None = None,
+    files_only: bool = False,
+) -> ToolResult:
+    """Поиск строк, совпадающих с ``regex``, в файлах и каталогах ``bases`` по очереди.
+
+    ``bases`` — раскрытые пути внутри проекта или подключённых каталогов. Секреты, файлы
+    из ``.gitignore``, служебные каталоги, бинарные и большие файлы пропускаются;
+    файл с секретами, указанный явно, — ToolError. ``limit`` — общий лимит совпадений
+    (строк вывода) на все ``bases``.
+    """
+    found = _Found(limit, files_only=files_only)
+    for base in bases:
+        _search_base(found, base, regex, search_filter or SearchFilter(), ctx)
+        if found.more:
+            break
+    return _report(found)
 
 
 def _report(found: _Found) -> ToolResult:
@@ -113,7 +207,8 @@ def _report(found: _Found) -> ToolResult:
     if found.more:
         body = f"{body}\n… показаны первые {found.limit} совпадений; уточните запрос"
     count = len(found.matches)
-    summary = f"совпадений: {count} (файлов просмотрено: {found.scanned})"
+    what = "файлов с совпадениями" if found.files_only else "совпадений"
+    summary = f"{what}: {count} (файлов просмотрено: {found.scanned})"
     if found.skipped:
         max_mb = _MAX_FILE_BYTES // _BYTES_IN_MB
         body = (
@@ -151,25 +246,9 @@ class SearchContentTool(Tool[SearchContentParams]):
         base = ctx.resolve(params.path)
         if not base.exists():
             raise ToolError(f"Путь не найден: {params.path}")
-        regex = _compile(params)
-        limit = min(max(params.max_results, 1), _MAX_MATCHES)
-
-        walking = base.is_dir()
-        if not walking and is_secret_target(ctx.root, base):
+        if not base.is_dir() and is_secret_target(ctx.root, base):
             raise ToolError(SECRET_READ_NOTE.format(path=params.path))
-        # .gitignore — того корня (проекта или подключённого каталога), где идёт поиск
-        owner = ctx.root_of(base)
-        files = walk_files(owner, base) if walking else [base]
-        found = _Found(limit)
-        for path in files:
-            rel = path.relative_to(owner).as_posix()
-            if not _wanted(path, rel, params, ctx, walking=walking):
-                continue
-            text = _read_text(path, found)
-            if text is None:
-                continue
-            found.scanned += 1
-            _collect(found, ctx.display(path), text, regex)
-            if found.more:
-                break
-        return _report(found)
+        regex = _compile(params)
+        limit = min(max(params.max_results, 1), MAX_MATCHES)
+        include = (params.glob,) if params.glob else ()
+        return search_paths(ctx, [base], regex, limit=limit, search_filter=SearchFilter(include))
