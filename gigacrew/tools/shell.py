@@ -6,17 +6,19 @@ import contextlib
 import os
 from typing import override
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from gigacrew.permissions import ToolKind
-from gigacrew.safety import MAX_COMMAND, CommandLevel, Verdict, classify
+from gigacrew.safety import MAX_COMMAND, CommandLevel, Part, Verdict, classify
 from gigacrew.security import (
     RiskLevel,
     classify_shell_command,
     subprocess_env,
 )
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
+from gigacrew.tools.grep_search import GrepSearch, as_grep_search
 from gigacrew.tools.process import ProcessResult, run_process, truncate_middle
+from gigacrew.tools.search import search_paths
 
 _MAX_OUTPUT = 30_000
 MIN_TIMEOUT = 1
@@ -27,6 +29,13 @@ _SHELL_FAILURES = (126, 127)
 # Сколько символов вызова показывать в UI (describe) и в кратком итоге команды.
 _DESCRIBE_LIMIT = 70
 _SUMMARY_COMMAND_LIMIT = 60
+# Пометка для модели к результату grep -r, выполненного встроенным поиском.
+_GREP_SEARCH_NOTE = (
+    "[grep -r здесь не выполнялся: по этому каталогу его не проверить (файлы с секретами, "
+    "ссылки за пределы проекта или слишком много файлов). Вместо него выполнен встроенный "
+    "поиск — {call}: файлы с секретами, из .gitignore, служебные каталоги и бинарные файлы "
+    "пропущены. Для поиска по содержимому сразу вызывайте search_content.]"
+)
 
 
 # Без докстринга: pydantic отдал бы его в JSON-схему параметров, которая уходит модели.
@@ -50,6 +59,22 @@ class RunShellParams(BaseModel):  # noqa: D101
             "the user is asked to confirm it)"
         ),
     )
+    _planned: GrepSearch | None = PrivateAttr(None)
+
+    @property
+    def planned(self) -> GrepSearch | None:
+        """Встроенный поиск, которым оценка (assess) решила выполнить вызов.
+
+        Разрешённый поиск run выполняет поиском, даже если к запуску перевод команды уже
+        не удаётся. None — оценки не было или она решила выполнить команду: тогда run
+        проверяет команду заново (дерево поиска могло измениться).
+        """
+        return self._planned
+
+    @planned.setter
+    def planned(self, search: GrepSearch | None) -> None:
+        # Приватный атрибут pydantic: в классе — его объявление, а не значение.
+        self._planned = search  # noqa: WPS601
 
 
 def command_verdict(params: RunShellParams, ctx: ToolContext) -> Verdict:
@@ -72,6 +97,63 @@ def _relative_cwd(params: RunShellParams, ctx: ToolContext) -> str:
         raise ToolError(f"Каталог '{params.cwd}' не найден в проекте.")
     rel = os.path.relpath(target, ctx.root)
     return "." if rel == "." else rel.replace(os.sep, "/")
+
+
+def _grep_substitute(
+    params: RunShellParams,
+    ctx: ToolContext,
+    verdict: Verdict | None = None,
+) -> GrepSearch | None:
+    """Рекурсивный grep, который run_shell выполнит встроенным поиском; None — команду.
+
+    Подменяется только grep, который классификатор не проверил (в дереве секреты, ссылки
+    наружу или слишком много файлов): проверенный выполняется как есть. ``verdict`` —
+    уже готовый вердикт команды (иначе он вычисляется, если команда — такой grep).
+    """
+    if os.name != "posix":  # команды выполняет не /bin/sh: разбор bash к ним не относится
+        return None
+    search = as_grep_search(params.command, ctx, _relative_cwd(params, ctx))
+    if search is None:
+        return None
+    if verdict is None:
+        verdict = command_verdict(params, ctx)
+    return search if verdict.level is None else None
+
+
+def _search_verdict(verdict: Verdict, search: GrepSearch) -> Verdict:
+    """Вердикт grep, выполняемого встроенным поиском: чтение без секретов."""
+    reason = f"выполняется встроенным поиском: {search.call}"
+    part = Part(CommandLevel.READ, reason, text=verdict.command)
+    return Verdict(
+        CommandLevel.READ,
+        reason,
+        verdict.cwd,
+        verdict.command,
+        parts=(part,),
+        extra_dirs=verdict.extra_dirs,
+    )
+
+
+def _search_result(command: str, search: GrepSearch, ctx: ToolContext) -> ToolResult:
+    """Результат grep -r, выполненного встроенным поиском, с пометкой для модели."""
+    # Пути проверены при оценке; ссылка, подменённая с тех пор, не уведёт поиск наружу.
+    bases = tuple(ctx.resolve(base) for base in search.bases)
+    found = search_paths(
+        ctx,
+        bases,
+        search.regex,
+        limit=search.limit,
+        search_filter=search.search_filter,
+        files_only=search.files_only,
+    )
+    note = _GREP_SEARCH_NOTE.format(call=search.call)
+    output = truncate_middle(found.content, _MAX_OUTPUT)
+    command_head = command[:_SUMMARY_COMMAND_LIMIT]
+    return ToolResult(
+        content=f"{note}\n{output}",
+        summary=f"$ {command_head} → встроенный поиск, {found.summary}",
+        display=Display(output, title=f"$ {command_head}"),
+    )
 
 
 def _risk(verdict: Verdict, command: str, *, classify_commands: bool) -> RiskLevel:
@@ -125,10 +207,12 @@ class RunShellTool(Tool[RunShellParams]):
     description = (
         "Runs a shell command and returns stdout/stderr and the exit code. Use it to build, "
         "run tests and utilities — not to read or search files (read_file, search_content "
-        "and the navigation tools are faster and safer). Commands that only read the "
-        "project (ls, cat, grep, git status/log/diff, Python one-liners that only read) run "
-        "without asking the user; others are checked by a reviewer model or confirmed by "
-        "the user. There is no keyboard "
+        "and the navigation tools are faster and safer). Search file contents with "
+        "search_content, not grep -r or rg: a recursive grep over a directory with secrets "
+        "(.env) or a virtualenv cannot be verified, so it is run as search_content instead. "
+        "Commands that only read the project (ls, cat, wc, git status/log/diff, Python "
+        "one-liners that only read) run without asking the user; others are checked by a "
+        "reviewer model or confirmed by the user. There is no keyboard "
         "input (stdin is empty) — use non-interactive flags. Network commands (curl/wget) "
         "are forbidden by the security policy. Put temporary files in .gigacode/tmp/ (it "
         "exists), not /tmp: writing outside the project always needs the user's "
@@ -143,6 +227,10 @@ class RunShellTool(Tool[RunShellParams]):
     def assess(self, params: RunShellParams, ctx: ToolContext) -> Assessment:
         """Оценка команды классификатором: риск, причина, вид вызова, вердикт."""
         verdict = command_verdict(params, ctx)
+        search = _grep_substitute(params, ctx, verdict)
+        params.planned = search
+        if search is not None:
+            verdict = _search_verdict(verdict, search)
         risk = _risk(verdict, params.command, classify_commands=ctx.classify_commands)
         reason = "" if verdict.level is CommandLevel.READ else verdict.reason
         if verdict.level is None:
@@ -183,36 +271,50 @@ class RunShellTool(Tool[RunShellParams]):
 
     @override
     def run(self, params: RunShellParams, ctx: ToolContext) -> ToolResult:
-        """Выполняет команду через /bin/sh и возвращает код возврата и вывод."""
-        timeout = min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)
-        cwd = (ctx.root / _relative_cwd(params, ctx)).resolve()
-        # Папка временных файлов модели есть к запуску команды: не нужен лишний шаг с mkdir.
-        # Не вышло (симлинк, нет прав) — команда всё равно выполняется.
-        with contextlib.suppress(OSError):
-            ctx.workspace.ensure_temp_dir()
-        # Оболочка — суть инструмента: команду до запуска проверяют классификатор и права.
-        res = run_process(params.command, cwd=cwd, timeout=timeout, shell=True)  # noqa: S604
+        """Выполняет команду через /bin/sh и возвращает код возврата и вывод.
 
-        combined = _combined_output(res)
-        command_head = params.command[:_SUMMARY_COMMAND_LIMIT]
-        if res.timed_out:
-            head = "exit code: (таймаут)"
-            summary = "таймаут команды"
-        else:
-            head = f"exit code: {res.returncode}"
-            summary = f"$ {command_head} → код {res.returncode}"
-        if res.escaped_output:
-            summary = f"{summary} · фоновый процесс остановить не удалось"
-        note_text = "".join(f"\n[{note}]" for note in _notes(res, timeout))
-        output = combined or "(пустой вывод)"
-        ok = res.returncode == 0 and not res.timed_out
-        return ToolResult(
-            content=f"{head}{note_text}\n{output}",
-            ok=ok,
-            summary=summary,
-            # Ненулевой код (grep без совпадений, упавшие тесты) — результат, а не
-            # застревание; таймаут и «команда не найдена/не запускается» — сбой.
-            soft=not ok and not res.timed_out and res.returncode not in _SHELL_FAILURES,
-            display=Display(combined, title=f"$ {command_head}") if combined else None,
-            exit_code=None if res.timed_out else res.returncode,
-        )
+        Непроверенный рекурсивный grep выполняется встроенным поиском
+        (:func:`_grep_substitute`). Поиск, разрешённый при оценке
+        (:attr:`RunShellParams.planned`), не превращается в команду. Команда проверяется
+        заново: если с оценки в дереве появились секреты, вместо неё выполняется поиск.
+        """
+        search = params.planned or _grep_substitute(params, ctx)
+        if search is not None:
+            return _search_result(params.command, search, ctx)
+        return _execute(params, ctx)
+
+
+def _execute(params: RunShellParams, ctx: ToolContext) -> ToolResult:
+    """Выполняет команду через /bin/sh: код возврата и вывод для модели."""
+    timeout = min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)
+    cwd = (ctx.root / _relative_cwd(params, ctx)).resolve()
+    # Папка временных файлов модели есть к запуску команды: не нужен лишний шаг с mkdir.
+    # Не вышло (симлинк, нет прав) — команда всё равно выполняется.
+    with contextlib.suppress(OSError):
+        ctx.workspace.ensure_temp_dir()
+    # Оболочка — суть инструмента: команду до запуска проверяют классификатор и права.
+    res = run_process(params.command, cwd=cwd, timeout=timeout, shell=True)  # noqa: S604
+
+    combined = _combined_output(res)
+    command_head = params.command[:_SUMMARY_COMMAND_LIMIT]
+    if res.timed_out:
+        head = "exit code: (таймаут)"
+        summary = "таймаут команды"
+    else:
+        head = f"exit code: {res.returncode}"
+        summary = f"$ {command_head} → код {res.returncode}"
+    if res.escaped_output:
+        summary = f"{summary} · фоновый процесс остановить не удалось"
+    note_text = "".join(f"\n[{note}]" for note in _notes(res, timeout))
+    output = combined or "(пустой вывод)"
+    ok = res.returncode == 0 and not res.timed_out
+    return ToolResult(
+        content=f"{head}{note_text}\n{output}",
+        ok=ok,
+        summary=summary,
+        # Ненулевой код (grep без совпадений, упавшие тесты) — результат, а не
+        # застревание; таймаут и «команда не найдена/не запускается» — сбой.
+        soft=not ok and not res.timed_out and res.returncode not in _SHELL_FAILURES,
+        display=Display(combined, title=f"$ {command_head}") if combined else None,
+        exit_code=None if res.timed_out else res.returncode,
+    )
