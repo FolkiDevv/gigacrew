@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import os
-from typing import override
+from typing import Literal, override
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from gigacrew.permissions import ToolKind
 from gigacrew.safety import MAX_COMMAND, CommandLevel, Part, Verdict, classify
@@ -29,6 +29,7 @@ _SHELL_FAILURES = (126, 127)
 # Сколько символов вызова показывать в UI (describe) и в кратком итоге команды.
 _DESCRIBE_LIMIT = 70
 _SUMMARY_COMMAND_LIMIT = 60
+_COMMAND: Literal["command"] = "command"  # вызов выполняется командой оболочки
 # Пометка для модели к результату grep -r, выполненного встроенным поиском.
 _GREP_SEARCH_NOTE = (
     "[grep -r здесь не выполнялся: по этому каталогу его не проверить (файлы с секретами, "
@@ -59,6 +60,21 @@ class RunShellParams(BaseModel):  # noqa: D101
             "the user is asked to confirm it)"
         ),
     )
+    _planned: GrepSearch | Literal["command"] | None = PrivateAttr(None)
+
+    @property
+    def planned(self) -> GrepSearch | Literal["command"] | None:
+        """Как выполнить вызов по его оценке: встроенным поиском или командой.
+
+        None — оценки не было. run выполняет вызов так, как его оценили и разрешили: если
+        к запуску поиск стал невозможен, команда всё равно не выполняется.
+        """
+        return self._planned
+
+    @planned.setter
+    def planned(self, plan: GrepSearch | Literal["command"]) -> None:
+        # Приватный атрибут pydantic: в классе — его объявление, а не значение.
+        self._planned = plan  # noqa: WPS601
 
 
 def command_verdict(params: RunShellParams, ctx: ToolContext) -> Verdict:
@@ -120,20 +136,23 @@ def _search_verdict(verdict: Verdict, search: GrepSearch) -> Verdict:
 
 def _search_result(command: str, search: GrepSearch, ctx: ToolContext) -> ToolResult:
     """Результат grep -r, выполненного встроенным поиском, с пометкой для модели."""
+    # Пути проверены при оценке; ссылка, подменённая с тех пор, не уведёт поиск наружу.
+    bases = tuple(ctx.resolve(base) for base in search.bases)
     found = search_paths(
         ctx,
-        search.bases,
+        bases,
         search.regex,
         limit=search.limit,
         search_filter=search.search_filter,
         files_only=search.files_only,
     )
     note = _GREP_SEARCH_NOTE.format(call=search.call)
+    output = truncate_middle(found.content, _MAX_OUTPUT)
     command_head = command[:_SUMMARY_COMMAND_LIMIT]
     return ToolResult(
-        content=f"{note}\n{found.content}",
+        content=f"{note}\n{output}",
         summary=f"$ {command_head} → встроенный поиск, {found.summary}",
-        display=Display(found.content, title=f"$ {command_head}"),
+        display=Display(output, title=f"$ {command_head}"),
     )
 
 
@@ -209,6 +228,7 @@ class RunShellTool(Tool[RunShellParams]):
         """Оценка команды классификатором: риск, причина, вид вызова, вердикт."""
         verdict = command_verdict(params, ctx)
         search = _grep_substitute(params, ctx, verdict)
+        params.planned = _COMMAND if search is None else search
         if search is not None:
             verdict = _search_verdict(verdict, search)
         risk = _risk(verdict, params.command, classify_commands=ctx.classify_commands)
@@ -254,12 +274,15 @@ class RunShellTool(Tool[RunShellParams]):
         """Выполняет команду через /bin/sh и возвращает код возврата и вывод.
 
         Непроверенный рекурсивный grep выполняется встроенным поиском
-        (:func:`_grep_substitute`). Вердикт считается заново: дерево могло измениться
-        после оценки, а безопасны оба исхода.
+        (:func:`_grep_substitute`) — так, как решила оценка
+        (:attr:`RunShellParams.planned`): разрешённый поиск не превращается в команду.
+        Без оценки это решается здесь.
         """
-        search = _grep_substitute(params, ctx)
-        if search is not None:
-            return _search_result(params.command, search, ctx)
+        planned = params.planned
+        if planned is None:
+            planned = _grep_substitute(params, ctx) or _COMMAND
+        if isinstance(planned, GrepSearch):
+            return _search_result(params.command, planned, ctx)
         return _execute(params, ctx)
 
 

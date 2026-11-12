@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -208,6 +209,37 @@ def test_unverified_recursive_grep_runs_as_search(secrets_project: ToolContext) 
     assert "src/app.py:1:needle = 1" in res.content
     assert "TOKEN" not in res.content
     assert "search_content" in res.content.splitlines()[0]
+
+
+def test_assessed_search_never_becomes_a_command(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle src ."})
+    assert sh.assess(params, secrets_project).risk is RiskLevel.SAFE
+    # между оценкой и запуском пропал путь поиска: заново команда уже не переводится,
+    # но разрешён был поиск — настоящий grep по дереву с .env не запускается
+    shutil.rmtree(secrets_project.root / "src")
+    res = sh.run(params, secrets_project)
+    assert "search_content" in res.content.splitlines()[0]
+    assert "TOKEN" not in res.content
+
+
+def test_assessed_command_stays_a_command(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle src"})
+    sh.assess(params, secrets_project)
+    res = sh.run(params, secrets_project)
+    assert res.content.startswith("exit code: 0")
+
+
+def test_search_output_is_capped(secrets_project: ToolContext) -> None:
+    line = "needle ".ljust(200, "x")
+    _write(secrets_project, "src/big.py", "\n".join(line for _ in range(500)))
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle . | head -500"})
+    sh.assess(params, secrets_project)
+    res = sh.run(params, secrets_project)
+    assert "search_content" in res.content.splitlines()[0]
+    assert len(res.content) < 32_000
 
 
 def test_unverified_grep_files_only(secrets_project: ToolContext) -> None:

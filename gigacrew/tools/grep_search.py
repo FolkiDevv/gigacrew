@@ -21,6 +21,7 @@ from gigacrew.safety import MAX_COMMAND
 from gigacrew.safety.bash import Command, Redirect
 from gigacrew.safety.bash import parse as parse_command
 from gigacrew.tools.base import ToolContext, ToolError
+from gigacrew.tools.grep_pattern import translate
 from gigacrew.tools.search import MAX_MATCHES, SearchFilter
 
 __all__ = ["DEFAULT_LIMIT", "GrepSearch", "as_grep_search"]
@@ -79,10 +80,6 @@ _VALUED_LONG = frozenset((_REGEXP, _INCLUDE, _EXCLUDE, _EXCLUDE_DIR))
 # Шаблон имён без кавычек оболочка раскрыла бы по файлам каталога: у этих флагов
 # совпадений нет (имя начинается с `--`), и слово остаётся как есть.
 _GLOB_PREFIXES = ("--include=", "--exclude=", "--exclude-dir=")
-# В базовом синтаксисе эти символы — литералы, а с обратной косой — операторы; в Python наоборот.
-_BASIC_OPERATORS = frozenset("|(){}?+")
-_WORD_EDGES = frozenset("<>")  # \< и \> — границы слова
-_BASIC_ENDS = (r"\)", r"\|")  # после `$` — конец выражения в базовом синтаксисе
 _HEAD_COUNT = re.compile(r"-n?(\d+)|--lines=(\d+)")
 _LINES_FLAGS = frozenset(("-n", "--lines"))
 _QUIET_TARGET = "/dev/null"
@@ -164,8 +161,13 @@ class _GrepArgs:
         patterns = (*self.include, *self.exclude, *self.exclude_dirs)
         if any("/" in pattern or "{" in pattern for pattern in patterns):
             return None
-        # --exclude перед --include: grep читает и файлы, не попавшие ни под один шаблон
-        if self.include and self.filters[0] != _INCLUDE:
+        # У grep из --include/--exclude, подошедших к файлу, решает последний, а если не
+        # подошёл ни один — первый из них: --include пропускает файл, --exclude — нет.
+        # Фильтр поиска повторяет это, только когда все --include стоят до --exclude.
+        first_exclude = len(self.filters)
+        if _EXCLUDE in self.filters:
+            first_exclude = self.filters.index(_EXCLUDE)
+        if _INCLUDE in self.filters[first_exclude:]:
             return None
         return SearchFilter(tuple(self.include), tuple(self.exclude), tuple(self.exclude_dirs))
 
@@ -175,7 +177,7 @@ class _GrepArgs:
         lines = [line for source in sources for line in source.split("\n")]
         parts: list[str] = []
         for line in lines:
-            translated = _translate(line, self.syntax)
+            translated = translate(line, self.syntax)
             if translated is None:
                 return None
             parts.append(translated)
@@ -257,14 +259,12 @@ class _GrepArgs:
         """Значение флага: образец или шаблон имён."""
         if name == _REGEXP:
             self.patterns.append(text)
-            return
-        self.filters.append(name if name == _INCLUDE else _EXCLUDE)
-        if name == _INCLUDE:
-            self.include.append(text)
-        elif name == _EXCLUDE:
-            self.exclude.append(text)
-        else:
+        elif name == _EXCLUDE_DIR:  # каталоги — отдельное правило, не в порядке --include
             self.exclude_dirs.append(text)
+        else:
+            self.filters.append(name)
+            target = self.include if name == _INCLUDE else self.exclude
+            target.append(text)
 
 
 def as_grep_search(command: str, ctx: ToolContext, cwd: str = ".") -> GrepSearch | None:
@@ -315,11 +315,17 @@ def _simple(command: Command) -> bool:
 
 
 def _quiet(redirect: Redirect) -> bool:
-    """Перенаправление не меняет, что увидит модель: дублирование или в /dev/null."""
-    if redirect.fd_dup:
-        return True
+    """Перенаправление не меняет найденного: ``2>/dev/null`` или ``2>&1``.
+
+    Вывод в /dev/null (``>/dev/null``, ``&>/dev/null``) или закрытый (``>&-``) скрыл бы
+    совпадения, а поиск их покажет: такая команда не переводится.
+    """
     target = redirect.target
-    return redirect.writes and target is not None and target.text == _QUIET_TARGET
+    if target is None:
+        return False
+    if redirect.fd_dup:
+        return target.text != "-"
+    return redirect.fd == "2" and redirect.op in {">", ">>"} and target.text == _QUIET_TARGET
 
 
 def _head_limit(command: Command) -> int | None:
@@ -352,7 +358,7 @@ def _grep(command: Command, limit: int, ctx: ToolContext) -> GrepSearch | None:
     if regex is None or search_filter is None or bases is None:
         return None
     files_only = _FILES_ONLY in args.switches
-    call = _call(regex, bases, search_filter, ctx)
+    call = _call(regex, bases, search_filter, ctx, files_only=files_only, limit=limit)
     return GrepSearch(regex, bases, search_filter, files_only, limit, call)
 
 
@@ -361,97 +367,38 @@ def _call(
     bases: tuple[Path, ...],
     search_filter: SearchFilter,
     ctx: ToolContext,
+    *,
+    files_only: bool,
+    limit: int,
 ) -> str:
-    """Тот же поиск вызовами search_content (по одному на путь)."""
-    extra = ""
-    if len(search_filter.include) == 1:
-        extra = f", glob={_quote(search_filter.include[0])}"
+    """Тот же поиск вызовами search_content (по одному на путь) и то, чего в них нет."""
+    include = search_filter.include
+    extra = f", glob={_quote(include[0])}" if len(include) == 1 else ""
     if regex.flags & re.IGNORECASE:
         extra = f"{extra}, ignore_case=true"
+    if not files_only:
+        extra = f"{extra}, max_results={limit}"
     pattern = _quote(regex.pattern)
     calls: list[str] = []
     for base in bases:
         path = _quote(ctx.display(base))
         calls.append(f"search_content(pattern={pattern}, path={path}{extra})")
-    return "; ".join(calls)
+    joined = "; ".join(calls)
+    unshown = _unshown(search_filter, files_only=files_only)
+    return f"{joined}, и как в grep: {unshown}" if unshown else joined
+
+
+def _unshown(search_filter: SearchFilter, *, files_only: bool) -> str:
+    """Флаги grep, которых нет в параметрах search_content ("" — таких нет)."""
+    flags = [f"--include={pattern}" for pattern in search_filter.include]
+    if len(flags) == 1:  # один шаблон — параметр glob
+        flags.clear()
+    flags.extend(f"--exclude={pattern}" for pattern in search_filter.exclude)
+    flags.extend(f"--exclude-dir={pattern}" for pattern in search_filter.exclude_dirs)
+    if files_only:
+        flags.append("-l (только имена файлов)")
+    return " ".join(flags)
 
 
 def _quote(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)
-
-
-def _translate(pattern: str, syntax: str) -> str | None:
-    """Образец grep в синтаксисе Python; None — не переводится точно."""
-    if syntax == "F":
-        return re.escape(pattern)
-    out: list[str] = []
-    index = 0
-    while index < len(pattern):
-        # начало выражения — начало образца, после \( или \|: от этого зависят * и ^
-        start = not out or out[-1] in {"(", "|"}
-        token = _token(pattern, index, basic=syntax == "G", start=start)
-        if token is None:
-            return None
-        text, index = token
-        out.append(text)
-    return "".join(out)
-
-
-def _token(pattern: str, index: int, *, basic: bool, start: bool) -> tuple[str, int] | None:
-    """Очередной элемент образца в синтаксисе Python и позиция после него."""
-    char = pattern[index]
-    if char == "[":
-        return _bracket(pattern, index)
-    if char == "\\":
-        return _escape(pattern, index, basic=basic)
-    if basic and _basic_literal(pattern, index, start=start):
-        return re.escape(char), index + 1
-    return char, index + 1
-
-
-def _basic_literal(pattern: str, index: int, *, start: bool) -> bool:
-    """Символ базового синтаксиса — литерал, хотя в Python он оператор.
-
-    ``| ( ) { } ? +`` — всегда; ``*`` — в начале выражения (``start``), ``^`` — не в
-    начале; ``$`` — не в конце выражения.
-    """
-    char = pattern[index]
-    if char in _BASIC_OPERATORS:
-        return True
-    if char == "*":
-        return start
-    if char == "^":
-        return not start
-    if char != "$":
-        return False
-    rest = pattern[index + 1 :]
-    return bool(rest) and not rest.startswith(_BASIC_ENDS)
-
-
-def _escape(pattern: str, index: int, *, basic: bool) -> tuple[str, int] | None:
-    r"""Последовательность с обратной косой: ``\|`` — оператор, ``\<`` — граница слова."""
-    nxt = pattern[index + 1 : index + 2]
-    if not nxt:
-        return None
-    end = index + 2
-    if nxt in _WORD_EDGES:
-        return r"\b", end
-    if basic and nxt in _BASIC_OPERATORS:
-        return nxt, end
-    return pattern[index:end], end
-
-
-def _bracket(pattern: str, index: int) -> tuple[str, int] | None:
-    """Скобочное выражение ``[...]`` как есть; классы POSIX (``[[:space:]]``) — None."""
-    pos = index + 1
-    if pattern.startswith("^", pos):
-        pos += 1
-    if pattern.startswith("]", pos):  # `]` сразу после `[` или `[^` — литерал
-        pos += 1
-    end = pattern.find("]", pos)
-    if end < 0:
-        return None
-    body = pattern[index : end + 1]
-    if any(mark in body for mark in ("[:", "[=", "[.")):
-        return None
-    return body, end + 1

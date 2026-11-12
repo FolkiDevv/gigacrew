@@ -98,6 +98,9 @@ def test_file_name_filters(tree: ToolContext) -> None:
         exclude=("x.py",),
         exclude_dirs=("build",),
     )
+    # --exclude-dir — правило для каталогов, порядок --include/--exclude оно не меняет
+    command = "grep -rn --exclude-dir=build --include='*.py' --exclude=x.py foo ."
+    assert _search(command, tree).search_filter.include == ("*.py",)
 
 
 @pytest.mark.parametrize(
@@ -127,6 +130,20 @@ def test_file_name_filters(tree: ToolContext) -> None:
         r"grep -rn 'foo\' .",
         "grep -rE '(' .",
         "grep -rn --exclude='*.txt' --include='*.py' foo .",
+        # решает последний подошедший флаг: app.py вернул бы --include после --exclude
+        "grep -rn --include='*.py' --exclude='*' --include=app.py foo .",
+        "grep -rn foo . >/dev/null | head -5",  # совпадения скрыты
+        "grep -rn foo . &>/dev/null",
+        "grep -rn foo . >&-",
+        r"grep -rn '\d' .",  # в grep это «d», а не цифра
+        r"grep -rE 'a\nb' .",
+        r"grep -r '\(a\)\1' .",  # обратная ссылка
+        "grep -rE 'a+?' .",  # повтор повтора
+        "grep -rE '(?i)foo' .",
+        "grep -rE '(a+)+$' .",  # вложенный повтор: поиск в Python бывает экспоненциальным
+        "grep -rE '(a|aa)*b' .",
+        r"grep -rP '(\w+\s?)*$' .",
+        "grep -rn '[a--z]' .",
         "grep -rn --include='src/*.py' foo .",
         "grep -rn - .",
         "rg foo",
@@ -137,7 +154,15 @@ def test_not_translated(command: str, tree: ToolContext) -> None:
 
 
 def test_call_shows_equivalent_search(tree: ToolContext) -> None:
-    search = _search("grep -rni --include='*.py' 'Foo' src", tree)
+    search = _search("grep -rni --include='*.py' 'Foo' src | head -5", tree)
     assert search.call == (
-        'search_content(pattern="Foo", path="src", glob="*.py", ignore_case=true)'
+        'search_content(pattern="Foo", path="src", glob="*.py", ignore_case=true, max_results=5)'
+    )
+
+
+def test_call_lists_what_search_content_cannot_express(tree: ToolContext) -> None:
+    command = "grep -rl --include='*.py' --include='*.md' --exclude-dir=build foo src"
+    assert _search(command, tree).call == (
+        'search_content(pattern="foo", path="src"), и как в grep: --include=*.py '
+        "--include=*.md --exclude-dir=build -l (только имена файлов)"
     )
