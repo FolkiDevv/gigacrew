@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import metadata
 
@@ -99,6 +100,7 @@ def run_repl(  # noqa: WPS211
     models: ModelCatalog | None = None,
     skills: SkillCatalog | None = None,
     trust_hooks: bool = False,
+    mcp_status: Callable[[], str] | None = None,
 ) -> int:
     """Запустить интерактивный режим и вернуть код выхода.
 
@@ -119,6 +121,8 @@ def run_repl(  # noqa: WPS211
 
     Хуки SessionStart — перед первым вводом, SessionEnd — при выходе (Ctrl+D, ``/exit``);
     ``trust_hooks`` (``--trust-hooks``) — для ``/hooks reload``.
+
+    ``mcp_status`` — текст ``/mcp`` о MCP-серверах сессии; None — серверов нет.
     """
     if interrupt is None:
         interrupt = EscInterrupt(enabled=None if read_input is None else False)
@@ -145,6 +149,7 @@ def run_repl(  # noqa: WPS211
         declined_windows=declined,
         skills=skills,
         trust_hooks=trust_hooks,
+        mcp_status=mcp_status,
     )
     repl = _Repl(
         agent=agent,

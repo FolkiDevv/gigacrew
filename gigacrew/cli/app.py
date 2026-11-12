@@ -20,6 +20,10 @@
 проекта (:mod:`gigacrew.cli.hooks`), после подтверждения или с ``--trust-hooks``; хук
 PreRequest срабатывает перед каждым запросом к бэкенду GigaCode.
 
+MCP-серверы — из ``mcpServers`` тех же файлов и ``.mcp.json`` проекта
+(:mod:`gigacrew.cli.mcp`), после подтверждения или с ``--trust-mcp``: запускаются перед
+началом работы, их инструменты (``mcp__<сервер>__<инструмент>``) — в реестре агента.
+
 Коды возврата: 0 — успех, 1 — ошибка конфигурации/внутренняя, 2 — ошибка LLM,
 3 — ход остановлен ограничителем (лимит шагов, серия ошибок, зацикливание) или запрос
 отклонён хуком, 130 — прервано пользователем (Ctrl+C).
@@ -30,6 +34,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 from contextlib import closing
+from functools import partial
 from importlib import metadata
 from pathlib import Path
 
@@ -40,6 +45,7 @@ from gigacrew.agent.loop import Agent
 from gigacrew.agent.reviewer import check_reviewer
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
 from gigacrew.cli.hooks import hook_session, install_request_hook, load_hooks
+from gigacrew.cli.mcp import connect_mcp, describe_hub
 from gigacrew.cli.models import (
     describe_result,
     ensure_context_window,
@@ -56,7 +62,8 @@ from gigacrew.permissions import PermissionMode, parse_mode
 from gigacrew.project.extra_dirs import check_extra_dir
 from gigacrew.project.skills import SkillCatalog
 from gigacrew.project.workspace import Workspace
-from gigacrew.tools.base import build_default_registry
+from gigacrew.tools.base import ToolRegistry, build_default_registry
+from gigacrew.tools.mcp import McpHub
 from gigacrew.ui.console import Console
 
 EXIT_OK = 0
@@ -66,6 +73,7 @@ EXIT_STOPPED = 3
 EXIT_INTERRUPTED = 130
 
 _STORE_TRUE = "store_true"
+NOT_IN_CATALOGUE = "модели {model} нет в каталоге бэкенда; доступны: {available}"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,12 +103,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-save",
         action=_STORE_TRUE,
         help="Не сохранять чат и журнал решений о командах (~/.gigacode/projects/)",
-    )
-    parser.add_argument(
-        "--trust-hooks",
-        action=_STORE_TRUE,
-        help="Запускать хуки (~/.gigacode/settings.json, .gigacode/settings*.json) без "
-        "подтверждения — для -p в CI; подтверждение не запоминается",
     )
     parser.add_argument(
         "--untrusted-project",
@@ -134,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
-    """Аргументы запуска: запрос, модель, корень проекта, подтверждения и режим."""
+    """Аргументы запуска: запрос, модель, корень проекта, подтверждения, доверие и режим."""
     parser.add_argument("-p", "--prompt", help="Одноразовый запрос (без интерактива)")
     parser.add_argument("-m", "--model", help="Модель (переопределяет GIGACREW_MODEL)")
     parser.add_argument(
@@ -166,6 +168,18 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         "повторить решение): агент читает и правит его, как проект, в любом режиме. "
         "Можно указать несколько раз; в REPL — /add-dir",
     )
+    parser.add_argument(
+        "--trust-hooks",
+        action=_STORE_TRUE,
+        help="Запускать хуки (~/.gigacode/settings.json, .gigacode/settings*.json) без "
+        "подтверждения — для -p в CI; подтверждение не запоминается",
+    )
+    parser.add_argument(
+        "--trust-mcp",
+        action=_STORE_TRUE,
+        help="Запускать MCP-серверы (mcpServers в settings.json, .mcp.json) без "
+        "подтверждения — для -p в CI; подтверждение не запоминается",
+    )
     modes = ",".join(mode.value for mode in PermissionMode)
     parser.add_argument(
         "--mode",
@@ -188,12 +202,6 @@ def _mode_arg(text: str) -> PermissionMode:
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
-def _make_provider(config: Config) -> LLMProvider:
-    if config.provider == "gigacode":
-        return GigaCodeProvider(config)
-    return ApiProvider(config)
-
-
 def tls_warning(config: Config) -> str | None:
     """Предупреждение о выключенной проверке TLS (только явный GIGACREW_VERIFY_SSL=0)."""
     if config.verify_ssl:
@@ -206,9 +214,10 @@ def tls_warning(config: Config) -> str | None:
     )
 
 
-def _not_in_catalogue(model: str, known: list[str]) -> str:
-    available = ", ".join(known)
-    return f"модели {model} нет в каталоге бэкенда; доступны: {available}"
+def _make_provider(config: Config) -> LLMProvider:
+    if config.provider == "gigacode":
+        return GigaCodeProvider(config)
+    return ApiProvider(config)
 
 
 def run_oneshot(
@@ -361,17 +370,18 @@ def _build_agent(
     windows: ModelWindows,
     hooks: HookRunner,
     known: list[str] | None,
+    registry: ToolRegistry,
 ) -> Agent | None:
     """Агент с моделью из настроек или из каталога ``known``; None — модели нет.
 
     ``known`` — модели каталога бэкенда (None — каталога нет, модель любая). Ошибка
-    выбора модели выводится здесь же.
+    выбора модели выводится здесь же. ``registry`` — инструменты агента.
     """
     if known is not None:
         if not config.model:  # модель по умолчанию — бэкенда
             config = dataclasses.replace(config, model=provider.model)
         elif config.model not in known:
-            missing = _not_in_catalogue(config.model, known)
+            missing = NOT_IN_CATALOGUE.format(model=config.model, available=", ".join(known))
             ui.error(f"{missing} (список — --list-models)")
             return None
     if not config.model:
@@ -391,7 +401,7 @@ def _build_agent(
         ui.warn(warning)
     return Agent(
         provider,
-        build_default_registry(),
+        registry,
         config,
         ui,
         windows=windows,
@@ -401,7 +411,13 @@ def _build_agent(
     )
 
 
-def _run_session(args: argparse.Namespace, agent: Agent, config: Config, ui: Console) -> int:
+def _run_session(
+    args: argparse.Namespace,
+    agent: Agent,
+    config: Config,
+    ui: Console,
+    mcp: McpHub,
+) -> int:
     """Чат (новый или продолженный) и режим работы: одноразовый запрос ``-p`` или REPL."""
     store = ChatStore(agent.workspace)
     for notice in store.migrate():  # чаты с прежнего места — из .gigacode/chats проекта
@@ -437,6 +453,7 @@ def _run_session(args: argparse.Namespace, agent: Agent, config: Config, ui: Con
         chats=chats,
         resumed=resumed,
         trust_hooks=args.trust_hooks,
+        mcp_status=partial(describe_hub, mcp, agent.workspace),
     )
 
 
@@ -472,14 +489,46 @@ def _run(args: argparse.Namespace, ui: Console, config: Config, provider: LLMPro
     if args.test_context is not None:
         model = args.test_context.strip()
         if known is not None and model not in known:
-            ui.error(_not_in_catalogue(model, known))
+            ui.error(NOT_IN_CATALOGUE.format(model=model, available=", ".join(known)))
             return EXIT_ERROR
         return run_test_context(provider, windows, model, ui, base_url=config.base_url)
 
-    agent = _build_agent(config, provider, ui, windows, hooks, known)
-    if agent is None:
-        return EXIT_ERROR
-    return _run_session(args, agent, config, ui)
+    return _run_agent(args, ui, config, provider, hooks, windows, known)
+
+
+def _run_agent(
+    args: argparse.Namespace,
+    ui: Console,
+    config: Config,
+    provider: LLMProvider,
+    hooks: HookRunner,
+    windows: ModelWindows,
+    known: list[str] | None,
+) -> int:
+    """MCP-серверы, агент и сессия; серверы закрываются при выходе."""
+    registry = build_default_registry()
+    workspace = Workspace(
+        config.project_root,
+        untrusted=config.untrusted_project,
+        extra_dirs=config.add_dirs,
+    )
+    try:
+        mcp = connect_mcp(
+            workspace,
+            ui,
+            registry,
+            interactive=args.prompt is None and ui.interactive(),
+            trust=args.trust_mcp,
+            version=metadata.version("gigacrew"),
+        )
+    except KeyboardInterrupt:
+        ui.system("\n(подключение к MCP-серверам прервано)")
+        return EXIT_INTERRUPTED
+    with closing(mcp):
+        agent = _build_agent(config, provider, ui, windows, hooks, known, registry)
+        if agent is None:
+            return EXIT_ERROR
+        return _run_session(args, agent, config, ui, mcp)
 
 
 def main(argv: list[str] | None = None) -> int:
