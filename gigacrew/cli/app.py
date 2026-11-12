@@ -496,7 +496,7 @@ def _run(args: argparse.Namespace, ui: Console, config: Config, provider: LLMPro
     return _run_agent(args, ui, config, provider, hooks, windows, known)
 
 
-def _run_agent(  # noqa: WPS211
+def _run_agent(
     args: argparse.Namespace,
     ui: Console,
     config: Config,

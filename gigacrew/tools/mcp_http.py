@@ -4,13 +4,19 @@
 перед ответом могут прийти запросы сервера (они уходят получателю и отвечаются
 отдельными POST). Сессия — заголовок ``Mcp-Session-Id``; истекла (404) — канал больше
 не годится, следующий вызов откроет новую сессию. Поток уведомлений сервера (GET) не
-открывается: gigacrew обходится без них. Проверка TLS — по стандартным корням.
+открывается: gigacrew обходится без них (поэтому и не предлагает HTTP-серверу
+``roots``). Проверка TLS — по стандартным корням.
+
+Поток SSE ограничен: строка и событие — не больше :data:`MAX_MESSAGE`, а срок ответа
+проверяется на каждой строке — keep-alive сервера (комментарии ``:``) его не продлевает.
 """
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import json
+import re
 import ssl
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -29,30 +35,57 @@ from gigacrew.tools.mcp_transport import (
     parse_message,
 )
 
-__all__ = ["HttpTransport", "parse_sse"]
+__all__ = ["HttpTransport", "parse_sse", "sse_lines"]
 
 _CONNECT_TIMEOUT = 30.0
 _CLOSE_TIMEOUT = 2.0
 _ERROR_BODY = 300  # символов тела HTTP-ответа с ошибкой в сообщении
 _MESSAGE_EVENTS: Final = frozenset(("", "message"))  # события SSE с сообщениями JSON-RPC
+# Конец строки SSE — только CRLF, LF и CR (str.splitlines режет ещё и по U+2028, U+0085…).
+_LINE_END_RE = re.compile(r"\r\n|\r|\n")
+
+
+def sse_lines(chunks: Iterable[bytes]) -> Iterator[str]:
+    """Строки потока SSE из байтов ответа.
+
+    httpx.iter_lines режет по str.splitlines — U+2028 или U+0085 в тексте ответа разорвали
+    бы событие, поэтому строки делятся здесь, по правилам SSE. CR в конце куска ждёт
+    следующего: это может быть начало CRLF. Строка длиннее :data:`MAX_MESSAGE` — McpError.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    for chunk in chunks:
+        pending = "".join((pending, decoder.decode(chunk)))
+        held = pending.endswith("\r")
+        *lines, rest = _LINE_END_RE.split(pending.removesuffix("\r") if held else pending)
+        pending = f"{rest}\r" if held else rest
+        if len(pending) > MAX_MESSAGE:
+            raise McpError("слишком длинная строка в потоке сервера")
+        yield from lines
+    yield from _LINE_END_RE.split("".join((pending, decoder.decode(b"", final=True))))
 
 
 def parse_sse(lines: Iterable[str]) -> Iterator[str]:
     """Данные событий ``message`` потока Server-Sent Events (строки без перевода строки).
 
     Многострочные ``data:`` склеиваются через перевод строки; комментарии и события
-    других видов пропускаются.
+    других видов пропускаются. Событие больше :data:`MAX_MESSAGE` — McpError.
     """
     event = ""
     chunks: list[str] = []
+    size = 0
     for line in lines:
         if line:
             event = _sse_field(line, event, chunks)
+            size += len(line)
+            if size > MAX_MESSAGE:
+                raise McpError("слишком большое событие в потоке сервера")
             continue
         if chunks and event in _MESSAGE_EVENTS:
             yield "\n".join(chunks)
         event = ""
         chunks = []
+        size = 0
     if chunks and event in _MESSAGE_EVENTS:
         yield "\n".join(chunks)
 
@@ -66,6 +99,14 @@ def _sse_field(line: str, event: str, chunks: list[str]) -> str:
     elif key == "event":
         return rest
     return event  # комментарий («:…»), id, retry
+
+
+def _before(deadline: float, lines: Iterable[str]) -> Iterator[str]:
+    """Строки потока, пока не истёк срок ответа (keep-alive его не продлевает)."""
+    for line in lines:
+        if time.monotonic() > deadline:
+            raise McpTimeoutError("сервер не прислал ответ вовремя")
+        yield line
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -141,7 +182,8 @@ class HttpTransport(Transport):
                 timeout=limits,
             ) as response:
                 self._accept(response, expected, deadline)
-        except (httpx.HTTPError, ValueError) as exc:  # ValueError — тело ответа не JSON
+        # ValueError — тело ответа не JSON, RecursionError — JSON чрезмерной вложенности.
+        except (httpx.HTTPError, ValueError, RecursionError) as exc:
             raise _http_error(exc, timeout) from exc
 
     @override
@@ -186,12 +228,11 @@ class HttpTransport(Transport):
             raise McpError("сервер не прислал ответ на запрос")
 
     def _read_events(self, response: httpx.Response, expected: object, deadline: float) -> None:
-        for chunk in parse_sse(response.iter_lines()):
+        lines = _before(deadline, sse_lines(response.iter_bytes()))
+        for chunk in parse_sse(lines):
             payload = parse_message(chunk.encode("utf-8"))
             if expected in deliver(payload, self._receive):
                 return
-            if time.monotonic() > deadline:
-                raise McpTimeoutError("сервер не прислал ответ вовремя")
         raise McpError("сервер закрыл поток, не прислав ответ")
 
 

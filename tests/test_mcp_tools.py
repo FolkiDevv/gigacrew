@@ -6,17 +6,20 @@ import json
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import closing
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
-from typing import Any, override
+from typing import Any, Literal, override
 
+import httpx
 import pytest
 from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
 
-from gigacrew.agent.guard import call_key
+from gigacrew.agent.guard import call_key, target_key
 from gigacrew.agent.loop import Agent
 from gigacrew.cli import app
 from gigacrew.cli.commands import default_commands
-from gigacrew.cli.mcp import connect_mcp, describe_hub
+from gigacrew.cli.mcp import connect_mcp, describe_hub, describe_servers
 from gigacrew.config import Config
 from gigacrew.llm.types import FunctionCall
 from gigacrew.permissions import PermissionMode, ToolKind
@@ -24,9 +27,12 @@ from gigacrew.project.mcp_config import MCP_JSON_FILE, McpServerConfig
 from gigacrew.project.settings import TrustStore
 from gigacrew.project.workspace import Workspace, user_settings_file
 from gigacrew.security import RiskLevel
+from gigacrew.tools import mcp as mcp_tools
 from gigacrew.tools.base import ToolContext, ToolError, ToolRegistry, build_default_registry
-from gigacrew.tools.mcp import McpArguments, McpHub, McpServer, McpTool, expand_env
+from gigacrew.tools.mcp import McpArguments, McpHub, McpServer, McpTool
 from gigacrew.tools.mcp_client import ServerInfo
+from gigacrew.tools.mcp_env import expand_env
+from gigacrew.tools.mcp_http import HttpTransport
 from gigacrew.tools.mcp_transport import McpError
 from gigacrew.ui.console import Console
 
@@ -112,6 +118,7 @@ def test_crashed_server_restarts_on_next_call(hub: McpHub) -> None:
         (_fake("--exit"), "fatal: no config"),
         (McpServerConfig("fake", "stdio", command="no-such-mcp-program"), "программа не найдена"),
         (_fake(env=(("TOKEN", "${MCP_TEST_UNSET}"),)), "MCP_TEST_UNSET"),
+        (_fake(env=(("A=B", "x"),)), "environment variable"),
     ],
 )
 def test_failed_start_reports_reason(
@@ -241,14 +248,30 @@ def test_agent_refusal_does_not_call_server(project: Path) -> None:
     assert not server.calls
 
 
-def test_auto_approved_tool_runs_without_question(project: Path) -> None:
+@pytest.mark.parametrize(
+    ("mode", "hints", "runs"),
+    [
+        (PermissionMode.AUTO, {}, True),
+        (PermissionMode.PLAN, {"readOnlyHint": True}, True),
+        # autoApprove — «без вопроса», а не «ничего не меняет»: в плане не действует.
+        (PermissionMode.PLAN, {}, False),
+    ],
+)
+def test_auto_approved_tool_runs_without_question(
+    project: Path,
+    mode: PermissionMode,
+    hints: dict[str, Any],
+    *,
+    runs: bool,
+) -> None:
     server = StubServer(project, _text_reply("ок"), auto_approve=frozenset(("*",)))
     events = RecordingEvents()
+    tool = _stub_tool(server, annotations=hints)
     turns = [tool_turn("mcp__stub__search", {}), text_turn("готово")]
-    agent, _ = _agent(project, _stub_tool(server), turns, events, mode=PermissionMode.PLAN)
+    agent, _ = _agent(project, tool, turns, events, mode=mode)
     agent.run_turn("найди")
     assert not events.confirms
-    assert len(server.calls) == 1
+    assert len(server.calls) == int(runs)
 
 
 def test_plan_mode_blocks_writer_but_asks_for_reader(project: Path) -> None:
@@ -365,3 +388,78 @@ def test_oneshot_trust_mcp_runs_tool(
     assert _function_results(provider) == [json.dumps({"text": "из CLI"}, ensure_ascii=False)]
     assert ECHO in {spec.name for spec in provider.requests[0]["tools"]}
     assert "MCP-серверы: подключение (fake)" in capsys.readouterr().out
+
+
+def test_http_server_is_not_offered_roots(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        message = json.loads(request.content)
+        seen.append(message)
+        if "id" not in message:
+            return httpx.Response(202)
+        reply = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}
+        if message["method"] == "tools/list":
+            reply = {"tools": []}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": reply})
+
+    factory = partial(HttpTransport, transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(mcp_tools, "HttpTransport", factory)
+    config = McpServerConfig("remote", "http", url="https://h.test/mcp")
+    with closing(McpServer(config, Workspace(project))) as server:
+        server.connect()
+        assert server.connected
+    assert not seen[0]["params"]["capabilities"]
+
+
+def test_confirmation_shows_argument_boundaries() -> None:
+    config = McpServerConfig("srv", "stdio", command="run me", args=("a b", "--x='1'"))
+    shown = describe_servers((config,))
+    assert "'run me' 'a b'" in shown
+
+
+@pytest.mark.parametrize("source", ["user", "project"])
+def test_user_servers_do_not_start_in_project(
+    project: Path,
+    user_home: Path,
+    source: Literal["user", "project"],
+) -> None:
+    config = replace(_fake(), source=source)
+    with closing(McpServer(config, Workspace(project))) as server:
+        server.connect()
+        cwd = server.call("cwd", {})["content"][0]["text"]
+    expected = project if source == "project" else user_home
+    assert Path(cwd).resolve() == expected.resolve()
+
+
+def test_confirmation_shows_header_values_and_newlines() -> None:
+    config = McpServerConfig(
+        "srv",
+        "http",
+        url="https://h.test/mcp",
+        headers=(("X-Leak", "${AWS_SECRET_ACCESS_KEY}"),),
+    )
+    assert "заголовок X-Leak: ${AWS_SECRET_ACCESS_KEY}" in describe_servers((config,))
+    forged = McpServerConfig("srv", "stdio", command="x", args=("ok\n  safe-looking",))
+    shown = describe_servers((forged,))
+    assert "⟨U+000A⟩" in shown
+    assert len(shown.splitlines()) == 2
+
+
+def test_preview_says_when_arguments_are_cut(project: Path) -> None:
+    tool = _stub_tool(StubServer(project, _text_reply("ок")))
+    preview = tool.preview(tool.parse({"text": "x" * 50_000}), ToolContext(Workspace(project)))
+    assert preview is not None
+    assert "показаны первые" in preview.text
+    assert "отклоните" in preview.text
+
+
+def test_similar_guard_tells_mcp_calls_apart() -> None:
+    first = FunctionCall(name="mcp__docs__lookup", arguments={"id": 1})
+    second = FunctionCall(name="mcp__docs__lookup", arguments={"id": 2})
+    assert target_key(first) != target_key(second)
+    builtin = FunctionCall(name="list_dir", arguments={"depth": 1})
+    assert target_key(builtin) == target_key(FunctionCall(name="list_dir", arguments={}))

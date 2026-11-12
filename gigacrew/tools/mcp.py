@@ -11,22 +11,26 @@
 глазами). Без вопроса — только инструменты из ``autoApprove`` сервера. Помеченный
 сервером как разрушительный (``destructiveHint``) — опасный: его не снимает и ``-y``.
 Помеченный как только читающий (``readOnlyHint``) в режиме плана спрашивается, а не
-блокируется.
+блокируется; остальные в плане блокируются, ``autoApprove`` им не помогает.
 
-``${VAR}`` и ``${VAR:-по умолчанию}`` в записи сервера раскрываются при запуске из
-окружения без секретов gigacrew (:func:`gigacrew.security.subprocess_env`): настройки
-проекта не должны вытянуть ключ API в чужой сервер. Переменной нет и значения по
-умолчанию нет — сервер не запускается.
+stdio-сервер проекта запускается в корне проекта, сервер пользователя — в домашнем
+каталоге: иначе репозиторий подменил бы то, что тот запускает (``node_modules`` и
+``.npmrc`` для ``npx``, модуль рядом для ``python -m``), — выполнение кода проекта без
+подтверждения. Проект сервер узнаёт из ``roots/list``.
+
+``${VAR}`` и ``${VAR:-по умолчанию}`` в записи сервера раскрываются при запуске
+(:mod:`gigacrew.tools.mcp_env`) из окружения без секретов gigacrew
+(:func:`gigacrew.security.subprocess_env`): настройки проекта не должны вытянуть ключ API
+в чужой сервер. Переменной нет и значения по умолчанию нет — сервер не запускается.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
-import re
 import threading
 import time
-from collections.abc import Mapping, Sequence
-from functools import partial
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, override
 
@@ -39,6 +43,7 @@ from gigacrew.project.workspace import PROJECTS_DIR, Workspace, project_key, use
 from gigacrew.security import RiskLevel, subprocess_env
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolRegistry, ToolResult
 from gigacrew.tools.mcp_client import McpClient, ServerInfo
+from gigacrew.tools.mcp_env import expand_all
 from gigacrew.tools.mcp_http import HttpTransport
 from gigacrew.tools.mcp_schema import render_result, tool_name, tool_schema
 from gigacrew.tools.mcp_transport import McpError, StdioTransport, Transport
@@ -48,20 +53,22 @@ __all__ = [
     "McpHub",
     "McpServer",
     "McpTool",
-    "expand_env",
 ]
 
 MAX_DESCRIPTION = 2000  # символов описания инструмента от сервера
 MAX_INSTRUCTIONS = 2000  # символов указаний сервера в системном промпте
 _DESCRIBE_LIMIT = 70
-_PREVIEW_LIMIT = 4000
+_PREVIEW_LIMIT = 20_000  # символов аргументов в вопросе пользователю
+TRUNCATED_ARGUMENTS = (
+    "… показаны первые {shown} из {total} символов аргументов — остальное не видно; "
+    "если не уверены, отклоните вызов"
+)
 _SUMMARY_LIMIT = 80
 _LOG_TAIL_LINES = 3
 _LOG_TAIL_BYTES = 4096
 _JOIN_MARGIN = 5  # секунд сверх таймаута запуска: поток успевает закрыть сервер
 # Описания инструментов сервера из tools/list.
 _Described = list[dict[str, Any]]
-_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
 def _clip(text: str, limit: int) -> str:
@@ -69,43 +76,6 @@ def _clip(text: str, limit: int) -> str:
         return text
     head = text[: limit - 1].rstrip()
     return f"{head}…"
-
-
-def expand_env(text: str, env: Mapping[str, str]) -> tuple[str, list[str]]:
-    """``${VAR}`` и ``${VAR:-по умолчанию}`` из ``env``; второе — переменные, которых нет.
-
-    Пустая переменная с ``:-`` даёт значение по умолчанию (как в оболочке).
-    """
-    missing: list[str] = []
-    expanded = _ENV_REF_RE.sub(partial(_substitute, env, missing), text)
-    return expanded, missing
-
-
-def _substitute(env: Mapping[str, str], missing: list[str], match: re.Match[str]) -> str:
-    """Значение ссылки ``${VAR}``/``${VAR:-…}``; переменной нет — она в ``missing``."""
-    name, default = match.group(1), match.group(2)
-    found = env.get(name, "")
-    if found:
-        return found
-    if default is not None:
-        return default
-    if name not in env:
-        missing.append(name)
-    return ""
-
-
-def _expanded(texts: list[str], env: Mapping[str, str]) -> list[str]:
-    """Строки с раскрытыми ``${VAR}``; переменной нет и нет значения по умолчанию — McpError."""
-    expanded: list[str] = []
-    missing: list[str] = []
-    for text in texts:
-        substituted, absent = expand_env(text, env)
-        expanded.append(substituted)
-        missing.extend(absent)
-    if missing:
-        names = ", ".join(sorted(set(missing)))
-        raise McpError(f"не заданы переменные окружения: {names}")
-    return expanded
 
 
 class McpServer:
@@ -154,7 +124,8 @@ class McpServer:
             program = exc.filename or self.config.command
             self._fail(f"программа не найдена: {program}")
             return
-        except (McpError, OSError) as exc:
+        # ValueError — окружение, которое ОС не принимает (имя переменной с «=»).
+        except (McpError, OSError, ValueError) as exc:
             self._fail(str(exc) or type(exc).__name__)
             return
         if not self._closed:
@@ -198,11 +169,11 @@ class McpServer:
     def _handshake(self) -> tuple[ServerInfo, _Described]:
         """Новая сессия: запуск, рукопожатие, список инструментов. Сбой — McpError/OSError."""
         timeout = self.config.startup_timeout
-        client = McpClient(
-            self._transport(),
-            roots=(self._workspace.root, *self._workspace.extra_dirs),
-            version=self._version,
-        )
+        # Корни — локальные каталоги: только stdio-серверу. HTTP-серверу они ни к чему, а
+        # запрос roots/list он прислал бы в поток, который gigacrew не открывает.
+        local = self.config.transport != HTTP
+        roots = (self._workspace.root, *self._workspace.extra_dirs) if local else ()
+        client = McpClient(self._transport(), roots=roots, version=self._version)
         with self._lock:
             if self._closed:
                 raise McpError("сервер закрыт")
@@ -235,21 +206,21 @@ class McpServer:
         config = self.config
         if config.transport == HTTP:
             header_names = [pair[0] for pair in config.headers]
-            url, *header_values = _expanded(
+            url, *header_values = expand_all(
                 [config.url, *(pair[1] for pair in config.headers)],
                 env,
             )
             return HttpTransport(url, dict(zip(header_names, header_values, strict=True)))
         env_names = [pair[0] for pair in config.env]
         argv_size = len(config.args) + 1
-        expanded = _expanded(
+        expanded = expand_all(
             [config.command, *config.args, *(pair[1] for pair in config.env)],
             env,
         )
         extra = dict(zip(env_names, expanded[argv_size:], strict=True))
         return StdioTransport(
             expanded[:argv_size],
-            cwd=self._workspace.root,
+            cwd=self._workspace.root if config.from_project else Path.home(),
             env={**env, **extra},
             log_path=self.log_path,
         )
@@ -336,12 +307,14 @@ class McpTool(Tool[McpArguments]):
         """Риск по ``autoApprove`` и пометкам сервера (см. описание модуля)."""
         server = self.server.name
         reason = f"инструмент {self.tool} MCP-сервера {server}"
-        if self.server.config.approves(self.tool):
+        mode = PermissionMode.AUTO if ctx.get_mode is None else ctx.get_mode()
+        planning = mode is PermissionMode.PLAN
+        # autoApprove — «без вопроса», а не «ничего не меняет»: в плане — только читающим.
+        if self.server.config.approves(self.tool) and (self.reads_only or not planning):
             return Assessment(RiskLevel.SAFE, reason)
         if self.reads_only:
-            mode = PermissionMode.AUTO if ctx.get_mode is None else ctx.get_mode()
             # В плане — как команда-проверка: с подтверждением, а не запрет.
-            kind = ToolKind.COMMAND if mode is PermissionMode.PLAN else None
+            kind = ToolKind.COMMAND if planning else None
             return Assessment(RiskLevel.WRITE, f"{reason}; сервер: только читает", kind=kind)
         if self._hints.get("destructiveHint") is True:
             return Assessment(RiskLevel.DANGEROUS, f"{reason}; сервер: может удалять данные")
@@ -349,11 +322,15 @@ class McpTool(Tool[McpArguments]):
 
     @override
     def preview(self, params: McpArguments, ctx: ToolContext) -> Display | None:
-        """Аргументы целиком — что именно уйдёт серверу."""
+        """Аргументы — что именно уйдёт серверу; не уместились — об этом сказано явно."""
         shown = json.dumps(params.arguments, ensure_ascii=False, indent=2, default=str)
         server = self.server.name
         title = f"{server} · {self.tool}"
-        return Display(_clip(shown, _PREVIEW_LIMIT), title=title)
+        if len(shown) > _PREVIEW_LIMIT:
+            head = shown[:_PREVIEW_LIMIT]
+            note = TRUNCATED_ARGUMENTS.format(shown=_PREVIEW_LIMIT, total=len(shown))
+            shown = f"{head}\n{note}"
+        return Display(shown, title=title)
 
     @override
     def run(self, params: McpArguments, ctx: ToolContext) -> ToolResult:
@@ -443,6 +420,7 @@ class McpHub:
         return warnings
 
     def close(self) -> None:
-        """Закрывает все серверы."""
-        for server in self.servers:
-            server.close()
+        """Закрывает все серверы — и при Ctrl+C посреди закрытия одного из них."""
+        with contextlib.ExitStack() as stack:
+            for server in self.servers:
+                stack.callback(server.close)

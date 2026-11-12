@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Final
 
 from gigacrew.tools.process import truncate_middle
@@ -39,6 +40,7 @@ _TYPE: Final = "type"
 _OBJECT: Final = "object"
 _PROPERTIES: Final = "properties"
 _REQUIRED: Final = "required"
+_DESCRIPTION: Final = "description"
 
 
 def tool_name(server: str, tool: str) -> str:
@@ -58,33 +60,70 @@ def tool_name(server: str, tool: str) -> str:
 def tool_schema(schema: object) -> dict[str, Any]:
     """Схема параметров инструмента в формате function calling API.
 
-    Верхний уровень — всегда объект. Ссылки ``$ref`` раскрываются из ``$defs`` и
-    ``definitions`` (циклические — до предела вложенности), варианты ``anyOf``/``oneOf``
-    сворачиваются к первому не-``null``, ``allOf`` — объединяется. Остаются только
-    ``type``, ``description``, ``properties``, ``required``, ``items`` и ``enum``.
+    Верхний уровень — всегда объект. Ссылки ``$ref`` внутри схемы (JSON Pointer:
+    ``#/$defs/A``, ``#/definitions/A``, ``#/properties/x``) раскрываются, а рекурсивная —
+    один раз на пути: дальше на её месте только тип, без свойств (иначе схема росла бы
+    экспоненциально). Варианты ``anyOf``/``oneOf`` сворачиваются к первому не-``null``,
+    ``allOf`` — объединяется. Остаются только ``type``, ``description``, ``properties``,
+    ``required``, ``items`` и ``enum``.
     """
     if not isinstance(schema, dict):
         return {_TYPE: _OBJECT, _PROPERTIES: {}}
-    defs: dict[str, Any] = {}
-    for key in ("definitions", "$defs"):
-        found = schema.get(key)
-        if isinstance(found, dict):
-            defs.update(found)
-    converted = _convert(schema, defs, 0)
+    converted = _convert(schema, _Refs(schema), 0)
     if converted[_TYPE] != _OBJECT:
         return {_TYPE: _OBJECT, _PROPERTIES: {}}
     converted.setdefault(_PROPERTIES, {})
     return converted
 
 
-def _convert(schema: dict[str, Any], defs: dict[str, Any], depth: int) -> dict[str, Any]:
+@dataclass(frozen=True)
+class _Refs:
+    """Корень схемы (для ``$ref``) и ссылки, уже раскрытые на текущем пути."""
+
+    root: dict[str, Any]
+    seen: frozenset[str] = frozenset()
+
+    def follow(self, ref: str) -> tuple[dict[str, Any], _Refs]:
+        """Цель ссылки и ссылки пути с ней; уже раскрытая на пути — только её тип."""
+        target = _pointer(self.root, ref)
+        if target is None:
+            return {}, self
+        if ref in self.seen:
+            shallow = {_TYPE: _type_of(target)}
+            if isinstance(target.get(_DESCRIPTION), str):
+                shallow[_DESCRIPTION] = target[_DESCRIPTION]
+            return shallow, self
+        return target, _Refs(self.root, self.seen | {ref})
+
+    def join(self, other: _Refs) -> _Refs:
+        """Ссылки обоих путей (части ``allOf``)."""
+        return _Refs(self.root, self.seen | other.seen)
+
+
+def _pointer(root: dict[str, Any], ref: str) -> dict[str, Any] | None:
+    """Цель ``$ref`` внутри схемы по JSON Pointer; внешняя ссылка или нет цели — None."""
+    if not ref.startswith("#"):
+        return None  # внешние документы не загружаются
+    node: object = root
+    for raw in ref[1:].split("/")[1:]:
+        key = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict):
+            node = node.get(key)
+        elif isinstance(node, list) and key.isdigit() and int(key) < len(node):
+            node = node[int(key)]
+        else:
+            return None
+    return node if isinstance(node, dict) else None
+
+
+def _convert(schema: dict[str, Any], refs: _Refs, depth: int) -> dict[str, Any]:
     """Один уровень схемы → упрощённая схема (см. :func:`tool_schema`)."""
-    merged = _resolve(schema, defs, depth)
+    merged, refs = _resolve(schema, refs, depth)
     kind = _type_of(merged)
     converted: dict[str, Any] = {_TYPE: kind}
-    description = merged.get("description")
+    description = merged.get(_DESCRIPTION)
     if isinstance(description, str) and description:
-        converted["description"] = description
+        converted[_DESCRIPTION] = description
     enum = merged.get("enum")
     if isinstance(enum, list):
         options = [option for option in enum if option is not None]
@@ -93,21 +132,21 @@ def _convert(schema: dict[str, Any], defs: dict[str, Any], depth: int) -> dict[s
     if kind == "array":
         element = merged.get("items")
         if isinstance(element, dict) and depth < _MAX_DEPTH:
-            converted["items"] = _convert(element, defs, depth + 1)
+            converted["items"] = _convert(element, refs, depth + 1)
         else:
             converted["items"] = {_TYPE: "string"}
     if kind == _OBJECT:
-        converted.update(_object_fields(merged, defs, depth))
+        converted.update(_object_fields(merged, refs, depth))
     return converted
 
 
-def _object_fields(schema: dict[str, Any], defs: dict[str, Any], depth: int) -> dict[str, Any]:
+def _object_fields(schema: dict[str, Any], refs: _Refs, depth: int) -> dict[str, Any]:
     """``properties`` и ``required`` объекта (только из его свойств)."""
     raw = schema.get(_PROPERTIES)
     if not isinstance(raw, dict) or depth >= _MAX_DEPTH:
         return {}
     props = {
-        str(name): _convert(prop, defs, depth + 1)
+        str(name): _convert(prop, refs, depth + 1)
         for name, prop in raw.items()
         if isinstance(prop, dict)
     }
@@ -120,25 +159,25 @@ def _object_fields(schema: dict[str, Any], defs: dict[str, Any], depth: int) -> 
     return fields
 
 
-def _resolve(schema: dict[str, Any], defs: dict[str, Any], depth: int) -> dict[str, Any]:
+def _resolve(schema: dict[str, Any], refs: _Refs, depth: int) -> tuple[dict[str, Any], _Refs]:
     """Схема без ``$ref``, ``anyOf``/``oneOf`` и ``allOf`` (их поля — в одном объекте).
 
-    Ссылка на ссылку раскрывается до :data:`_MAX_DEPTH` раз — цикл не зависает.
+    Второе — ссылки пути с раскрытыми здесь: по ним свойства не раскроют их снова.
     """
     merged = dict(schema)
     for _ in range(_MAX_DEPTH):
-        unfolded = _unfold(merged, defs, depth)
+        unfolded = _unfold(merged, refs, depth)
         if unfolded is None:
             break
-        merged = unfolded
-    return merged
+        merged, refs = unfolded
+    return merged, refs
 
 
 def _unfold(
     schema: dict[str, Any],
-    defs: dict[str, Any],
+    refs: _Refs,
     depth: int,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any], _Refs] | None:
     """Один шаг :func:`_resolve`; None — раскрывать нечего."""
     merged = dict(schema)
     ref = merged.pop("$ref", None)
@@ -147,14 +186,13 @@ def _unfold(
     if ref is None and variants is None and parts is None:
         return None
     if isinstance(ref, str) and depth < _MAX_DEPTH:
-        target = defs.get(ref.rsplit("/", 1)[-1])
-        if isinstance(target, dict):
-            merged = {**target, **merged}  # описание поля важнее описания определения
+        target, refs = refs.follow(ref)
+        merged = {**target, **merged}  # описание поля важнее описания определения
     if isinstance(variants, list):
         merged = {**_first_variant(variants), **merged}
     if isinstance(parts, list):
-        merged = _merge_all(parts, merged)
-    return merged
+        merged, refs = _merge_all(parts, merged, refs, depth)
+    return merged, refs
 
 
 def _first_variant(variants: list[Any]) -> dict[str, Any]:
@@ -166,14 +204,26 @@ def _first_variant(variants: list[Any]) -> dict[str, Any]:
     return candidates[0] if candidates else {}
 
 
-def _merge_all(parts: list[Any], base: dict[str, Any]) -> dict[str, Any]:
-    """``allOf``: свойства и обязательные поля всех частей — в одном объекте."""
+def _merge_all(
+    parts: list[Any],
+    base: dict[str, Any],
+    refs: _Refs,
+    depth: int,
+) -> tuple[dict[str, Any], _Refs]:
+    """``allOf``: свойства и обязательные поля всех частей — в одном объекте.
+
+    Каждая часть сначала раскрывается (``$ref``, вложенный ``allOf``): иначе поля второй
+    и следующих ссылок потерялись бы.
+    """
     merged = dict(base)
     props: dict[str, Any] = dict(merged.get(_PROPERTIES) or {})
     required: list[Any] = list(merged.get(_REQUIRED) or [])
-    for part in parts:
-        if not isinstance(part, dict):
+    joined = refs
+    for raw in parts:
+        if not isinstance(raw, dict):
             continue
+        part, part_refs = _resolve(raw, refs, depth + 1)
+        joined = joined.join(part_refs)
         props.update(part.get(_PROPERTIES) or {})
         required.extend(part.get(_REQUIRED) or [])
         for key, setting in part.items():
@@ -182,7 +232,7 @@ def _merge_all(parts: list[Any], base: dict[str, Any]) -> dict[str, Any]:
         merged[_PROPERTIES] = props
     if required:
         merged[_REQUIRED] = required
-    return merged
+    return merged, joined
 
 
 def _type_of(schema: dict[str, Any]) -> str:

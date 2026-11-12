@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from gigacrew.tools.mcp_client import PROTOCOL_VERSION, McpClient
-from gigacrew.tools.mcp_http import HttpTransport, parse_sse
+from gigacrew.tools.mcp_http import HttpTransport, parse_sse, sse_lines
 from gigacrew.tools.mcp_transport import McpError, McpTimeoutError, StdioTransport
 
 FAKE_SERVER = Path(__file__).with_name("fake_mcp_server.py")
@@ -113,6 +113,7 @@ class FakeHttpServer:
         self.requests: list[httpx.Request] = []
         self.replies: list[dict[str, Any]] = []  # ответы клиента на запросы сервера
         self.status = 200
+        self.stream: httpx.Response | None = None  # ответ на tools/call вместо обычного
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -143,6 +144,8 @@ class FakeHttpServer:
                 {"jsonrpc": "2.0", "id": 77, "method": "ping"},
                 {"jsonrpc": "2.0", "id": message["id"], "result": {"tools": [{"name": "t"}]}},
             )
+        if self.stream is not None:
+            return self.stream
         return _json(message, {"content": [{"type": "text", "text": "ок"}]})
 
 
@@ -218,3 +221,85 @@ def test_parse_sse() -> None:
         "data:2",
     ]
     assert list(parse_sse(lines)) == ['{\n"a": 1}', "2"]
+
+
+def test_parse_sse_splits_only_on_sse_line_ends() -> None:
+    chunks = [
+        "data: a\u2028b\u0085c\r".encode(),
+        b"\ndata: \xd0",
+        b"\xb0\r\rdata: last",
+    ]
+    lines = list(sse_lines(chunks))
+    assert lines == ["data: a\u2028b\u0085c", "data: а", "", "data: last"]
+    assert list(parse_sse(lines)) == ["a\u2028b\u0085c\nа", "last"]
+
+
+def test_sse_size_is_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("gigacrew.tools.mcp_http.MAX_MESSAGE", 20)
+    with pytest.raises(McpError, match="слишком большое событие"):
+        list(parse_sse(["data: 0123456789", "data: 0123456789"]))
+    with pytest.raises(McpError, match="слишком длинная строка"):
+        list(sse_lines([b"data: 0123456789012345678901234567890"]))
+
+
+def _keepalive_forever() -> Iterator[bytes]:
+    for _ in range(10_000):  # дольше любого таймаута теста: ответа так и нет
+        time.sleep(0.05)
+        yield b": ping\n\n"
+
+
+def test_http_keepalive_does_not_extend_timeout() -> None:
+    server = FakeHttpServer()
+    session = _http_client(server)
+    session.connect(TIMEOUT)
+    endless = httpx.Response(
+        200,
+        headers={"Content-Type": "text/event-stream"},
+        content=_keepalive_forever(),
+    )
+    server.stream = endless
+    started = time.monotonic()
+    with pytest.raises(McpTimeoutError):
+        session.call_tool("t", {}, timeout=0.5)
+    assert time.monotonic() - started < 5
+
+
+def test_deeply_nested_reply_fails_request_at_once(client: McpClient) -> None:
+    client.connect(TIMEOUT)
+    started = time.monotonic()
+    with pytest.raises(McpError, match="завершился"):
+        client.call_tool("deep", {}, timeout=30)
+    assert time.monotonic() - started < 10
+
+
+def test_closed_transport_does_not_start(tmp_path: Path) -> None:
+    session = _stdio_client(tmp_path)
+    session.close()
+    with pytest.raises(McpError, match="закрыт"):
+        session.connect(TIMEOUT)
+    assert not session.alive
+
+
+def test_interrupted_close_still_kills_server(tmp_path: Path) -> None:
+    transport = StdioTransport(
+        [sys.executable, str(FAKE_SERVER)],
+        cwd=tmp_path,
+        env=dict(os.environ),
+    )
+    session = McpClient(transport)
+    session.connect(TIMEOUT)
+    proc = transport._proc
+    assert proc is not None
+    original_wait = proc.wait
+    calls: list[float | None] = []
+
+    def wait(timeout: float | None = None) -> int:
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return original_wait(timeout)
+
+    proc.wait = wait  # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        transport.close()
+    assert proc.poll() is not None

@@ -11,6 +11,7 @@ MCP-сервер — программа, которую gigacrew запуска�
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
@@ -126,7 +127,7 @@ def confirm_servers(
     return settings
 
 
-def connect_mcp(  # noqa: WPS211
+def connect_mcp(
     workspace: Workspace,
     ui: Console,
     registry: ToolRegistry,
@@ -169,8 +170,13 @@ def connect_mcp(  # noqa: WPS211
 
 
 def _shown(text: str) -> str:
-    """Текст для подтверждения: невидимые символы — как ``⟨U+202E⟩``."""
-    return visible_text(text, numbered=False).plain
+    """Текст для подтверждения: невидимые символы и переводы строк — как ``⟨U+202E⟩``.
+
+    Перевод строки в аргументе или значении переменной иначе нарисовал бы поддельные
+    строки и столкнул настоящую команду с экрана.
+    """
+    one_line = text.replace("\r", "⟨U+000D⟩").replace("\n", "⟨U+000A⟩")
+    return visible_text(one_line, numbered=False).plain
 
 
 def _listed(names: Iterable[str]) -> str:
@@ -181,14 +187,16 @@ def _target(server: McpServerConfig) -> str:
     """Что запускается или куда подключение."""
     if server.transport == HTTP:
         return f"http {server.url}"
-    return " ".join((server.command, *server.args))
+    # Как в оболочке: границы аргументов с пробелами и кавычками видны.
+    return shlex.join((server.command, *server.args))
 
 
 def describe_servers(servers: tuple[McpServerConfig, ...]) -> str:
     """Серверы для подтверждения: полная команда или адрес, окружение, заголовки, файл.
 
-    Пользователь подтверждает ровно то, что запустится: невидимые символы показываются
-    как ``⟨U+202E⟩``. Значения заголовков не показываются (там обычно ключи), имена — да.
+    Пользователь подтверждает ровно то, что запустится: невидимые символы и переводы
+    строк показываются как ``⟨U+202E⟩``. Значения заголовков и переменных — как записаны,
+    с ``${VAR}``: видно, какие переменные окружения уйдут серверу.
     """
     lines: list[str] = []
     for server in servers:
@@ -197,9 +205,9 @@ def describe_servers(servers: tuple[McpServerConfig, ...]) -> str:
             f"    {_shown(_target(server))}",
         ))
         lines.extend(f"    env {_shown(key)}={_shown(setting)}" for key, setting in server.env)
-        if server.headers:
-            names = _listed(_shown(key) for key, _ in server.headers)
-            lines.append(f"    заголовки: {names}")
+        lines.extend(
+            f"    заголовок {_shown(key)}: {_shown(header)}" for key, header in server.headers
+        )
         if server.auto_approve:
             approved = _listed(sorted(_shown(tool) for tool in server.auto_approve))
             lines.append(f"    без вопроса: {approved}")

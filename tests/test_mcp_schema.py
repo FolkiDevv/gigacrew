@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -159,3 +160,51 @@ def test_render_truncates_long_output() -> None:
     reply = {"content": [{"type": "text", "text": "x" * (MAX_RESULT_CHARS * 2)}]}
     text, _ = render_result(reply)
     assert len(text) < MAX_RESULT_CHARS + 200
+
+
+def test_all_of_with_several_refs_keeps_every_part() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"item": {"allOf": [{"$ref": "#/$defs/A"}, {"$ref": "#/$defs/B"}]}},
+        "$defs": {
+            "A": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+            "B": {"type": "object", "properties": {"b": {"type": "integer"}}, "required": ["b"]},
+        },
+    }
+    nested = tool_schema(schema)["properties"]["item"]
+    _check(nested)
+    assert set(nested["properties"]) == {"a", "b"}
+    assert sorted(nested["required"]) == ["a", "b"]
+
+
+def test_recursive_refs_expand_once_per_path() -> None:
+    node_props = {f"link{index}": {"$ref": "#/$defs/Node"} for index in range(6)}
+    schema = {
+        "type": "object",
+        "properties": {"root": {"$ref": "#/$defs/Node"}},
+        "$defs": {"Node": {"type": "object", "properties": node_props, "description": "узел"}},
+    }
+    converted = tool_schema(schema)
+    _check(converted)
+    root = converted["properties"]["root"]
+    assert set(root["properties"]) == set(node_props)
+    assert root["properties"]["link0"] == {"type": "object", "description": "узел"}
+    assert len(json.dumps(converted)) < 2000
+
+
+def test_json_pointer_refs_into_properties() -> None:
+    # zod-to-json-schema ссылается на уже описанное свойство: #/properties/<имя>.
+    schema = {
+        "type": "object",
+        "properties": {
+            "source": {"type": "object", "properties": {"path": {"type": "string"}}},
+            "target": {"$ref": "#/properties/source"},
+            "escaped": {"$ref": "#/properties/a~1b"},
+            "a/b": {"type": "integer"},
+            "external": {"$ref": "https://example.com/schema.json"},
+        },
+    }
+    props = tool_schema(schema)["properties"]
+    assert props["target"]["properties"] == {"path": {"type": "string"}}
+    assert props["escaped"] == {"type": "integer"}
+    assert props["external"] == {"type": "string"}

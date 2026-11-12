@@ -111,6 +111,9 @@ def test_disabled_server_skipped(project: Path) -> None:
         ("srv", ["x"], "ожидается объект"),
         ("srv", {"type": "sse", "url": "https://s.test"}, "sse"),
         ("srv", {"type": "websocket"}, "не поддерживается"),
+        ("srv", {"type": []}, "не поддерживается"),
+        ("srv", {"command": "x", "env": {"A=B": "1"}}, "env"),
+        ("srv", {"command": "x", "env": {"": "1"}}, "env"),
         ("srv", {"command": ""}, "command"),
         ("srv", {"command": "x\u0000y"}, "command"),
         ("srv", {"type": "http", "url": "ftp://h.test"}, "url"),
@@ -192,3 +195,16 @@ def test_fingerprint_tracks_every_field() -> None:
         ),
     )
     assert all(servers_fingerprint((variant,)) != fingerprint for variant in variants)
+
+
+def test_disabled_entry_turns_off_earlier_server(project: Path) -> None:
+    _write(user_settings_file(), _servers({"srv": {"command": "x"}, "other": {"command": "y"}}))
+    _write(Workspace(project).local_settings_file, _servers({"srv": {"disabled": True}}))
+    settings, warnings = load_mcp_settings(Workspace(project))
+    assert warnings == []
+    assert [server.name for server in settings.effective()] == ["other"]
+    # Выключение ничего не запускает: подтверждать в проекте нечего, и без подтверждения
+    # проекта оно всё равно действует.
+    assert settings.project_servers == ()
+    unconfirmed = settings.without("project", "local")
+    assert [server.name for server in unconfirmed.effective()] == ["other"]

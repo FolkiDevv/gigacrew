@@ -20,6 +20,7 @@ import os
 import queue
 import signal
 import subprocess
+import sys
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -110,7 +111,11 @@ def _nothing() -> None:
 
 
 class StdioTransport(Transport):
-    """Сервер — дочерний процесс; сообщения — строки JSON (см. описание модуля)."""
+    """Сервер — дочерний процесс; сообщения — строки JSON (см. описание модуля).
+
+    Запуск и закрытие идут под одной блокировкой: закрытый канал не запускает процесс,
+    даже если :meth:`close` пришёл из другого потока раньше :meth:`open`.
+    """
 
     def __init__(
         self,
@@ -128,6 +133,8 @@ class StdioTransport(Transport):
         self._proc: subprocess.Popen[bytes] | None = None
         self._outbox: queue.Queue[bytes | None] = queue.Queue()
         self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._closed = False
         self._dead = threading.Event()
         self._receive: Receiver = ignore_message
         self._gone: Callable[[], None] = _nothing
@@ -141,32 +148,25 @@ class StdioTransport(Transport):
 
     @override
     def open(self, receive: Receiver, gone: Callable[[], None]) -> None:
-        """Запускает процесс сервера и потоки чтения и записи. OSError — не запустился."""
+        """Запускает процесс сервера и потоки чтения и записи.
+
+        OSError или ValueError (недопустимое окружение) — не запустился; канал уже
+        закрыт — McpError.
+        """
         self._receive = receive
         self._gone = gone
-        kwargs: dict[str, Any] = {}
-        if os.name == "posix":
-            kwargs["start_new_session"] = True
-        else:
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        with contextlib.ExitStack() as stack:
-            # Свой файл журнала закрывается сразу после запуска: у процесса своя копия.
-            stderr: IO[bytes] | int = subprocess.DEVNULL
-            if self._log_path is not None:
-                stderr = stack.enter_context(_open_log(self._log_path))
-            self._proc = subprocess.Popen(
-                self._argv,
-                cwd=self._cwd,
-                env=self._env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr,
-                **kwargs,
-            )
-        for target, name in ((self._read_loop, "mcp-reader"), (self._write_loop, "mcp-writer")):
-            worker = threading.Thread(target=target, name=name, daemon=True)
-            worker.start()
-            self._threads.append(worker)
+        with self._lock:
+            if self._closed:
+                raise McpError("канал закрыт")
+            proc = _spawn(self._argv, self._cwd, self._env, self._log_path)
+            self._proc = proc
+            for target, stream, name in (
+                (self._read_loop, proc.stdout, "mcp-reader"),
+                (self._write_loop, proc.stdin, "mcp-writer"),
+            ):
+                worker = threading.Thread(target=target, args=(stream,), name=name, daemon=True)
+                worker.start()
+                self._threads.append(worker)
 
     @override
     def send(self, message: dict[str, Any], *, timeout: float) -> None:
@@ -177,14 +177,27 @@ class StdioTransport(Transport):
 
     @override
     def close(self) -> None:
-        """Закрывает stdin (сигнал серверу завершиться), затем убивает группу процессов."""
-        proc = self._proc
+        """Закрывает stdin (сигнал серверу завершиться), затем убивает группу процессов.
+
+        Ctrl+C посреди ожидания не оставляет сервер сиротой: процесс всё равно убивается.
+        """
+        with self._lock:
+            self._closed = True
+            proc = self._proc
         if proc is None:
             return
-        self._outbox.put(None)  # писатель закроет stdin
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=_CLOSE_TIMEOUT)
+        try:
+            self._outbox.put(None)  # писатель закроет stdin
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=_CLOSE_TIMEOUT)
+        except BaseException:
+            _kill(proc)
+            raise
         _kill(proc)
+        self._release(proc)
+
+    def _release(self, proc: subprocess.Popen[bytes]) -> None:
+        """Дожидается потоков и закрывает свободный канал от убитого сервера."""
         for worker in self._threads:
             worker.join(timeout=_CLOSE_TIMEOUT)
         # Поток, всё ещё занятый каналом, держит его блокировку — такой не закрываем.
@@ -194,11 +207,7 @@ class StdioTransport(Transport):
         self._dead.set()
         self._proc = None
 
-    def _write_loop(self) -> None:
-        proc = self._proc
-        if proc is None or proc.stdin is None:
-            raise AssertionError("писатель запущен без канала к серверу")
-        stdin = proc.stdin
+    def _write_loop(self, stdin: IO[bytes]) -> None:
         # ValueError — запись в закрытый поток; сломанный канал — сервер завершился.
         with contextlib.suppress(OSError, ValueError):
             for chunk in iter(self._outbox.get, None):
@@ -207,20 +216,50 @@ class StdioTransport(Transport):
         with contextlib.suppress(OSError, ValueError):
             stdin.close()
 
-    def _read_loop(self) -> None:
-        proc = self._proc
-        if proc is None or proc.stdout is None:
-            raise AssertionError("читатель запущен без канала от сервера")
-        # Оборванный или испорченный поток — как завершение сервера.
-        with contextlib.suppress(OSError, ValueError):
-            for line in _lines(proc.stdout):
+    def _read_loop(self, stdout: IO[bytes]) -> None:
+        # Любой сбой чтения или разбора (обрыв, строка без конца, JSON чрезмерной
+        # вложенности) — как завершение сервера: ожидающие запросы получают отказ сразу.
+        with contextlib.suppress(Exception):
+            for line in _lines(stdout):
                 deliver(parse_message(line), self._receive)
         self._dead.set()
         self._gone()
 
 
+def _spawn(
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    log_path: Path | None,
+) -> subprocess.Popen[bytes]:
+    """Процесс сервера в своей группе процессов; stderr — в журнал ``log_path``."""
+    kwargs: dict[str, Any] = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    with contextlib.ExitStack() as stack:
+        # Свой файл журнала закрывается сразу после запуска: у процесса своя копия.
+        stderr: IO[bytes] | int = subprocess.DEVNULL
+        if log_path is not None:
+            stderr = stack.enter_context(_open_log(log_path))
+        return subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            **kwargs,
+        )
+
+
 def parse_message(line: bytes) -> object:
-    """Строка stdout или данные события SSE → JSON; не JSON (отладочная печать) — None."""
+    """Строка stdout или данные события SSE → JSON; не JSON (отладочная печать) — None.
+
+    JSON чрезмерной вложенности (RecursionError) — не пропускается: это нарушение
+    протокола, вызывающий обрывает чтение.
+    """
     try:
         return json.loads(line)
     except ValueError:

@@ -100,6 +100,13 @@ class McpServerConfig:
     auto_approve: frozenset[str] = field(default_factory=frozenset)
     source: SettingsSource = "user"
     origin: str = ""
+    # Запись "disabled": true: выключает одноимённый сервер из более ранних файлов.
+    disabled: bool = False
+
+    @property
+    def from_project(self) -> bool:
+        """Сервер описан в файлах проекта (а не в ``~/.gigacode/settings.json``)."""
+        return self.source in PROJECT_SOURCES
 
     def approves(self, tool: str) -> bool:
         """Выполняется ли инструмент ``tool`` без вопроса (``autoApprove``)."""
@@ -130,15 +137,23 @@ class McpSettings:
     servers: tuple[McpServerConfig, ...] = ()
 
     def effective(self) -> tuple[McpServerConfig, ...]:
-        """Действующие серверы: из одноимённых — последний (личные настройки важнее)."""
+        """Действующие серверы: из одноимённых — последний (личные настройки важнее).
+
+        Последний — ``"disabled": true``: сервера нет.
+        """
         by_name: dict[str, McpServerConfig] = {}
         for server in self.servers:
             by_name[server.name] = server
-        return tuple(by_name.values())
+        return tuple(config for config in by_name.values() if not config.disabled)
 
     def from_sources(self, *sources: SettingsSource) -> tuple[McpServerConfig, ...]:
-        """Записи из файлов ``sources``."""
-        return tuple(server for server in self.servers if server.source in sources)
+        """Серверы из файлов ``sources`` — то, что подтверждает пользователь.
+
+        Записи ``"disabled": true`` ничего не запускают: их подтверждать не нужно.
+        """
+        return tuple(
+            server for server in self.servers if server.source in sources and not server.disabled
+        )
 
     @property
     def project_servers(self) -> tuple[McpServerConfig, ...]:
@@ -151,8 +166,13 @@ class McpSettings:
         return self.from_sources("user")
 
     def without(self, *sources: SettingsSource) -> McpSettings:
-        """Без серверов из ``sources`` (не подтверждены)."""
-        kept = tuple(server for server in self.servers if server.source not in sources)
+        """Без серверов из ``sources`` (не подтверждены); их ``"disabled": true`` остаются.
+
+        Выключить сервер безопасно и без подтверждения.
+        """
+        kept = tuple(
+            server for server in self.servers if server.source not in sources or server.disabled
+        )
         return replace(self, servers=kept)
 
 
@@ -226,6 +246,9 @@ def _parse_servers(
             warnings.append(f"{where}: ожидается объект — сервер пропущен")
             continue
         if entry.get("disabled") is True:
+            servers.append(
+                McpServerConfig(name, STDIO, source=source, origin=origin, disabled=True),
+            )
             continue
         server = _parse_server(name, entry, where, warnings)
         if server is not None:
@@ -277,7 +300,7 @@ def _transport(entry: dict[str, Any], where: str, warnings: list[str]) -> McpTra
         kind = HTTP if "url" in entry and "command" not in entry else STDIO
     if kind == STDIO:
         return STDIO
-    if kind in _HTTP_TYPES:
+    if isinstance(kind, str) and kind in _HTTP_TYPES:
         return HTTP
     if kind == "sse":
         warnings.append(
@@ -302,6 +325,10 @@ def _parse_stdio(
     args = _strings(entry.get("args"), f"{where}.args", warnings)
     env = _pairs(entry.get("env"), f"{where}.env", warnings)
     if args is None or env is None:
+        return None
+    # Имя переменной с «=» или пустое ОС не примет — сервер не запустился бы.
+    if any(not key or "=" in key for key, _ in env):
+        warnings.append(f"{where}.env: недопустимое имя переменной (пустое или с «=»)")
         return None
     return McpServerConfig(name, STDIO, command=command, args=tuple(args), env=env)
 

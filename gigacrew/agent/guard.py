@@ -158,7 +158,9 @@ def target_key(call: FunctionCall) -> str:
     """Ключ «похожести»: имя + главная цель вызова, без диапазонов строк и флагов.
 
     ``read_file`` одного файла с разными диапазонами, ``search_content`` одного
-    шаблона в разных каталогах — похожие вызовы. Без цели — ключ по имени.
+    шаблона в разных каталогах — похожие вызовы. Без цели — ключ по имени; у инструмента
+    MCP-сервера, чьих аргументов gigacrew не знает, — по всем аргументам (иначе 7 запросов
+    к одному инструменту с разными аргументами выглядели бы топтанием на месте).
     """
     for field in _TARGET_FIELDS:
         target = call.arguments.get(field)
@@ -170,7 +172,7 @@ def target_key(call: FunctionCall) -> str:
             else:
                 text = " ".join(text.split())
             return f"{call.name}:{field}={text}"
-    return call.name
+    return call_key(call) if call.name.startswith(MCP_PREFIX) else call.name
 
 
 class LoopGuard:
