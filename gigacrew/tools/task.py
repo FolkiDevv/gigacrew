@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import override
@@ -41,8 +41,16 @@ class SubagentSpec:
 
 
 # Суб-агенту недоступны: запуск суб-агентов (без вложенности), вопросы пользователю и
-# одобрение плана — пользователь говорит только с основным агентом.
-SUBAGENT_EXCLUDED: frozenset[str] = frozenset(("task", "explore", "ask_user", "exit_plan_mode"))
+# одобрение плана — пользователь говорит только с основным агентом; фоновые задачи — тоже
+# только у основного агента.
+SUBAGENT_EXCLUDED: frozenset[str] = frozenset((
+    "task",
+    "explore",
+    "ask_user",
+    "exit_plan_mode",
+    "background_output",
+    "background_stop",
+))
 
 EXPLORE = SubagentSpec(
     name="explore",
@@ -117,6 +125,16 @@ class TaskParams(BaseModel):  # noqa: D101
     description: str = Field(
         "",
         description="3–5 words in the user's language: what is delegated (shown to the user).",
+    )
+    run_in_background: bool = Field(
+        default=False,
+        description=(
+            "Run the subagent in the background: returns a job id at once and you continue "
+            "working; its report is delivered to you automatically when it finishes. For "
+            "long independent work while you do something else — not when your next step "
+            "needs its report. A background subagent cannot ask the user: anything that "
+            "needs confirmation is refused to it."
+        ),
     )
 
 
@@ -198,6 +216,8 @@ class TaskTool(Tool[TaskParams]):
         """Тип суб-агента и краткое название задачи, обрезанные для UI."""
         kind = params.subagent_type.strip()
         title = task_title(params.description, params.prompt)
+        if params.run_in_background:
+            kind = f"{kind} (в фоне)"
         return f"{kind} · {title}"[:_DESCRIBE_LIMIT]
 
     @override
@@ -212,9 +232,19 @@ class TaskTool(Tool[TaskParams]):
         prompt = params.prompt.strip()
         if not prompt:
             raise ToolError("Пустая задача: опиши её в параметре prompt.")
-        if ctx.run_subagent is None:
-            raise ToolError("суб-агенты здесь недоступны — выполни задачу сам.")
-        return ctx.run_subagent(agent, task_title(params.description, prompt), prompt)
+        runner = _runner(ctx, background=params.run_in_background)
+        return runner(agent, task_title(params.description, prompt), prompt)
+
+
+def _runner(ctx: ToolContext, *, background: bool) -> Callable[[str, str, str], ToolResult]:
+    """Запуск суб-агента: обычный или фоновой задачей; ToolError — запускать некому."""
+    if not background and ctx.run_subagent is not None:
+        return ctx.run_subagent
+    if background and ctx.start_subagent is not None:
+        return ctx.start_subagent
+    hint = "запусти без run_in_background" if background else "выполни задачу сам"
+    prefix = "фоновые суб-агенты" if background else "суб-агенты"
+    raise ToolError(f"{prefix} здесь недоступны — {hint}.")
 
 
 def task_title(description: str, prompt: str) -> str:

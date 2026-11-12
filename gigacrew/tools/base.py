@@ -29,6 +29,7 @@ from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety.levels import Verdict
 from gigacrew.security import RiskLevel, resolve_in_roots
+from gigacrew.tools.jobs import BackgroundJobs
 from gigacrew.tools.questions import AskUser
 
 __all__ = [
@@ -94,7 +95,10 @@ class ToolContext:
     None — запускать некому (в том числе у самого суб-агента: без вложенности).
     ``plan`` — файл плана чата (None — плана нет: суб-агент, тесты инструментов).
     ``classify_commands`` — команды, которые классификатор признал «только чтение»,
-    выполняются без вопроса (``GIGACREW_SAFE_COMMANDS``).
+    выполняются без вопроса (``GIGACREW_SAFE_COMMANDS``). ``background`` — фоновые задачи
+    агента (``run_in_background``; None — фоновый запуск недоступен, как у суб-агента);
+    ``start_subagent`` — суб-агент фоновой задачей: ``(агент, описание, задача) → результат
+    вызова с id задачи``.
     """
 
     workspace: Workspace
@@ -105,6 +109,8 @@ class ToolContext:
     run_subagent: Callable[[str, str, str], ToolResult] | None = None
     plan: PlanFile | None = None
     classify_commands: bool = True
+    background: BackgroundJobs | None = None
+    start_subagent: Callable[[str, str, str], ToolResult] | None = None
 
     @property
     def root(self) -> Path:
@@ -382,6 +388,12 @@ def build_default_registry() -> ToolRegistry:
     )
 
     # Тоже отложенный импорт: цикл через base.
+    from gigacrew.tools.background import (  # noqa: PLC0415
+        BackgroundOutputTool,
+        BackgroundStopTool,
+    )
+
+    # Тоже отложенный импорт: цикл через base.
     from gigacrew.tools.skill import SkillTool  # noqa: PLC0415
 
     # Тоже отложенный импорт: цикл через base.
@@ -409,6 +421,8 @@ def build_default_registry() -> ToolRegistry:
         ask_user.AskUserTool(),
         plan.ExitPlanModeTool(),
         TaskTool(),
+        BackgroundOutputTool(),
+        BackgroundStopTool(),
     ):
         reg.register(tool)
     return reg
