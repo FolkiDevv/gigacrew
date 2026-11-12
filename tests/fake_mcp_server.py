@@ -1,6 +1,7 @@
 """Поддельный MCP-сервер для тестов: JSON-RPC строками в stdin/stdout.
 
-Запуск: ``python tests/fake_mcp_server.py [--version V] [--exit] [--no-tools-capability]``.
+Запуск: ``python tests/fake_mcp_server.py [--version V] [--exit] [--no-tools-capability]
+[--marker PATH]`` (есть файл PATH — инструмент echo помечен разрушительным).
 
 Инструменты: ``echo`` (аргументы — текстом), ``fail`` (ошибка инструмента), ``slow``
 (спит ``seconds``), ``crash`` (процесс завершается), ``deep`` (ответ с JSON чрезмерной
@@ -111,6 +112,14 @@ def call(params: dict[str, Any]) -> dict[str, Any]:
     return text(f"неизвестный инструмент {name}", error=True)
 
 
+def page_one(options: list[str]) -> list[dict[str, Any]]:
+    """Первая страница; с ``--marker PATH`` и существующим PATH echo — разрушительный."""
+    tools = [dict(tool) for tool in PAGE_ONE]
+    if "--marker" in options and Path(options[options.index("--marker") + 1]).exists():
+        tools[0]["annotations"] = {"destructiveHint": True}
+    return tools
+
+
 def answer(message: dict[str, Any], options: list[str]) -> dict[str, Any] | None:
     method = message.get("method")
     params = message.get("params") or {}
@@ -128,7 +137,7 @@ def answer(message: dict[str, Any], options: list[str]) -> dict[str, Any] | None
     if method == "tools/list":
         if params.get("cursor") == "page-2":
             return {"tools": list(PAGE_TWO)}
-        return {"tools": list(PAGE_ONE), "nextCursor": "page-2"}
+        return {"tools": page_one(options), "nextCursor": "page-2"}
     if method == "tools/call":
         return call(params)
     if method == "ping":

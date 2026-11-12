@@ -59,6 +59,11 @@ MAX_DESCRIPTION = 2000  # символов описания инструмент
 MAX_INSTRUCTIONS = 2000  # символов указаний сервера в системном промпте
 _DESCRIBE_LIMIT = 70
 _PREVIEW_LIMIT = 20_000  # символов аргументов в вопросе пользователю
+CHANGED_AFTER_RESTART = (
+    "инструмент {tool} изменился после перезапуска сервера (пометки readOnlyHint, "
+    "destructiveHint или сам инструмент) — вызов не выполнен; повторите его, gigacrew "
+    "заново решит, нужно ли подтверждение"
+)
 TRUNCATED_ARGUMENTS = (
     "… показаны первые {shown} из {total} символов аргументов — остальное не видно; "
     "если не уверены, отклоните вызов"
@@ -133,10 +138,30 @@ class McpServer:
             self.about = about
             self.error = ""
 
-    def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Вызов инструмента; упавший сервер перед этим запускается заново. Сбой — McpError."""
+    def annotations_of(self, tool: str) -> dict[str, Any] | None:
+        """Пометки инструмента (``annotations``) по текущему списку сервера; нет его — None."""
+        for described in self.tools:
+            if described.get("name") == tool:
+                found = described.get("annotations")
+                return found if isinstance(found, dict) else {}
+        return None
+
+    def call(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        hints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Вызов инструмента; упавший сервер перед этим запускается заново. Сбой — McpError.
+
+        ``hints`` — пометки, по которым вызов разрешён. Сервер пришлось перезапустить, и
+        пометки инструмента стали другими (или его нет) — вызов не выполняется: разрешение
+        выдано другому инструменту. Следующий вызов оценится уже по новым пометкам.
+        """
         if not self.connected and not self._closed:
             self.connect()
+            self._check_unchanged(tool, hints)
         client = self._client
         if client is None or not self.connected:
             raise McpError(self.error or "сервер не подключён")
@@ -165,6 +190,11 @@ class McpServer:
                 f"<mcp_instructions>\n{clipped}\n</mcp_instructions>",
             )
         return "\n".join(parts)
+
+    def _check_unchanged(self, tool: str, hints: dict[str, Any] | None) -> None:
+        """После перезапуска пометки инструмента — те же, по которым разрешён вызов."""
+        if hints is not None and self.connected and self.annotations_of(tool) != hints:
+            raise McpError(CHANGED_AFTER_RESTART.format(tool=tool))
 
     def _handshake(self) -> tuple[ServerInfo, _Described]:
         """Новая сессия: запуск, рукопожатие, список инструментов. Сбой — McpError/OSError."""
@@ -272,12 +302,18 @@ class McpTool(Tool[McpArguments]):
         )
         self._schema = tool_schema(described.get("inputSchema"))
         hints = described.get("annotations")
-        self._hints: dict[str, Any] = hints if isinstance(hints, dict) else {}
+        self._initial_hints: dict[str, Any] = hints if isinstance(hints, dict) else {}
+
+    @property
+    def hints(self) -> dict[str, Any]:
+        """Пометки инструмента по текущему списку сервера (после перезапуска — новые)."""
+        current = self.server.annotations_of(self.tool)
+        return self._initial_hints if current is None else current
 
     @property
     def reads_only(self) -> bool:
         """Сервер помечает инструмент как только читающий (``readOnlyHint``)."""
-        return self._hints.get("readOnlyHint") is True
+        return self.hints.get("readOnlyHint") is True
 
     @override
     def input_schema(self) -> dict[str, Any]:
@@ -316,7 +352,7 @@ class McpTool(Tool[McpArguments]):
             # В плане — как команда-проверка: с подтверждением, а не запрет.
             kind = ToolKind.COMMAND if planning else None
             return Assessment(RiskLevel.WRITE, f"{reason}; сервер: только читает", kind=kind)
-        if self._hints.get("destructiveHint") is True:
+        if self.hints.get("destructiveHint") is True:
             return Assessment(RiskLevel.DANGEROUS, f"{reason}; сервер: может удалять данные")
         return Assessment(RiskLevel.WRITE, reason)
 
@@ -336,7 +372,8 @@ class McpTool(Tool[McpArguments]):
     def run(self, params: McpArguments, ctx: ToolContext) -> ToolResult:
         """Вызов на сервере; ответ — текстом (ошибка инструмента — неуспех для модели)."""
         try:
-            reply = self.server.call(self.tool, params.arguments)
+            # Пометки — те же, по которым только что решалось разрешение (assess).
+            reply = self.server.call(self.tool, params.arguments, hints=self.hints)
         except McpError as exc:
             server = self.server.name
             raise ToolError(f"MCP-сервер {server}: {exc}") from exc

@@ -8,7 +8,8 @@
 ``roots``). Проверка TLS — по стандартным корням.
 
 Поток SSE ограничен: строка и событие — не больше :data:`MAX_MESSAGE`, а срок ответа
-проверяется на каждой строке — keep-alive сервера (комментарии ``:``) его не продлевает.
+проверяется на каждом принятом куске — ни keep-alive сервера (комментарии ``:``), ни
+строка без конца его не продлевают.
 """
 
 from __future__ import annotations
@@ -101,12 +102,16 @@ def _sse_field(line: str, event: str, chunks: list[str]) -> str:
     return event  # комментарий («:…»), id, retry
 
 
-def _before(deadline: float, lines: Iterable[str]) -> Iterator[str]:
-    """Строки потока, пока не истёк срок ответа (keep-alive его не продлевает)."""
-    for line in lines:
+def _before[ChunkT](deadline: float, chunks: Iterable[ChunkT]) -> Iterator[ChunkT]:
+    """Куски потока, пока не истёк срок ответа.
+
+    Срок проверяется на каждом принятом куске, а не на строке: ни keep-alive, ни строка,
+    которую сервер шлёт по байту без конца, его не продлевают.
+    """
+    for chunk in chunks:
         if time.monotonic() > deadline:
             raise McpTimeoutError("сервер не прислал ответ вовремя")
-        yield line
+        yield chunk
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -228,7 +233,7 @@ class HttpTransport(Transport):
             raise McpError("сервер не прислал ответ на запрос")
 
     def _read_events(self, response: httpx.Response, expected: object, deadline: float) -> None:
-        lines = _before(deadline, sse_lines(response.iter_bytes()))
+        lines = sse_lines(_before(deadline, response.iter_bytes()))
         for chunk in parse_sse(lines):
             payload = parse_message(chunk.encode("utf-8"))
             if expected in deliver(payload, self._receive):

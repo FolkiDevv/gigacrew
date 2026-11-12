@@ -303,3 +303,25 @@ def test_interrupted_close_still_kills_server(tmp_path: Path) -> None:
     with pytest.raises(KeyboardInterrupt):
         transport.close()
     assert proc.poll() is not None
+
+
+def _endless_line() -> Iterator[bytes]:
+    yield b"data: {"
+    for _ in range(10_000):  # строка без конца, по байту: ответа так и нет
+        time.sleep(0.05)
+        yield b"x"
+
+
+def test_http_unfinished_line_does_not_extend_timeout() -> None:
+    server = FakeHttpServer()
+    session = _http_client(server)
+    session.connect(TIMEOUT)
+    server.stream = httpx.Response(
+        200,
+        headers={"Content-Type": "text/event-stream"},
+        content=_endless_line(),
+    )
+    started = time.monotonic()
+    with pytest.raises(McpTimeoutError):
+        session.call_tool("t", {}, timeout=0.5)
+    assert time.monotonic() - started < 5

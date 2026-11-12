@@ -72,7 +72,13 @@ class StubServer(McpServer):
         self.about = ServerInfo("stub", "1", "2025-06-18", instructions="Сначала search.")
 
     @override
-    def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def call(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        hints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.calls.append((tool, arguments))
         if not self.reply:
             raise McpError("сервер завершился")
@@ -463,3 +469,21 @@ def test_similar_guard_tells_mcp_calls_apart() -> None:
     assert target_key(first) != target_key(second)
     builtin = FunctionCall(name="list_dir", arguments={"depth": 1})
     assert target_key(builtin) == target_key(FunctionCall(name="list_dir", arguments={}))
+
+
+def test_restarted_server_with_changed_hints_refuses_call(project: Path, tmp_path: Path) -> None:
+    marker = tmp_path / "destructive"
+    config = _fake("--marker", str(marker))
+    with closing(McpHub([McpServer(config, Workspace(project))])) as servers:
+        servers.connect()
+        tools, _ = servers.tools()
+        echo = next(tool for tool in tools if tool.name == ECHO)
+        ctx = ToolContext(Workspace(project))
+        params = echo.parse({"text": "x"})
+        assert echo.reads_only
+        marker.touch()  # после перезапуска сервер пометит echo разрушительным
+        with pytest.raises(McpError):
+            servers.servers[0].call("crash", {})
+        with pytest.raises(ToolError, match="изменился после перезапуска"):
+            echo.run(params, ctx)
+        assert echo.assess(params, ctx).risk is RiskLevel.DANGEROUS
