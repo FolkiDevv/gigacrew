@@ -2701,6 +2701,22 @@ def test_without_yes_unverified_command_goes_to_reviewer(tmp_path: Path) -> None
     assert not (tmp_path / "made.txt").exists()
 
 
+def test_unverified_recursive_grep_needs_no_reviewer(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("needle = 1\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=needle\n", encoding="utf-8")
+    run = tool_turn("run_shell", {"command": "grep -rn needle ."})
+    provider = ScriptedProvider([run, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events, auto_approve=False).run_turn("x")
+    # grep -r по дереву с .env классификатор не проверил бы: его выполняет встроенный
+    # поиск — без рецензента, без вопроса и без секретов
+    assert provider.summary_requests == []
+    assert events.confirms == []
+    output = events.tool_results[-1][1].content
+    assert "app.py:1:needle = 1" in output
+    assert "TOKEN" not in output
+
+
 def _ask_hook_later() -> FakeHooks:
     """Хук PreToolUse: в первом ходе молчит, со второго требует спрашивать.
 

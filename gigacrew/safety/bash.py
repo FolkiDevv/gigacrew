@@ -207,6 +207,7 @@ class Redirect:
     body_static: bool = True
     body_vars: tuple[str, ...] = ()
     body_plain: tuple[str, ...] = ()  # как Word.plain
+    fd: str = ""  # дескриптор слева (`2>`); пусто — по умолчанию для op
 
     @property
     def writes(self) -> bool:
@@ -565,13 +566,16 @@ class _Walker:
     def redirect(self, node: _Node) -> tuple[Redirect, list[_Node]]:
         """Перенаправление и лишние слова (``echo hi > f more`` — ``more`` попадает сюда)."""
         op = ""
+        fd = ""
         words: list[_Node] = []
         for child in node.children:
             if child.type in {">", ">>", ">|", "&>", "&>>", "<", ">&", "<&", "<>", "<<<", "&>|"}:
                 op = child.type
             elif child.type in _WORD_NODES:
                 words.append(child)
-            elif child.type != "file_descriptor":
+            elif child.type == "file_descriptor":
+                fd = _text(child)
+            else:
                 self.problem(f"перенаправление {child.type}")
         if not words:
             self.problem("перенаправление без цели")
@@ -587,10 +591,10 @@ class _Walker:
             )
             return redirect, words[1:]
         if op in {">&", "<&"} and first.static and (first.text.isdigit() or first.text == "-"):
-            return Redirect(op, first, fd_dup=True), words[1:]
+            return Redirect(op, first, fd_dup=True, fd=fd), words[1:]
         if op == "<>":
             self.problem("перенаправление <>")
-        return Redirect(op, first), words[1:]
+        return Redirect(op, first, fd=fd), words[1:]
 
     def heredoc(self, node: _Node) -> tuple[Redirect, list[_Node]]:
         quoted = False
