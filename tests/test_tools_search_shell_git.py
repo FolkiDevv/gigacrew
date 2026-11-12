@@ -231,6 +231,19 @@ def test_assessed_command_stays_a_command(secrets_project: ToolContext) -> None:
     assert res.content.startswith("exit code: 0")
 
 
+def test_assessed_command_is_rechecked_before_run(secrets_project: ToolContext) -> None:
+    sh = RunShellTool()
+    params = sh.parse({"command": "grep -rn needle src"})
+    assessment = sh.assess(params, secrets_project)
+    assert assessment.verdict is not None
+    assert assessment.verdict.command == "grep -rn needle src"
+    # после оценки в src появился файл с секретами: настоящий grep прочитал бы его
+    (secrets_project.root / "src" / ".env").write_text("TOKEN=needle\n", encoding="utf-8")
+    res = sh.run(params, secrets_project)
+    assert "search_content" in res.content.splitlines()[0]
+    assert "TOKEN" not in res.content
+
+
 def test_search_output_is_capped(secrets_project: ToolContext) -> None:
     line = "needle ".ljust(200, "x")
     _write(secrets_project, "src/big.py", "\n".join(line for _ in range(500)))

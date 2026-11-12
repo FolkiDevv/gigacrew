@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from typing import Literal, override
+from typing import override
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -29,7 +29,6 @@ _SHELL_FAILURES = (126, 127)
 # Сколько символов вызова показывать в UI (describe) и в кратком итоге команды.
 _DESCRIBE_LIMIT = 70
 _SUMMARY_COMMAND_LIMIT = 60
-_COMMAND: Literal["command"] = "command"  # вызов выполняется командой оболочки
 # Пометка для модели к результату grep -r, выполненного встроенным поиском.
 _GREP_SEARCH_NOTE = (
     "[grep -r здесь не выполнялся: по этому каталогу его не проверить (файлы с секретами, "
@@ -60,21 +59,22 @@ class RunShellParams(BaseModel):  # noqa: D101
             "the user is asked to confirm it)"
         ),
     )
-    _planned: GrepSearch | Literal["command"] | None = PrivateAttr(None)
+    _planned: GrepSearch | None = PrivateAttr(None)
 
     @property
-    def planned(self) -> GrepSearch | Literal["command"] | None:
-        """Как выполнить вызов по его оценке: встроенным поиском или командой.
+    def planned(self) -> GrepSearch | None:
+        """Встроенный поиск, которым оценка (assess) решила выполнить вызов.
 
-        None — оценки не было. run выполняет вызов так, как его оценили и разрешили: если
-        к запуску поиск стал невозможен, команда всё равно не выполняется.
+        Разрешённый поиск run выполняет поиском, даже если к запуску перевод команды уже
+        не удаётся. None — оценки не было или она решила выполнить команду: тогда run
+        проверяет команду заново (дерево поиска могло измениться).
         """
         return self._planned
 
     @planned.setter
-    def planned(self, plan: GrepSearch | Literal["command"]) -> None:
+    def planned(self, search: GrepSearch | None) -> None:
         # Приватный атрибут pydantic: в классе — его объявление, а не значение.
-        self._planned = plan  # noqa: WPS601
+        self._planned = search  # noqa: WPS601
 
 
 def command_verdict(params: RunShellParams, ctx: ToolContext) -> Verdict:
@@ -228,7 +228,7 @@ class RunShellTool(Tool[RunShellParams]):
         """Оценка команды классификатором: риск, причина, вид вызова, вердикт."""
         verdict = command_verdict(params, ctx)
         search = _grep_substitute(params, ctx, verdict)
-        params.planned = _COMMAND if search is None else search
+        params.planned = search
         if search is not None:
             verdict = _search_verdict(verdict, search)
         risk = _risk(verdict, params.command, classify_commands=ctx.classify_commands)
@@ -274,15 +274,13 @@ class RunShellTool(Tool[RunShellParams]):
         """Выполняет команду через /bin/sh и возвращает код возврата и вывод.
 
         Непроверенный рекурсивный grep выполняется встроенным поиском
-        (:func:`_grep_substitute`) — так, как решила оценка
-        (:attr:`RunShellParams.planned`): разрешённый поиск не превращается в команду.
-        Без оценки это решается здесь.
+        (:func:`_grep_substitute`). Поиск, разрешённый при оценке
+        (:attr:`RunShellParams.planned`), не превращается в команду. Команда проверяется
+        заново: если с оценки в дереве появились секреты, вместо неё выполняется поиск.
         """
-        planned = params.planned
-        if planned is None:
-            planned = _grep_substitute(params, ctx) or _COMMAND
-        if isinstance(planned, GrepSearch):
-            return _search_result(params.command, planned, ctx)
+        search = params.planned or _grep_substitute(params, ctx)
+        if search is not None:
+            return _search_result(params.command, search, ctx)
         return _execute(params, ctx)
 
 
