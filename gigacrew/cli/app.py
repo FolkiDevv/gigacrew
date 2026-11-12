@@ -46,7 +46,13 @@ from gigacrew.cli.models import (
     measure_context_window,
     save_window,
 )
-from gigacrew.cli.repl import autosave, esc_interrupt_for, run_repl
+from gigacrew.cli.repl import (
+    EXIT_REASON,
+    autosave,
+    esc_interrupt_for,
+    finish_background,
+    run_repl,
+)
 from gigacrew.config import Config, ConfigError
 from gigacrew.llm.api import ApiProvider
 from gigacrew.llm.base import LLMError, LLMProvider
@@ -222,6 +228,8 @@ def run_oneshot(
     """Один ход; хуки SessionStart/SessionEnd — вокруг него.
 
     SessionEnd — после сохранения чата. ``resumed`` — чат продолжен (``-c``/``-r``).
+    Фоновые задачи, запущенные в ходе, gigacrew дожидается и передаёт агенту их итоги
+    (:func:`~gigacrew.cli.repl.finish_background`); при выходе остановлены все.
     """
     esc = esc_interrupt_for(ui, agent=agent)
     source = "resume" if resumed else "startup"
@@ -229,6 +237,7 @@ def run_oneshot(
         try:
             with esc:
                 agent.run_turn(prompt)
+            finish_background(agent, ui, esc)
         except (PromptBlockedError, LLMError) as error:
             ui.stop_live()
             if isinstance(error, PromptBlockedError):
@@ -245,6 +254,7 @@ def run_oneshot(
             ui.error(f"внутренняя ошибка: {type(error).__name__}: {error}")
             return EXIT_ERROR
         finally:
+            agent.stop_background(EXIT_REASON)
             autosave(chats, agent, ui)
     stats = agent.last_turn
     return EXIT_STOPPED if stats is not None and stats.stop_reason else EXIT_OK

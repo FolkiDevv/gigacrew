@@ -49,6 +49,11 @@ _PERCENT = 100
 _DEFAULT_SUBAGENT_MAX_STEPS = 25
 _DEFAULT_SUBAGENT_TIMEOUT = 600
 _MIN_SUBAGENT_TIMEOUT = 10
+# Фоновые суб-агенты: сколько работают одновременно и сколько ждут в очереди.
+_DEFAULT_BACKGROUND_SUBAGENTS = 2
+_MAX_BACKGROUND_SUBAGENTS = 8
+_DEFAULT_BACKGROUND_QUEUE = 4
+_MAX_BACKGROUND_QUEUE = 16
 
 
 class ConfigError(ValueError):
@@ -392,6 +397,10 @@ class Config:
     subagent_max_steps: int = _DEFAULT_SUBAGENT_MAX_STEPS
     subagent_context_share: float = 0.8
     subagent_timeout: int = _DEFAULT_SUBAGENT_TIMEOUT
+    # Фоновые суб-агенты (task с run_in_background): сколько работают одновременно и
+    # сколько могут ждать в очереди; сверх — запуск отклоняется.
+    background_subagents: int = _DEFAULT_BACKGROUND_SUBAGENTS
+    background_queue: int = _DEFAULT_BACKGROUND_QUEUE
     # Настройки безопасности, которые .env проекта задавал, но они пропущены:
     # (ключ, файл) — для предупреждения при запуске (:attr:`ignored_env_warning`).
     ignored_env: tuple[tuple[str, str], ...] = ()
@@ -518,6 +527,19 @@ class Config:
                 "GIGACREW_SUBAGENT_TIMEOUT",
                 _DEFAULT_SUBAGENT_TIMEOUT,
                 minimum=_MIN_SUBAGENT_TIMEOUT,
+            ),
+            background_subagents=_env_int(
+                env,
+                "GIGACREW_BACKGROUND_SUBAGENTS",
+                _DEFAULT_BACKGROUND_SUBAGENTS,
+                maximum=_MAX_BACKGROUND_SUBAGENTS,
+            ),
+            background_queue=_env_int(
+                env,
+                "GIGACREW_BACKGROUND_QUEUE",
+                _DEFAULT_BACKGROUND_QUEUE,
+                minimum=0,
+                maximum=_MAX_BACKGROUND_QUEUE,
             ),
             ignored_env=collected.ignored,
         )

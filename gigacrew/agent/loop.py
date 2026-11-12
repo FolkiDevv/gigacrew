@@ -31,6 +31,13 @@ except ImportError:  # Windows: файл плана не блокируется
 else:
     _HAS_FLOCK = True
 
+from gigacrew.agent.background import (
+    SubagentJob,
+    active_note,
+    finished_note,
+    job_limits,
+    started_note,
+)
 from gigacrew.agent.chat_store import ChatStore
 from gigacrew.agent.compaction import (
     CompactionError,
@@ -90,6 +97,7 @@ from gigacrew.agent.reviewer import (
 # Запуск суб-агента и его отчёты для основного агента — всё из одного модуля.
 from gigacrew.agent.subagents import (  # noqa: WPS235
     MAX_SUBAGENTS_PER_TURN,
+    NO_ANSWER_MARK,
     READ_ONLY_BLOCKED_NOTE,
     READ_ONLY_SHELL_NOTE,
     SUBAGENT_PLAN_BLOCKED_NOTE,
@@ -122,6 +130,7 @@ from gigacrew.safety import CommandLevel, Verdict
 from gigacrew.security import RiskLevel, SandboxError
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 from gigacrew.tools.fs import write_atomic
+from gigacrew.tools.jobs import BackgroundJobs, Job, JobCancelledError, JobInfo, job_info
 from gigacrew.tools.plan import PlanReview, review_plan
 from gigacrew.tools.process import quote_reminder_tags
 from gigacrew.tools.questions import Answer, Question
@@ -256,6 +265,8 @@ MIN_PLAUSIBLE_SCALE = 0.25
 
 # Похожие вызовы суб-агента (та же цель): на N-м — предупреждение, затем остановка.
 SUBAGENT_MAX_SIMILAR = 5
+# Почему остановлены фоновые задачи при смене чата (/clear, /resume).
+CHAT_SWITCH_REASON = "начат другой чат"
 USER_STOP_REASON = "Пользователь остановил суб-агента досрочно."
 
 # Уровень предупреждений пользователю (AgentEvents.on_notice).
@@ -266,7 +277,6 @@ _LOCK_FILE_MODE = 0o600
 _MAX_ERROR_CHARS = 200
 # Столько разрешений пользователя без единого отказа — и команда запоминается («всегда»).
 AUTO_REMEMBER_AFTER = 3
-_NO_ANSWER_ERROR = "нет ответа на подтверждение"
 # Длительность в журнале решений для вызова, который не выполнялся (заблокирован).
 _NO_DURATION = float(0)
 
@@ -400,6 +410,7 @@ class Agent:
         decisions: DecisionMemory | None = None,
         reviewer: Reviewer | None = None,
         hooks: HookRunner | None = None,
+        cancel: threading.Event | None = None,
     ):
         """Конструктор не обращается к файловой системе и сети.
 
@@ -420,6 +431,11 @@ class Agent:
         из ``config.reviewer_model`` без проверки); у суб-агента — общая с основным.
 
         ``hooks`` — хуки пользователя (по умолчанию нет); у суб-агента — основного агента.
+
+        ``cancel`` — это фоновый суб-агент: работает в своём потоке, флаг отменяет его
+        (:class:`~gigacrew.tools.jobs.JobCancelledError` перед ближайшим шагом или вызовом),
+        его расход токенов не входит в ход основного агента. Фоновые задачи (``run_in_background``)
+        есть только у основного агента.
         """
         self._provider = provider
         self._registry = registry
@@ -436,6 +452,11 @@ class Agent:
         self._parent = parent
         self._subagent = subagent
         main = parent is None  # основной агент, а не суб-агент
+        self._cancel = cancel
+        limits = job_limits(config.background_subagents, config.background_queue)
+        self._jobs = BackgroundJobs(limits) if main else None
+        # Расход токенов пишут и фоновые суб-агенты из своих потоков.
+        self._bill_lock = threading.Lock()
         # Файл плана чата — только у основного агента: суб-агент план не пишет.
         self._chat_id = chat_id or ChatStore.new_id()
         self._plan = PlanFile(self._plan_path(self._chat_id)) if main else None
@@ -709,6 +730,17 @@ class Agent:
             child._stop_level = 2 if child._wrapping else child._stop_level + 1
             return True
 
+    @property
+    def background(self) -> BackgroundJobs | None:
+        """Фоновые задачи чата (у суб-агента — None: фоновых задач у него нет)."""
+        return self._jobs
+
+    def stop_background(self, reason: str) -> list[JobInfo]:
+        """Остановить незавершённые фоновые задачи (выход); их итоги не будят агента."""
+        if self._jobs is None:
+            return []
+        return [job_info(job) for job in self._jobs.stop_all(reason)]
+
     def reset(
         self,
         conversation: Conversation | None = None,
@@ -719,8 +751,17 @@ class Agent:
 
         ``chat_id`` — id чата (продолженного — его id: агент найдёт его план); по
         умолчанию — новый. Контекст проекта будет собран заново; потраченные токены
-        сессии не сбрасываются.
+        сессии не сбрасываются. Фоновые задачи прежнего чата останавливаются и забываются:
+        их итоги относятся к нему.
         """
+        if self._jobs is not None:
+            stopped = self._jobs.stop_all(CHAT_SWITCH_REASON, forget=True)
+            if stopped:
+                ids = ", ".join(job.id for job in stopped)
+                self._events.on_notice(
+                    f"остановлены фоновые задачи прежнего чата: {ids}",
+                    level=_WARN,
+                )
         self.chat_id = chat_id or ChatStore.new_id()
         self._conversation = Conversation() if conversation is None else conversation
         self._project_context = None
@@ -761,12 +802,19 @@ class Agent:
         хуком UserPromptSubmit, — :class:`~gigacrew.agent.hooks.PromptBlockedError`, история
         не меняется.
         """
-        self._last_turn = None
-        try:
-            return self._run_turn(user_input)
-        except BaseException:
-            self._conversation.repair()
-            raise
+        return self._guarded_turn(user_input)
+
+    def wake(self) -> str | None:
+        """Ход по готовности фоновых задач: их итоги приходят модели служебным сообщением.
+
+        None — доставлять нечего (хода не было). Ход — как :meth:`run_turn`, но без хуков
+        UserPromptSubmit (запрос пишет не пользователь) и в рамках того же хода
+        пользователя: ответы «да до конца хода» и отказы рецензента сохраняются.
+        """
+        finished = [] if self._jobs is None else self._jobs.take_finished()
+        if not finished:
+            return None
+        return self._guarded_turn(self._background_report(finished), meta=True)
 
     # ------------------------------------------------------------------ #
     def project_context(self) -> str:
@@ -819,7 +867,10 @@ class Agent:
         Инструкции подкаталогов, калибровка токенов, разрешения «всегда», память
         решений и рецензент — одни на сессию.
         """
-        self._nested = parent._nested
+        # Фоновый суб-агент работает параллельно с основным — свои инструкции подкаталогов.
+        self._nested = (
+            parent._nested if self._cancel is None else NestedInstructions(self._workspace.root)
+        )
         self._token_scale = parent._token_scale
         self._session_allowed = parent._session_allowed
         self._turn_allowed = parent._turn_allowed
@@ -1009,6 +1060,8 @@ class Agent:
             run_subagent=self._run_subagent if main else None,
             plan=self._plan,
             classify_commands=self._cfg.safe_commands,
+            background=self._jobs,
+            start_subagent=self._start_subagent if main else None,
         )
 
     def _plan_path(self, chat_id: str) -> Path:
@@ -1059,15 +1112,25 @@ class Agent:
         context = _reminder(f"{HOOK_CONTEXT_HEADER}\n{outcome.context_text}")
         return f"{prompt}\n\n{context}"
 
-    def _run_turn(self, user_input: str) -> str:
-        if self._parent is None:  # задачу суб-агента пишет модель, а не пользователь
+    def _guarded_turn(self, text: str, *, meta: bool = False) -> str:
+        """Ход с согласованной историей при любом прерывании."""
+        self._last_turn = None
+        try:
+            return self._run_turn(text, meta=meta)
+        except BaseException:
+            self._conversation.repair()
+            raise
+
+    def _run_turn(self, user_input: str, *, meta: bool = False) -> str:
+        # Задачу суб-агента пишет модель, итоги фоновых задач (meta) — harness.
+        if self._parent is None and not meta:
             user_input = self._prompt_hooks(user_input)
             self._reviewer.new_turn()  # отказы рецензента считаются за ход пользователя
             self._turn_allowed.clear()  # «да до конца хода» — на один ход пользователя
         self._unanswered.clear()
         # Рассуждения прошлых ходов модели больше не нужны (GIGACREW_REASONING=turn).
         self._conversation.forget_reasoning()
-        self._conversation.add_user(user_input)
+        self._conversation.add_user(user_input, meta=meta)
         specs = self._registry.specs()
         guard = self._new_guard()
         stats = TurnStats()
@@ -1161,11 +1224,13 @@ class Agent:
 
         Возвращает финальный текст хода; None — ход продолжается следующим шагом.
         """
+        self._check_cancel()
         context = self._subagent_context(specs, stats)
         stop = self._before_step(guard, context, state)
         if stop is not None:
             return self._stopped(specs, stop, stats)
         stats.steps = guard.steps
+        self._deliver_background()  # до сжатия: итоги не потеряются и при нём
         if self._cfg.auto_compact and not state.compact_failed:
             state.compact_failed = not self._auto_compact(specs, stats)
         failures_note = self._failures_note(guard)
@@ -1173,6 +1238,7 @@ class Agent:
             guard.pressure(context),
             failures_note,
             self._plan_reminder(state.reviews),
+            self._background_reminder(),
             state.note,
         )
         turn = self._next_turn(specs, note=note)
@@ -1453,6 +1519,7 @@ class Agent:
         заглушкой.
         """
         for call in calls:
+            self._check_cancel()
             check = guard.before_tool(call)
             if check.stop is not None:
                 # Вызов не выполняется; история остаётся согласованной.
@@ -1522,15 +1589,20 @@ class Agent:
 
     def _bill(self, usage: Usage) -> None:
         """Оплаченные токены сессии; у суб-агента — ещё и у основного агента."""
-        self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
+        with self._bill_lock:
+            self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
         if self._parent is not None:
             parent: Agent = self._parent
-            parent._bill_child(usage)
+            parent._bill_child(usage, background=self._cancel is not None)
 
-    def _bill_child(self, usage: Usage) -> None:
-        """Расход суб-агента: в сессию и в статистику идущего хода (не в контекст)."""
-        self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
-        if self._turn_stats is not None:
+    def _bill_child(self, usage: Usage, *, background: bool = False) -> None:
+        """Расход суб-агента: в сессию и в статистику идущего хода (не в контекст).
+
+        Фоновый суб-агент (``background``) работает вне хода основного — только в сессию.
+        """
+        with self._bill_lock:
+            self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
+        if not background and self._turn_stats is not None:
             _add_usage(self._turn_stats, usage)
 
     def _wrap_up(
@@ -2206,29 +2278,11 @@ class Agent:
         во время его работы — подвести итог, повторный Esc — оборвать (ход основного
         агента продолжается в обоих случаях); Ctrl+C останавливает весь ход.
         """
-        spec = SUBAGENTS.get(name)
-        if spec is None:
-            available = ", ".join(SUBAGENTS)
-            raise ToolError(f"неизвестный суб-агент {name!r}; доступны: {available}.")
-        if self._subagent_runs >= MAX_SUBAGENTS_PER_TURN:
-            raise ToolError(
-                f"лимит суб-агентов в этом ходе исчерпан ({MAX_SUBAGENTS_PER_TURN}) — "
-                "продолжай сам.",
-            )
+        spec = self._subagent_spec(name)
         self._subagent_runs += 1
         subagent_info = SubagentInfo(spec.name, description)
         events = SubagentEvents(self._events, subagent_info)
-        child = Agent(
-            self._provider,
-            subagent_registry(self._registry, spec),
-            # Без сжатия: предел суб-агента — заполнение контекста, у него он подводит итог.
-            replace(self._cfg, max_steps=self._cfg.subagent_max_steps, auto_compact=False),
-            events,
-            workspace=self._workspace,
-            windows=self._windows,
-            parent=self,
-            subagent=spec,
-        )
+        child: Agent = self._new_subagent(spec, events)
         self._events.on_subagent_start(subagent_info)
         with self._stop_lock:
             self._child = child
@@ -2253,6 +2307,98 @@ class Agent:
                 self._child = None
             self._events.on_subagent_end(subagent_info, child.last_turn)
         return subagent_report(spec, text, child.last_turn, events.trail)
+
+    def _start_subagent(self, name: str, description: str, prompt: str) -> ToolResult:
+        """Запустить суб-агента ``name`` фоновой задачей (``task`` с ``run_in_background``).
+
+        Результат вызова — id задачи (или место в очереди); отчёт суб-агента модель
+        получит, когда он закончит. Спросить пользователя он не может.
+        """
+        if self._jobs is None:  # ToolContext даёт запуск только основному агенту
+            raise ToolError("фоновые суб-агенты здесь недоступны.")
+        spec = self._subagent_spec(name)
+        job = SubagentJob(
+            spec,
+            description,
+            timeout=self._cfg.subagent_timeout,
+            run=partial(self._run_background, spec, prompt),
+        )
+        job_id = self._jobs.start(job)
+        self._subagent_runs += 1
+        where = "в очереди" if job.queued else "в фоне"
+        return ToolResult(content=started_note(job), summary=f"{where} {job_id} · {spec.name}")
+
+    def _run_background(self, spec: SubagentSpec, prompt: str, job: SubagentJob) -> ToolResult:
+        """Фоновый суб-агент до отчёта (в потоке задачи); отмена — JobCancelledError."""
+        child = self._new_subagent(spec, job.events, cancel=job.cancel_event)
+        try:
+            text = child.run_turn(prompt)
+        except LLMError as exc:
+            return model_error_report(spec, exc, job.events.trail)
+        return subagent_report(spec, text, child.last_turn, job.events.trail)
+
+    def _subagent_spec(self, name: str) -> SubagentSpec:
+        """Суб-агент ``name`` для запуска; ToolError — нет такого или лимит хода исчерпан."""
+        spec = SUBAGENTS.get(name)
+        if spec is None:
+            available = ", ".join(SUBAGENTS)
+            raise ToolError(f"неизвестный суб-агент {name!r}; доступны: {available}.")
+        if self._subagent_runs >= MAX_SUBAGENTS_PER_TURN:
+            raise ToolError(
+                f"лимит суб-агентов в этом ходе исчерпан ({MAX_SUBAGENTS_PER_TURN}) — "
+                "продолжай сам.",
+            )
+        return spec
+
+    def _new_subagent(
+        self,
+        spec: SubagentSpec,
+        events: AgentEvents,
+        *,
+        cancel: threading.Event | None = None,
+    ) -> Agent:
+        """Суб-агент ``spec`` с событиями ``events``; ``cancel`` — фоновый."""
+        return Agent(
+            self._provider,
+            subagent_registry(self._registry, spec),
+            # Без сжатия: предел суб-агента — заполнение контекста, у него он подводит итог.
+            replace(self._cfg, max_steps=self._cfg.subagent_max_steps, auto_compact=False),
+            events,
+            workspace=self._workspace,
+            windows=self._windows,
+            parent=self,
+            subagent=spec,
+            cancel=cancel,
+        )
+
+    def _check_cancel(self) -> None:
+        """Фоновую задачу суб-агента отменили — прекратить работу."""
+        if self._cancel is not None and self._cancel.is_set():
+            raise JobCancelledError
+
+    def _deliver_background(self) -> None:
+        """Итоги завершившихся фоновых задач — в историю, к последнему сообщению.
+
+        Модель видит их в ближайшем запросе, и они остаются в истории, как результаты
+        инструментов. Дописать некуда — итоги подождут (их доставит ход по готовности).
+        """
+        jobs = self._jobs
+        if jobs is None or not jobs.pending() or not self._conversation.can_append_note():
+            return
+        finished = jobs.take_finished()
+        if finished:
+            self._conversation.append_note(self._background_report(finished))
+
+    def _background_report(self, finished: Sequence[Job]) -> str:
+        """Заметка модели с итогами задач; интерфейс узнаёт о каждой."""
+        for job in finished:
+            self._events.on_background_end(job_info(job))
+        return _reminder(finished_note(finished))
+
+    def _background_reminder(self) -> str:
+        """Напоминание модели о незавершённых фоновых задачах ("" — их нет)."""
+        active = [] if self._jobs is None else self._jobs.active()
+        return active_note(active) if active else ""
 
     def _allow_always(self, call: ToolCallInfo, key: str, verdict: Verdict | None = None) -> None:
         """«Да, и не спрашивать»: команды — сохранённые разрешения, прочее — до конца сессии.
@@ -2373,7 +2519,7 @@ class Agent:
         error, model_text = "отклонено пользователем", REJECTED_NOTE
         if not answer.answered:
             self._unanswered.add(key)
-            error, model_text = _NO_ANSWER_ERROR, NO_ANSWER_NOTE
+            error, model_text = NO_ANSWER_MARK, NO_ANSWER_NOTE
         elif answer.feedback:
             model_text += FEEDBACK_NOTE.format(feedback=answer.feedback)
         self._fail(call, error, model_text=model_text, note=note)
@@ -2383,7 +2529,7 @@ class Agent:
         """Повтор вызова, на который в этом ходе уже не ответили «да»: не переспрашиваем."""
         error, model_text = "уже отклонено пользователем", REJECTED_AGAIN_NOTE
         if key in self._unanswered:
-            error, model_text = _NO_ANSWER_ERROR, NO_ANSWER_NOTE
+            error, model_text = NO_ANSWER_MARK, NO_ANSWER_NOTE
         self._fail(call, error, model_text=model_text, note=note)
         return ToolOutcome(ok=False, rejected=True)
 

@@ -453,6 +453,49 @@ def _hooks(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+TASKS_USAGE = "/tasks [stop <id…|all>]"
+# Почему задача остановлена — для модели: итог она получит со следующим запросом.
+_USER_STOP_REASON = "stopped by the user (/tasks stop)"
+
+
+def _tasks(ctx: CommandContext, arg: str) -> bool:
+    """Фоновые задачи чата; ``stop <id…|all>`` — остановить."""
+    jobs = ctx.agent.background
+    words = arg.split()
+    if words and words[0] == "stop" and len(words) > 1:
+        _stop_tasks(ctx, words[1:])
+    elif words:
+        ctx.ui.warn(f"использование: {TASKS_USAGE}")
+    else:
+        ctx.ui.background_jobs([] if jobs is None else jobs.jobs())
+    return True
+
+
+def _stop_tasks(ctx: CommandContext, targets: list[str]) -> None:
+    """Остановить задачи ``targets`` (id или ``all``); итоги агент получит без пробуждения."""
+    jobs = ctx.agent.background
+    if jobs is None:
+        return
+    everything = targets == ["all"]
+    chosen = jobs.active() if everything else []
+    unknown: list[str] = []
+    for target in () if everything else targets:
+        job = jobs.get(target)
+        if job is None:
+            unknown.append(target)
+        else:
+            chosen.append(job)
+    if unknown:
+        missing = ", ".join(unknown)
+        ctx.ui.warn(f"нет таких фоновых задач: {missing}")
+    stopped = [job.id for job in chosen if jobs.stop(job, _USER_STOP_REASON, quiet=True)]
+    if stopped:
+        ids = ", ".join(stopped)
+        ctx.ui.info(f"остановлены: {ids} — агент узнает об этом со следующим запросом")
+    elif chosen or everything:
+        ctx.ui.info("остановить нечего: задачи уже завершены")
+
+
 def _exit(ctx: CommandContext, _arg: str) -> bool:
     ctx.ui.system("до встречи!")
     return False
@@ -461,35 +504,29 @@ def _exit(ctx: CommandContext, _arg: str) -> bool:
 def default_commands() -> CommandRegistry:
     """Реестр встроенных слеш-команд REPL."""
     registry = CommandRegistry()
-    registry.register(SlashCommand("/help", "справка", _help))
-    registry.register(SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"))
-    registry.register(SlashCommand("/mode", "режим: авто или план", _mode, usage=MODE_USAGE))
-    registry.register(
+    for command in (
+        SlashCommand("/help", "справка", _help),
+        SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"),
+        SlashCommand("/mode", "режим: авто или план", _mode, usage=MODE_USAGE),
         SlashCommand(
             "/permissions",
             "разрешённые без вопросов команды и журнал решений",
             _permissions,
             usage=PERMISSIONS_USAGE,
         ),
-    )
-    registry.register(
         SlashCommand(
             "/add-dir",
             "подключить каталог вне проекта (чтение и правки)",
             _add_dir,
             usage=ADD_DIR_USAGE,
         ),
-    )
-    registry.register(SlashCommand("/clear", "новый чат", _clear))
-    registry.register(
+        SlashCommand("/clear", "новый чат", _clear),
         SlashCommand(
             "/compact",
             "сжать историю в краткое содержание",
             _compact,
             usage="/compact [пожелания]",
         ),
-    )
-    registry.register(
         SlashCommand(
             "/resume",
             "открыть сохранённый чат",
@@ -497,10 +534,10 @@ def default_commands() -> CommandRegistry:
             usage="/resume [id]",
             aliases=("/chats",),
         ),
-    )
-    registry.register(
         SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]"),
-    )
-    registry.register(SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"))
-    registry.register(SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")))
+        SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"),
+        SlashCommand("/tasks", "фоновые задачи", _tasks, usage=TASKS_USAGE),
+        SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")),
+    ):
+        registry.register(command)
     return registry

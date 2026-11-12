@@ -58,6 +58,7 @@ from gigacrew.agent.hooks import short_command
 from gigacrew.llm.types import FunctionCall, Message
 from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolResult
+from gigacrew.tools.jobs import STATE_LABELS, Job, JobInfo, JobState, job_info
 from gigacrew.tools.questions import Answer, Question, QuestionsUnavailableError
 from gigacrew.ui import banner as banner_art
 from gigacrew.ui import theme
@@ -1307,6 +1308,30 @@ class Console(events.AgentEvents):  # noqa: WPS338
     @override
     def on_hook_end(self) -> None:
         self.stop_live()
+
+    @override
+    def on_background_end(self, job: JobInfo) -> None:
+        summary = job.summary or STATE_LABELS[job.state]
+        self.info(
+            sanitize(f"фоновая задача {job.id} ({job.kind}): {summary} · {job.elapsed:.0f} с"),
+        )
+
+    def background_jobs(self, jobs: Sequence[Job]) -> None:
+        """Фоновые задачи чата (``/tasks``): состояние, время, описание, чем занята или итог."""
+        if not jobs:
+            self.info("фоновых задач в этом чате нет")
+            return
+        for job in map(job_info, jobs):
+            state = STATE_LABELS[job.state]
+            when = "" if job.state is JobState.QUEUED else f" · {job.elapsed:.0f} с"
+            line = f"{job.id}  {state}{when}  {job.kind}: {job.title}"
+            tail = job.activity or job.summary
+            if tail:
+                line = f"{line} — {tail}"
+            active = job.state in {JobState.QUEUED, JobState.RUNNING}
+            style = "" if active else self._palette.muted
+            self._emit(self._fit(Text(sanitize(line), style=style)))
+        self.info("/tasks stop <id|all> — остановить")
 
     @override
     def on_notice(self, text: str, *, level: events.NoticeLevel = "info") -> None:
