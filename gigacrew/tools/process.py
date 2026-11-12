@@ -392,7 +392,9 @@ class BackgroundProcess:
     stdout (строки идут в том порядке, в каком их писала команда) и копится в
     :attr:`output`. Поток-надзиратель ждёт выхода команды не дольше ``timeout`` секунд,
     затем убивает группу целиком — как и оставшихся после выхода фоновых потомков, — и
-    вызывает ``on_exit``. :meth:`kill` останавливает команду досрочно.
+    вызывает ``on_exit(процесс)``: он может прийти раньше, чем конструктор вернёт объект
+    (быстрая команда), поэтому процесс передаётся аргументом. :meth:`kill` останавливает
+    команду досрочно; сбой самого надзора — :attr:`error` (команда при этом убита).
     """
 
     def __init__(
@@ -402,7 +404,7 @@ class BackgroundProcess:
         cwd: Path,
         timeout: float,
         shell: bool = False,
-        on_exit: Callable[[], None] | None = None,
+        on_exit: Callable[[BackgroundProcess], None] | None = None,
     ) -> None:
         """Запустить ``cmd``; FileNotFoundError — если нет программы."""
         self.output = OutputLog()
@@ -410,6 +412,7 @@ class BackgroundProcess:
         self._timeout = timeout
         self._done = threading.Event()
         self._killed = False
+        self._error = ""
         self._flags = (False, False, False)  # таймаут, убиты потомки, вывод держит чужой
         self._proc = _spawn(
             cmd,
@@ -465,6 +468,11 @@ class BackgroundProcess:
         """Вывод держит процесс, ушедший из группы (setsid): его не остановить."""
         return self._flags[2]
 
+    @property
+    def error(self) -> str:
+        """Сбой надзора за командой ("" — не было); команда при нём убита."""
+        return self._error
+
     def wait(self, timeout: float | None = None) -> bool:
         """Ждать завершения не дольше ``timeout`` секунд; True — команда завершилась."""
         return self._done.wait(timeout)
@@ -479,10 +487,14 @@ class BackgroundProcess:
     def _watch(self) -> None:
         try:
             self._flags = _supervise(self._proc, [self._reader], self._timeout)
-        except Exception:
-            # Надзор сломался — команда не должна остаться работать без него.
+        except Exception as exc:
+            # Надзор сломался: команда не должна остаться работать без него, а сбой —
+            # пропасть из итога.
+            self._error = f"{type(exc).__name__}: {exc}"
             _kill_group(self._proc)
+            with contextlib.suppress(Exception):
+                self._proc.wait(timeout=_PIPE_GRACE_SECONDS)
         _close_streams(self._proc, [self._reader])
         self._done.set()
         if self._on_exit is not None:
-            self._on_exit()
+            self._on_exit(self)

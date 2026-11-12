@@ -1969,12 +1969,12 @@ def test_resumed_compacted_chat_reports_estimated_context(tmp_path: Path) -> Non
     saved = Conversation()
     long_tail = "x" * 3_000
     saved.add_user(f"вопрос {long_tail}")
-    saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=9_000))
+    saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=20_000))
     saved.set_summary(Summary("СВОДКА", 2))  # чат сохранён после /compact
     agent = _agent(ScriptedProvider(), tmp_path)
     agent.reset(saved)
     estimate = agent.context_tokens
-    assert 0 < estimate < 9_000
+    assert 0 < estimate < 20_000
     assert agent.context_tokens == estimate  # посчитано один раз
 
 

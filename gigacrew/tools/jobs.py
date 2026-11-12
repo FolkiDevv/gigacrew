@@ -482,9 +482,7 @@ def _admission(
     limits: PoolLimits,
 ) -> bool:
     """Запускать задачу сейчас (True) или в очередь (False); ToolError — мест нет нигде."""
-    running = [
-        known for known in jobs if known.pool == job.pool and known.state is JobState.RUNNING
-    ]
+    running = _occupied(jobs, queue, job.pool)
     if len(running) < limits.running:
         return True
     waiting = [known for known in queue if known.pool == job.pool]
@@ -506,14 +504,27 @@ def _next_in_queue(
     limit: Callable[[str], PoolLimits],
 ) -> Job | None:
     """Снять с очереди первую задачу вида ``pool``, если для неё освободилось место."""
-    running = sum(1 for known in jobs if known.pool == pool and known.state is JobState.RUNNING)
-    if running >= limit(pool).running:
+    if len(_occupied(jobs, queue, pool)) >= limit(pool).running:
         return None
     for waiting in queue:
         if waiting.pool == pool:
             queue.remove(waiting)
             return waiting
     return None
+
+
+def _occupied(jobs: Iterable[Job], queue: Iterable[Job], pool: str) -> list[Job]:
+    """Задачи вида ``pool``, занимающие место: не завершены и не ждут в очереди.
+
+    Задача, снятая с очереди, занимает место сразу, под блокировкой реестра, — ещё до того,
+    как запустится её работа: иначе параллельный запуск увидел бы то же свободное место.
+    """
+    waiting = list(queue)
+    return [
+        known
+        for known in jobs
+        if known.pool == pool and not known.finished and known not in waiting
+    ]
 
 
 def _settle(job: Job, grace: float) -> None:

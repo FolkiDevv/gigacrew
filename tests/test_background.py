@@ -26,6 +26,8 @@ from gigacrew.config import Config
 from gigacrew.llm.types import AssistantTurn, Message, ToolSpec
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools import jobs as jobs_module
+from gigacrew.tools import process as process_module
+from gigacrew.tools import shell as shell_module
 from gigacrew.tools.background import (
     BackgroundOutputParams,
     BackgroundOutputTool,
@@ -40,7 +42,7 @@ from gigacrew.tools.base import (
     build_default_registry,
 )
 from gigacrew.tools.jobs import BackgroundJobs, Job, JobInfo, JobReport, JobState, PoolLimits
-from gigacrew.tools.process import OutputLog
+from gigacrew.tools.process import BackgroundProcess, OutputLog
 from gigacrew.tools.shell import RunShellParams, RunShellTool
 from gigacrew.ui.console import Console
 
@@ -296,6 +298,31 @@ def test_queued_job_limit_counts_from_its_start(monkeypatch: pytest.MonkeyPatch)
     assert _state(waiting) is JobState.TIMED_OUT
 
 
+class RacingJob(FakeJob):
+    """Задача, перед запуском которой успевает вклиниться другой запуск (``sneak_in``)."""
+
+    def __init__(self, sneak_in: Callable[[], object]) -> None:
+        super().__init__("гонка")
+        self._sneak_in = sneak_in
+
+    @override
+    def launch(self, on_finish: Callable[[Job], None]) -> None:
+        self._sneak_in()  # снята с очереди, но ещё не запущена
+        super().launch(on_finish)
+
+
+def test_job_taken_off_queue_holds_its_slot_before_launch() -> None:
+    jobs = BackgroundJobs({jobs_module.SUBAGENT_POOL: PoolLimits(running=1, queued=1)})
+    first, third = FakeJob("1"), FakeJob("3")
+    second = RacingJob(lambda: jobs.start(third))
+    jobs.start(first)
+    jobs.start(second)
+    first.done()  # освободилось место: вторая снята с очереди, третья вклинилась
+    assert second.started
+    assert third.queued  # место уже занято второй — третья ждёт, а не работает сверх предела
+    assert not third.started
+
+
 def test_stop_all_forget_clears_chat_jobs() -> None:
     jobs = BackgroundJobs()
     job = FakeJob()
@@ -364,6 +391,59 @@ def test_background_command_is_killed_by_its_timeout(tmp_path: Path) -> None:
     assert job.wait(10)
     assert job.state is JobState.TIMED_OUT
     assert time.monotonic() - started < 10
+
+
+class InstantProcess(BackgroundProcess):
+    """Команда, завершившаяся раньше, чем конструктор вернул процесс."""
+
+    def __init__(
+        self,
+        cmd: str,
+        *,
+        cwd: Path,
+        timeout: float,
+        shell: bool = False,
+        on_exit: Callable[[BackgroundProcess], None] | None = None,
+    ) -> None:
+        super().__init__(cmd, cwd=cwd, timeout=timeout, shell=shell)
+        assert self.wait(10)
+        if on_exit is not None:
+            on_exit(self)
+
+
+@posix_only
+def test_fast_command_keeps_its_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shell_module, "BackgroundProcess", InstantProcess)
+    jobs = BackgroundJobs()
+    params = RunShellParams(command="echo быстро; exit 7", run_in_background=True)
+    RunShellTool().run(params, _ctx(tmp_path, jobs))
+    report = _report(_job(jobs))
+    assert report.state is JobState.DONE
+    assert report.content.startswith("exit code: 7")
+    assert "быстро" in report.content
+
+
+@posix_only
+def test_supervision_failure_kills_command_and_reaches_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(*args: object) -> tuple[bool, bool, bool]:
+        raise RuntimeError("надзор сломался")
+
+    monkeypatch.setattr(process_module, "_supervise", broken)
+    jobs = BackgroundJobs()
+    started = time.monotonic()
+    RunShellTool().run(
+        RunShellParams(command="sleep 30", run_in_background=True),
+        _ctx(tmp_path, jobs),
+    )
+    job = _job(jobs)
+    assert job.wait(10)
+    assert time.monotonic() - started < 10  # команда убита, а не дождалась sleep 30
+    report = _report(job)
+    assert report.state is JobState.FAILED
+    assert "надзор сломался" in report.content
 
 
 def test_run_in_background_needs_background_jobs(tmp_path: Path) -> None:

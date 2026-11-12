@@ -227,6 +227,15 @@ def _notes(res: ProcessResult | BackgroundProcess, timeout: int) -> list[str]:
     return notes
 
 
+def _exit_state(process: BackgroundProcess) -> tuple[JobState, str]:
+    """Состояние итога команды, завершившейся без запроса остановки, и его причина."""
+    if process.error:
+        return JobState.FAILED, f"supervising the command failed ({process.error}); it was killed"
+    if process.timed_out:
+        return JobState.TIMED_OUT, ""
+    return JobState.DONE, ""
+
+
 class ShellJob(Job):
     """Команда ``run_shell`` в фоне: вывод копится, модель читает его частями."""
 
@@ -275,13 +284,14 @@ class ShellJob(Job):
         lines = [line.strip() for line in tail.splitlines() if line.strip()]
         return lines[-1] if lines else ""
 
-    def _exited(self) -> None:
-        """Команда завершилась (вызывается надзирателем процесса)."""
-        stop = self.stop_request
-        if stop is None:
-            timed_out = self._process is not None and self._process.timed_out
-            stop = (JobState.TIMED_OUT if timed_out else JobState.DONE, "")
-        self.finish(self._build_report(*stop))
+    def _exited(self, process: BackgroundProcess) -> None:
+        """Команда завершилась (вызывает надзиратель процесса, из своего потока).
+
+        Процесс — аргументом: быстрая команда завершается раньше, чем :meth:`start`
+        сохранит его, а итог должен содержать её код и вывод.
+        """
+        self._process = process
+        self.finish(self._build_report(*(self.stop_request or _exit_state(process))))
 
     def _unread(self, limit: int) -> str:
         """Вывод, который модель ещё не видела (середина длинного — пропущена)."""
@@ -301,6 +311,9 @@ class ShellJob(Job):
         elif state is JobState.TIMED_OUT:
             head = f"exit code: (timeout: stopped after {self.timeout} s)"
             summary = f"$ {self.title} → таймаут"
+        elif state is JobState.FAILED:
+            head = f"failed: {reason}"
+            summary = f"$ {self.title} → сбой"
         else:
             head = f"stopped before it finished: {reason}"
             summary = f"$ {self.title} → остановлена"

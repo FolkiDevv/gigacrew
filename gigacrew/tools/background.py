@@ -15,6 +15,14 @@ from pydantic import BaseModel, Field
 from gigacrew.tools.base import Tool, ToolContext, ToolError, ToolResult
 from gigacrew.tools.jobs import STATE_LABELS, BackgroundJobs, Job, job_heading
 
+__all__ = [
+    "MAX_WAIT",
+    "BackgroundOutputParams",
+    "BackgroundOutputTool",
+    "BackgroundStopParams",
+    "BackgroundStopTool",
+]
+
 # Дольше одного вызова модель не ждёт: дальше её разбудит итог задачи.
 MAX_WAIT = 300
 # Ожидание — короткими отрезками: Esc/Ctrl+C прерывает его сразу.
