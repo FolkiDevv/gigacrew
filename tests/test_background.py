@@ -947,8 +947,9 @@ def test_repl_limits_wakes_in_a_row(
     _jobs(agent).start(first)
     _jobs(agent).start(second)
     first.done("первый итог")
-    assert _run_repl(agent, ui, _reader("а второй?", "/exit")) == 0
-    assert provider.calls == 2  # второй ход — по сообщению пользователя, а не сам
+    assert _run_repl(agent, ui, _reader("/tasks", "а второй?", "/exit")) == 0
+    # Второй ход — по сообщению пользователя, а не сам: /tasks — не сообщение агенту.
+    assert provider.calls == 2
     user_request = _sent(provider, 1)
     assert request_text(user_request.content) == "а второй?"
     assert "второй итог" in user_request.content
@@ -985,8 +986,8 @@ def test_repl_does_not_wake_agent_after_interrupted_turn(
     agent, ui = _repl_env(tmp_path, provider)
     monkeypatch.setattr(ui, "interactive", lambda: True)
     _jobs(agent).start(job)
-    assert _run_repl(agent, ui, _reader("сделай X", "/exit")) == 0
-    assert provider.calls == 0  # агент не продолжил работу сам после Esc
+    assert _run_repl(agent, ui, _reader("сделай X", "/tasks", "/exit")) == 0
+    assert provider.calls == 0  # агент не продолжил работу сам ни после Esc, ни после /tasks
     assert "получит с вашим следующим сообщением" in capsys.readouterr().out
 
 

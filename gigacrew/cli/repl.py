@@ -13,6 +13,7 @@
 возвращается в неё. Таких ходов подряд, без сообщения пользователя, — не больше
 :data:`MAX_AUTO_WAKES`: дальше итоги ждут его следующего сообщения. Ход прерван (Esc,
 Ctrl+C) или сорвался (ошибка модели) — итоги тоже ждут сообщения пользователя.
+Служебные команды (``/tasks``, ``/help``) сообщением агенту не считаются.
 
 Диалог сохраняется после каждого хода — и прерванного тоже (см. :func:`autosave`).
 """
@@ -438,10 +439,6 @@ class _Repl:
 
     def _execute(self, line: str) -> bool:
         """Выполнить строку: скилл, слеш-команду или ход агента. False — выход из REPL."""
-        # Пользователь здесь — агент снова может продолжать работу сам по итогам задач.
-        self.auto_wakes = 0
-        self.paused = False
-        self.wakes_held = False
         if is_repl_command(line):
             self.skills.refresh()  # скилл могли установить, пока открыто приглашение
         try:
@@ -451,6 +448,11 @@ class _Repl:
             return True
         if request is None and is_repl_command(line):
             return self._dispatch(line)
+        # Запрос агенту — итоги задач придут с ним, и агент снова может продолжать работу
+        # сам. Служебная команда (/tasks, /help) — не запрос: пауза и лимит остаются.
+        self.auto_wakes = 0
+        self.paused = False
+        self.wakes_held = False
         self._run_turn(line if request is None else request)
         return True
 
