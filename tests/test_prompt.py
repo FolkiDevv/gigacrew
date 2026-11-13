@@ -55,6 +55,7 @@ def test_completes_commands_with_descriptions() -> None:
         "/index",
         "/hooks",
         "/tasks",
+        "/mcp",
         "/exit",
     }
     assert _complete("/q") == [("/quit", "выход")]  # по алиасу

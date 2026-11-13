@@ -826,10 +826,16 @@ class Agent:
         return self._project_context
 
     def system_prompt(self) -> str:
-        """Системный промпт агента (у суб-агента — свой) с контекстом проекта."""
+        """Системный промпт агента (у суб-агента — свой) с контекстом проекта.
+
+        В конце контекста — указания подключённых инструментов (MCP-серверов) из реестра
+        этого агента: у суб-агента — только тех, что ему доступны.
+        """
+        context = self.project_context()
+        notes = [tool.guidance() for tool in self._registry]
         if self._subagent is not None:
-            return subagent_system_prompt(self._subagent.name, self.project_context())
-        return compose_system_prompt(SYSTEM_PROMPT, self.project_context())
+            return subagent_system_prompt(self._subagent.name, context, notes)
+        return compose_system_prompt(SYSTEM_PROMPT, context, notes)
 
     # ------------------------------------------------------------------ #
     def compact(self, instructions: str = "") -> CompactResult | None:

@@ -275,8 +275,15 @@ class Tool[ParamsT: BaseModel](ABC):
         return ToolSpec(
             name=self.name,
             description=self.description,
-            parameters=_clean_schema(self.Params),
+            parameters=self.input_schema(),
         )
+
+    def input_schema(self) -> dict[str, Any]:
+        """JSON-schema параметров: по умолчанию — из модели ``Params``.
+
+        Инструменты со схемой извне (MCP-сервер) переопределяют.
+        """
+        return _clean_schema(self.Params)
 
     def parse(self, arguments: dict[str, Any]) -> ParamsT:
         """Проверяет аргументы вызова от модели и строит из них параметры."""
@@ -329,6 +336,14 @@ class Tool[ParamsT: BaseModel](ABC):
         Вызывается только для операций, требующих подтверждения. Ошибка превью
         (ToolError) означает, что операция невыполнима: она не будет запущена.
         """
+
+    def guidance(self) -> str:
+        """Указания модели для системного промпта ("" — нет).
+
+        Для группы инструментов с общими указаниями (инструменты одного MCP-сервера):
+        одинаковый текст нескольких инструментов входит в промпт один раз.
+        """
+        return ""
 
     @abstractmethod
     def run(self, params: ParamsT, ctx: ToolContext) -> ToolResult:

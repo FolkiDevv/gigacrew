@@ -69,6 +69,8 @@ class CommandContext:
     declined_windows: set[str] = field(default_factory=set)
     skills: SkillCatalog | None = None  # для /help и подсказок (None — без скиллов)
     trust_hooks: bool = False  # --trust-hooks: /hooks reload не спрашивает подтверждение
+    # Текст /mcp о MCP-серверах сессии (gigacrew.cli.mcp.describe_hub); None — серверов нет.
+    mcp_status: Callable[[], str] | None = None
 
 
 # Обработчик получает контекст и аргумент (текст после имени команды).
@@ -496,6 +498,14 @@ def _stop_tasks(ctx: CommandContext, targets: list[str]) -> None:
         ctx.ui.info("остановить нечего: задачи уже завершены")
 
 
+def _mcp(ctx: CommandContext, arg: str) -> bool:
+    if arg:
+        ctx.ui.error("использование: /mcp")
+        return True
+    ctx.ui.info("MCP-серверов нет" if ctx.mcp_status is None else ctx.mcp_status())
+    return True
+
+
 def _exit(ctx: CommandContext, _arg: str) -> bool:
     ctx.ui.system("до встречи!")
     return False
@@ -537,6 +547,7 @@ def default_commands() -> CommandRegistry:
         SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]"),
         SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"),
         SlashCommand("/tasks", "фоновые задачи", _tasks, usage=TASKS_USAGE),
+        SlashCommand("/mcp", "MCP-серверы и их инструменты", _mcp),
         SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")),
     ):
         registry.register(command)
