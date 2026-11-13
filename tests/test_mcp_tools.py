@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import replace
@@ -116,6 +118,37 @@ def test_crashed_server_restarts_on_next_call(hub: McpHub) -> None:
     assert json.loads(server.call("echo", {"text": "снова"})["content"][0]["text"]) == {
         "text": "снова",
     }
+
+
+def test_concurrent_calls_reconnect_crashed_server_once(
+    hub: McpHub,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub.connect()
+    server = hub.servers[0]
+    with pytest.raises(McpError, match="завершился"):
+        server.call("crash", {})
+    connects: list[str] = []
+    original = McpServer.connect
+
+    def slow_connect(self: McpServer) -> None:
+        connects.append(self.name)
+        time.sleep(0.2)  # второй вызов (фоновый суб-агент) приходит, пока первый подключается
+        original(self)
+
+    monkeypatch.setattr(McpServer, "connect", slow_connect)
+    replies: list[dict[str, Any]] = []
+
+    def call_echo() -> None:
+        replies.append(server.call("echo", {"text": "x"}))
+
+    workers = [threading.Thread(target=call_echo) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(30)
+    assert connects == ["fake"]  # переподключал один поток
+    assert len(replies) == 2
 
 
 @pytest.mark.parametrize(

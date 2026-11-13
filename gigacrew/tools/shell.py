@@ -253,13 +253,17 @@ class ShellJob(Job):
     @override
     def start(self) -> None:
         # Оболочка — суть инструмента: команду до запуска проверили классификатор и права.
-        self._process = BackgroundProcess(  # noqa: S604
+        process = BackgroundProcess(  # noqa: S604
             self._command,
             cwd=self._cwd,
             timeout=self.timeout,
             shell=True,
             on_exit=self._exited,
         )
+        self._process = process
+        if self.stop_request is not None:
+            # Остановили, пока команда запускалась: cancel() не застал процесс.
+            process.kill()
 
     @override
     def cancel(self) -> None:
@@ -426,11 +430,15 @@ def _execute(params: RunShellParams, ctx: ToolContext) -> ToolResult:
         return _start_background(params, ctx.background, cwd)
     timeout = min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)
     # Оболочка — суть инструмента: команду до запуска проверяют классификатор и права.
+    # У фонового суб-агента команда убивается, как только его остановят (флаг потока).
     res = run_process(params.command, cwd=cwd, timeout=timeout, shell=True)  # noqa: S604
 
     combined = _combined_output(res)
     command_head = params.command[:_SUMMARY_COMMAND_LIMIT]
-    if res.timed_out:
+    if res.cancelled:
+        head = "exit code: (команда остановлена: фоновую задачу отменили)"
+        summary = "команда остановлена"
+    elif res.timed_out:
         head = "exit code: (таймаут)"
         summary = "таймаут команды"
     else:

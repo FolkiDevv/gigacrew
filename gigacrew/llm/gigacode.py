@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -232,7 +233,9 @@ class GigaCodeProvider(HttpProvider):
         self._token_file = token_path(config.gigacode_dir) if token_file is None else token_file
         self._session_id = str(uuid.uuid4())
         self._token: Token | None = None
-        self._sent_token: Token | None = None  # токен последнего запроса (для 401)
+        # Токен последнего запроса — у каждого потока свой: фоновые суб-агенты шлют запросы
+        # параллельно с основным агентом, а повтор после 401 сверяет токен своего запроса.
+        self._sent = threading.local()
         self._catalogue: Catalogue | None = None
 
     @property
@@ -418,10 +421,11 @@ class GigaCodeProvider(HttpProvider):
         if force:
             # Отвергнут токен, ушедший в прошлом запросе, а не текущий: хук перед повтором
             # мог уже положить в файл новый.
-            token = self._reload_rejected(self._sent_token or self._current_token())
+            sent: Token | None = getattr(self._sent, "token", None)
+            token = self._reload_rejected(sent or self._current_token())
         else:
             token = self._current_token()
-        self._sent_token = token
+        self._sent.token = token
         return {"Authorization": f"Bearer {token.access_token}"}
 
     @property

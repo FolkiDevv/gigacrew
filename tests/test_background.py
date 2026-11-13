@@ -15,16 +15,19 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from gigacrew.agent import loop
+from gigacrew.agent.background import SubagentJob
 from gigacrew.agent.conversation import BACKGROUND_HEADER, request_text
 from gigacrew.agent.reviewer import recent_requests
 from gigacrew.cli import repl
 from gigacrew.cli.app import EXIT_OK, run_oneshot
 from gigacrew.cli.commands import CommandRegistry, default_commands
+from gigacrew.cli.interrupt import EscInterrupt
 from gigacrew.cli.prompt import StatusInfo, create_prompt_session
 from gigacrew.cli.reader import BackgroundWakeError, PromptReader
 from gigacrew.config import Config
 from gigacrew.llm.types import AssistantTurn, Message, ToolSpec
 from gigacrew.project.workspace import Workspace
+from gigacrew.security import RiskLevel
 from gigacrew.tools import jobs as jobs_module
 from gigacrew.tools import process as process_module
 from gigacrew.tools import shell as shell_module
@@ -323,6 +326,33 @@ def test_job_taken_off_queue_holds_its_slot_before_launch() -> None:
     assert not third.started
 
 
+class StoppedBeforeLaunch(FakeJob):
+    """Задача, которую останавливают после снятия с очереди, но до запуска."""
+
+    def __init__(self, jobs: BackgroundJobs) -> None:
+        super().__init__("снята и остановлена")
+        self._jobs = jobs
+
+    @override
+    def launch(self, on_finish: Callable[[Job], None]) -> None:
+        self._jobs.stop(self, "пользователь остановил", quiet=True)
+        super().launch(on_finish)
+
+
+def test_job_stopped_between_queue_and_launch_never_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jobs_module, "STOP_GRACE", 0.05)
+    jobs = BackgroundJobs({jobs_module.SUBAGENT_POOL: PoolLimits(running=1, queued=1)})
+    first = FakeJob()
+    waiting = StoppedBeforeLaunch(jobs)
+    jobs.start(first)
+    jobs.start(waiting)
+    first.done()  # снята с очереди — и тут же остановлена, до запуска
+    assert not waiting.started
+    assert _state(waiting) is JobState.STOPPED
+
+
 def test_stop_all_forget_clears_chat_jobs() -> None:
     jobs = BackgroundJobs()
     job = FakeJob()
@@ -602,6 +632,86 @@ def test_stopped_background_subagent_runs_no_more_tools(
     assert fake.runs == 0
     assert "stopped before it finished" in _report(job).content
     assert not _jobs(agent).pending()  # итог получил вызов background_stop
+
+
+class StopDuringReview(FakeTool):
+    """Инструмент, пока оценивается вызов которого фоновую задачу останавливают.
+
+    Так же вызов может ждать рецензента или хук PreToolUse, когда приходит остановка.
+    """
+
+    def __init__(self, stop: Callable[[], object]) -> None:
+        super().__init__()
+        self._stop = stop
+
+    @override
+    def risk(self, params: Any, ctx: ToolContext) -> RiskLevel:
+        self._stop()
+        return RiskLevel.WRITE
+
+
+def test_subagent_stopped_while_call_waits_does_not_run_it(tmp_path: Path) -> None:
+    agents: list[loop.Agent] = []
+    fake = StopDuringReview(lambda: _job(_jobs(agents[0])).request_stop("остановлена"))
+    registry = build_default_registry()
+    registry.register(fake)
+    provider = BackgroundProvider(
+        [_bg_task("почини", "general"), text_turn("ок")],
+        background=[tool_turn("fake_write", {}), text_turn("готово")],
+    )
+    agents.append(_agent(provider, tmp_path, registry=registry))
+    agents[0].run_turn("почини в фоне")
+    _join_job_thread("bg1")
+    assert fake.runs == 0  # разрешение получено, но задачу уже остановили
+    assert _state(_job(_jobs(agents[0]))) is JobState.STOPPED
+
+
+@posix_only
+def test_stopping_background_subagent_kills_its_running_command(tmp_path: Path) -> None:
+    provider = BackgroundProvider(
+        [_bg_task("собери", "general"), text_turn("жду")],
+        background=[tool_turn("run_shell", {"command": "sleep 30"})],
+    )
+    agent = _agent(provider, tmp_path)  # -y: команда выполняется без вопроса
+    agent.run_turn("собери в фоне")
+    jobs = _jobs(agent)
+    job = _job(jobs)
+    assert isinstance(job, SubagentJob)
+    deadline = time.monotonic() + 10
+    while "run_shell" not in job.activity() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert "run_shell" in job.activity()
+    time.sleep(0.3)  # команда запущена
+    started = time.monotonic()
+    assert jobs.stop(job, "не нужна")
+    _join_job_thread("bg1")
+    assert time.monotonic() - started < 10  # sleep 30 убит, суб-агент завершился
+    assert _state(job) is JobState.STOPPED
+
+
+def test_finish_background_stops_jobs_left_after_wake_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jobs_module, "HARD_STOP_GRACE", 0)
+    later = FakeJob("долгая", timeout=3)
+    agents: list[loop.Agent] = []
+
+    def start_later(requests: int) -> None:
+        if requests == 0:
+            _jobs(agents[0]).start(later)  # ход по готовности запустил новую долгую задачу
+
+    provider = HookedProvider([text_turn("учёл и запустил ещё")], start_later)
+    agent, ui = _repl_env(tmp_path, provider)
+    agents.append(agent)
+    first = FakeJob("первая")
+    _jobs(agent).start(first)
+    first.done("итог")
+    started = time.monotonic()
+    repl.finish_background(agent, ui, EscInterrupt(enabled=False), limit=1)
+    assert time.monotonic() - started < 2  # не ждёт задачу, итог которой уже не доставить
+    assert provider.calls == 1
+    assert _state(later) is JobState.STOPPED
 
 
 def test_background_subagents_wait_in_queue(tmp_path: Path) -> None:

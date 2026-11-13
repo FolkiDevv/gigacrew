@@ -93,6 +93,7 @@ class McpServer:
         self._version = version
         self._client: McpClient | None = None
         self._lock = threading.Lock()
+        self._reconnect_lock = threading.Lock()  # переподключает упавший сервер один поток
         self._closed = False
         self.about: ServerInfo | None = None  # что сервер сообщил о себе при рукопожатии
         self.tools: list[dict[str, Any]] = []  # описания инструментов из tools/list
@@ -160,7 +161,7 @@ class McpServer:
         выдано другому инструменту. Следующий вызов оценится уже по новым пометкам.
         """
         if not self.connected and not self._closed:
-            self.connect()
+            self._reconnect()
             self._check_unchanged(tool, hints)
         client = self._client
         if client is None or not self.connected:
@@ -190,6 +191,16 @@ class McpServer:
                 f"<mcp_instructions>\n{clipped}\n</mcp_instructions>",
             )
         return "\n".join(parts)
+
+    def _reconnect(self) -> None:
+        """Переподключить упавший сервер.
+
+        Вызовы идут и из фоновых суб-агентов: переподключает один поток, остальные ждут его и
+        не закрывают только что открытую им сессию.
+        """
+        with self._reconnect_lock:
+            if not self.connected and not self._closed:
+                self.connect()
 
     def _check_unchanged(self, tool: str, hints: dict[str, Any] | None) -> None:
         """После перезапуска пометки инструмента — те же, по которым разрешён вызов."""

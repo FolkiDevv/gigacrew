@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from gigacrew.security import subprocess_env
+from gigacrew.tools.cancel import current_cancel
 
 # Сколько ждать закрытия вывода после выхода команды, прежде чем считать,
 # что его держат фоновые потомки.
@@ -49,6 +50,8 @@ _GROUP_POLL_SECONDS = 0.01
 _CAPTURE_LIMIT = 200_000
 # Сколько байт канала читать за раз.
 _READ_CHUNK_BYTES = 65536
+# Как часто проверять флаг отмены, пока команда работает (фоновый суб-агент).
+_CANCEL_POLL_SECONDS = 0.1
 # Состояния процесса в /proc/<pid>/stat, которые не считаются живыми: зомби и мёртвый.
 _DEAD_STATES = frozenset((b"Z", b"X"))
 
@@ -124,6 +127,7 @@ class ProcessResult:
     killed_background: bool = False  # после выхода остались фоновые потомки — убиты
     # Вывод держит процесс, ушедший из группы (setsid): остановить его не удалось.
     escaped_output: bool = False
+    cancelled: bool = False  # остановлена флагом отмены (фоновую задачу отменили)
 
 
 def _kill_group(proc: subprocess.Popen[bytes]) -> None:
@@ -295,18 +299,26 @@ def _supervise(
     proc: subprocess.Popen[bytes],
     readers: list[threading.Thread],
     timeout: float,
+    cancel: threading.Event | None = None,
 ) -> tuple[bool, bool, bool]:
     """Ждёт завершения команды и её вывода, убивает оставшихся в группе потомков.
 
-    Возвращает флаги: таймаут, убиты фоновые потомки, вывод держит процесс вне группы.
+    ``cancel`` — флаг отмены: поднят — команда убивается, как по таймауту.
+    Возвращает флаги: таймаут (или отмена), убиты фоновые потомки, вывод держит процесс
+    вне группы.
     """
     timed_out = False
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_group(proc)
-        proc.wait()
+    deadline = time.monotonic() + timeout
+    poll = timeout if cancel is None else _CANCEL_POLL_SECONDS
+    while proc.poll() is None:
+        left = deadline - time.monotonic()
+        if left <= 0 or (cancel is not None and cancel.is_set()):
+            timed_out = True
+            _kill_group(proc)
+            proc.wait()
+            break
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=min(left, poll))
     # Команда завершилась, но вывод может держать фоновый потомок (`cmd &`).
     alive = _join_readers(readers)
     # Потомки в группе команды убиваются, даже если вывод они не держат
@@ -350,8 +362,11 @@ def run_process(
 
     ``stdin_text`` — текст на stdin (UTF-8). Он пишется во временный файл, а не в канал:
     без потока-писателя, который мог бы заблокироваться на процессе, не читающем
-    stdin. ``extra_env`` добавляется к окружению после фильтра секретов.
+    stdin. ``extra_env`` добавляется к окружению после фильтра секретов. Флаг отмены
+    потока (:func:`~gigacrew.tools.cancel.current_cancel`, у фонового суб-агента): поднят —
+    команда убивается, итог — ``cancelled``.
     """
+    cancel = current_cancel()
     env = subprocess_env(environ)
     if extra_env:
         env.update(extra_env)
@@ -367,7 +382,7 @@ def run_process(
         ]
         for reader in readers:
             reader.start()
-        timed_out, killed_background, escaped = _supervise(proc, readers, timeout)
+        timed_out, killed_background, escaped = _supervise(proc, readers, timeout, cancel)
     except BaseException:  # Ctrl+C или сбой запуска читателей
         _kill_group(proc)
         proc.wait()
@@ -375,13 +390,15 @@ def run_process(
     finally:
         _close_streams(proc, readers)
 
+    # Убита по флагу отмены, а не по таймауту: флаг поднят.
     return ProcessResult(
         returncode=None if timed_out else proc.returncode,
         stdout=quote_reminder_tags(out.text()),
         stderr=quote_reminder_tags(err.text()),
-        timed_out=timed_out,
+        timed_out=timed_out and not (cancel is not None and cancel.is_set()),
         killed_background=killed_background,
         escaped_output=escaped,
+        cancelled=timed_out and cancel is not None and cancel.is_set(),
     )
 
 

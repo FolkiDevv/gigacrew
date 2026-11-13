@@ -129,6 +129,7 @@ from gigacrew.project.workspace import Workspace
 from gigacrew.safety import CommandLevel, Verdict
 from gigacrew.security import RiskLevel, SandboxError
 from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
+from gigacrew.tools.cancel import cancellation
 from gigacrew.tools.fs import write_atomic
 from gigacrew.tools.jobs import BackgroundJobs, Job, JobCancelledError, JobInfo, job_info
 from gigacrew.tools.plan import PlanReview, review_plan
@@ -1920,7 +1921,11 @@ class Agent:
         return turn
 
     def _stream_delta(self, streamed: list[str], text: str, *, quiet: bool) -> None:
-        """Кусок потокового ответа: в ``streamed`` и, если ответ не тихий, — на экран."""
+        """Кусок потокового ответа: в ``streamed`` и, если ответ не тихий, — на экран.
+
+        Фоновый суб-агент, которого остановили, обрывает поток сразу.
+        """
+        self._check_cancel()
         streamed.append(text)
         if not quiet:
             self._events.on_stream_delta(text)
@@ -2189,6 +2194,11 @@ class Agent:
         if moved is not None:
             return self._fail(call, "файл плана пишет другая сессия", model_text=moved, note=note)
 
+        if self._cancel is not None and self._cancel.is_set():
+            # Фоновую задачу остановили, пока вызов ждал рецензента или хук: не запускать.
+            self._journal_end(journal, interrupted=True)
+            raise JobCancelledError
+
         # 3) Выполнение
         tool_result: ToolResult | None = None
         error = ""
@@ -2338,7 +2348,9 @@ class Agent:
         """Фоновый суб-агент до отчёта (в потоке задачи); отмена — JobCancelledError."""
         child = self._new_subagent(spec, job.events, cancel=job.cancel_event)
         try:
-            text = child.run_turn(prompt)
+            # Команды и хуки суб-агента убиваются, как только задачу остановят.
+            with cancellation(job.cancel_event):
+                text = child.run_turn(prompt)
         except LLMError as exc:
             return model_error_report(spec, exc, job.events.trail)
         return subagent_report(spec, text, child.last_turn, job.events.trail)

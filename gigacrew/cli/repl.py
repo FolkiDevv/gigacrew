@@ -93,18 +93,10 @@ def finish_background(
     if jobs is None:
         return
     wakes = 0
-    while True:
-        if not jobs.pending(waking=True):
-            active = jobs.active()
-            if not active:
-                return
-            ids = ", ".join(job.id for job in active)
-            with interrupt, ui.progress(f"жду фоновые задачи ({ids})"):
-                waited = False
-                while not waited:
-                    waited = jobs.wait(_WAIT_SLICE)
-            continue
+    while jobs.active() or jobs.pending(waking=True):
         if wakes >= limit:
+            # Лимит — до ожидания: итог задачи, запущенной последним ходом, агент уже не
+            # получит, и ждать её до конца таймаута незачем.
             stopped = agent.stop_background(EXIT_REASON)
             ids = ", ".join(job.id for job in stopped) or "—"
             ui.warn(
@@ -112,6 +104,13 @@ def finish_background(
                 f"больше не жду; остановлены: {ids}",
             )
             return
+        if not jobs.pending(waking=True):
+            ids = ", ".join(job.id for job in jobs.active())
+            with interrupt, ui.progress(f"жду фоновые задачи ({ids})"):
+                waited = False
+                while not waited:
+                    waited = jobs.wait(_WAIT_SLICE)
+            continue
         wakes += 1
         ui.print()
         with interrupt:

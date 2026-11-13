@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
@@ -502,6 +503,22 @@ def test_chat_http401_rereads_the_token_file(tmp_path: Path) -> None:
     backend.valid = {"tok-3"}
     write_token(tmp_path, "tok-3")
     assert provider.complete(_msgs()).message.content == "ok"  # и без потока — так же
+
+
+def test_http401_retry_checks_the_token_this_thread_sent(tmp_path: Path) -> None:
+    provider = _provider(Backend(), tmp_path)
+    assert provider._auth_headers() == {"Authorization": "Bearer tok-1"}  # основной поток
+    write_token(tmp_path, "tok-2")
+
+    def background_request() -> None:
+        provider._token = None  # хук PreRequest обновил файл — токен перечитывается
+        provider._auth_headers()  # фоновый суб-агент отправил tok-2
+
+    worker = threading.Thread(target=background_request)
+    worker.start()
+    worker.join()
+    # Чат отверг tok-1 основного потока: повтор берёт новый токен, а не «тот же токен».
+    assert provider._auth_headers(force=True) == {"Authorization": "Bearer tok-2"}
 
 
 def test_chat_http401_with_the_same_token_asks_to_log_in(tmp_path: Path) -> None:

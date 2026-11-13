@@ -229,10 +229,23 @@ class Job(ABC):
         return ended - started
 
     def launch(self, on_finish: Callable[[Job], None]) -> None:
-        """Запустить работу; ``on_finish`` — кого известить об итоге (из потока задачи)."""
+        """Запустить работу; ``on_finish`` — кого известить об итоге (из потока задачи).
+
+        Задачу остановили раньше (снята с очереди, но ещё не запущена) — работа не
+        начинается, итог — «остановлена». Запуск и остановка решают это под одной
+        блокировкой: остановка либо застаёт задачу запущенной и отменяет её, либо
+        запрещает запуск.
+        """
         self._on_finish = on_finish
-        self._started = time.monotonic()
-        self.start()
+        with self._lock:
+            allowed = self.stop_request is None and self._report is None
+            if allowed:
+                self._started = time.monotonic()
+        if allowed:
+            self.start()
+            return
+        state, reason = self.stop_request or (JobState.STOPPED, "")
+        self.finish(self.stopped_report(state, reason))
 
     def wait(self, timeout: float | None = None) -> bool:
         """Ждать итога не дольше ``timeout`` секунд; True — итог есть."""
@@ -244,7 +257,9 @@ class Job(ABC):
             if self._report is not None or self.stop_request is not None:
                 return False
             self.stop_request = (state, reason)
-        if self._started is not None:
+            started = self._started is not None
+        # Не запущенную задачу отменять нечем: launch увидит запрос и не запустит её.
+        if started:
             self.cancel()
         return True
 
