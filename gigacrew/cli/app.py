@@ -52,7 +52,13 @@ from gigacrew.cli.models import (
     measure_context_window,
     save_window,
 )
-from gigacrew.cli.repl import autosave, esc_interrupt_for, run_repl
+from gigacrew.cli.repl import (
+    autosave,
+    esc_interrupt_for,
+    finish_background,
+    run_repl,
+    stopping_background,
+)
 from gigacrew.config import Config, ConfigError
 from gigacrew.llm.api import ApiProvider
 from gigacrew.llm.base import LLMError, LLMProvider
@@ -231,13 +237,19 @@ def run_oneshot(
     """Один ход; хуки SessionStart/SessionEnd — вокруг него.
 
     SessionEnd — после сохранения чата. ``resumed`` — чат продолжен (``-c``/``-r``).
+    Фоновые задачи, запущенные в ходе, gigacrew дожидается и передаёт агенту их итоги
+    (:func:`~gigacrew.cli.repl.finish_background`); при выходе остановлены все.
     """
     esc = esc_interrupt_for(ui, agent=agent)
     source = "resume" if resumed else "startup"
-    with hook_session(agent, ui, source=source, end_reason="other"):
+    stopped = False
+    hooked = hook_session(agent, ui, source=source, end_reason="other")
+    with hooked, stopping_background(agent, chats, ui):
         try:
             with esc:
                 agent.run_turn(prompt)
+            # Код выхода — и по ходу пользователя, и по ходам по готовности фоновых задач.
+            stopped = finish_background(agent, ui, esc)
         except (PromptBlockedError, LLMError) as error:
             ui.stop_live()
             if isinstance(error, PromptBlockedError):
@@ -255,8 +267,7 @@ def run_oneshot(
             return EXIT_ERROR
         finally:
             autosave(chats, agent, ui)
-    stats = agent.last_turn
-    return EXIT_STOPPED if stats is not None and stats.stop_reason else EXIT_OK
+    return EXIT_STOPPED if stopped else EXIT_OK
 
 
 def run_test_context(

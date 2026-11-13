@@ -20,6 +20,7 @@ from typing import Literal
 
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, ToolResult
+from gigacrew.tools.jobs import JobInfo
 from gigacrew.tools.questions import Answer, Question, QuestionsUnavailableError
 
 NoticeLevel = Literal["info", "warn", "error"]
@@ -278,6 +279,14 @@ class AgentEvents:
 
     def on_subagent_end(self, subagent: SubagentInfo, stats: TurnStats | None) -> None:
         """Суб-агент закончил (вызывается всегда). None — прерван исключением."""
+
+    # --- фоновые задачи ---
+    def on_background_end(self, job: JobInfo) -> None:
+        """Итог фоновой задачи передан модели (во время хода или ходом по её готовности).
+
+        Вызывается из основного потока, один раз на задачу; задачи, итог которых модель
+        получила через ``background_output``/``background_stop``, сюда не приходят.
+        """
 
     # --- хуки пользователя ---
     def on_hook_start(self, event: str, command: str) -> None:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
+from pathlib import Path
 from typing import override
 
 from pydantic import BaseModel, Field, PrivateAttr
@@ -16,14 +18,28 @@ from gigacrew.security import (
     subprocess_env,
 )
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
+from gigacrew.tools.cancel import time_left
 from gigacrew.tools.grep_search import GrepSearch, as_grep_search
-from gigacrew.tools.process import ProcessResult, run_process, truncate_middle
+from gigacrew.tools.jobs import SHELL_POOL, BackgroundJobs, Job, JobReport, JobState
+from gigacrew.tools.process import (
+    BackgroundProcess,
+    ProcessResult,
+    quote_reminder_tags,
+    run_process,
+    truncate_middle,
+)
 from gigacrew.tools.search import search_paths
 
 _MAX_OUTPUT = 30_000
 MIN_TIMEOUT = 1
 MAX_TIMEOUT = 600
 _DEFAULT_TIMEOUT = 120
+# Предел фоновой команды (run_in_background): сборка, долгие тесты.
+MAX_BACKGROUND_TIMEOUT = 3600
+# Сколько вывода фоновой команды модель получает в итоге (остальное — пропуск в середине).
+_REPORT_OUTPUT = 8_000
+# Сколько последних символов вывода смотреть, чтобы показать его последнюю строку.
+_ACTIVITY_CHARS = 200
 # Коды оболочки: команда не запускается (126) или не найдена (127).
 _SHELL_FAILURES = (126, 127)
 # Сколько символов вызова показывать в UI (describe) и в кратком итоге команды.
@@ -43,7 +59,10 @@ class RunShellParams(BaseModel):  # noqa: D101
     command: str = Field(description="Command to run with /bin/sh")
     timeout: int = Field(
         default=_DEFAULT_TIMEOUT,
-        description=f"Timeout in seconds ({MIN_TIMEOUT}–{MAX_TIMEOUT})",
+        description=(
+            f"Timeout in seconds ({MIN_TIMEOUT}–{MAX_TIMEOUT}; with run_in_background up to "
+            f"{MAX_BACKGROUND_TIMEOUT})"
+        ),
     )
     cwd: str = Field(
         default="",
@@ -57,6 +76,15 @@ class RunShellParams(BaseModel):  # noqa: D101
         description=(
             "What the command is for, in a few words in the user's language (shown when "
             "the user is asked to confirm it)"
+        ),
+    )
+    run_in_background: bool = Field(
+        default=False,
+        description=(
+            "Run without waiting: returns a job id at once, the command keeps running (up "
+            "to timeout) while you continue; its exit code and output are delivered to you "
+            "automatically when it finishes. For long builds and test runs when you have "
+            "other work meanwhile — not when your next step needs the result"
         ),
     )
     _planned: GrepSearch | None = PrivateAttr(None)
@@ -181,7 +209,7 @@ def _combined_output(res: ProcessResult) -> str:
     return truncate_middle(combined, _MAX_OUTPUT)
 
 
-def _notes(res: ProcessResult, timeout: int) -> list[str]:
+def _notes(res: ProcessResult | BackgroundProcess, timeout: int) -> list[str]:
     """Пояснения к итогу команды: остановленные фоновые процессы, таймаут."""
     notes: list[str] = []
     if res.killed_background:
@@ -198,6 +226,106 @@ def _notes(res: ProcessResult, timeout: int) -> list[str]:
             "он продолжает работать, его вывод сюда больше не попадёт",
         )
     return notes
+
+
+def _exit_state(process: BackgroundProcess) -> tuple[JobState, str]:
+    """Состояние итога команды, завершившейся без запроса остановки, и его причина."""
+    if process.error:
+        return JobState.FAILED, f"supervising the command failed ({process.error}); it was killed"
+    if process.timed_out:
+        return JobState.TIMED_OUT, ""
+    return JobState.DONE, ""
+
+
+class ShellJob(Job):
+    """Команда ``run_shell`` в фоне: вывод копится, модель читает его частями."""
+
+    pool = SHELL_POOL
+
+    def __init__(self, command: str, *, cwd: Path, timeout: int) -> None:
+        """Команда ``command`` в каталоге ``cwd`` с пределом ``timeout`` секунд."""
+        super().__init__("shell", command[:_SUMMARY_COMMAND_LIMIT], timeout=timeout)
+        self._command = command
+        self._cwd = cwd
+        self._process: BackgroundProcess | None = None
+        self._read_lock = threading.Lock()
+        self._read_to = 0  # до какой позиции вывод уже отдан модели
+
+    @override
+    def start(self) -> None:
+        # Оболочка — суть инструмента: команду до запуска проверили классификатор и права.
+        process = BackgroundProcess(  # noqa: S604
+            self._command,
+            cwd=self._cwd,
+            timeout=self.timeout,
+            shell=True,
+            on_exit=self._exited,
+        )
+        self._process = process
+        if self.stop_request is not None:
+            # Остановили, пока команда запускалась: cancel() не застал процесс.
+            process.kill()
+
+    @override
+    def cancel(self) -> None:
+        if self._process is not None:
+            self._process.kill()
+
+    @override
+    def stopped_report(self, state: JobState, reason: str) -> JobReport:
+        return self._build_report(state, reason)
+
+    @override
+    def progress(self) -> str:
+        output = self._unread(_MAX_OUTPUT)
+        return f"New output since the last check:\n{output}" if output else "No new output."
+
+    @override
+    def activity(self) -> str:
+        if self._process is None:
+            return ""
+        output = self._process.output
+        tail, _ = output.read(max(output.total - _ACTIVITY_CHARS, 0))
+        lines = [line.strip() for line in tail.splitlines() if line.strip()]
+        return lines[-1] if lines else ""
+
+    def _exited(self, process: BackgroundProcess) -> None:
+        """Команда завершилась (вызывает надзиратель процесса, из своего потока).
+
+        Процесс — аргументом: быстрая команда завершается раньше, чем :meth:`start`
+        сохранит его, а итог должен содержать её код и вывод.
+        """
+        self._process = process
+        self.finish(self._build_report(*(self.stop_request or _exit_state(process))))
+
+    def _unread(self, limit: int) -> str:
+        """Вывод, который модель ещё не видела (середина длинного — пропущена)."""
+        if self._process is None:
+            return ""
+        with self._read_lock:
+            text, end = self._process.output.read(self._read_to)
+            self._read_to = end
+        return truncate_middle(quote_reminder_tags(text), limit, head=limit // 4)
+
+    def _build_report(self, state: JobState, reason: str) -> JobReport:
+        process = self._process
+        code = None if process is None else process.returncode
+        if state is JobState.DONE:
+            head = f"exit code: {code}"
+            summary = f"$ {self.title} → код {code}"
+        elif state is JobState.TIMED_OUT:
+            head = f"exit code: (timeout: stopped after {self.timeout} s)"
+            summary = f"$ {self.title} → таймаут"
+        elif state is JobState.FAILED:
+            head = f"failed: {reason}"
+            summary = f"$ {self.title} → сбой"
+        else:
+            head = f"stopped before it finished: {reason}"
+            summary = f"$ {self.title} → остановлена"
+        notes = [] if process is None else _notes(process, int(self.timeout))
+        note_text = "".join(f"\n[{note}]" for note in notes)
+        output = self._unread(_REPORT_OUTPUT) or "(no new output)"
+        return JobReport(state, f"{head}{note_text}\n{output}", summary)
 
 
 class RunShellTool(Tool[RunShellParams]):
@@ -254,6 +382,8 @@ class RunShellTool(Tool[RunShellParams]):
         """Команда (с рабочим каталогом, если он не корень) для UI."""
         cwd = params.cwd.strip()
         prefix = "" if cwd in {"", "."} else f"[{cwd}] "
+        if params.run_in_background:
+            prefix = f"(в фоне) {prefix}"
         return f"{prefix}{params.command}"[:_DESCRIBE_LIMIT]
 
     @override
@@ -277,7 +407,13 @@ class RunShellTool(Tool[RunShellParams]):
         (:func:`_grep_substitute`). Поиск, разрешённый при оценке
         (:attr:`RunShellParams.planned`), не превращается в команду. Команда проверяется
         заново: если с оценки в дереве появились секреты, вместо неё выполняется поиск.
+        С ``run_in_background`` команда запускается фоновой задачей и вызов сразу
+        возвращает её id; встроенный поиск быстрый — он выполняется сразу.
         """
+        if params.run_in_background and ctx.background is None:
+            raise ToolError(
+                "фоновые команды здесь недоступны — запусти команду без run_in_background.",
+            )
         search = params.planned or _grep_substitute(params, ctx)
         if search is not None:
             return _search_result(params.command, search, ctx)
@@ -285,19 +421,27 @@ class RunShellTool(Tool[RunShellParams]):
 
 
 def _execute(params: RunShellParams, ctx: ToolContext) -> ToolResult:
-    """Выполняет команду через /bin/sh: код возврата и вывод для модели."""
-    timeout = min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)
+    """Выполняет команду через /bin/sh: код возврата и вывод для модели (или фоновая задача)."""
     cwd = (ctx.root / _relative_cwd(params, ctx)).resolve()
     # Папка временных файлов модели есть к запуску команды: не нужен лишний шаг с mkdir.
     # Не вышло (симлинк, нет прав) — команда всё равно выполняется.
     with contextlib.suppress(OSError):
         ctx.workspace.ensure_temp_dir()
+    if params.run_in_background and ctx.background is not None:
+        return _start_background(params, ctx.background, cwd)
+    # Команда фонового суб-агента не переживает его предела времени: после него — отчёт.
+    timeout = int(time_left(min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)))
+    timeout = max(timeout, MIN_TIMEOUT)
     # Оболочка — суть инструмента: команду до запуска проверяют классификатор и права.
+    # У фонового суб-агента команда убивается, как только его остановят (флаг потока).
     res = run_process(params.command, cwd=cwd, timeout=timeout, shell=True)  # noqa: S604
 
     combined = _combined_output(res)
     command_head = params.command[:_SUMMARY_COMMAND_LIMIT]
-    if res.timed_out:
+    if res.cancelled:
+        head = "exit code: (команда остановлена: фоновую задачу отменили)"
+        summary = "команда остановлена"
+    elif res.timed_out:
         head = "exit code: (таймаут)"
         summary = "таймаут команды"
     else:
@@ -317,4 +461,21 @@ def _execute(params: RunShellParams, ctx: ToolContext) -> ToolResult:
         soft=not ok and not res.timed_out and res.returncode not in _SHELL_FAILURES,
         display=Display(combined, title=f"$ {command_head}") if combined else None,
         exit_code=None if res.timed_out else res.returncode,
+    )
+
+
+def _start_background(params: RunShellParams, jobs: BackgroundJobs, cwd: Path) -> ToolResult:
+    """Запустить команду фоновой задачей; результат вызова — её id."""
+    timeout = min(max(params.timeout, MIN_TIMEOUT), MAX_BACKGROUND_TIMEOUT)
+    job = ShellJob(params.command, cwd=cwd, timeout=timeout)
+    job_id = jobs.start(job)
+    return ToolResult(
+        content=(
+            f"Started in the background as job {job_id} (timeout {timeout} s). Continue with "
+            "other work: its exit code and output will be delivered to you automatically when "
+            "it finishes — do not poll it. If you have nothing else to do until then, end your "
+            "turn: you will be woken with the result. background_output shows its output so "
+            "far, background_stop stops it."
+        ),
+        summary=f"в фоне {job_id}: $ {job.title}",
     )

@@ -32,6 +32,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from gigacrew.agent.compaction import clip_middle
+from gigacrew.agent.conversation import without_background
 from gigacrew.agent.events import Review
 from gigacrew.agent.prompts import REVIEWER_PROMPT
 from gigacrew.llm.base import LLMError, LLMProvider
@@ -92,8 +93,11 @@ class ReviewError(LLMError):
 # ------------------------------- запрос ------------------------------- #
 def recent_requests(messages: Sequence[Message], limit: int = MAX_REQUESTS) -> list[str]:
     """Последние ``limit`` запросов пользователя (без служебных сообщений harness'а)."""
+    # Итоги фоновых задач, дописанные к запросу, — не слова пользователя.
     requests = [
-        message.content for message in messages if message.is_request and message.content.strip()
+        without_background(message.content)
+        for message in messages
+        if message.is_request and message.content.strip()
     ]
     return requests[-limit:]
 

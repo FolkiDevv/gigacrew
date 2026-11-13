@@ -24,6 +24,11 @@ INTERRUPTED_NOTE = "Execution was interrupted by the user (Ctrl+C). No result."
 # пользователя: по ней блок отрезается при показе запроса (заголовок чата, продолжение).
 HOOK_CONTEXT_HEADER = "Context from the user's UserPromptSubmit hooks:"
 _HOOK_CONTEXT_TAIL = f"\n\n<system-reminder>\n{HOOK_CONTEXT_HEADER}\n"
+# Первая строка блока с итогами фоновых задач, который harness дописывает к последнему
+# сообщению истории (:meth:`Conversation.append_note`): по ней блок отрезается от запроса
+# пользователя при показе и для рецензента команд.
+BACKGROUND_HEADER = "# Background jobs finished"
+_BACKGROUND_TAIL = f"\n\n<system-reminder>\n{BACKGROUND_HEADER}\n"
 # Версии формата, которые читает :meth:`Conversation.from_dict`.
 _READABLE_VERSIONS = (1, 2)
 
@@ -74,9 +79,16 @@ def _clean_message(message: Message) -> Message:
 
 
 def request_text(content: str) -> str:
-    """Текст запроса пользователя для показа — без контекста хуков UserPromptSubmit."""
-    head, found, _ = content.partition(_HOOK_CONTEXT_TAIL)
-    return head if found else content
+    """Текст запроса пользователя для показа — без заметок harness'а.
+
+    Отрезаются контекст хуков UserPromptSubmit и итоги фоновых задач.
+    """
+    return without_background(content).partition(_HOOK_CONTEXT_TAIL)[0]
+
+
+def without_background(content: str) -> str:
+    """Сообщение без итогов фоновых задач, которые harness дописал к нему."""
+    return content.partition(_BACKGROUND_TAIL)[0]
 
 
 @dataclass(frozen=True)
@@ -202,6 +214,28 @@ class Conversation:
         self._messages.append(
             Message(role="function", name=name, content=clean_text(content), call_id=call_id),
         )
+
+    def can_append_note(self) -> bool:
+        """Есть куда дописать заметку (:meth:`append_note`).
+
+        Последнее сообщение — запрос или результат вызова, и оно не свёрнуто в краткое
+        содержание (иначе модель заметку не увидит).
+        """
+        if not self._messages or self._messages[-1].role not in {"user", "function"}:
+            return False
+        return self._summary is None or self._summary.upto < len(self._messages)
+
+    def append_note(self, note: str) -> None:
+        """Дописать заметку harness'а к последнему сообщению — запросу или результату вызова.
+
+        В отличие от заметки одного запроса, она остаётся в истории. ValueError — дописать
+        некуда (:meth:`can_append_note`).
+        """
+        if not self.can_append_note():
+            raise ValueError("заметку некуда дописать")
+        last = self._messages[-1]
+        content = clean_text(f"{last.content}\n\n{note}")
+        self._messages[-1] = last.model_copy(update={"content": content})
 
     # ------------------------------------------------------------------ #
     def pending_calls(self) -> list[FunctionCall]:

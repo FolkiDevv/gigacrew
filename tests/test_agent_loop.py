@@ -1969,12 +1969,12 @@ def test_resumed_compacted_chat_reports_estimated_context(tmp_path: Path) -> Non
     saved = Conversation()
     long_tail = "x" * 3_000
     saved.add_user(f"вопрос {long_tail}")
-    saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=9_000))
+    saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=20_000))
     saved.set_summary(Summary("СВОДКА", 2))  # чат сохранён после /compact
     agent = _agent(ScriptedProvider(), tmp_path)
     agent.reset(saved)
     estimate = agent.context_tokens
-    assert 0 < estimate < 9_000
+    assert 0 < estimate < 20_000
     assert agent.context_tokens == estimate  # посчитано один раз
 
 
@@ -2096,11 +2096,11 @@ def test_explicit_budget_is_not_scaled(tmp_path: Path) -> None:
 # --------------------------- счётчик контекста --------------------------- #
 def test_context_counts_cached_part_of_prompt(tmp_path: Path) -> None:
     """API не включил закешированную часть в prompt_tokens: контекст — их сумма."""
-    usage = Usage(prompt_tokens=300, precached_prompt_tokens=8_000, completion_tokens=50)
+    usage = Usage(prompt_tokens=300, precached_prompt_tokens=12_000, completion_tokens=50)
     events = RecordingEvents()
     agent = _agent(ScriptedProvider([text_turn("a", usage)]), tmp_path, events=events)
     agent.run_turn("x")
-    assert agent.context_tokens == events.stats[-1].context_tokens == 8_350
+    assert agent.context_tokens == events.stats[-1].context_tokens == 12_350
     assert agent.token_scale > 1  # калибровка — по полному размеру запроса
     assert agent.billed_tokens == 350  # оплата — как сообщил API
 

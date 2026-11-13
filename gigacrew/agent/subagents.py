@@ -44,6 +44,8 @@ MAX_SUBAGENTS_PER_TURN = 8
 # инструментов всё равно режутся до 2K символов.
 MAX_REPORT_CHARS = 8_000
 REJECTED_MARK = "отклонено пользователем"
+# Ошибка вызова, который некому подтвердить (запуск без клавиатуры, фоновый суб-агент).
+NO_ANSWER_MARK = "нет ответа на подтверждение"
 
 # Заметки для моделей — на английском, как и промпты (пользователь их не видит).
 SUBAGENT_STOP_NOTE = (
@@ -109,11 +111,26 @@ class SubagentTrail:
     # Прочие изменяющие операции: команды, изменяющий git.
     operations: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
+    # Не выполнено: нужно подтверждение, а спросить некого (фоновый суб-агент).
+    unconfirmed: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
         """Суб-агент что-то изменил: файлы или изменяющие операции."""
         return bool(self.changed_files or self.operations)
+
+    def record(self, call: ToolCallInfo, tool_result: ToolResult) -> None:
+        """Учесть результат вызова суб-агента."""
+        described = f"{call.name} {call.summary}".strip()
+        if tool_result.ok and tool_result.changed:
+            if call.kind is ToolKind.EDIT and call.summary:
+                self.changed_files.append(call.summary)
+            else:
+                self.operations.append(described)
+        elif not tool_result.ok and NO_ANSWER_MARK in tool_result.content:
+            self.unconfirmed.append(described)
+        elif not tool_result.ok and REJECTED_MARK in tool_result.content:
+            self.rejected.append(described)
 
     def lines(self) -> list[str]:
         """Строки фактов для отчёта (повторы убраны, порядок сохранён)."""
@@ -127,6 +144,9 @@ class SubagentTrail:
         if self.rejected:
             rejected = "; ".join(dict.fromkeys(self.rejected))
             out.append(f"Rejected by the user: {rejected}")
+        if self.unconfirmed:
+            unconfirmed = "; ".join(dict.fromkeys(self.unconfirmed))
+            out.append(f"Not run, needs the user's confirmation: {unconfirmed}")
         return out
 
 
@@ -182,13 +202,7 @@ class SubagentEvents(AgentEvents):
         *,
         previewed: bool,
     ) -> None:
-        if tool_result.ok and tool_result.changed:
-            if call.kind is ToolKind.EDIT and call.summary:
-                self.trail.changed_files.append(call.summary)
-            else:
-                self.trail.operations.append(f"{call.name} {call.summary}".strip())
-        elif not tool_result.ok and REJECTED_MARK in tool_result.content:
-            self.trail.rejected.append(f"{call.name} {call.summary}".strip())
+        self.trail.record(call, tool_result)
         self._parent.on_subagent_tool_result(self._subagent, call, tool_result, previewed=previewed)
 
     @override

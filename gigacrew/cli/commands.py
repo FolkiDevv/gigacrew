@@ -18,7 +18,7 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 
 from gigacrew.agent.chat_store import ChatInfo, ChatRecorder, ChatStoreError, SavedChat
-from gigacrew.agent.loop import Agent
+from gigacrew.agent.loop import CHAT_SWITCH_REASON, Agent
 from gigacrew.agent.prompts import skill_invocation_prompt
 from gigacrew.cli.approvals import PERMISSIONS_USAGE, permissions_command
 from gigacrew.cli.hooks import (
@@ -306,6 +306,32 @@ def _permissions(ctx: CommandContext, arg: str) -> bool:
     return permissions_command(ctx.agent, ctx.ui, arg)
 
 
+def _leave_chat(ctx: CommandContext) -> None:
+    """Перед сменой чата: остановить его фоновые задачи и сохранить их итоги в нём.
+
+    Иначе продолженный позже чат ждал бы итогов задач, которых уже нет.
+    """
+    agent = ctx.agent
+    jobs = agent.background
+    if jobs is None or not (jobs.active() or jobs.pending()):
+        return
+    stopped = agent.stop_background(CHAT_SWITCH_REASON)
+    if stopped:
+        ids = ", ".join(job.id for job in stopped)
+        ctx.ui.warn(f"остановлены фоновые задачи прежнего чата: {ids}")
+    if ctx.chats is not None:
+        save_chat(ctx.chats, agent, ctx.ui)
+
+
+def _load_leaving(ctx: CommandContext, chats: ChatRecorder, chat_id: str) -> SavedChat:
+    """Загрузить чат ``chat_id``, оставив текущий (:func:`_leave_chat`).
+
+    Сначала — уход: продолжают и этот же чат, и тогда он загружается уже с итогами задач.
+    """
+    _leave_chat(ctx)
+    return chats.store.load(chat_id)
+
+
 def _start_new_chat(ctx: CommandContext) -> None:
     """Сбросить историю агента и начать новый чат (для ``/clear``)."""
     if ctx.chats is None:
@@ -316,6 +342,7 @@ def _start_new_chat(ctx: CommandContext) -> None:
 
 
 def _clear(ctx: CommandContext, _arg: str) -> bool:
+    _leave_chat(ctx)
     restart_session(
         ctx.agent,
         ctx.ui,
@@ -395,11 +422,11 @@ def _resume(ctx: CommandContext, arg: str) -> bool:
     chats = ctx.chats
     try:
         chosen = _choose_chat(ctx, chats, arg)
-        if chosen is None:
-            return True
-        saved = chats.store.load(chosen.id)
+        saved = None if chosen is None else _load_leaving(ctx, chats, chosen.id)
     except ChatStoreError as error:
         ctx.ui.error(str(error))
+        return True
+    if saved is None:
         return True
     agent = ctx.agent
     previous = agent.model
@@ -455,6 +482,49 @@ def _hooks(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+TASKS_USAGE = "/tasks [stop <id…|all>]"
+# Почему задача остановлена — для модели: итог она получит со следующим запросом.
+_USER_STOP_REASON = "stopped by the user (/tasks stop)"
+
+
+def _tasks(ctx: CommandContext, arg: str) -> bool:
+    """Фоновые задачи чата; ``stop <id…|all>`` — остановить."""
+    jobs = ctx.agent.background
+    words = arg.split()
+    if words and words[0] == "stop" and len(words) > 1:
+        _stop_tasks(ctx, words[1:])
+    elif words:
+        ctx.ui.warn(f"использование: {TASKS_USAGE}")
+    else:
+        ctx.ui.background_jobs([] if jobs is None else jobs.jobs())
+    return True
+
+
+def _stop_tasks(ctx: CommandContext, targets: list[str]) -> None:
+    """Остановить задачи ``targets`` (id или ``all``); итоги агент получит без пробуждения."""
+    jobs = ctx.agent.background
+    if jobs is None:
+        return
+    everything = targets == ["all"]
+    chosen = jobs.active() if everything else []
+    unknown: list[str] = []
+    for target in () if everything else targets:
+        job = jobs.get(target)
+        if job is None:
+            unknown.append(target)
+        else:
+            chosen.append(job)
+    if unknown:
+        missing = ", ".join(unknown)
+        ctx.ui.warn(f"нет таких фоновых задач: {missing}")
+    stopped = [job.id for job in jobs.stop_many(chosen, _USER_STOP_REASON, quiet=True)]
+    if stopped:
+        ids = ", ".join(stopped)
+        ctx.ui.info(f"остановлены: {ids} — агент узнает об этом со следующим запросом")
+    elif chosen or everything:
+        ctx.ui.info("остановить нечего: задачи уже завершены")
+
+
 def _mcp(ctx: CommandContext, arg: str) -> bool:
     if arg:
         ctx.ui.error("использование: /mcp")
@@ -503,6 +573,7 @@ def default_commands() -> CommandRegistry:
         ),
         SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]"),
         SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"),
+        SlashCommand("/tasks", "фоновые задачи", _tasks, usage=TASKS_USAGE),
         SlashCommand("/mcp", "MCP-серверы и их инструменты", _mcp),
         SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")),
     ):

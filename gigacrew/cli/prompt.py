@@ -9,7 +9,11 @@ r"""Строка ввода REPL на prompt_toolkit.
   Esc Esc — очистить ввод (черновик сохраняется в истории);
   вставка многострочного текста не отправляет его;
 * Shift+Tab — сменить режим разрешений (авто ↔ план);
-* статус-строка: модель, режим, заполнение контекста, потраченные токены, ``-y``.
+* статус-строка: модель, режим, заполнение контекста, потраченные токены, ``-y``,
+  число незавершённых фоновых задач;
+* строку можно прервать из другого потока (:class:`~gigacrew.cli.reader.PromptReader`):
+  завершилась фоновая задача — агент продолжит работу сам, набранный текст вернётся в
+  строку ввода.
 
 Если stdin/stdout не терминал (pipe, CI) или prompt_toolkit не смог запуститься,
 используется обычный ``input()``.
@@ -36,6 +40,7 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 
+from gigacrew.cli.reader import PromptReader
 from gigacrew.permissions import PermissionMode
 from gigacrew.project.workspace import Workspace
 from gigacrew.ui.colors import prompt_color_depth, prompt_style
@@ -88,6 +93,7 @@ class StatusInfo:
     billed_tokens: int = 0
     auto_approve: bool = False
     mode: PermissionMode = PermissionMode.AUTO
+    background: int = 0  # незавершённые фоновые задачи
 
 
 def toolbar_fragments(status: StatusInfo) -> list[tuple[str, str]]:
@@ -111,6 +117,8 @@ def toolbar_fragments(status: StatusInfo) -> list[tuple[str, str]]:
         used, budget = format_tokens(status.context_tokens), format_tokens(status.context_budget)
         parts += [sep, ("", "контекст "), (style, f"{used}/{budget} ({percent}%)")]
     parts += [sep, ("", f"потрачено {format_tokens(status.billed_tokens)}")]
+    if status.background:
+        parts += [sep, ("class:toolbar.warn", f"фоновые задачи: {status.background}")]
     if status.auto_approve:
         parts += [sep, ("class:toolbar.danger", "⚠ авто-подтверждение")]
     return parts
@@ -317,11 +325,6 @@ def _read_plain(default: str = "") -> str:
     return default + input(PLAIN_PROMPT + default)  # noqa: WPS421
 
 
-def _read_line(session: PromptSession[str], default: str = "") -> str:
-    """Строка из prompt_toolkit; ``default`` — текст, которым заполнить ввод."""
-    return session.prompt(default=default)
-
-
 def make_input_reader(
     *,
     commands: CommandRegistry,
@@ -332,7 +335,7 @@ def make_input_reader(
     on_cycle_mode: Callable[[], object] | None = None,
     skills: SkillChoices | None = None,
 ) -> InputReader:
-    """Функция чтения строки: prompt_toolkit в терминале, иначе ``input()``."""
+    """Функция чтения строки: :class:`PromptReader` в терминале, иначе ``input()``."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return _read_plain
     try:
@@ -347,4 +350,4 @@ def make_input_reader(
         )
     except Exception:  # терминал не поддерживается (например, mintty без консоли)
         return _read_plain
-    return partial(_read_line, session)
+    return PromptReader(session)

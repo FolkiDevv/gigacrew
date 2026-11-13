@@ -34,7 +34,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, override
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from gigacrew.errors import ToolError
 from gigacrew.permissions import PermissionMode, ToolKind
@@ -93,6 +93,7 @@ class McpServer:
         self._version = version
         self._client: McpClient | None = None
         self._lock = threading.Lock()
+        self._reconnect_lock = threading.Lock()  # переподключает упавший сервер один поток
         self._closed = False
         self.about: ServerInfo | None = None  # что сервер сообщил о себе при рукопожатии
         self.tools: list[dict[str, Any]] = []  # описания инструментов из tools/list
@@ -160,8 +161,9 @@ class McpServer:
         выдано другому инструменту. Следующий вызов оценится уже по новым пометкам.
         """
         if not self.connected and not self._closed:
-            self.connect()
-            self._check_unchanged(tool, hints)
+            self._reconnect()
+        # Перезапустить сервер мог и другой поток (фоновый суб-агент) — проверка всегда.
+        self._check_unchanged(tool, hints)
         client = self._client
         if client is None or not self.connected:
             raise McpError(self.error or "сервер не подключён")
@@ -190,6 +192,16 @@ class McpServer:
                 f"<mcp_instructions>\n{clipped}\n</mcp_instructions>",
             )
         return "\n".join(parts)
+
+    def _reconnect(self) -> None:
+        """Переподключить упавший сервер.
+
+        Вызовы идут и из фоновых суб-агентов: переподключает один поток, остальные ждут его и
+        не закрывают только что открытую им сессию.
+        """
+        with self._reconnect_lock:
+            if not self.connected and not self._closed:
+                self.connect()
 
     def _check_unchanged(self, tool: str, hints: dict[str, Any] | None) -> None:
         """После перезапуска пометки инструмента — те же, по которым разрешён вызов."""
@@ -284,6 +296,21 @@ def _log_tail(path: Path | None) -> str:
 # Без docstring: он ушёл бы в JSON-схему параметров (её всё равно заменяет схема сервера).
 class McpArguments(BaseModel):  # noqa: D101
     arguments: dict[str, Any] = Field(default_factory=dict)
+    _assessed: dict[str, Any] | None = PrivateAttr(None)
+
+    @property
+    def assessed(self) -> dict[str, Any] | None:
+        """Пометки инструмента, по которым оценка (assess) решала о вызове (None — не было).
+
+        Вызов сверяет с ними пометки сервера: пока он ждал разрешения, сервер мог
+        перезапустить и другой поток — тогда разрешение выдано уже другому инструменту.
+        """
+        return self._assessed
+
+    @assessed.setter
+    def assessed(self, hints: dict[str, Any] | None) -> None:
+        # Приватный атрибут pydantic: в классе — его объявление, а не значение.
+        self._assessed = hints  # noqa: WPS601
 
 
 class McpTool(Tool[McpArguments]):
@@ -345,14 +372,17 @@ class McpTool(Tool[McpArguments]):
         reason = f"инструмент {self.tool} MCP-сервера {server}"
         mode = PermissionMode.AUTO if ctx.get_mode is None else ctx.get_mode()
         planning = mode is PermissionMode.PLAN
+        hints = self.hints
+        params.assessed = hints
+        reads_only = hints.get("readOnlyHint") is True
         # autoApprove — «без вопроса», а не «ничего не меняет»: в плане — только читающим.
-        if self.server.config.approves(self.tool) and (self.reads_only or not planning):
+        if self.server.config.approves(self.tool) and (reads_only or not planning):
             return Assessment(RiskLevel.SAFE, reason)
-        if self.reads_only:
+        if reads_only:
             # В плане — как команда-проверка: с подтверждением, а не запрет.
             kind = ToolKind.COMMAND if planning else None
             return Assessment(RiskLevel.WRITE, f"{reason}; сервер: только читает", kind=kind)
-        if self.hints.get("destructiveHint") is True:
+        if hints.get("destructiveHint") is True:
             return Assessment(RiskLevel.DANGEROUS, f"{reason}; сервер: может удалять данные")
         return Assessment(RiskLevel.WRITE, reason)
 
@@ -371,9 +401,10 @@ class McpTool(Tool[McpArguments]):
     @override
     def run(self, params: McpArguments, ctx: ToolContext) -> ToolResult:
         """Вызов на сервере; ответ — текстом (ошибка инструмента — неуспех для модели)."""
+        hints = self.hints if params.assessed is None else params.assessed
         try:
-            # Пометки — те же, по которым только что решалось разрешение (assess).
-            reply = self.server.call(self.tool, params.arguments, hints=self.hints)
+            # Пометки — те же, по которым решалось разрешение (assess).
+            reply = self.server.call(self.tool, params.arguments, hints=hints)
         except McpError as exc:
             server = self.server.name
             raise ToolError(f"MCP-сервер {server}: {exc}") from exc
