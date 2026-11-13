@@ -352,14 +352,16 @@ class _Repl:
     def _may_exit(self) -> bool:
         """Можно выходить: фоновых задач нет или пользователь согласен их остановить.
 
-        Ввод не из терминала спросить не даёт — gigacrew дожидается итогов задач.
+        Ввод не из терминала спросить не даёт — gigacrew дожидается итогов задач и отдаёт
+        агенту и те, что пришли, пока ввод ждал данных.
         """
         jobs = self.agent.background
         active = [] if jobs is None else jobs.active()
-        if not active:
-            return True
-        if not self.ui.interactive():
+        pending = jobs is not None and jobs.pending(waking=True)
+        if not self.ui.interactive() and (active or pending):
             self._guarded(partial(finish_background, self.agent, self.ui, self.esc))
+            return True
+        if not active:
             return True
         ids = ", ".join(job.id for job in active)
         if self.ui.ask(f"фоновые задачи ещё не завершены ({ids}) — остановить их и выйти?"):

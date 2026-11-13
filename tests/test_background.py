@@ -343,14 +343,15 @@ def test_job_stopped_between_queue_and_launch_never_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(jobs_module, "STOP_GRACE", 0.05)
-    jobs = BackgroundJobs({jobs_module.SUBAGENT_POOL: PoolLimits(running=1, queued=1)})
-    first = FakeJob()
+    jobs = BackgroundJobs({jobs_module.SUBAGENT_POOL: PoolLimits(running=1, queued=2)})
+    first, last = FakeJob("1"), FakeJob("3")
     waiting = StoppedBeforeLaunch(jobs)
-    jobs.start(first)
-    jobs.start(waiting)
+    for job in (first, waiting, last):
+        jobs.start(job)
     first.done()  # снята с очереди — и тут же остановлена, до запуска
     assert not waiting.started
     assert _state(waiting) is JobState.STOPPED
+    assert last.started  # остановленная до запуска не держит очередь
 
 
 def test_stop_all_forget_clears_chat_jobs() -> None:
@@ -858,6 +859,21 @@ def test_repl_without_terminal_waits_for_jobs_before_exit(tmp_path: Path) -> Non
     threading.Timer(0.2, job.done, args=("готово",)).start()
     assert _run_repl(agent, ui, _reader(EOFError())) == 0
     assert provider.calls == 1
+    assert "готово" in _sent(provider, 0).content
+
+
+def test_repl_without_terminal_delivers_job_finished_while_reading(tmp_path: Path) -> None:
+    provider = ScriptedProvider([text_turn("итог учтён")])
+    agent, ui = _repl_env(tmp_path, provider)
+    job = FakeJob()
+    _jobs(agent).start(job)
+
+    def read(default: str = "") -> str:
+        job.done("готово")  # задача завершилась, пока ввод из pipe ждал данных
+        raise EOFError
+
+    assert _run_repl(agent, ui, read) == 0
+    assert provider.calls == 1  # агент получил итог перед выходом
     assert "готово" in _sent(provider, 0).content
 
 

@@ -173,6 +173,7 @@ class Job(ABC):
         self._ended: float | None = None
         self._report: JobReport | None = None
         self._on_finish: Callable[[Job], None] | None = None
+        self._announced = False  # об итоге извещён тот, кто запускал (on_finish)
 
     # ------------------------------------------------------------------ #
     @abstractmethod
@@ -234,18 +235,23 @@ class Job(ABC):
         Задачу остановили раньше (снята с очереди, но ещё не запущена) — работа не
         начинается, итог — «остановлена». Запуск и остановка решают это под одной
         блокировкой: остановка либо застаёт задачу запущенной и отменяет её, либо
-        запрещает запуск.
+        запрещает запуск. Итог, записанный ещё до запуска (остановка не дождалась его),
+        ``on_finish`` получает здесь — ровно один раз: иначе очередь за задачей не сдвинется.
         """
-        self._on_finish = on_finish
         with self._lock:
+            self._on_finish = on_finish
             allowed = self.stop_request is None and self._report is None
             if allowed:
                 self._started = time.monotonic()
+            missed = self._report is not None and not self._announced
+            self._announced = self._announced or missed
         if allowed:
             self.start()
-            return
-        state, reason = self.stop_request or (JobState.STOPPED, "")
-        self.finish(self.stopped_report(state, reason))
+        elif missed:
+            on_finish(self)
+        else:
+            state, reason = self.stop_request or (JobState.STOPPED, "")
+            self.finish(self.stopped_report(state, reason))
 
     def wait(self, timeout: float | None = None) -> bool:
         """Ждать итога не дольше ``timeout`` секунд; True — итог есть."""
@@ -270,9 +276,11 @@ class Job(ABC):
                 return False
             self._report = report
             self._ended = time.monotonic()
+            callback = self._on_finish
+            self._announced = callback is not None
         self._done.set()
-        if self._on_finish is not None:
-            self._on_finish(self)
+        if callback is not None:
+            callback(self)
         return True
 
 
