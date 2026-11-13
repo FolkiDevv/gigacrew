@@ -53,11 +53,11 @@ from gigacrew.cli.models import (
     save_window,
 )
 from gigacrew.cli.repl import (
-    EXIT_REASON,
     autosave,
     esc_interrupt_for,
     finish_background,
     run_repl,
+    stopping_background,
 )
 from gigacrew.config import Config, ConfigError
 from gigacrew.llm.api import ApiProvider
@@ -242,11 +242,14 @@ def run_oneshot(
     """
     esc = esc_interrupt_for(ui, agent=agent)
     source = "resume" if resumed else "startup"
-    with hook_session(agent, ui, source=source, end_reason="other"):
+    stopped = False
+    hooked = hook_session(agent, ui, source=source, end_reason="other")
+    with hooked, stopping_background(agent, chats, ui):
         try:
             with esc:
                 agent.run_turn(prompt)
-            finish_background(agent, ui, esc)
+            # Код выхода — и по ходу пользователя, и по ходам по готовности фоновых задач.
+            stopped = finish_background(agent, ui, esc)
         except (PromptBlockedError, LLMError) as error:
             ui.stop_live()
             if isinstance(error, PromptBlockedError):
@@ -263,10 +266,8 @@ def run_oneshot(
             ui.error(f"внутренняя ошибка: {type(error).__name__}: {error}")
             return EXIT_ERROR
         finally:
-            agent.stop_background(EXIT_REASON)
             autosave(chats, agent, ui)
-    stats = agent.last_turn
-    return EXIT_STOPPED if stats is not None and stats.stop_reason else EXIT_OK
+    return EXIT_STOPPED if stopped else EXIT_OK
 
 
 def run_test_context(

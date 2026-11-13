@@ -520,3 +520,25 @@ def test_restarted_server_with_changed_hints_refuses_call(project: Path, tmp_pat
         with pytest.raises(ToolError, match="изменился после перезапуска"):
             echo.run(params, ctx)
         assert echo.assess(params, ctx).risk is RiskLevel.DANGEROUS
+
+
+def test_call_checks_hints_of_its_decision_when_another_call_restarted_server(
+    project: Path,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "destructive"
+    config = _fake("--marker", str(marker))
+    with closing(McpHub([McpServer(config, Workspace(project))])) as servers:
+        servers.connect()
+        tools, _ = servers.tools()
+        echo = next(tool for tool in tools if tool.name == ECHO)
+        ctx = ToolContext(Workspace(project))
+        params = echo.parse({"text": "x"})
+        echo.assess(params, ctx)  # разрешение — по пометке «только читает»
+        marker.touch()  # после перезапуска сервер пометит echo разрушительным
+        server = servers.servers[0]
+        with pytest.raises(McpError):
+            server.call("crash", {})
+        server.call("echo", {"text": "y"})  # сервер перезапустил другой поток
+        with pytest.raises(ToolError, match="изменился после перезапуска"):
+            echo.run(params, ctx)

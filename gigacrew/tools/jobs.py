@@ -316,7 +316,8 @@ class BackgroundJobs:
         Поставлена ли задача в очередь — ``job.queued``.
         """
         with self._cond:
-            now = _admission(job, self._jobs.values(), self._queue, self._limit(job.pool))
+            limits = self._limits.get(job.pool, _FALLBACK_LIMITS)
+            now = _admission(job, self._jobs.values(), self._queue, limits)
             self._counter += 1
             job.id = f"bg{self._counter}"
             self._jobs[job.id] = job
@@ -331,8 +332,13 @@ class BackgroundJobs:
             try:
                 self._launch(job)
             except BaseException:
+                # Работа могла начаться (сбой — у таймера предела): остановить её. Задачу —
+                # забыть, а её место отдать очереди: ждущие за ней не должны застрять.
+                with contextlib.suppress(Exception):
+                    job.request_stop("the job could not start")
                 with self._cond:
                     self._jobs.pop(job.id, None)
+                self._finished(job)
                 raise
         return job.id
 
@@ -391,50 +397,51 @@ class BackgroundJobs:
 
         ``quiet`` — итог не будит агента (остановил пользователь).
         """
-        if quiet:
-            job.quiet = True
-        with self._cond:
-            dequeued = job in self._queue
-            if dequeued:
-                self._queue.remove(job)
-        if dequeued:
-            job.finish(job.stopped_report(JobState.STOPPED, f"{reason} (before it started)"))
-            self._finished(job)  # на запуск она не подписывалась — известить самим
-            return True
-        if not job.request_stop(reason):
-            return False
-        _settle(job, STOP_GRACE)
-        return True
+        return bool(self.stop_many([job], reason, quiet=quiet))
 
-    def stop_all(self, reason: str, *, forget: bool = False) -> list[Job]:
-        """Остановить все незавершённые задачи (их итоги не будят агента); вернуть их.
+    def stop_many(self, jobs: Iterable[Job], reason: str, *, quiet: bool = False) -> list[Job]:
+        """Остановить задачи и дождаться их итогов; вернуть те, что ещё не были завершены.
 
-        Очередь снимается первой: остановка работающих не должна запускать ждущие.
-        ``forget`` — забыть и все задачи с их итогами (новый чат).
+        Ждущие в очереди снимаются с неё все сразу и первыми: остановка работающей
+        освобождает место, и его заняла бы ждущая задача, которую тоже останавливают.
+        Остановка, запрошенная раньше (а её ожидание прервано), тоже доводится до итога.
+        ``quiet`` — итоги не будят агента (остановил пользователь или выход).
         """
+        targets = [job for job in jobs if not job.finished]
+        if quiet:
+            for target in targets:
+                target.quiet = True
         with self._cond:
-            queued = list(self._queue)
-            self._queue.clear()
-        for waiting in queued:
-            waiting.quiet = True
-            waiting.finish(waiting.stopped_report(JobState.STOPPED, reason))
-        running = self.active()
+            dequeued = [job for job in targets if job in self._queue]
+            for waiting in dequeued:
+                self._queue.remove(waiting)
+        for waiting in dequeued:
+            waiting.finish(
+                waiting.stopped_report(JobState.STOPPED, f"{reason} (before it started)"),
+            )
+            self._finished(waiting)  # на запуск она не подписывалась — известить самим
+        running = [job for job in targets if job not in dequeued]
         for job in running:
-            job.quiet = True
             job.request_stop(reason)
         deadline = time.monotonic() + STOP_GRACE
         for job in running:
             _settle(job, max(deadline - time.monotonic(), 0))
+        return targets
+
+    def stop_all(self, reason: str, *, forget: bool = False) -> list[Job]:
+        """Остановить все незавершённые задачи (их итоги не будят агента); вернуть их.
+
+        ``forget`` — забыть и все задачи с их итогами (новый чат).
+        """
+        stopped = self.stop_many(self.active(), reason, quiet=True)
         with self._cond:
             if forget:
                 self._jobs.clear()
                 self._delivered.clear()
             self._cond.notify_all()
-        return [*queued, *running]
+        return stopped
 
     # ------------------------------------------------------------------ #
-    def _limit(self, pool: str) -> PoolLimits:
-        return self._limits.get(pool, _FALLBACK_LIMITS)
 
     def _launch(self, job: Job) -> None:
         """Запустить задачу и завести таймер её жёсткого предела."""
@@ -452,7 +459,8 @@ class BackgroundJobs:
         with self._cond:
             timer = self._timers.pop(job.id, None)
             listeners = list(self._listeners)
-            following = _next_in_queue(self._queue, self._jobs.values(), job.pool, self._limit)
+            limits = self._limits.get(job.pool, _FALLBACK_LIMITS)
+            following = _next_in_queue(self._queue, self._jobs.values(), job.pool, limits)
             self._cond.notify_all()
         if timer is not None:
             timer.cancel()
@@ -524,10 +532,10 @@ def _next_in_queue(
     queue: deque[Job],
     jobs: Iterable[Job],
     pool: str,
-    limit: Callable[[str], PoolLimits],
+    limits: PoolLimits,
 ) -> Job | None:
     """Снять с очереди первую задачу вида ``pool``, если для неё освободилось место."""
-    if len(_occupied(jobs, queue, pool)) >= limit(pool).running:
+    if len(_occupied(jobs, queue, pool)) >= limits.running:
         return None
     for waiting in queue:
         if waiting.pool == pool:
@@ -559,10 +567,13 @@ def _settle(job: Job, grace: float) -> None:
 
 
 def _expire(job: Job) -> None:
-    """Жёсткий предел задачи истёк: остановить её (из потока таймера)."""
+    """Жёсткий предел задачи истёк: остановить её (из потока таймера).
+
+    Остановку могли запросить и раньше, а её ожидание — прервать (Esc): итог будет и тогда.
+    """
     limit = int(job.timeout)
-    if job.request_stop(f"превышен лимит времени ({limit} с)", state=JobState.TIMED_OUT):
-        _settle(job, STOP_GRACE)
+    job.request_stop(f"превышен лимит времени ({limit} с)", state=JobState.TIMED_OUT)
+    _settle(job, STOP_GRACE)
 
 
 def _pending(jobs: Iterable[Job], delivered: set[str], *, waking: bool) -> bool:

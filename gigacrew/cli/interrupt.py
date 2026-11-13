@@ -18,6 +18,11 @@
 (:meth:`EscInterrupt.paused`) и терминал возвращается в обычный режим.
 
 Работает, только если stdin — терминал; иначе — ничего не делает.
+
+Здесь же — выход по сигналам завершения (:func:`exit_on_signals`): SIGHUP (закрыли окно
+терминала) и SIGTERM по умолчанию убивают процесс сразу, без ``finally`` и ``atexit``, и
+фоновые команды gigacrew (у них своя группа процессов) пережили бы его — уже без предела
+времени. Внутри блока сигнал — :class:`SystemExit` в основном потоке, обычный выход.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ import signal
 import sys
 import threading
 from collections.abc import Callable, Generator
+from types import FrameType
 from typing import Any
 
 _ESC = 0x1B
@@ -378,3 +384,34 @@ def _supported() -> bool:
     except ImportError:
         return False
     return True
+
+
+# Сигналы завершения извне (SIGHUP есть не везде) и код выхода по ним — как у оболочки.
+_EXIT_SIGNALS = ("SIGHUP", "SIGTERM")
+_SIGNAL_EXIT_BASE = 128
+
+
+def _exit_by_signal(signum: int, _frame: FrameType | None) -> None:
+    sys.exit(_SIGNAL_EXIT_BASE + signum)
+
+
+@contextlib.contextmanager
+def exit_on_signals() -> Generator[None]:
+    """Внутри блока SIGHUP и SIGTERM — обычный выход (:class:`SystemExit`); после — как было.
+
+    Обработчик ставится только из основного потока (так требует ``signal``).
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous: dict[int, Any] = {}
+    for name in _EXIT_SIGNALS:
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            previous[signum] = signal.signal(signum, _exit_by_signal)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            # None — прежний обработчик ставили не из Python: вернуть поведение по умолчанию.
+            signal.signal(signum, signal.SIG_DFL if handler is None else handler)

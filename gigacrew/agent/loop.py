@@ -737,10 +737,22 @@ class Agent:
         return self._jobs
 
     def stop_background(self, reason: str) -> list[JobInfo]:
-        """Остановить незавершённые фоновые задачи (выход); их итоги не будят агента."""
+        """Остановить незавершённые фоновые задачи (выход, смена чата); вернуть их.
+
+        Итоги, которых модель ещё не получила, записываются в историю чата (агента они не
+        будят): продолженный позже чат не должен ждать задач, которых уже нет.
+        """
         if self._jobs is None:
             return []
-        return [job_info(job) for job in self._jobs.stop_all(reason)]
+        stopped = self._jobs.stop_all(reason)
+        finished = self._jobs.take_finished()
+        if finished:
+            note = finished_note(finished)
+            if self._conversation.can_append_note():
+                self._conversation.append_note(note)
+            else:
+                self._conversation.add_user(note, meta=True)
+        return [job_info(job) for job in stopped]
 
     def reset(
         self,
@@ -756,7 +768,8 @@ class Agent:
         их итоги относятся к нему.
         """
         if self._jobs is not None:
-            stopped = self._jobs.stop_all(CHAT_SWITCH_REASON, forget=True)
+            stopped = self.stop_background(CHAT_SWITCH_REASON)
+            self._jobs.stop_all(CHAT_SWITCH_REASON, forget=True)
             if stopped:
                 ids = ", ".join(job.id for job in stopped)
                 self._events.on_notice(
@@ -880,7 +893,9 @@ class Agent:
         )
         self._token_scale = parent._token_scale
         self._session_allowed = parent._session_allowed
-        self._turn_allowed = parent._turn_allowed
+        # «Да до конца хода» — ответ на один ход пользователя; фоновый суб-агент работает и
+        # после него, а сам спросить не может — у него ответов нет.
+        self._turn_allowed = parent._turn_allowed if self._cancel is None else set()
         self._decisions = parent._decisions
         self._reviewer = parent._reviewer
 
@@ -2348,8 +2363,9 @@ class Agent:
         """Фоновый суб-агент до отчёта (в потоке задачи); отмена — JobCancelledError."""
         child = self._new_subagent(spec, job.events, cancel=job.cancel_event)
         try:
-            # Команды и хуки суб-агента убиваются, как только задачу остановят.
-            with cancellation(job.cancel_event):
+            # Команды и хуки суб-агента убиваются, как только задачу остановят; команды не
+            # переживают его предел времени — после него остаётся время на отчёт.
+            with cancellation(job.cancel_event, deadline=time.monotonic() + job.timeout):
                 text = child.run_turn(prompt)
         except LLMError as exc:
             return model_error_report(spec, exc, job.events.trail)
@@ -2411,7 +2427,7 @@ class Agent:
         """Заметка модели с итогами задач; интерфейс узнаёт о каждой."""
         for job in finished:
             self._events.on_background_end(job_info(job))
-        return _reminder(finished_note(finished))
+        return finished_note(finished)
 
     def _background_reminder(self) -> str:
         """Напоминание модели о незавершённых фоновых задачах ("" — их нет)."""
@@ -2704,11 +2720,16 @@ class Agent:
         return "", ""
 
     def _can_confirm(self) -> bool:
-        """Есть ли кому подтвердить операцию; у суб-агента отвечает интерфейс основного."""
+        """Есть ли кому подтвердить операцию; у суб-агента отвечает интерфейс основного.
+
+        Фоновому суб-агенту — некому (так говорят его события): интерфейс занят основным.
+        """
+        if not self._events.can_confirm():
+            return False
         if self._parent is not None:
             parent: Agent = self._parent
             return parent._can_confirm()
-        return self._events.can_confirm()
+        return True
 
     def _count_question(self) -> None:
         """Учесть заданный вопрос в статистике хода; вопросы суб-агентов — у основного."""

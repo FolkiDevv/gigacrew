@@ -11,7 +11,8 @@
 Завершилась фоновая задача — агент продолжает работу сам (ход по готовности,
 :meth:`~gigacrew.agent.loop.Agent.wake`), прервав строку ввода; набранный текст
 возвращается в неё. Таких ходов подряд, без сообщения пользователя, — не больше
-:data:`MAX_AUTO_WAKES`: дальше итоги ждут его следующего сообщения.
+:data:`MAX_AUTO_WAKES`: дальше итоги ждут его следующего сообщения. Ход прерван (Esc,
+Ctrl+C) или сорвался (ошибка модели) — итоги тоже ждут сообщения пользователя.
 
 Диалог сохраняется после каждого хода — и прерванного тоже (см. :func:`autosave`).
 """
@@ -37,7 +38,7 @@ from gigacrew.cli.commands import (
 )
 from gigacrew.cli.hooks import hook_session
 from gigacrew.cli.indexing import ensure_index
-from gigacrew.cli.interrupt import EscInterrupt
+from gigacrew.cli.interrupt import EscInterrupt, exit_on_signals
 from gigacrew.cli.models import ModelCatalog, ensure_context_window
 from gigacrew.cli.prompt import ArgChoices, InputReader, StatusInfo, make_input_reader
 from gigacrew.cli.reader import BackgroundWakeError, PromptReader
@@ -76,46 +77,70 @@ def status_of(agent: Agent) -> StatusInfo:
     )
 
 
+def turn_stopped(agent: Agent) -> bool:
+    """Последний ход агента остановлен пределом (шагов, ошибок, хуком), а не закончен."""
+    stats = agent.last_turn
+    return stats is not None and bool(stats.stop_reason)
+
+
 def finish_background(
     agent: Agent,
     ui: Console,
     interrupt: EscInterrupt,
     *,
     limit: int = MAX_AUTO_WAKES,
-) -> None:
+) -> bool:
     """Дождаться фоновых задач и передать агенту их итоги — запуск без пользователя.
 
     Для ``-p`` и ввода не из терминала: агент не должен закончить работу, не узнав итогов
     запущенных им задач. Ходов по готовности — не больше ``limit``; задачи, оставшиеся
     после них, останавливаются. Esc/Ctrl+C прерывает ожидание (``KeyboardInterrupt``).
+    True — работу агента остановил предел: в последнем ходе до вызова, в ходе по
+    готовности или ``limit``.
     """
+    stopped = turn_stopped(agent)
     jobs = agent.background
     if jobs is None:
-        return
+        return stopped
     wakes = 0
     while jobs.active() or jobs.pending(waking=True):
         if wakes >= limit:
             # Лимит — до ожидания: итог задачи, запущенной последним ходом, агент уже не
             # получит, и ждать её до конца таймаута незачем.
-            stopped = agent.stop_background(EXIT_REASON)
-            ids = ", ".join(job.id for job in stopped) or "—"
+            halted = agent.stop_background(EXIT_REASON)
+            ids = ", ".join(job.id for job in halted) or "—"
             ui.warn(
-                f"агент {limit} раз подряд продолжал работу по итогам фоновых задач — "
+                "агент исчерпал лимит ходов подряд по итогам фоновых задач — "
                 f"больше не жду; остановлены: {ids}",
             )
-            return
-        if not jobs.pending(waking=True):
-            ids = ", ".join(job.id for job in jobs.active())
-            with interrupt, ui.progress(f"жду фоновые задачи ({ids})"):
-                waited = False
-                while not waited:
-                    waited = jobs.wait(_WAIT_SLICE)
-            continue
-        wakes += 1
-        ui.print()
-        with interrupt:
-            agent.wake()
-        ui.print()
+            return True
+        if jobs.pending(waking=True):
+            wakes += 1
+            _wake_once(agent, ui, interrupt)
+            stopped = stopped or turn_stopped(agent)
+        else:
+            _wait_jobs(agent, ui, interrupt)
+    return stopped
+
+
+def _wait_jobs(agent: Agent, ui: Console, interrupt: EscInterrupt) -> None:
+    """Ждать итога, который будит агента (Esc/Ctrl+C — ``KeyboardInterrupt``)."""
+    jobs = agent.background
+    if jobs is None:
+        return
+    ids = ", ".join(job.id for job in jobs.active())
+    with interrupt, ui.progress(f"жду фоновые задачи ({ids})"):
+        waited = False
+        while not waited:
+            waited = jobs.wait(_WAIT_SLICE)
+
+
+def _wake_once(agent: Agent, ui: Console, interrupt: EscInterrupt) -> None:
+    """Ход агента по готовности фоновых задач."""
+    ui.print()
+    with interrupt:
+        agent.wake()
+    ui.print()
 
 
 def autosave(chats: ChatRecorder | None, agent: Agent, ui: Console) -> None:
@@ -227,17 +252,26 @@ def run_repl(  # noqa: WPS211
         agent.background.subscribe(read.wake)
     source = "startup" if resumed is None else "resume"
     hooked = hook_session(agent, ui, source=source, end_reason="prompt_input_exit")
-    with hooked, stopping_background(agent):
+    with hooked, stopping_background(agent, chats, ui):
         return repl.loop()
 
 
 @contextmanager
-def stopping_background(agent: Agent) -> Generator[None]:
-    """Фоновые задачи не переживают сессию: при выходе (и при сбое) они останавливаются."""
+def stopping_background(agent: Agent, chats: ChatRecorder | None, ui: Console) -> Generator[None]:
+    """Фоновые задачи не переживают сессию: при выходе (и при сбое) они останавливаются.
+
+    Сигналы завершения (закрыли терминал, ``kill``) — тоже выход. Итоги, которых агент не
+    получил, записываются в чат, и он сохраняется: продолженный позже чат не ждёт задач,
+    которых уже нет.
+    """
     try:
-        yield
+        with exit_on_signals():
+            yield
     finally:
-        agent.stop_background(EXIT_REASON)
+        jobs = agent.background
+        if jobs is not None and (jobs.active() or jobs.pending()):
+            agent.stop_background(EXIT_REASON)
+            autosave(chats, agent, ui)
 
 
 def _make_reader(
@@ -307,6 +341,8 @@ class _Repl:
     typeahead: str = ""
     # Ходы по готовности фоновых задач подряд, без сообщения пользователя.
     auto_wakes: int = 0
+    # Ход прерван или сорвался: агент не продолжает работу сам до сообщения пользователя.
+    paused: bool = False
     wakes_held: bool = False  # сказано, что итоги ждут сообщения пользователя
 
     def loop(self) -> int:
@@ -326,9 +362,9 @@ class _Repl:
                 return 0
 
     def wake_due(self) -> bool:
-        """Агенту пора продолжить работу сам: есть итоги фоновых задач, лимит не исчерпан."""
+        """Агенту пора продолжить работу сам: есть итоги фоновых задач, ничто не держит."""
         jobs = self.agent.background
-        if jobs is None or self.auto_wakes >= MAX_AUTO_WAKES:
+        if jobs is None or self.paused or self.auto_wakes >= MAX_AUTO_WAKES:
             return False
         return jobs.pending(waking=True)
 
@@ -359,7 +395,9 @@ class _Repl:
         active = [] if jobs is None else jobs.active()
         pending = jobs is not None and jobs.pending(waking=True)
         if not self.ui.interactive() and (active or pending):
-            self._guarded(partial(finish_background, self.agent, self.ui, self.esc))
+            # Ходы по готовности перед выходом — в счёт тех же подряд, что уже были.
+            budget = max(MAX_AUTO_WAKES - self.auto_wakes, 0)
+            self._guarded(partial(finish_background, self.agent, self.ui, self.esc, limit=budget))
             return True
         if not active:
             return True
@@ -382,21 +420,27 @@ class _Repl:
         self.ui.print()
 
     def _hold_notice(self) -> None:
-        """Лимит ходов по готовности исчерпан — сказать один раз, что итоги ждут сообщения."""
+        """Итоги задач ждут сообщения пользователя (лимит ходов, прерванный ход) — сказать раз."""
         jobs = self.agent.background
-        if self.wakes_held or self.auto_wakes < MAX_AUTO_WAKES or jobs is None:
+        limited = self.auto_wakes >= MAX_AUTO_WAKES
+        if self.wakes_held or not (limited or self.paused) or jobs is None:
             return
-        if jobs.pending(waking=True):
-            self.wakes_held = True
+        if not jobs.pending(waking=True):
+            return
+        self.wakes_held = True
+        if limited:
             self.ui.warn(
                 f"агент {MAX_AUTO_WAKES} раз подряд продолжал работу сам по итогам фоновых "
                 "задач — новые итоги он получит с вашим следующим сообщением",
             )
+        else:
+            self.ui.info("итоги фоновых задач агент получит с вашим следующим сообщением")
 
     def _execute(self, line: str) -> bool:
         """Выполнить строку: скилл, слеш-команду или ход агента. False — выход из REPL."""
         # Пользователь здесь — агент снова может продолжать работу сам по итогам задач.
         self.auto_wakes = 0
+        self.paused = False
         self.wakes_held = False
         if is_repl_command(line):
             self.skills.refresh()  # скилл могли установить, пока открыто приглашение
@@ -433,12 +477,15 @@ class _Repl:
         except (PromptBlockedError, LLMError) as error:
             self.ui.stop_live()
             _report_turn_error(self.ui, error)
+            self.paused = True  # повтор хода по готовности сорвался бы так же — ждём человека
         except KeyboardInterrupt:
             self.ui.stop_live()
             self.ui.system("\n(прервано)")
+            self.paused = True  # прервал пользователь — агент не продолжает сам
         except Exception as exc:  # ошибка внутри хода не должна закрывать REPL
             self.ui.stop_live()
             self.ui.error(f"внутренняя ошибка: {type(exc).__name__}: {exc}")
+            self.paused = True
         autosave(self.chats, self.agent, self.ui)
         # Черновик, прерванный ходом по готовности задач, + набранное во время хода.
         self.typeahead += self.esc.take_typeahead()

@@ -78,5 +78,7 @@ class PromptReader:
             return
         if not self.wake_due():
             return
-        self._draft = app.current_buffer.text
+        # Черновик — из строки ввода, а не из текущего буфера: в поиске (Ctrl+R) тот —
+        # строка поиска.
+        self._draft = self._session.default_buffer.text
         app.exit(result="")

@@ -18,6 +18,7 @@ from gigacrew.security import (
     subprocess_env,
 )
 from gigacrew.tools.base import Assessment, Display, Tool, ToolContext, ToolError, ToolResult
+from gigacrew.tools.cancel import time_left
 from gigacrew.tools.grep_search import GrepSearch, as_grep_search
 from gigacrew.tools.jobs import SHELL_POOL, BackgroundJobs, Job, JobReport, JobState
 from gigacrew.tools.process import (
@@ -428,7 +429,9 @@ def _execute(params: RunShellParams, ctx: ToolContext) -> ToolResult:
         ctx.workspace.ensure_temp_dir()
     if params.run_in_background and ctx.background is not None:
         return _start_background(params, ctx.background, cwd)
-    timeout = min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)
+    # Команда фонового суб-агента не переживает его предела времени: после него — отчёт.
+    timeout = int(time_left(min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)))
+    timeout = max(timeout, MIN_TIMEOUT)
     # Оболочка — суть инструмента: команду до запуска проверяют классификатор и права.
     # У фонового суб-агента команда убивается, как только его остановят (флаг потока).
     res = run_process(params.command, cwd=cwd, timeout=timeout, shell=True)  # noqa: S604

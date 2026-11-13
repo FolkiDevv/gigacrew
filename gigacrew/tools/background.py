@@ -150,7 +150,8 @@ class BackgroundStopTool(Tool[BackgroundStopParams]):
         jobs = _jobs(ctx)
         job = _job(jobs, params.job_id)
         stopped = jobs.stop(job, "stopped by the agent (background_stop)")
-        jobs.mark_delivered(job)
+        if job.finished:  # итог получен здесь — заметкой его не доставлять
+            jobs.mark_delivered(job)
         prefix = "" if stopped else "The job had already finished before the stop. "
         return ToolResult(content=_job_text(job, prefix), summary=_summary(job))
 
