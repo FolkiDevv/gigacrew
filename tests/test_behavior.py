@@ -442,6 +442,55 @@ def test_pinpoint_question_answered_directly(shop: Path) -> None:
     assert record["research_calls"] == 1
 
 
+def test_long_check_started_in_background(shop: Path) -> None:
+    readme = "README.md"
+    tests_line = "Тесты: `python -m pytest -q`."
+    outcome = _run(
+        "background_long",
+        [
+            tool_turn("run_shell", {"command": "ls tests", "run_in_background": True}),
+            tool_turn("read_file", {"path": readme}),
+            tool_turn(
+                "edit_file",
+                {
+                    "path": readme,
+                    "old_string": tests_line,
+                    "new_string": f"## Настройки\n\nСм. `shop/config.py`.\n\n{tests_line}",
+                },
+            ),
+            # Итог команды приходит либо посреди хода, либо ходом по готовности: во втором
+            # случае этим ответом ход кончается, а следующий — ответ на итог.
+            text_turn("Раздел дописан, тесты прошли."),
+            text_turn("Тесты прошли."),
+        ],
+        shop,
+    )
+    record = outcome.record
+    assert outcome.error is None
+    assert record["ok"]
+    assert record["background_calls"] == 1
+    assert record["background_polls"] == 0
+    assert record["changed_files"] == [readme]
+    assert record["well_formed"]
+    # Итог фоновой команды модель получила, незавершённых задач прогон не оставил.
+    assert "Background jobs finished" in str(outcome.transcript["conversation"])
+
+
+def test_quick_command_runs_without_background(shop: Path) -> None:
+    outcome = _run(
+        "background_quick",
+        [
+            tool_turn("run_shell", {"command": "ls tests"}),
+            text_turn("Прошли все 3 теста."),
+        ],
+        shop,
+    )
+    record = outcome.record
+    assert record["ok"]
+    assert record["background_calls"] == 0
+    assert record["requests"] == 2
+
+
 def test_api_error_is_recorded_not_lost(shop: Path) -> None:
     outcome = _run("delegate_pinpoint", [LLMError("шлюз недоступен")], shop)
     assert isinstance(outcome.error, LLMError)
@@ -655,7 +704,7 @@ def test_digest_fits_a_chat_message() -> None:
     lines = behavior.digest_report(report)
     assert len(lines) <= 100
     text = "\n".join(lines)
-    assert "Неуспешные прогоны: 41 из 82" in text
+    assert "Неуспешные прогоны: 41 из 90" in text
     assert "… и ещё 11" in text
     assert "40× LLMError: The read operation timed out" in text
     assert "стоп tool_failures" in text

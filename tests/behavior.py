@@ -79,6 +79,13 @@ SELF_CHECK_MARK = SELF_CHECK_NOTE.splitlines()[0]
 PLAN_BLOCKED_MARK = PLAN_BLOCKED_NOTE.split("{path}")[0]
 # Уведомление о паузе из-за лимита запросов шлюза (429).
 RATE_LIMIT_MARK = "(429)"
+# Инструменты, которые запускают фоновую задачу параметром run_in_background.
+BACKGROUND_STARTERS = frozenset(("run_shell", "task"))
+# Ходов по готовности фоновых задач на один запрос сценария и ожидание их итога, с.
+MAX_WAKES = 5
+JOB_WAIT = 900.0
+# Почему фоновые задачи остановлены в конце запроса сценария (для их итога).
+SCENARIO_END_REASON = "the scenario is over"
 # Инструменты исследования кода: их вызовы основным агентом — «работа вместо суб-агента».
 RESEARCH_TOOLS = frozenset((
     "read_file",
@@ -942,6 +949,28 @@ SCENARIOS: tuple[Scenario, ...] = (
         run_tests=True,
         check=lambda record: bool(record["files_ok"]) and bool(record["tests_pass"]),
     ),
+    Scenario(
+        id="background_long",
+        goal="долгая проверка — в фоне, пока делается независимая часть задачи",
+        mode=PermissionMode.AUTO,
+        turns=(
+            Turn(
+                "Полный прогон тестов (python -m pytest -q) в этом проекте долгий — несколько "
+                "минут. Запусти его и, пока он идёт, допиши в README.md раздел «Настройки» "
+                "по shop/config.py. В конце скажи, прошли ли тесты.",
+            ),
+        ),
+        files_expect={"README.md": "Настройки"},
+        check=lambda record: record["background_calls"] >= 1 and bool(record["files_ok"]),
+    ),
+    Scenario(
+        id="background_quick",
+        goal="быстрая команда, результат нужен сразу — без фона",
+        mode=PermissionMode.AUTO,
+        turns=(Turn("Запусти тесты из tests/test_money.py и скажи, сколько из них прошло."),),
+        expect=("3",),
+        check=lambda record: record["background_calls"] == 0 and record["answer_hits"] == 1,
+    ),
 )
 SCENARIO_BY_ID: Mapping[str, Scenario] = MappingProxyType({
     scenario.id: scenario for scenario in SCENARIOS
@@ -1044,12 +1073,32 @@ def _play_turns(
                 agent.set_mode(turn.mode)
             turns.append(_turn_start(agent, user))
             agent.run_turn(turn.text)
+            _finish_background(agent)
             _turn_end(turns[-1], agent, user)
     except BaseException as exc:  # запись нужна и при сбое; пробрасывает вызывающий
         error = exc
         if turns and "mode_after" not in turns[-1]:
             _turn_end(turns[-1], agent, user)
     return error, time.monotonic() - started
+
+
+def _finish_background(agent: Agent) -> None:
+    """Дождаться фоновых задач хода и передать агенту их итоги — как запуск с ``-p``.
+
+    Сценарный пользователь не пишет «что там с тестами?»: итог задачи агент получает ходом
+    по готовности. Таких ходов — не больше :data:`MAX_WAKES`; задачи, не уложившиеся в
+    :data:`JOB_WAIT` или оставшиеся после этих ходов, останавливаются.
+    """
+    jobs = agent.background
+    if jobs is None:
+        return
+    for _ in range(MAX_WAKES):
+        if not (jobs.active() or jobs.pending(waking=True)):
+            return
+        if not jobs.wait(JOB_WAIT):
+            break
+        agent.wake()
+    agent.stop_background(SCENARIO_END_REASON)
 
 
 def _transcript(agent: Agent, user: ScriptedUser, recorder: RecordingProvider) -> dict[str, Any]:
@@ -1191,6 +1240,7 @@ def _metrics(
     return {
         **_plan_metrics(agent, user, calls, turns, root, tool_results),
         **_delegation_metrics(messages, calls, user),
+        **_background_metrics(calls),
         **_usage_metrics(user, recorder, tool_results),
         **_quality_metrics(scenario, agent, turns, root, changes),
     }
@@ -1279,6 +1329,18 @@ def _delegation_metrics(
         "research_calls": sum(1 for call in calls if call.name in RESEARCH_TOOLS),
         "ask_user_calls": sum(1 for call in calls if call.name == "ask_user"),
         "model_questions": user.model_questions,
+    }
+
+
+def _background_metrics(calls: Sequence[FunctionCall]) -> dict[str, Any]:
+    """Фоновые задачи: запуски с ``run_in_background`` и опросы через ``background_output``."""
+    return {
+        "background_calls": sum(
+            1
+            for call in calls
+            if call.name in BACKGROUND_STARTERS and call.arguments.get("run_in_background") is True
+        ),
+        "background_polls": sum(1 for call in calls if call.name == "background_output"),
     }
 
 
@@ -1711,7 +1773,8 @@ def _problem(record: Mapping[str, Any]) -> str:
         parts.append(f"стоп {stops}")
     parts.append(
         f"shown={record.get('plan_shown', 0)} exit={record.get('exit_calls', 0)} "
-        f"chk={record.get('self_checks', 0)} task={record.get('task_calls', 0)}",
+        f"chk={record.get('self_checks', 0)} task={record.get('task_calls', 0)} "
+        f"bg={record.get('background_calls', 0)}",
     )
     if record.get("answer"):
         parts.append(f"ответ «{_clip(record['answer'], 60)}»")
