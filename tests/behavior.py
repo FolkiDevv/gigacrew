@@ -825,9 +825,20 @@ class Scenario:
     run_tests: bool = False
 
 
-def _ran_pytest(commands: Iterable[str], target: str = "") -> bool:
+# Запуск pytest как программы — в начале команды или после разделителя, а не слово в
+# аргументах («echo pytest»): pytest, python -m pytest, uv run pytest, путь к pytest.
+# Группа — аргументы этого запуска (до следующего разделителя).
+_PYTEST_RUN = re.compile(
+    r"(?:^|&&|\|\||[;|(])\s*(?:\w+=\S+\s+)*(?:uv\s+run\s+)?"
+    r"(?:\S*python[\d.]*\s+-m\s+)?(?:\S*/)?pytest(?=\s|$)([^;&|]*)",
+)
+
+
+def ran_pytest(commands: Iterable[str], target: str = "") -> bool:
     """Среди команд есть запуск pytest (с ``target`` — этого файла или каталога)."""
-    return any("pytest" in command and target in command for command in commands)
+    return any(
+        target in run.group(1) for command in commands for run in _PYTEST_RUN.finditer(command)
+    )
 
 
 PROMO_TASK = (
@@ -968,9 +979,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         files_expect={"README.md": "Настройки"},
         # Опросы (background_polls) — в отчёте, а не в критерии: один background_output с
         # wait, когда другой работы не осталось, — допустимый способ дождаться итога.
-        check=lambda record: (
-            _ran_pytest(record["background_commands"]) and bool(record["files_ok"])
-        ),
+        check=lambda record: ran_pytest(record["background_commands"]) and bool(record["files_ok"]),
     ),
     Scenario(
         id="background_quick",
@@ -980,7 +989,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         expect=("3",),
         check=lambda record: (
             record["background_calls"] == 0
-            and _ran_pytest(record["shell_commands"], "test_money")
+            and ran_pytest(record["shell_commands"], "test_money")
             and record["answer_hits"] == 1
         ),
     ),
