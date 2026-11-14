@@ -524,6 +524,7 @@ def test_background_scenarios_need_the_requested_test_run(shop: Path) -> None:
         ("uv run pytest tests/test_money.py -q", "test_money"),
         ("cd shop && python3 -m pytest -q ../tests/test_money.py", "test_money"),
         (".venv/bin/pytest -q", ""),
+        (f"ls tests\n{PYTEST_MONEY}", "test_money"),
     ],
 )
 def test_ran_pytest_recognizes_a_test_run(command: str, target: str) -> None:
@@ -537,6 +538,7 @@ def test_ran_pytest_recognizes_a_test_run(command: str, target: str) -> None:
         ("echo pytest tests/test_money.py", "test_money"),
         ("python -m pytest -q tests/test_cart.py; echo test_money", "test_money"),
         ("pip show pytest-cov", ""),
+        ("python -m pytest -q tests/test_cart.py\necho test_money", "test_money"),
     ],
 )
 def test_ran_pytest_ignores_the_word_in_arguments(command: str, target: str) -> None:

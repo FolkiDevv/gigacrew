@@ -825,12 +825,13 @@ class Scenario:
     run_tests: bool = False
 
 
-# Запуск pytest как программы — в начале команды или после разделителя, а не слово в
+# Запуск pytest как программы — в начале строки команды или после разделителя, а не слово в
 # аргументах («echo pytest»): pytest, python -m pytest, uv run pytest, путь к pytest.
 # Группа — аргументы этого запуска (до следующего разделителя).
 _PYTEST_RUN = re.compile(
     r"(?:^|&&|\|\||[;|(])\s*(?:\w+=\S+\s+)*(?:uv\s+run\s+)?"
-    r"(?:\S*python[\d.]*\s+-m\s+)?(?:\S*/)?pytest(?=\s|$)([^;&|]*)",
+    r"(?:\S*python[\d.]*\s+-m\s+)?(?:\S*/)?pytest(?=\s|$)([^;&|\n]*)",
+    re.MULTILINE,
 )
 
 
