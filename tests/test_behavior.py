@@ -35,6 +35,15 @@ def shop(tmp_path: Path) -> Path:
     return behavior.make_project(tmp_path / "shop")
 
 
+# Команды учебного проекта: весь набор, один файл и заведомо долгий прогон.
+PYTEST_ALL = "python -m pytest -q"
+PYTEST_MONEY = "python -m pytest -q tests/test_money.py"
+SLOW_PYTEST = "sleep 30; python -m pytest -q"
+# Команда, перенесённая на вторую строку обратной косой чертой.
+CONTINUED_PYTEST = r"""python -m pytest -q \
+  tests/test_money.py"""
+
+
 def _run(
     scenario_id: str,
     turns: list[AssistantTurn | BaseException],
@@ -442,6 +451,118 @@ def test_pinpoint_question_answered_directly(shop: Path) -> None:
     assert record["research_calls"] == 1
 
 
+def test_long_check_started_in_background(shop: Path) -> None:
+    readme = "README.md"
+    tests_line = "Тесты: `python -m pytest -q`."
+    outcome = _run(
+        "background_long",
+        [
+            tool_turn("run_shell", {"command": PYTEST_ALL, "run_in_background": True}),
+            tool_turn("read_file", {"path": readme}),
+            tool_turn(
+                "edit_file",
+                {
+                    "path": readme,
+                    "old_string": tests_line,
+                    "new_string": f"## Настройки\n\nСм. `shop/config.py`.\n\n{tests_line}",
+                },
+            ),
+            # Итог команды приходит либо посреди хода, либо ходом по готовности: во втором
+            # случае этим ответом ход кончается, а следующий — ответ на итог.
+            text_turn("Раздел дописан, тесты прошли."),
+            text_turn("Тесты прошли."),
+        ],
+        shop,
+    )
+    record = outcome.record
+    assert outcome.error is None
+    assert record["ok"]
+    assert record["background_calls"] == 1
+    assert record["background_commands"] == [PYTEST_ALL]
+    assert record["background_polls"] == 0
+    assert record["changed_files"] == [readme]
+    assert record["well_formed"]
+    # Итог фоновой команды модель получила, незавершённых задач прогон не оставил.
+    assert "Background jobs finished" in str(outcome.transcript["conversation"])
+
+
+def test_quick_command_runs_without_background(shop: Path) -> None:
+    outcome = _run(
+        "background_quick",
+        [
+            tool_turn("run_shell", {"command": PYTEST_MONEY}),
+            text_turn("Прошли все 3 теста."),
+        ],
+        shop,
+    )
+    record = outcome.record
+    assert record["ok"]
+    assert record["background_calls"] == 0
+    assert record["shell_commands"] == [PYTEST_MONEY]
+    assert "3 passed" in str(outcome.transcript["conversation"])
+
+
+def test_background_scenarios_need_the_requested_test_run(shop: Path) -> None:
+    """Фон ради фона и ответ без прогона тестов критерий не проходят."""
+    idle = _run(
+        "background_long",
+        [
+            tool_turn("run_shell", {"command": "echo pytest", "run_in_background": True}),
+            tool_turn("write_file", {"path": "README.md", "content": "## Настройки\n"}),
+            text_turn("Готово."),
+        ],
+        shop,
+    )
+    assert idle.record["background_calls"] == 1
+    assert not idle.record["ok"]
+    guess = _run("background_quick", [text_turn("Прошли все 3 теста.")], shop)
+    assert not guess.record["ok"]
+
+
+@pytest.mark.parametrize(
+    ("command", "target"),
+    [
+        (PYTEST_ALL, ""),
+        (PYTEST_MONEY, "test_money"),
+        ("uv run pytest tests/test_money.py -q", "test_money"),
+        ("cd shop && python3 -m pytest -q ../tests/test_money.py", "test_money"),
+        (".venv/bin/pytest -q", ""),
+        (f"ls tests\n{PYTEST_MONEY}", "test_money"),
+        (CONTINUED_PYTEST, "test_money"),
+    ],
+)
+def test_ran_pytest_recognizes_a_test_run(command: str, target: str) -> None:
+    assert behavior.ran_pytest([command], target)
+
+
+@pytest.mark.parametrize(
+    ("command", "target"),
+    [
+        ("echo pytest", ""),
+        ("echo pytest tests/test_money.py", "test_money"),
+        ("python -m pytest -q tests/test_cart.py; echo test_money", "test_money"),
+        ("pip show pytest-cov", ""),
+        ("python -m pytest -q tests/test_cart.py\necho test_money", "test_money"),
+    ],
+)
+def test_ran_pytest_ignores_the_word_in_arguments(command: str, target: str) -> None:
+    assert not behavior.ran_pytest([command], target)
+
+
+def test_failed_turn_leaves_no_background_jobs(shop: Path) -> None:
+    outcome = _run(
+        "background_long",
+        [
+            tool_turn("run_shell", {"command": SLOW_PYTEST, "run_in_background": True}),
+            LLMError("шлюз недоступен"),
+        ],
+        shop,
+    )
+    assert isinstance(outcome.error, LLMError)
+    # Команда ещё шла, когда ход сорвался: прогон её остановил и записал это в историю.
+    assert behavior.SCENARIO_END_REASON in str(outcome.transcript["conversation"])
+
+
 def test_api_error_is_recorded_not_lost(shop: Path) -> None:
     outcome = _run("delegate_pinpoint", [LLMError("шлюз недоступен")], shop)
     assert isinstance(outcome.error, LLMError)
@@ -655,7 +776,7 @@ def test_digest_fits_a_chat_message() -> None:
     lines = behavior.digest_report(report)
     assert len(lines) <= 100
     text = "\n".join(lines)
-    assert "Неуспешные прогоны: 41 из 82" in text
+    assert "Неуспешные прогоны: 41 из 90" in text
     assert "… и ещё 11" in text
     assert "40× LLMError: The read operation timed out" in text
     assert "стоп tool_failures" in text

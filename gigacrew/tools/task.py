@@ -206,7 +206,8 @@ class TaskTool(Tool[TaskParams]):
         "what needs the user's decisions, and do not let it edit files you are changing "
         "yourself. A report of a subagent stopped by a limit is partial but useful: do not "
         "rerun the same task — narrow it to what remains. If the user stopped a subagent, "
-        "do not run the same task again unless asked."
+        "do not run the same task again unless asked. run_in_background — for a long "
+        "independent subtask that runs while you do something else."
     )
     # Модель параметров, а не константа: имя задаёт базовый класс Tool.
     Params = TaskParams  # noqa: WPS115

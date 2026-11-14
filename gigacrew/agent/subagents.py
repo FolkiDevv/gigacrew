@@ -240,8 +240,16 @@ class SubagentEvents(AgentEvents):
 
 
 def subagent_registry(registry: ToolRegistry, spec: SubagentSpec) -> ToolRegistry:
-    """Инструменты основного агента, доступные суб-агенту ``spec``."""
-    return registry.subset(lambda tool: allows_tool(spec, tool.name))
+    """Инструменты основного агента, доступные суб-агенту ``spec``.
+
+    Фоновых задач у суб-агента нет: инструменты входят вариантом без них
+    (:meth:`~gigacrew.tools.base.Tool.foreground`).
+    """
+    allowed = ToolRegistry()
+    for tool in registry:
+        if allows_tool(spec, tool.name):
+            allowed.register(tool.foreground())
+    return allowed
 
 
 def _clip(text: str) -> str:
