@@ -835,10 +835,19 @@ _PYTEST_RUN = re.compile(
 )
 
 
+# Перенос команды оболочки на следующую строку: обратная косая черта в конце строки.
+_LINE_CONTINUATION = re.compile(r"\\\n")
+
+
 def ran_pytest(commands: Iterable[str], target: str = "") -> bool:
-    """Среди команд есть запуск pytest (с ``target`` — этого файла или каталога)."""
+    """Среди команд есть запуск pytest (с ``target`` — этого файла или каталога).
+
+    Перенос строки через обратную косую черту — продолжение той же команды.
+    """
     return any(
-        target in run.group(1) for command in commands for run in _PYTEST_RUN.finditer(command)
+        target in run.group(1)
+        for command in commands
+        for run in _PYTEST_RUN.finditer(_LINE_CONTINUATION.sub(" ", command))
     )
 
 

@@ -39,6 +39,9 @@ def shop(tmp_path: Path) -> Path:
 PYTEST_ALL = "python -m pytest -q"
 PYTEST_MONEY = "python -m pytest -q tests/test_money.py"
 SLOW_PYTEST = "sleep 30; python -m pytest -q"
+# Команда, перенесённая на вторую строку обратной косой чертой.
+CONTINUED_PYTEST = r"""python -m pytest -q \
+  tests/test_money.py"""
 
 
 def _run(
@@ -525,6 +528,7 @@ def test_background_scenarios_need_the_requested_test_run(shop: Path) -> None:
         ("cd shop && python3 -m pytest -q ../tests/test_money.py", "test_money"),
         (".venv/bin/pytest -q", ""),
         (f"ls tests\n{PYTEST_MONEY}", "test_money"),
+        (CONTINUED_PYTEST, "test_money"),
     ],
 )
 def test_ran_pytest_recognizes_a_test_run(command: str, target: str) -> None:
