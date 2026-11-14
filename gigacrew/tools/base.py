@@ -345,6 +345,14 @@ class Tool[ParamsT: BaseModel](ABC):
         """
         return ""
 
+    def foreground(self) -> Tool[Any]:
+        """Вариант инструмента для агента без фоновых задач (суб-агент).
+
+        По умолчанию — сам инструмент; инструмент с параметром ``run_in_background``
+        возвращает вариант, в схеме и описании которого его нет.
+        """
+        return self
+
     @abstractmethod
     def run(self, params: ParamsT, ctx: ToolContext) -> ToolResult:
         """Выполняет вызов и возвращает результат (ошибка — :class:`ToolError`)."""

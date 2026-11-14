@@ -6,7 +6,7 @@ import contextlib
 import os
 import threading
 from pathlib import Path
-from typing import override
+from typing import Any, override
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -33,7 +33,7 @@ from gigacrew.tools.search import search_paths
 _MAX_OUTPUT = 30_000
 MIN_TIMEOUT = 1
 MAX_TIMEOUT = 600
-_DEFAULT_TIMEOUT = 120
+DEFAULT_TIMEOUT = 120
 # Предел фоновой команды (run_in_background): сборка, долгие тесты.
 MAX_BACKGROUND_TIMEOUT = 3600
 # Сколько вывода фоновой команды модель получает в итоге (остальное — пропуск в середине).
@@ -52,13 +52,37 @@ _GREP_SEARCH_NOTE = (
     "поиск — {call}: файлы с секретами, из .gitignore, служебные каталоги и бинарные файлы "
     "пропущены. Для поиска по содержимому сразу вызывайте search_content.]"
 )
+# Пометка к остановленным потомкам команды: агенту с фоновыми задачами и без них.
+_BACKGROUND_HINT = "процесс, который должен работать дольше команды, запускай с run_in_background"
+_NO_BACKGROUND_HINT = "долгоживущие процессы через run_shell не поддерживаются"
+# Описание run_shell: общая часть и фраза о фоне (её нет у агента без фоновых задач).
+_SHELL_HELP = (
+    "Runs a shell command and returns stdout/stderr and the exit code. Use it to build, "
+    "run tests and utilities — not to read or search files (read_file, search_content "
+    "and the navigation tools are faster and safer). Search file contents with "
+    "search_content, not grep -r or rg: a recursive grep over a directory with secrets "
+    "(.env) or a virtualenv cannot be verified, so it is run as search_content instead. "
+    "Commands that only read the project (ls, cat, wc, git status/log/diff, Python "
+    "one-liners that only read) run without asking the user; others are checked by a "
+    "reviewer model or confirmed by the user. There is no keyboard "
+    "input (stdin is empty) — use non-interactive flags. Network commands (curl/wget) "
+    "are forbidden by the security policy. Put temporary files in .gigacode/tmp/ (it "
+    "exists), not /tmp: writing outside the project always needs the user's "
+    "confirmation; output saved there with > or tee does not change how the command "
+    "is checked."
+)
+_BACKGROUND_HELP = (
+    " A long command while you have other work, or a process that must keep running — "
+    "with run_in_background."
+)
+_TIMEOUT_HELP = f"Timeout in seconds ({MIN_TIMEOUT}–{MAX_TIMEOUT})"
 
 
 # Без докстринга: pydantic отдал бы его в JSON-схему параметров, которая уходит модели.
 class RunShellParams(BaseModel):  # noqa: D101
     command: str = Field(description="Command to run with /bin/sh")
     timeout: int = Field(
-        default=_DEFAULT_TIMEOUT,
+        default=DEFAULT_TIMEOUT,
         description=(
             f"Timeout in seconds ({MIN_TIMEOUT}–{MAX_TIMEOUT}; with run_in_background up to "
             f"{MAX_BACKGROUND_TIMEOUT})"
@@ -209,14 +233,21 @@ def _combined_output(res: ProcessResult) -> str:
     return truncate_middle(combined, _MAX_OUTPUT)
 
 
-def _notes(res: ProcessResult | BackgroundProcess, timeout: int) -> list[str]:
-    """Пояснения к итогу команды: остановленные фоновые процессы, таймаут."""
+def _notes(
+    res: ProcessResult | BackgroundProcess,
+    timeout: int,
+    *,
+    background: bool = False,
+) -> list[str]:
+    """Пояснения к итогу команды: остановленные фоновые процессы, таймаут.
+
+    ``background`` — у агента есть фоновые задачи: вместо «не поддерживаются» — подсказка
+    запускать долгоживущий процесс с ``run_in_background``.
+    """
     notes: list[str] = []
     if res.killed_background:
-        notes.append(
-            "фоновые процессы, оставшиеся после команды, остановлены "
-            "(долгоживущие процессы через run_shell не поддерживаются)",
-        )
+        hint = _BACKGROUND_HINT if background else _NO_BACKGROUND_HINT
+        notes.append(f"фоновые процессы, оставшиеся после команды, остановлены ({hint})")
     if res.timed_out:
         notes.append(f"команда превысила таймаут ({timeout}с) и была остановлена")
     if res.escaped_output:
@@ -332,24 +363,15 @@ class RunShellTool(Tool[RunShellParams]):
     """Инструмент run_shell: команда оболочки в каталоге проекта."""
 
     name = "run_shell"
-    description = (
-        "Runs a shell command and returns stdout/stderr and the exit code. Use it to build, "
-        "run tests and utilities — not to read or search files (read_file, search_content "
-        "and the navigation tools are faster and safer). Search file contents with "
-        "search_content, not grep -r or rg: a recursive grep over a directory with secrets "
-        "(.env) or a virtualenv cannot be verified, so it is run as search_content instead. "
-        "Commands that only read the project (ls, cat, wc, git status/log/diff, Python "
-        "one-liners that only read) run without asking the user; others are checked by a "
-        "reviewer model or confirmed by the user. There is no keyboard "
-        "input (stdin is empty) — use non-interactive flags. Network commands (curl/wget) "
-        "are forbidden by the security policy. Put temporary files in .gigacode/tmp/ (it "
-        "exists), not /tmp: writing outside the project always needs the user's "
-        "confirmation; output saved there with > or tee does not change how the command "
-        "is checked."
-    )
+    description = _SHELL_HELP + _BACKGROUND_HELP
     # Модель параметров (класс pydantic), а не константа: имя — часть API инструментов.
     Params = RunShellParams  # noqa: WPS115
     kind = ToolKind.COMMAND
+
+    @override
+    def foreground(self) -> Tool[Any]:
+        """Тот же run_shell без параметра ``run_in_background`` — агенту без фоновых задач."""
+        return ForegroundShellTool()
 
     @override
     def assess(self, params: RunShellParams, ctx: ToolContext) -> Assessment:
@@ -420,6 +442,25 @@ class RunShellTool(Tool[RunShellParams]):
         return _execute(params, ctx)
 
 
+class ForegroundShellTool(RunShellTool):
+    """run_shell агента без фоновых задач (суб-агент): модель не видит ``run_in_background``.
+
+    Параметры разбираются той же моделью: присланный вопреки схеме ``run_in_background``
+    отклоняет :meth:`RunShellTool.run` — фоновых задач у такого агента нет.
+    """
+
+    description = _SHELL_HELP
+
+    @override
+    def input_schema(self) -> dict[str, Any]:
+        """Схема параметров без ``run_in_background`` и без его предела таймаута."""
+        schema = super().input_schema()
+        props = schema["properties"]
+        props.pop("run_in_background", None)
+        props["timeout"]["description"] = _TIMEOUT_HELP
+        return schema
+
+
 def _execute(params: RunShellParams, ctx: ToolContext) -> ToolResult:
     """Выполняет команду через /bin/sh: код возврата и вывод для модели (или фоновая задача)."""
     cwd = (ctx.root / _relative_cwd(params, ctx)).resolve()
@@ -449,7 +490,9 @@ def _execute(params: RunShellParams, ctx: ToolContext) -> ToolResult:
         summary = f"$ {command_head} → код {res.returncode}"
     if res.escaped_output:
         summary = f"{summary} · фоновый процесс остановить не удалось"
-    note_text = "".join(f"\n[{note}]" for note in _notes(res, timeout))
+    note_text = "".join(
+        f"\n[{note}]" for note in _notes(res, timeout, background=ctx.background is not None)
+    )
     output = combined or "(пустой вывод)"
     ok = res.returncode == 0 and not res.timed_out
     return ToolResult(

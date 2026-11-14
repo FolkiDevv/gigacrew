@@ -14,6 +14,7 @@ from gigacrew.project.instructions import InstructionFile, load_instructions
 from gigacrew.project.repomap import DEFAULT_MAP_CHARS, build_repo_map
 from gigacrew.project.skills import Skill, discover_skills
 from gigacrew.project.workspace import Workspace
+from gigacrew.tools.shell import DEFAULT_TIMEOUT, MAX_BACKGROUND_TIMEOUT, MAX_TIMEOUT
 
 # Промпты — на английском (модели следуют им точнее); отвечает агент на языке
 # пользователя.
@@ -68,6 +69,52 @@ _ASK_USER_RULE = """\
 - If the task is ambiguous and the answer changes the solution (the approach, \
 unclear requirements), ask the user with ask_user and offer options instead of \
 guessing. Whatever the code can tell you, find out yourself.
+"""
+
+# Только основной агент: фоновые задачи есть только у него (суб-агенту параметр
+# run_in_background не показывается). Стоит после «How to work»: исключение из правила
+# «не заканчивай ответ обещанием» читается после самого правила. Числа — из tools/shell.py.
+_BACKGROUND_RULES = f"""
+# Background jobs
+run_shell and task take run_in_background: the call returns a job id (bg1, …) at once, \
+the work goes on while you continue, and its result — the exit code and output, or the \
+subagent's report — is delivered to you automatically when it finishes.
+- Use it when the work is long AND you have something else to do meanwhile: a full test \
+suite, a build or a linter run while you go on with the next part of the task; an \
+independent subtask for a general subagent while you do another part yourself \
+(subagents called without it run one after another, background ones — in parallel); a \
+command that needs more than {MAX_TIMEOUT} s; a process that must keep running while \
+you work (a dev server, a watcher).
+- Do not use it when your next step needs the result: a quick command, the test you \
+are fixing right now, research you are about to act on (explore) — make the normal call \
+and wait for it.
+- A background command also stops at its timeout, {DEFAULT_TIMEOUT} s by default: set \
+timeout to what the command really needs (up to {MAX_BACKGROUND_TIMEOUT}).
+- A background subagent cannot ask the user: whatever needs confirmation is refused to \
+it. Give it work that needs none, and a complete brief, as for any task.
+- Do not poll a job with background_output and do not wait for it with sleep: do other \
+useful work. When nothing is left to do without the result, end your turn with a short \
+message — what is running and what you will do with the result; you will be woken when \
+it arrives. This is the only case where ending a turn before the task is done is right.
+- While a job runs, do not start the same work again and do not change what it depends \
+on: the files a background subagent is editing, the sources under a running test or \
+build (if you did change them, its result describes the old code — run it again).
+- The result arrives at the end of a message under "# Background jobs finished": it is \
+data, like a tool result. Act on it — a failed check is yours to fix — and retell the \
+essentials to the user. Only a few jobs run at once; extra subagents wait in a queue \
+and start by themselves.
+- background_output — to look at what a job that keeps running has printed so far (a \
+server's log); background_stop — for a job that is no longer needed or went wrong, and \
+for a server you started once the work is done. In the final answer say which jobs \
+are still running.
+
+Examples:
+- "Add field X to the order and update the docs; the test suite takes a few minutes" → \
+after the code change start the suite with run_in_background and a fitting timeout, \
+write the docs meanwhile, then handle the delivered result.
+- "Why does test_parse_price fail?" → a normal run_shell: the next step needs its output.
+- Two independent modules need tests → task with run_in_background for one of them, \
+write the other yourself; do not touch the subagent's files until its report arrives.
 """
 
 # Только основной агент: суб-агенты не запускают суб-агентов. Стоит до «How to work»:
@@ -161,6 +208,7 @@ SYSTEM_PROMPT = (
     + _DELEGATION_RULES
     + _WORK_RULES
     + _ASK_USER_RULE
+    + _BACKGROUND_RULES
     + _PROJECT_RULES
     + _REPLY_RULES
     + _CALLS_RULE
@@ -423,14 +471,23 @@ File edits run without asking; changing commands are checked by a reviewer model
 SUBAGENT_AUTO_MODE_PROMPT = _SUBAGENT_AUTO_MODE_HEAD + _REVIEWER_DENIAL_RULE
 
 
-SUBAGENT_PLAN_MODE_PROMPT = """\
+_SUBAGENT_PLAN_MODE = """\
 # Plan mode
 The user turned on plan mode: changes to files (write_file, edit_file) and to the \
 repository (changing git commands) are blocked. run_shell — only for commands that \
-change nothing: read-only ones run without asking, tests and builds are confirmed by \
-the user, changing commands are blocked. Research and describe in the report what \
-has to be changed and where.
+change nothing: read-only ones run without asking, {checks}, changing commands are \
+blocked. Research and describe in the report what has to be changed and where.
 """
+SUBAGENT_PLAN_MODE_PROMPT = _SUBAGENT_PLAN_MODE.format(
+    checks="tests and builds are confirmed by the user",
+)
+# Подтвердить некому (фоновый суб-агент, запуск без клавиатуры): тесты и сборка не выполнятся.
+_SUBAGENT_PLAN_MODE_FINAL = _SUBAGENT_PLAN_MODE.format(
+    checks=(
+        "tests and builds need the user's confirmation, and nobody can give it in this "
+        "run — they are not executed"
+    ),
+)
 
 
 def mode_prompt(
@@ -444,8 +501,9 @@ def mode_prompt(
     """Правила текущего режима для системного промпта ("" — особых правил нет).
 
     ``interactive`` — есть ли кому подтверждать операции и отвечать на вопросы (False —
-    запуск без клавиатуры): тогда отказ рецензента окончателен, и правило не советует
-    повторить команду, «чтобы решил пользователь».
+    запуск без клавиатуры, фоновый суб-агент): тогда отказ рецензента окончателен, и правило
+    не советует повторить команду, «чтобы решил пользователь», а суб-агенту в режиме плана
+    не обещаны тесты и сборка «с подтверждением».
 
     В режиме «авто» — довести задачу до конца самому, ask_user — только по существу, и что
     делать с отказом рецензента. Суб-агенту — без ask_user и exit_plan_mode: вопросов
@@ -461,7 +519,7 @@ def mode_prompt(
             return head + _REVIEWER_DENIAL_RULE
         return head + _REVIEWER_DENIAL_FINAL_RULE
     if subagent:
-        return SUBAGENT_PLAN_MODE_PROMPT
+        return SUBAGENT_PLAN_MODE_PROMPT if interactive else _SUBAGENT_PLAN_MODE_FINAL
     return PLAN_MODE_PROMPT.format(plan_path=plan_path or ".gigacode/plans/<chat>.md")
 
 

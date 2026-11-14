@@ -24,7 +24,7 @@ from fakes import (
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from gigacrew.agent import loop
+from gigacrew.agent import loop, prompts
 from gigacrew.agent.background import SubagentJob
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore
 from gigacrew.agent.conversation import BACKGROUND_HEADER, request_text
@@ -39,6 +39,7 @@ from gigacrew.cli.reader import BackgroundWakeError, PromptReader
 from gigacrew.config import Config
 from gigacrew.llm.base import LLMError
 from gigacrew.llm.types import AssistantTurn, Message, ToolSpec
+from gigacrew.permissions import PermissionMode
 from gigacrew.project.workspace import Workspace
 from gigacrew.security import RiskLevel
 from gigacrew.tools import jobs as jobs_module
@@ -61,6 +62,7 @@ from gigacrew.tools.cancel import cancellation
 from gigacrew.tools.jobs import BackgroundJobs, Job, JobInfo, JobReport, JobState, PoolLimits
 from gigacrew.tools.process import BackgroundProcess, OutputLog
 from gigacrew.tools.shell import RunShellParams, RunShellTool
+from gigacrew.tools.task import TaskTool
 from gigacrew.ui.console import Console
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="команды /bin/sh")
@@ -1233,3 +1235,86 @@ def test_status_line_shows_unfinished_background_jobs(tmp_path: Path) -> None:
     agent, _ = _repl_env(tmp_path, ScriptedProvider())
     _jobs(agent).start(FakeJob())
     assert repl.status_of(agent).background == 1
+
+
+# --------------------- чему учат модель: промпт и схема --------------------- #
+def _shell_spec(request: dict[str, Any]) -> ToolSpec:
+    """Спецификация run_shell из запроса к модели."""
+    specs: Sequence[ToolSpec] = request["tools"]
+    by_name = {spec.name: spec for spec in specs}
+    return by_name["run_shell"]
+
+
+def test_background_rules_only_for_main_agent() -> None:
+    """Когда запускать в фоне — знает основной агент; у суб-агента фоновых задач нет."""
+    system_prompt = prompts.SYSTEM_PROMPT
+    start = system_prompt.index("# Background jobs")
+    # После «How to work»: срез правил делегирования (до него) остаётся прежним.
+    assert start > system_prompt.index("# How to work")
+    rules = system_prompt[start : system_prompt.index("# Project instructions")]
+    assert "run_in_background" in rules
+    assert "background_output" in rules
+    assert "background_stop" in rules
+    assert BACKGROUND_HEADER in rules
+    assert "end your turn" in rules
+    assert "background" not in prompts.SUBAGENT_PROMPT
+
+
+def test_background_rules_quote_the_real_timeouts() -> None:
+    assert f"more than {shell_module.MAX_TIMEOUT} s" in prompts.SYSTEM_PROMPT
+    assert f"{shell_module.DEFAULT_TIMEOUT} s by default" in prompts.SYSTEM_PROMPT
+    assert f"up to {shell_module.MAX_BACKGROUND_TIMEOUT})" in prompts.SYSTEM_PROMPT
+
+
+def test_tool_descriptions_point_to_background() -> None:
+    assert "run_in_background" in RunShellTool.description
+    assert "run_in_background" in TaskTool.description
+
+
+@pytest.mark.parametrize(
+    "delegation",
+    [
+        tool_turn("explore", {"question": "где foo?"}),
+        tool_turn("task", {"agent": "general", "prompt": "почини foo", "description": "правка"}),
+    ],
+    ids=["explore", "general"],
+)
+def test_subagent_does_not_see_run_in_background(
+    tmp_path: Path,
+    delegation: AssistantTurn,
+) -> None:
+    provider = ScriptedProvider([delegation, text_turn("отчёт"), text_turn("готово")])
+    agent = _agent(provider, tmp_path)
+    assert agent.run_turn("сделай") == "готово"
+    main, child = (_shell_spec(request) for request in provider.requests[:2])
+    main_fields = set(main.parameters["properties"])
+    assert "run_in_background" in main_fields
+    assert "run_in_background" in main.description
+    assert set(child.parameters["properties"]) == main_fields - {"run_in_background"}
+    assert "run_in_background" not in str(child.parameters)
+    assert "run_in_background" not in child.description
+
+
+def test_foreground_shell_still_rejects_run_in_background(tmp_path: Path) -> None:
+    params = RunShellParams(command="true", run_in_background=True)
+    with pytest.raises(ToolError, match="фоновые команды здесь недоступны"):
+        RunShellTool().foreground().run(params, _ctx(tmp_path))
+
+
+@posix_only
+def test_leftover_process_note_points_to_background(tmp_path: Path) -> None:
+    params = RunShellParams(command="sleep 30 > /dev/null 2>&1 & echo started", timeout=60)
+    with_jobs = RunShellTool().run(params, _ctx(tmp_path, BackgroundJobs()))
+    assert "запускай с run_in_background" in with_jobs.content
+    without_jobs = RunShellTool().run(params, _ctx(tmp_path))
+    assert "остановлены" in without_jobs.content
+    assert "run_in_background" not in without_jobs.content
+
+
+def test_plan_mode_subagent_without_user_is_not_promised_confirmations() -> None:
+    """Фоновому суб-агенту подтвердить некому: тесты и сборка в режиме плана не выполнятся."""
+    asked = prompts.mode_prompt(PermissionMode.PLAN, subagent=True)
+    alone = prompts.mode_prompt(PermissionMode.PLAN, subagent=True, interactive=False)
+    assert "confirmed by the user" in asked
+    assert "confirmed by the user" not in alone
+    assert "nobody can give it in this run" in alone
