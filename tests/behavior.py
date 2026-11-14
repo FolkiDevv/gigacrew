@@ -825,6 +825,11 @@ class Scenario:
     run_tests: bool = False
 
 
+def _ran_pytest(commands: Iterable[str], target: str = "") -> bool:
+    """Среди команд есть запуск pytest (с ``target`` — этого файла или каталога)."""
+    return any("pytest" in command and target in command for command in commands)
+
+
 PROMO_TASK = (
     "Добавь промокоды: скидка в процентах при оформлении заказа, не больше предела скидки "
     "из настроек; неизвестный промокод — ошибка валидации."
@@ -961,7 +966,11 @@ SCENARIOS: tuple[Scenario, ...] = (
             ),
         ),
         files_expect={"README.md": "Настройки"},
-        check=lambda record: record["background_calls"] >= 1 and bool(record["files_ok"]),
+        # Опросы (background_polls) — в отчёте, а не в критерии: один background_output с
+        # wait, когда другой работы не осталось, — допустимый способ дождаться итога.
+        check=lambda record: (
+            _ran_pytest(record["background_commands"]) and bool(record["files_ok"])
+        ),
     ),
     Scenario(
         id="background_quick",
@@ -969,7 +978,11 @@ SCENARIOS: tuple[Scenario, ...] = (
         mode=PermissionMode.AUTO,
         turns=(Turn("Запусти тесты из tests/test_money.py и скажи, сколько из них прошло."),),
         expect=("3",),
-        check=lambda record: record["background_calls"] == 0 and record["answer_hits"] == 1,
+        check=lambda record: (
+            record["background_calls"] == 0
+            and _ran_pytest(record["shell_commands"], "test_money")
+            and record["answer_hits"] == 1
+        ),
     ),
 )
 SCENARIO_BY_ID: Mapping[str, Scenario] = MappingProxyType({
@@ -1079,6 +1092,9 @@ def _play_turns(
         error = exc
         if turns and "mode_after" not in turns[-1]:
             _turn_end(turns[-1], agent, user)
+    finally:
+        # И при сбое хода: фоновая задача не должна менять проект после снятия метрик.
+        agent.stop_background(SCENARIO_END_REASON)
     return error, time.monotonic() - started
 
 
@@ -1334,13 +1350,20 @@ def _delegation_metrics(
 
 def _background_metrics(calls: Sequence[FunctionCall]) -> dict[str, Any]:
     """Фоновые задачи: запуски с ``run_in_background`` и опросы через ``background_output``."""
+    started = [
+        call
+        for call in calls
+        if call.name in BACKGROUND_STARTERS and call.arguments.get("run_in_background") is True
+    ]
+    shell = [call for call in calls if call.name == "run_shell"]
     return {
-        "background_calls": sum(
-            1
-            for call in calls
-            if call.name in BACKGROUND_STARTERS and call.arguments.get("run_in_background") is True
-        ),
+        "background_calls": len(started),
         "background_polls": sum(1 for call in calls if call.name == "background_output"),
+        # Команды run_shell по порядку: все и из них — запущенные в фоне.
+        "shell_commands": [str(call.arguments.get("command", "")) for call in shell],
+        "background_commands": [
+            str(call.arguments.get("command", "")) for call in shell if call in started
+        ],
     }
 
 

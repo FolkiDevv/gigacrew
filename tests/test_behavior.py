@@ -35,6 +35,12 @@ def shop(tmp_path: Path) -> Path:
     return behavior.make_project(tmp_path / "shop")
 
 
+# Команды учебного проекта: весь набор, один файл и заведомо долгий прогон.
+PYTEST_ALL = "python -m pytest -q"
+PYTEST_MONEY = "python -m pytest -q tests/test_money.py"
+SLOW_PYTEST = "sleep 30; python -m pytest -q"
+
+
 def _run(
     scenario_id: str,
     turns: list[AssistantTurn | BaseException],
@@ -448,7 +454,7 @@ def test_long_check_started_in_background(shop: Path) -> None:
     outcome = _run(
         "background_long",
         [
-            tool_turn("run_shell", {"command": "ls tests", "run_in_background": True}),
+            tool_turn("run_shell", {"command": PYTEST_ALL, "run_in_background": True}),
             tool_turn("read_file", {"path": readme}),
             tool_turn(
                 "edit_file",
@@ -469,6 +475,7 @@ def test_long_check_started_in_background(shop: Path) -> None:
     assert outcome.error is None
     assert record["ok"]
     assert record["background_calls"] == 1
+    assert record["background_commands"] == [PYTEST_ALL]
     assert record["background_polls"] == 0
     assert record["changed_files"] == [readme]
     assert record["well_formed"]
@@ -480,7 +487,7 @@ def test_quick_command_runs_without_background(shop: Path) -> None:
     outcome = _run(
         "background_quick",
         [
-            tool_turn("run_shell", {"command": "ls tests"}),
+            tool_turn("run_shell", {"command": PYTEST_MONEY}),
             text_turn("Прошли все 3 теста."),
         ],
         shop,
@@ -488,7 +495,39 @@ def test_quick_command_runs_without_background(shop: Path) -> None:
     record = outcome.record
     assert record["ok"]
     assert record["background_calls"] == 0
-    assert record["requests"] == 2
+    assert record["shell_commands"] == [PYTEST_MONEY]
+    assert "3 passed" in str(outcome.transcript["conversation"])
+
+
+def test_background_scenarios_need_the_requested_test_run(shop: Path) -> None:
+    """Фон ради фона и ответ без прогона тестов критерий не проходят."""
+    idle = _run(
+        "background_long",
+        [
+            tool_turn("run_shell", {"command": "ls tests", "run_in_background": True}),
+            tool_turn("write_file", {"path": "README.md", "content": "## Настройки\n"}),
+            text_turn("Готово."),
+        ],
+        shop,
+    )
+    assert idle.record["background_calls"] == 1
+    assert not idle.record["ok"]
+    guess = _run("background_quick", [text_turn("Прошли все 3 теста.")], shop)
+    assert not guess.record["ok"]
+
+
+def test_failed_turn_leaves_no_background_jobs(shop: Path) -> None:
+    outcome = _run(
+        "background_long",
+        [
+            tool_turn("run_shell", {"command": SLOW_PYTEST, "run_in_background": True}),
+            LLMError("шлюз недоступен"),
+        ],
+        shop,
+    )
+    assert isinstance(outcome.error, LLMError)
+    # Команда ещё шла, когда ход сорвался: прогон её остановил и записал это в историю.
+    assert behavior.SCENARIO_END_REASON in str(outcome.transcript["conversation"])
 
 
 def test_api_error_is_recorded_not_lost(shop: Path) -> None:
