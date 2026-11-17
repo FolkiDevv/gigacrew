@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ssl
 import sys
 from pathlib import Path
 
 import pytest
+import truststore
 
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety import MAX_COMMAND, CommandLevel
@@ -14,6 +16,7 @@ from gigacrew.security import (
     SandboxError,
     classify_shell_command,
     resolve_in_root,
+    system_ssl_context,
 )
 from gigacrew.tools.base import Assessment, ToolContext
 from gigacrew.tools.shell import RunShellTool
@@ -139,3 +142,11 @@ def test_run_shell_over_long_command_is_dangerous(tmp_path: Path) -> None:
     assert assessment.verdict.level is None
     assert assessment.risk is RiskLevel.DANGEROUS
     assert assessment.reason == "не удалось проверить: слишком длинная команда"
+
+
+def test_tls_trusts_os_certificate_store() -> None:
+    """Корни — из хранилища ОС (корпоративный УЦ), а не собственный набор; проверка строгая."""
+    context = system_ssl_context()
+    assert isinstance(context, truststore.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname

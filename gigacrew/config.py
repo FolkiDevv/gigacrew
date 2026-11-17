@@ -28,10 +28,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import httpx
-
 from gigacrew.permissions import PermissionMode, parse_mode
 from gigacrew.project.workspace import user_data_dir
+from gigacrew.security import system_ssl_context
 
 # Значения по умолчанию и границы числовых настроек (время — в секундах, доли — в процентах).
 _DEFAULT_TIMEOUT = 120
@@ -321,8 +320,8 @@ class Config:
     # ключ, токен и сам код ушли бы любому, кто подменит сервер. Выключает её только
     # явный GIGACREW_VERIFY_SSL=0.
     verify_ssl: bool = True
-    # Корневой сертификат для проверки сервера, чей корень не в стандартном хранилище.
-    # У API v2 — вместо стандартных корней, у бэкенда GigaCode — в дополнение к ним.
+    # Корневой сертификат для проверки сервера, чей корень не в хранилище ОС.
+    # У API v2 — вместо корней ОС, у бэкенда GigaCode — в дополнение к ним.
     ca_bundle: str | None = None
     # User-Agent всех запросов к бэкенду GigaCode; значения по умолчанию тоже нет.
     user_agent: str | None = None
@@ -638,10 +637,10 @@ class Config:
             )
 
     def _server_ssl_context(self) -> ssl.SSLContext:
-        """Проверка сервера API v2: корни из ``ca_bundle``, если он задан, иначе стандартные.
+        """Проверка сервера API v2: корни из ``ca_bundle``, если он задан, иначе — корни ОС.
 
-        Стандартные — как у httpx (certifi или SSL_CERT_FILE/SSL_CERT_DIR) и системное
-        хранилище (туда ставят корпоративные корни).
+        Корни ОС — хранилище сертификатов системы (:func:`system_ssl_context`): туда ставят
+        корпоративные корни, собственный набор (certifi) не используется.
         """
         if self.ca_bundle:
             try:
@@ -650,18 +649,17 @@ class Config:
                 raise RuntimeError(
                     f"не удалось загрузить GIGACREW_CA_BUNDLE {self.ca_bundle}: {exc}",
                 ) from exc
-        context = httpx.create_ssl_context()
-        context.load_default_certs()
-        return context
+        return system_ssl_context()
 
     def _gigacode_ssl_context(self) -> ssl.SSLContext:
         """Проверка сервера GigaCode с теми же корнями, что у официального CLI.
 
-        Корни: стандартные (как у httpx), его сертификаты — ``certs/*.pem`` и ``*.crt`` в
-        :attr:`gigacode_dir` (туда CLI кладёт свой корпоративный корень) — и ``ca_bundle``.
+        Корни: хранилище ОС (:func:`system_ssl_context`), его сертификаты — ``certs/*.pem``
+        и ``*.crt`` в :attr:`gigacode_dir` (туда CLI кладёт свой корпоративный корень) — и
+        ``ca_bundle``.
         Файл, который не читается как сертификат, — ошибка, а не тихий пропуск.
         """
-        context = httpx.create_ssl_context()
+        context = system_ssl_context()
         certs = self.gigacode_dir / "certs"
         candidates: Iterable[Path] = certs.iterdir() if certs.is_dir() else ()
         files = sorted(

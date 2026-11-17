@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import os
 import re
+import ssl
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
 from pathlib import Path
+
+import truststore
 
 from gigacrew.errors import SandboxError
 
@@ -29,7 +32,20 @@ __all__ = [
     "resolve_in_root",
     "resolve_in_roots",
     "subprocess_env",
+    "system_ssl_context",
 ]
+
+
+def system_ssl_context() -> ssl.SSLContext:
+    """Проверка TLS-сервера по хранилищу сертификатов ОС, а не по собственному набору корней.
+
+    Корпоративные серверы подписаны корпоративным УЦ, а его корень ставят в хранилище
+    системы: Windows (CryptoAPI), macOS (Keychain), Linux (системный пакет корней, например
+    ``/etc/ssl/certs``; ``SSL_CERT_FILE``/``SSL_CERT_DIR`` тоже учитываются). Корни,
+    добавленные в контекст через ``load_verify_locations``, работают в дополнение к ним.
+    Проверка имени хоста и цепочки обязательна (``PROTOCOL_TLS_CLIENT``).
+    """
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
 
 class RiskLevel(IntEnum):

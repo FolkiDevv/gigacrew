@@ -18,13 +18,13 @@ import codecs
 import contextlib
 import json
 import re
-import ssl
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any, Final, override
 
 import httpx
 
+from gigacrew.security import system_ssl_context
 from gigacrew.tools.mcp_transport import (
     MAX_MESSAGE,
     McpError,
@@ -114,13 +114,6 @@ def _before[ChunkT](deadline: float, chunks: Iterable[ChunkT]) -> Iterator[Chunk
         yield chunk
 
 
-def _ssl_context() -> ssl.SSLContext:
-    """Проверка сервера: корни как у httpx (certifi, SSL_CERT_FILE) и системное хранилище."""
-    context = httpx.create_ssl_context()
-    context.load_default_certs()
-    return context
-
-
 def _http_error(error: Exception, timeout: float) -> McpError:
     """Ошибка httpx или разбора ответа → McpError (таймаут — McpTimeoutError)."""
     if isinstance(error, httpx.TimeoutException):
@@ -164,7 +157,7 @@ class HttpTransport(Transport):
         """Создаёт HTTP-клиент; сеть пока не трогается."""
         self._receive = receive
         self._client = httpx.Client(
-            verify=_ssl_context(),
+            verify=system_ssl_context(),  # корни — из хранилища ОС
             follow_redirects=False,
             transport=self._transport,
         )
