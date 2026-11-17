@@ -7,6 +7,8 @@
 Запуск — ``make eval`` (только эти тесты; дорого). Настройки (окружение или ``.env``):
 
 * ``GIGACREW_EVAL_MODELS`` — модели через запятую (по умолчанию ``GIGACREW_TEST_MODEL``);
+* ``GIGACREW_TEST_PROVIDER=openrouter`` — модели OpenRouter вместо API v2 (ключ —
+  ``GIGACREW_OPENROUTER_API_KEY``, см. ``tests/openrouter.py``); окна — из его каталога;
 * ``GIGACREW_EVAL_RUNS`` — повторов каждого сценария (по умолчанию 3);
 * ``GIGACREW_EVAL_LABEL`` — метка отчёта (``baseline-t02``…);
 * ``GIGACREW_EVAL_DIR`` — папка отчётов (по умолчанию ``.gigacode/evals``);
@@ -33,9 +35,9 @@ from pathlib import Path
 
 import behavior
 import pytest
+from openrouter import LiveUnavailableError, open_live_provider
 
-from gigacrew.config import Config, load_environment
-from gigacrew.llm.api import ApiProvider
+from gigacrew.config import load_environment
 from gigacrew.llm.model_windows import ModelWindows
 
 pytestmark = [pytest.mark.live, pytest.mark.eval]
@@ -69,15 +71,15 @@ def eval_session(request: pytest.FixtureRequest) -> Iterator[behavior.EvalSessio
     Окна читаются до того, как фикстура ``_isolated_home`` подменит домашнюю папку
     (фикстуры сессии создаются раньше фикстур теста).
     """
-    config = Config.load(project_root=behavior.REPO_ROOT, trusted_dotenv=True, model=MODELS[0])
-    if config.provider != "api":
-        pytest.skip("eval — для API v2 (GIGACREW_PROVIDER=api)")
     try:
-        config.require_credentials()
-    except RuntimeError as error:
+        config, provider = open_live_provider(MODELS[0], ENV)
+    except LiveUnavailableError as error:
         pytest.skip(f"{error} — eval пропущен")
+    provider.connect()  # каталог моделей (OpenRouter): окна незамеренных моделей
     windows, _ = ModelWindows.load(base_url=config.base_url)
-    provider = ApiProvider(config)
+    catalogue = provider.known_models()
+    if catalogue is not None:
+        windows.report({entry.id: entry.context_window for entry in catalogue})
     session = behavior.EvalSession(
         config=config,
         provider=provider,

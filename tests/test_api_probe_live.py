@@ -38,6 +38,7 @@ from behavior import (
     report_dir,
     with_reasoning,
 )
+from openrouter import OPENROUTER, live_provider_kind
 
 from gigacrew.agent.prompts import SYSTEM_PROMPT, build_project_context, compose_system_prompt
 from gigacrew.config import Config, load_environment
@@ -83,6 +84,8 @@ SAMPLING = MappingProxyType({
 def api() -> Iterator[ApiProvider]:
     if not MODELS:
         pytest.skip("не заданы модели")
+    if live_provider_kind(ENV) == OPENROUTER:
+        pytest.skip("пробы шлюза — для API v2, а модели — OpenRouter (GIGACREW_TEST_PROVIDER)")
     config = Config.load(project_root=REPO_ROOT, trusted_dotenv=True, model=MODELS[0])
     if config.provider != "api":
         pytest.skip("пробы шлюза — для API v2 (GIGACREW_PROVIDER=api)")
