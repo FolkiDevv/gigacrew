@@ -12,6 +12,7 @@ from typing import TypedDict, Unpack, cast
 
 import certifi
 import pytest
+import truststore
 from fakes import ScriptedProvider, text_turn
 
 from gigacrew.cli import main
@@ -467,15 +468,17 @@ def _self_signed(tmp_path: Path, cn: str = "test") -> tuple[Path, Path]:
     return cert, key
 
 
-@pytest.fixture
-def _certifi_roots(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Стандартные корни — из certifi, как у httpx.
+def _empty_os_roots() -> ssl.SSLContext:
+    return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
-    Не из SSL_CERT_FILE/SSL_CERT_DIR машины: корни из каталога грузятся лениво, и
-    get_ca_certs() их не показал бы.
+
+@pytest.fixture
+def _bare_os_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Хранилище ОС — пустой контекст: видны только корни, которые gigacrew добавил сам.
+
+    truststore берёт корни системы при рукопожатии и get_ca_certs() не поддерживает.
     """
-    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
-    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    monkeypatch.setattr("gigacrew.config.system_ssl_context", _empty_os_roots)
 
 
 def _common_names(cfg: Config) -> set[str]:
@@ -489,16 +492,14 @@ def _common_names(cfg: Config) -> set[str]:
     return names
 
 
-@pytest.mark.usefixtures("_certifi_roots")
 def test_gigacode_verifies_tls_by_default(tmp_path: Path) -> None:
     env = {"GIGACREW_PROVIDER": "gigacode"}
     cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
     assert cfg.verify_ssl  # токен официального CLI без проверки сервера не уходит
     context = cfg.build_ssl_verify()
-    assert isinstance(context, ssl.SSLContext)
+    assert isinstance(context, truststore.SSLContext)  # корни — из хранилища ОС
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname
-    assert context.get_ca_certs()
     cfg = Config.load(
         project_root=tmp_path,
         environ={**env, "GIGACREW_VERIFY_SSL": "0"},
@@ -507,7 +508,7 @@ def test_gigacode_verifies_tls_by_default(tmp_path: Path) -> None:
     assert cfg.build_ssl_verify() is False  # явное значение важнее
 
 
-@pytest.mark.usefixtures("_certifi_roots")
+@pytest.mark.usefixtures("_bare_os_roots")
 def test_gigacode_trusts_official_cli_certificates(tmp_path: Path, user_home: Path) -> None:
     certs = user_home / ".gigacode" / "certs"
     certs.mkdir(parents=True)
@@ -525,9 +526,7 @@ def test_gigacode_trusts_official_cli_certificates(tmp_path: Path, user_home: Pa
         environ={**env, "GIGACREW_CA_BUNDLE": str(own)},
         cwd=tmp_path,
     )
-    names = _common_names(cfg)
-    assert {"bundled", "extra", "own"} <= names
-    assert len(names) > 3
+    assert _common_names(cfg) == {"bundled", "extra", "own"}
 
     other = tmp_path / "other-home"
     (other / "certs").mkdir(parents=True)
@@ -555,15 +554,9 @@ def test_gigacode_broken_certificate_is_an_error(tmp_path: Path, user_home: Path
         cfg.build_ssl_verify()
 
 
-def test_mtls_verification_loads_trust_anchors(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_mtls_verification_loads_trust_anchors(tmp_path: Path) -> None:
     """Голый SSLContext без корневых сертификатов не проверил бы ни один сервер."""
     cert, key = _self_signed(tmp_path)
-    # Системные корни бывают только в capath (подгружаются лениво, счётчики пусты) —
-    # подменяем хранилище по умолчанию, чтобы проверка не зависела от машины.
-    monkeypatch.setenv("SSL_CERT_FILE", str(cert))
     base = {"GIGACREW_CERT": str(cert), "GIGACREW_KEY": str(key)}
     cfg = Config.load(
         project_root=tmp_path,
@@ -571,9 +564,8 @@ def test_mtls_verification_loads_trust_anchors(
         cwd=tmp_path,
     )
     context = cfg.build_ssl_verify()
-    assert isinstance(context, ssl.SSLContext)
+    assert isinstance(context, truststore.SSLContext)  # корни — из хранилища ОС
     assert context.verify_mode == ssl.CERT_REQUIRED
-    assert context.cert_store_stats()["x509_ca"] > 0 or context.get_ca_certs() != []
     cfg = Config.load(
         project_root=tmp_path,
         environ={**base, "GIGACREW_CA_BUNDLE": str(cert)},
@@ -586,35 +578,31 @@ def test_mtls_verification_loads_trust_anchors(
 
 
 # ------------------------- проверка TLS у API v2 ------------------------- #
-@pytest.mark.usefixtures("_certifi_roots")
 def test_api_verifies_tls_by_default(tmp_path: Path) -> None:
     """Ключ OAuth и Bearer-токен не уходят на непроверенный сервер.
 
-    Проверка TLS у API v2 включена и без GIGACREW_CA_BUNDLE — стандартными корнями.
+    Проверка TLS у API v2 включена и без GIGACREW_CA_BUNDLE — корнями из хранилища ОС.
     """
     assert Config().verify_ssl  # и у конфигурации, собранной вручную
     cfg = Config.load(project_root=tmp_path, environ={"GIGACREW_ACCESS_KEY": "k"}, cwd=tmp_path)
     assert cfg.verify_ssl
     context = cfg.build_ssl_verify()
-    assert isinstance(context, ssl.SSLContext)
+    assert isinstance(context, truststore.SSLContext)
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname
-    assert context.get_ca_certs()
     env = {"GIGACREW_ACCESS_KEY": "k", "GIGACREW_VERIFY_SSL": "0"}  # явный отказ — работает
     cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
     assert not cfg.verify_ssl
     assert cfg.build_ssl_verify() is False
 
 
-@pytest.mark.usefixtures("_certifi_roots")
 def test_mtls_verifies_server_by_default(tmp_path: Path) -> None:
     cert, key = _self_signed(tmp_path)
     env = {"GIGACREW_CERT": str(cert), "GIGACREW_KEY": str(key)}
     context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
-    assert isinstance(context, ssl.SSLContext)
+    assert isinstance(context, truststore.SSLContext)
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname
-    assert context.get_ca_certs()
     env["GIGACREW_VERIFY_SSL"] = "0"
     context = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path).build_ssl_verify()
     assert isinstance(context, ssl.SSLContext)

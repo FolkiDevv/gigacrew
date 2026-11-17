@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "gigacrew"
-version = "0.8.2"
+version = "0.9.1"
 description = "Консольный помощник для работы с кодом проекта"
 readme = "README.md"
 authors = [
@@ -54,6 +54,8 @@ dependencies = [
     "tree-sitter-bash>=0.25,<0.26",
     "tree-sitter-scala>=0.26",
     "tree-sitter-swift>=0.7",
+    # проверка TLS по хранилищу сертификатов ОС (корпоративные корни), а не по certifi
+    "truststore>=0.10",
 ]
 
 [dependency-groups]
