@@ -478,7 +478,7 @@ class Agent:
         self._ctx = self._tool_context()
         self._conversation = Conversation() if conversation is None else conversation
         if conversation is not None:
-            self._deferred.restore(conversation.messages)
+            self._deferred.restore(conversation.context_messages())
         self._model_name = config.model if parent is None else parent.model
         # Режим разрешений — состояние сессии, как модель: reset() его не меняет.
         # Может смениться посреди хода (Shift+Tab из потока клавиш) — читается при
@@ -785,7 +785,7 @@ class Agent:
                 )
         self.chat_id = chat_id or ChatStore.new_id()
         self._conversation = Conversation() if conversation is None else conversation
-        self._deferred.restore(self._conversation.messages)
+        self._deferred.restore(self._conversation.context_messages())
         self._project_context = None
         self._session_context = ""  # новый чат — хуки SessionStart запустит вызывающий
         self._nested.reset()
@@ -1828,6 +1828,8 @@ class Agent:
                 on_usage=on_usage,
                 auto=auto,
             )
+            # Загруженные схемы — по видимой модели истории: свёрнутые вызовы ушли из неё.
+            self._deferred.restore(conversation.context_messages())
         except BaseException:
             self._events.on_compact_end(compacted)
             raise

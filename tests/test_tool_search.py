@@ -9,7 +9,7 @@ import pytest
 from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn, tools_turn
 from pydantic import BaseModel
 
-from gigacrew.agent.conversation import Conversation
+from gigacrew.agent.conversation import Conversation, Summary
 from gigacrew.agent.loop import Agent
 from gigacrew.config import Config
 from gigacrew.llm.types import FunctionCall, Message
@@ -256,4 +256,32 @@ def test_resumed_chat_restores_loaded(project: Path) -> None:
     agent.run_turn("ещё")
     assert SEARCH in _names(provider.requests[0]["tools"])
     agent.reset()
+    assert not agent.loaded_tools
+
+
+def _searched_chat() -> Conversation:
+    """Чат, где модель загрузила SEARCH и ответила."""
+    conversation = Conversation()
+    conversation.add_user("найди задачи")
+    call = FunctionCall(name=TOOL_SEARCH, arguments={"query": f"select:{SEARCH}"}, id="1")
+    conversation.add_assistant(Message(role="assistant", function_calls=[call]))
+    conversation.add_function_result(TOOL_SEARCH, "Loaded", call_id="1")
+    # Длинный ответ: краткое содержание при сжатии выходит короче истории.
+    conversation.add_assistant(Message(role="assistant", content="нашёл задачу " * 300))
+    return conversation
+
+
+def test_compact_drops_loaded(project: Path) -> None:
+    agent, provider = _agent(project, [text_turn("ок")], *_remotes(), conversation=_searched_chat())
+    assert agent.loaded_tools == {SEARCH}
+    assert agent.compact() is not None
+    assert not agent.loaded_tools
+    agent.run_turn("ещё")
+    assert SEARCH not in _names(provider.requests[0]["tools"])
+
+
+def test_resumed_compacted_chat_skips_summarized_calls(project: Path) -> None:
+    conversation = _searched_chat()
+    conversation.set_summary(Summary("модель искала задачи", upto=len(conversation)))
+    agent, _ = _agent(project, [], *_remotes(), conversation=conversation)
     assert not agent.loaded_tools
