@@ -420,12 +420,21 @@ def test_oneshot_trust_mcp_runs_tool(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _write(tmp_path / MCP_JSON_FILE, _settings(_fake()))
-    provider = ScriptedProvider([tool_turn(ECHO, {"text": "из CLI"}), text_turn("готово")])
+    turns = [
+        tool_turn("tool_search", {"query": f"select:{ECHO}"}),
+        tool_turn(ECHO, {"text": "из CLI"}),
+        text_turn("готово"),
+    ]
+    provider = ScriptedProvider(turns)
     oneshot(provider)
     argv = ["-C", str(tmp_path), "-p", "эхо", "--no-color", "--no-stream", "-y", "--trust-mcp"]
     assert app.main(argv) == app.EXIT_OK
-    assert _function_results(provider) == [json.dumps({"text": "из CLI"}, ensure_ascii=False)]
-    assert ECHO in {spec.name for spec in provider.requests[0]["tools"]}
+    assert _function_results(provider)[-1] == json.dumps({"text": "из CLI"}, ensure_ascii=False)
+    # Схема инструмента сервера — только после tool_search.
+    first, second = ({spec.name for spec in request["tools"]} for request in provider.requests[:2])
+    assert ECHO not in first
+    assert "tool_search" in first
+    assert ECHO in second
     assert "MCP-серверы: подключение (fake)" in capsys.readouterr().out
 
 

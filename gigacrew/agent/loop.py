@@ -136,6 +136,7 @@ from gigacrew.tools.plan import PlanReview, review_plan
 from gigacrew.tools.process import quote_reminder_tags
 from gigacrew.tools.questions import Answer, Question
 from gigacrew.tools.task import SUBAGENTS, SubagentSpec
+from gigacrew.tools.tool_search import DeferredTools, not_loaded_note
 
 # Заметки для модели — на английском, как и промпты (пользователь их не видит).
 REJECTED_NOTE = (
@@ -470,8 +471,14 @@ class Agent:
         self._hooks = HookRunner() if hooks is None else hooks
         # Контекст хуков SessionStart: в системном сообщении до reset().
         self._session_context = ""
+        # Загруженные схемы отложенных инструментов (MCP): у суб-агента сначала — те же,
+        # что у основного агента; продолженный чат загружает их по своей истории.
+        loaded = frozenset[str]() if parent is None else parent.loaded_tools
+        self._deferred = DeferredTools(registry, loaded, enabled=config.mcp_defer)
         self._ctx = self._tool_context()
         self._conversation = Conversation() if conversation is None else conversation
+        if conversation is not None:
+            self._deferred.restore(conversation.messages)
         self._model_name = config.model if parent is None else parent.model
         # Режим разрешений — состояние сессии, как модель: reset() его не меняет.
         # Может смениться посреди хода (Shift+Tab из потока клавиш) — читается при
@@ -778,6 +785,7 @@ class Agent:
                 )
         self.chat_id = chat_id or ChatStore.new_id()
         self._conversation = Conversation() if conversation is None else conversation
+        self._deferred.restore(self._conversation.messages)
         self._project_context = None
         self._session_context = ""  # новый чат — хуки SessionStart запустит вызывающий
         self._nested.reset()
@@ -839,6 +847,11 @@ class Agent:
             self._project_context = build_project_context(self._workspace)
         return self._project_context
 
+    @property
+    def loaded_tools(self) -> frozenset[str]:
+        """Отложенные инструменты (MCP), схемы которых модель загрузила (``tool_search``)."""
+        return self._deferred.loaded
+
     def system_prompt(self) -> str:
         """Системный промпт агента (у суб-агента — свой) с контекстом проекта.
 
@@ -847,6 +860,7 @@ class Agent:
         """
         context = self.project_context()
         notes = [tool.guidance() for tool in self._registry]
+        notes.append(self._deferred.guidance())
         if self._subagent is not None:
             return subagent_system_prompt(self._subagent.name, context, notes)
         return compose_system_prompt(SYSTEM_PROMPT, context, notes)
@@ -858,7 +872,7 @@ class Agent:
         ``instructions`` — пожелания пользователя к резюме. None — сжимать нечего.
         Ошибка модели — :class:`~gigacrew.llm.base.LLMError`; диалог тогда не меняется.
         """
-        specs = self._registry.specs()
+        specs = self._deferred.specs()
         return self._compact(self._history_budget(specs), specs, instructions=instructions)
 
     def call_info(self, call: FunctionCall) -> ToolCallInfo:
@@ -914,9 +928,10 @@ class Agent:
             self.mode,
             len(self._nested.files),
             self._session_context,
+            len(self._deferred.loaded),
         )
         if self._context_estimate is None or self._context_estimate[0] != key:
-            specs = self._registry.specs()
+            specs = self._deferred.specs()
             size = self._overhead_tokens(specs) + _history_tokens(conversation)
             self._context_estimate = (key, size)
         return self._context_estimate[1]
@@ -1084,6 +1099,7 @@ class Agent:
             classify_commands=self._cfg.safe_commands,
             background=self._jobs,
             start_subagent=self._start_subagent if main else None,
+            deferred=self._deferred,
         )
 
     def _plan_path(self, chat_id: str) -> Path:
@@ -1153,7 +1169,6 @@ class Agent:
         # Рассуждения прошлых ходов модели больше не нужны (GIGACREW_REASONING=turn).
         self._conversation.forget_reasoning()
         self._conversation.add_user(user_input, meta=meta)
-        specs = self._registry.specs()
         guard = self._new_guard()
         stats = TurnStats()
         self._turn_stats = stats
@@ -1161,11 +1176,11 @@ class Agent:
         self._wrapping = False
         started = time.monotonic()
         try:
-            final_text = self._loop(specs, guard, stats)
+            final_text = self._loop(guard, stats)
         except KeyboardInterrupt:
             if not self._take_soft_stop():
                 raise
-            final_text = self._user_stop(specs, stats)
+            final_text = self._user_stop(self._deferred.specs(), stats)
         finally:
             self._turn_stats = None
             stats.changes = guard.changes
@@ -1221,8 +1236,11 @@ class Agent:
             user_stop=True,
         )
 
-    def _loop(self, specs: list[ToolSpec], guard: LoopGuard, stats: TurnStats) -> str:
+    def _loop(self, guard: LoopGuard, stats: TurnStats) -> str:
         """Шаги хода до финального ответа модели или остановки ограничителем.
+
+        Схемы инструментов — заново на каждом шаге: ``tool_search`` загружает отложенные, а
+        вызвать отложенный инструмент можно, только если его схема была в запросе шага.
 
         Ход в режиме плана, закончившийся текстом, harness проверяет по структуре, не по
         тексту ответа: записанный, но не отправленный план показывает пользователю сам
@@ -1231,7 +1249,7 @@ class Agent:
         """
         state = _TurnLoop(reviews=0 if self._plan is None else self._plan.reviews)
         while True:
-            final_text = self._step(specs, guard, stats, state)
+            final_text = self._step(self._deferred.step_specs(), guard, stats, state)
             if final_text is not None:
                 return final_text
 
@@ -1972,6 +1990,19 @@ class Agent:
             unknown = ToolCallInfo(name, "(неизвестный инструмент)")
             self._events.on_tool_call(unknown)
             return self._fail(unknown, f"инструмент '{name}' не существует.", note=note)
+
+        # Отложенный инструмент, схему которого модель не загружала: аргументы — догадка.
+        if self._deferred.pending(name):
+            self._deferred.load((name,))
+            skipped = ToolCallInfo(name, "(схема не загружена)", tool.kind)
+            self._events.on_tool_call(skipped)
+            self._fail(
+                skipped,
+                "схема инструмента не загружена — загружена теперь, модель повторит вызов",
+                model_text=not_loaded_note(tool),
+                note=note,
+            )
+            return ToolOutcome(ok=False, soft=True)
 
         # 1) Валидация параметров
         try:
