@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from openrouter import LiveUnavailableError, open_live_provider  # noqa: E402
 
 from gigacrew.cli import app as cli_app  # noqa: E402
 from gigacrew.config import Config, load_environment  # noqa: E402
@@ -56,23 +59,23 @@ def ctx(project: Path) -> ToolContext:
 
 
 @pytest.fixture(scope="session")
-def live_config() -> Config:
-    """Конфиг для live-тестов (окружение + .env репозитория, OAuth или mTLS).
+def live_provider() -> Iterator[LLMProvider]:
+    """Провайдер live-тестов: API v2 из настроек или OpenRouter (``GIGACREW_TEST_PROVIDER``).
 
-    Пропускает тест, если не заданы реквизиты, адрес API или GIGACREW_TEST_MODEL.
+    Модель — GIGACREW_TEST_MODEL. Пропускает тест, если она, реквизиты или адрес API не
+    заданы (см. :func:`openrouter.open_live_provider`).
     """
     env = load_environment(REPO_ROOT)
     model = env.get("GIGACREW_TEST_MODEL")
     if not model:
         pytest.skip("Не задана GIGACREW_TEST_MODEL — live-тесты пропущены")
-    cfg = Config.load(project_root=REPO_ROOT, trusted_dotenv=True, model=model)
-    if cfg.provider != "api":
-        pytest.skip("live-тесты — для API v2 (GIGACREW_PROVIDER=api)")
     try:
-        cfg.require_credentials()
-    except RuntimeError as error:
+        _config, provider = open_live_provider(model, env)
+    except LiveUnavailableError as error:
         pytest.skip(f"{error} — live-тесты пропущены")
-    return cfg
+    with contextlib.closing(provider):
+        provider.connect()  # каталог моделей (OpenRouter)
+        yield provider
 
 
 @pytest.fixture

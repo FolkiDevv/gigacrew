@@ -1,23 +1,23 @@
 """Live-тесты реального API модели.
 
-Проверяют все типы обращений к LLM на живом API (v2):
+Проверяют все типы обращений к LLM на живом API — API v2 из настроек или модели
+OpenRouter (``GIGACREW_TEST_PROVIDER=openrouter``, см. ``tests/openrouter.py``):
   1. простой запрос-ответ;
   2. вызов функции (tool call), в том числе несколько вызовов за ответ;
   3. многошаговый диалог с возвратом результатов инструментов в модель.
 
-Помечены маркером ``live`` и пропускаются, если нет доступного ключа.
+Помечены маркером ``live`` и пропускаются, если нет доступного ключа. Непрозрачное состояние
+инструментов (``tools_state_id``) проверяется только у API v2: в формате OpenAI его нет.
 Запуск только live-тестов:  pytest -m live
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-
 import pytest
 
-from gigacrew.config import Config
 from gigacrew.llm.api import ApiProvider
-from gigacrew.llm.types import FunctionCall, Message, ToolSpec
+from gigacrew.llm.base import LLMProvider
+from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec
 
 pytestmark = pytest.mark.live
 
@@ -25,14 +25,18 @@ pytestmark = pytest.mark.live
 _FIRST_TEMPERATURE = 10
 
 
-@pytest.fixture(scope="module")
-def provider(live_config: Config) -> Iterator[ApiProvider]:
-    api = ApiProvider(live_config)
-    yield api
-    api.close()
+@pytest.fixture
+def provider(live_provider: LLMProvider) -> LLMProvider:
+    return live_provider
 
 
-def test_simple_completion(provider: ApiProvider) -> None:
+def _assert_tools_state(provider: LLMProvider, turn: AssistantTurn) -> None:
+    """У API v2 ход с вызовами несёт состояние инструментов; в формате OpenAI его нет."""
+    if isinstance(provider, ApiProvider):
+        assert turn.message.state_id
+
+
+def test_simple_completion(provider: LLMProvider) -> None:
     """Тип 1: простой запрос-ответ."""
     turn = provider.complete(
         [Message(role="user", content="Ответь ровно одним словом: столица России?")],
@@ -42,7 +46,7 @@ def test_simple_completion(provider: ApiProvider) -> None:
     assert turn.usage.total_tokens > 0
 
 
-def test_models_listing(provider: ApiProvider) -> None:
+def test_models_listing(provider: LLMProvider) -> None:
     """Список — чат-модели шлюза, и модель тестов среди них."""
     models = provider.list_models()
     assert provider.model in models, f"{provider.model} нет в списке моделей: {models}"
@@ -51,7 +55,7 @@ def test_models_listing(provider: ApiProvider) -> None:
     assert len(set(models)) == len(models)
 
 
-def test_streaming_text(provider: ApiProvider) -> None:
+def test_streaming_text(provider: LLMProvider) -> None:
     """Потоковая генерация: дельты приходят и собираются в полный ответ."""
     deltas: list[str] = []
     turn = provider.stream(
@@ -67,7 +71,7 @@ def test_streaming_text(provider: ApiProvider) -> None:
     assert turn.message.content.lower().count("фиолет") == 1
 
 
-def test_streaming_tool_call(provider: ApiProvider) -> None:
+def test_streaming_tool_call(provider: LLMProvider) -> None:
     """Потоковый режим корректно отдаёт вызов функции."""
     turn = provider.stream(
         [Message(role="user", content="Погода в Сочи? Вызови get_weather.")],
@@ -80,7 +84,7 @@ def test_streaming_tool_call(provider: ApiProvider) -> None:
     assert "сочи" in str(fc.arguments.get("city", "")).lower()
     # вызов из потока можно вернуть в историю: id и состояние пришли и здесь
     assert fc.id
-    assert turn.message.state_id
+    _assert_tools_state(provider, turn)
 
 
 WEATHER_TOOL = ToolSpec(
@@ -94,7 +98,7 @@ WEATHER_TOOL = ToolSpec(
 )
 
 
-def test_single_tool_call(provider: ApiProvider) -> None:
+def test_single_tool_call(provider: LLMProvider) -> None:
     """Тип 2: модель запрашивает вызов функции."""
     turn = provider.complete(
         [
@@ -113,10 +117,10 @@ def test_single_tool_call(provider: ApiProvider) -> None:
     assert "москв" in str(fc.arguments.get("city", "")).lower()
     # API возвращает id вызова и непрозрачный идентификатор состояния инструментов
     assert fc.id
-    assert turn.message.state_id
+    _assert_tools_state(provider, turn)
 
 
-def test_multistep_with_tool_result(provider: ApiProvider) -> None:
+def test_multistep_with_tool_result(provider: LLMProvider) -> None:
     """Тип 3: возврат результата инструмента обратно в модель."""
     messages = [
         Message(
@@ -162,7 +166,7 @@ def _weather_replies(calls: list[FunctionCall]) -> list[Message]:
     return replies
 
 
-def test_parallel_calls_round_trip(provider: ApiProvider) -> None:
+def test_parallel_calls_round_trip(provider: LLMProvider) -> None:
     """Несколько вызовов за ответ: результаты всех возвращаются одним шагом."""
     messages = [
         Message(
@@ -192,7 +196,7 @@ def test_parallel_calls_round_trip(provider: ApiProvider) -> None:
     assert all(temperature in answer for temperature in temperatures), answer
 
 
-def test_tool_choice_none_answers_with_text(provider: ApiProvider) -> None:
+def test_tool_choice_none_answers_with_text(provider: LLMProvider) -> None:
     """Итог после остановки: инструменты в запросе, но модель отвечает только текстом."""
     turn = provider.complete(
         [Message(role="user", content="Какая погода в Москве? Вызови get_weather.")],
@@ -205,7 +209,7 @@ def test_tool_choice_none_answers_with_text(provider: ApiProvider) -> None:
     assert turn.message.content.strip()
 
 
-def test_history_without_call_ids_continues(provider: ApiProvider) -> None:
+def test_history_without_call_ids_continues(provider: LLMProvider) -> None:
     """Чат, сохранённый до перехода на v2: у вызова нет id, состояния нет."""
     messages = [
         Message(role="user", content="Какая погода в Москве? Вызови get_weather."),
