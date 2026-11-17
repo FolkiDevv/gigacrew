@@ -22,6 +22,7 @@ gigacrew работает с API v2 и бэкендом GigaCode; чтобы г�
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -57,6 +58,21 @@ KEY_ENVS: Final = ("GIGACREW_OPENROUTER_API_KEY", "OPENROUTER_API_KEY")
 # Провайдеры live-тестов: API v2 из настроек gigacrew и OpenRouter.
 API: Final = "api"
 OPENROUTER: Final = "openrouter"
+# Настройки подключения к API v2 и бэкенду GigaCode. OpenRouter они не нужны, а
+# некорректные (GIGACREW_CA_BUNDLE без файла, опечатка в GIGACREW_PROVIDER) сорвали бы
+# загрузку настроек агента — при загрузке для OpenRouter они пустые.
+_GATEWAY_ENVS: Final = (
+    "GIGACREW_PROVIDER",
+    "GIGACREW_API_URL",
+    "GIGACREW_ACCESS_KEY",
+    "GIGACREW_AUTH_URL",
+    "GIGACREW_SCOPE",
+    "GIGACREW_CERT",
+    "GIGACREW_KEY",
+    "GIGACREW_CA_BUNDLE",
+    "GIGACREW_VERIFY_SSL",
+    "GIGACREW_USER_AGENT",
+)
 # Сколько символов некорректного ответа показывать в ошибке.
 _SHOWN_CHARS: Final = 200
 
@@ -105,14 +121,22 @@ def openrouter_config(config: Config) -> Config:
 def open_live_provider(model: str, env: Mapping[str, str]) -> tuple[Config, LLMProvider]:
     """Конфиг и провайдер live-тестов для ``model`` по ``GIGACREW_TEST_PROVIDER``.
 
-    Настройки — окружение и ``.env`` репозитория (доверенный). Провайдер не настроен —
+    Настройки — окружение и ``.env`` репозитория (доверенный); для OpenRouter — без настроек
+    подключения к API v2 (:data:`_GATEWAY_ENVS`). Провайдер не настроен —
     :class:`LiveUnavailableError` с причиной для ``pytest.skip``.
     """
-    kind = live_provider_kind(env)
+    if live_provider_kind(env) == OPENROUTER:
+        key = _openrouter_key(env)
+        blank = dict.fromkeys(_GATEWAY_ENVS, "")
+        loaded = Config.load(
+            project_root=REPO_ROOT,
+            trusted_dotenv=True,
+            model=model,
+            environ={**os.environ, **blank},
+        )
+        router_config = openrouter_config(loaded)
+        return router_config, OpenRouterProvider(router_config, key)
     config = Config.load(project_root=REPO_ROOT, trusted_dotenv=True, model=model)
-    if kind == OPENROUTER:
-        router_config = openrouter_config(config)
-        return router_config, OpenRouterProvider(router_config, _openrouter_key(env))
     if config.provider != API:
         raise LiveUnavailableError(
             f"live-тесты — для API v2 (GIGACREW_PROVIDER={API}) "

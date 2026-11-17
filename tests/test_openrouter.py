@@ -152,3 +152,21 @@ def test_live_provider_selection() -> None:
     assert isinstance(provider, OpenRouterProvider)
     assert provider.model == _MODEL
     assert config.base_url == OPENROUTER_URL
+
+
+def test_openrouter_ignores_gateway_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Настройки подключения к API v2 (CA без файла, VERIFY_SSL=0) не мешают OpenRouter."""
+    monkeypatch.setenv("GIGACREW_CA_BUNDLE", str(tmp_path / "missing.pem"))
+    monkeypatch.setenv("GIGACREW_VERIFY_SSL", "0")
+    monkeypatch.setenv("GIGACREW_PROVIDER", "gigacode")
+    monkeypatch.setenv("GIGACREW_TEMPERATURE", "0.7")
+    env = {"GIGACREW_TEST_PROVIDER": "openrouter", "GIGACREW_OPENROUTER_API_KEY": _KEY}
+    config, provider = open_live_provider(_MODEL, env)
+    provider.close()
+    assert config.ca_bundle is None
+    assert config.verify_ssl
+    assert config.provider == "api"
+    assert config.temperature == pytest.approx(0.7)

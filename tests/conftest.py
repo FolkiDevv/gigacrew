@@ -14,7 +14,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from openrouter import LiveUnavailableError, open_live_provider  # noqa: E402
+from openrouter import (  # noqa: E402
+    API,
+    LiveUnavailableError,
+    live_provider_kind,
+    open_live_provider,
+)
 
 from gigacrew.cli import app as cli_app  # noqa: E402
 from gigacrew.config import Config, load_environment  # noqa: E402
@@ -56,6 +61,29 @@ def config(project: Path) -> Config:
 @pytest.fixture
 def ctx(project: Path) -> ToolContext:
     return ToolContext(workspace=Workspace(project))
+
+
+@pytest.fixture(scope="session")
+def live_config() -> Config:
+    """Конфиг API v2 для live-тестов, которые сами строят ``ApiProvider`` (smoke агента).
+
+    Пропускает тест, если не заданы реквизиты, адрес API или GIGACREW_TEST_MODEL, а также
+    с ``GIGACREW_TEST_PROVIDER=openrouter``: модель тогда — id OpenRouter.
+    """
+    env = load_environment(REPO_ROOT)
+    model = env.get("GIGACREW_TEST_MODEL")
+    if not model:
+        pytest.skip("Не задана GIGACREW_TEST_MODEL — live-тесты пропущены")
+    if live_provider_kind(env) != API:
+        pytest.skip("тест — для API v2, а модель — OpenRouter (GIGACREW_TEST_PROVIDER)")
+    cfg = Config.load(project_root=REPO_ROOT, trusted_dotenv=True, model=model)
+    if cfg.provider != API:
+        pytest.skip("live-тесты — для API v2 (GIGACREW_PROVIDER=api)")
+    try:
+        cfg.require_credentials()
+    except RuntimeError as error:
+        pytest.skip(f"{error} — live-тесты пропущены")
+    return cfg
 
 
 @pytest.fixture(scope="session")
