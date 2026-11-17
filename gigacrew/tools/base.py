@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Protocol
 
 from pydantic import BaseModel
 
@@ -39,6 +39,7 @@ __all__ = [
     "Tool",
     "ToolContext",
     "ToolError",
+    "ToolLoader",
     "ToolRegistry",
     "ToolResult",
     "build_default_registry",
@@ -82,6 +83,13 @@ class PlanFile:
         return Path(path).resolve() == self.path.resolve()
 
 
+class ToolLoader(Protocol):
+    """Загрузка отложенных инструментов агента (``tool_search.DeferredTools``)."""
+
+    def search(self, query: str, limit: int) -> list[Tool[Any]]:
+        """Найти отложенные инструменты по запросу и загрузить их схемы."""
+
+
 @dataclass(frozen=True)
 class ToolContext:
     """Контекст выполнения, доступный инструменту.
@@ -98,7 +106,8 @@ class ToolContext:
     выполняются без вопроса (``GIGACREW_SAFE_COMMANDS``). ``background`` — фоновые задачи
     агента (``run_in_background``; None — фоновый запуск недоступен, как у суб-агента);
     ``start_subagent`` — суб-агент фоновой задачей: ``(агент, описание, задача) → результат
-    вызова с id задачи``.
+    вызова с id задачи``. ``deferred`` — отложенные инструменты агента (``tool_search``;
+    None — агента нет).
     """
 
     workspace: Workspace
@@ -111,6 +120,7 @@ class ToolContext:
     classify_commands: bool = True
     background: BackgroundJobs | None = None
     start_subagent: Callable[[str, str, str], ToolResult] | None = None
+    deferred: ToolLoader | None = None
 
     @property
     def root(self) -> Path:
@@ -268,6 +278,9 @@ class Tool[ParamsT: BaseModel](ABC):
     # Только смотрит проект (читает, ищет): интерфейс сворачивает подряд идущие такие
     # вызовы в одну строку.
     read_only: bool = False
+    # Отложенный: схема уходит модели, только когда та загрузит её инструментом
+    # tool_search (инструменты MCP-серверов, см. gigacrew.tools.tool_search).
+    deferred: bool = False
 
     # ------------------------------------------------------------------ #
     def spec(self) -> ToolSpec:
@@ -422,6 +435,9 @@ def build_default_registry() -> ToolRegistry:
     # Тоже отложенный импорт: цикл через base.
     from gigacrew.tools.task import ExploreTool, TaskTool  # noqa: PLC0415
 
+    # Тоже отложенный импорт: цикл через base.
+    from gigacrew.tools.tool_search import ToolSearchTool  # noqa: PLC0415
+
     reg = ToolRegistry()
     for tool in (
         # Первым: исследование через суб-агента — выбор по умолчанию для вопросов о коде.
@@ -446,6 +462,8 @@ def build_default_registry() -> ToolRegistry:
         TaskTool(),
         BackgroundOutputTool(),
         BackgroundStopTool(),
+        # Модель видит его, только когда есть отложенные инструменты (MCP).
+        ToolSearchTool(),
     ):
         reg.register(tool)
     return reg

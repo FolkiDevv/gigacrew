@@ -102,7 +102,9 @@ environment from `security.subprocess_env`, which strips `GIGACREW_*` secrets.
 
 MCP servers (`mcpServers` in the settings files and the project's `.mcp.json`) are parsed by
 `project/mcp_config.py`, confirmed like hooks (`cli/mcp.py`, `~/.gigacode/trusted_mcp.json`) and
-exposed as `mcp__<server>__<tool>` tools by `tools/mcp.py` (`McpHub`, `McpServer`, `McpTool`). The
+exposed as `mcp__<server>__<tool>` tools by `tools/mcp.py` (`McpHub`, `McpServer`, `McpTool`).
+MCP tools are deferred (`Tool.deferred`): the model sees only their names and loads schemas with
+`tool_search`; `tools/tool_search.py` (`DeferredTools`) decides which specs the agent sends. The
 client is a small synchronous JSON-RPC implementation (`tools/mcp_client.py`) over stdio
 (`tools/mcp_transport.py`) or Streamable HTTP (`tools/mcp_http.py`), not the async `mcp` SDK.
 

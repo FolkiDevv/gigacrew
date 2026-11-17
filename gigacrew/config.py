@@ -346,6 +346,9 @@ class Config:
     # Ответ «всегда» на вопрос о команде сохраняется для проекта в ~/.gigacode/projects/
     # (переживает сессии); False — только до конца сессии.
     remember_approvals: bool = True
+    # Инструменты MCP-серверов отложены: модель видит их имена и загружает схемы нужных
+    # инструментом tool_search; False — схемы всех уходят в каждый запрос.
+    mcp_defer: bool = True
     # Начальный режим разрешений (авто / план); в работе режим меняется в агенте
     # (Shift+Tab, /mode).
     mode: PermissionMode = PermissionMode.AUTO
@@ -502,6 +505,7 @@ class Config:
             ty=_env_bool(env, "GIGACREW_TY", default=True),
             safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", default=True),
             remember_approvals=_env_bool(env, "GIGACREW_REMEMBER_APPROVALS", default=True),
+            mcp_defer=_env_bool(env, "GIGACREW_MCP_DEFER", default=True),
             reviewer_model=(env.get("GIGACREW_REVIEWER_MODEL") or "").strip() or None,
             reviewer_timeout=_env_int(
                 env,
