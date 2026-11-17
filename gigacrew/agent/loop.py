@@ -1273,6 +1273,8 @@ class Agent:
         self._deliver_background()  # до сжатия: итоги не потеряются и при нём
         if self._cfg.auto_compact and not state.compact_failed:
             state.compact_failed = not self._auto_compact(specs, stats)
+            # Сжатие пересчитывает загруженные схемы: запрос шага уходит уже с ними.
+            specs = self._deferred.step_specs()
         failures_note = self._failures_note(guard)
         note = _join_notes(
             guard.pressure(context),

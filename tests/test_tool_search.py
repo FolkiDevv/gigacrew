@@ -285,3 +285,26 @@ def test_resumed_compacted_chat_skips_summarized_calls(project: Path) -> None:
     conversation.set_summary(Summary("модель искала задачи", upto=len(conversation)))
     agent, _ = _agent(project, [], *_remotes(), conversation=conversation)
     assert not agent.loaded_tools
+
+
+def test_auto_compaction_in_step_drops_schema(project: Path) -> None:
+    """Автосжатие перед запросом шага свернуло загрузку: схемы в запросе уже нет."""
+    remote = _remotes()[1]
+    conversation = _searched_chat()
+    details = "подробности " * 200
+    for step in range(6):
+        conversation.add_user(f"вопрос {step} {details}")
+        conversation.add_assistant(Message(role="assistant", content="ответ " * 200))
+    turns = [tool_turn(SEARCH, {"text": "догадка"}), text_turn("ок")]
+    agent, provider = _agent(
+        project,
+        turns,
+        remote,
+        conversation=conversation,
+        context_budget_tokens=6_500,
+    )
+    assert agent.loaded_tools == {SEARCH}
+    agent.run_turn("ещё")
+    assert provider.summary_requests
+    assert SEARCH not in _names(provider.requests[0]["tools"])
+    assert not remote.calls
