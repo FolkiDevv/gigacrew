@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -36,7 +37,8 @@ def _fake_tool(bin_dir: Path, name: str, *, code: int = 0) -> Path:
     out = bin_dir / f"{name}.out"
     script = bin_dir / name
     cat = shutil.which("cat")  # PATH в тестах — только каталог поддельных утилит
-    script.write_text(f'#!/bin/sh\n{cat} > "{out}"\nexit {code}\n', encoding="utf-8")
+    command = f"{shlex.quote(str(cat))} > {shlex.quote(str(out))}"
+    script.write_text(f"#!/bin/sh\n{command}\nexit {code}\n", encoding="utf-8")
     script.chmod(0o755)
     return out
 
@@ -46,6 +48,7 @@ def test_clipboard_commands_follow_platform_and_display() -> None:
     assert clipboard_commands({}, "linux") == []
     wayland = clipboard_commands({"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}, "linux")
     assert [command[0] for command in wayland] == ["wl-copy", "xclip", "xsel"]
+    assert "text/plain;charset=utf-8" in wayland[0]
 
 
 def test_copy_text_pipes_to_tool_and_falls_back(tmp_path: Path) -> None:
@@ -106,6 +109,7 @@ def test_copy_puts_raw_markdown_of_answers(
     call = FunctionCall(name="read_file", arguments={"path": "a.py"})
     conversation.add_assistant(Message(role="assistant", function_calls=[call]))
     conversation.add_function_result("read_file", "x = 1")
+    conversation.add_assistant(Message(role="assistant", content="\a"))  # пусто после очистки
     conversation.add_assistant(Message(role="assistant", content=f"\n{ANSWER}\n"))
 
     assert ctx.commands.dispatch("/copy", ctx) is True
@@ -123,6 +127,7 @@ def test_copy_puts_raw_markdown_of_answers(
         ("", "ответов модели ещё нет"),
         ("0", "использование: /copy [N]"),
         ("два", "использование: /copy [N]"),
+        ("1" * 5000, "использование: /copy [N]"),  # не доходит до int()
     ],
 )
 def test_copy_reports_bad_requests(
@@ -147,3 +152,16 @@ def test_copy_beyond_answers(
     ctx.commands.dispatch("/copy 3", ctx)
     assert "в чате 1 ответ модели" in capsys.readouterr().out
     assert not out.exists()
+
+
+def test_copy_keeps_indented_code(
+    copy_ctx: tuple[CommandContext, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ctx, out = copy_ctx
+    ctx.agent.conversation.add_user("код")
+    content = "\n\n    print(1)\n    print(2)\n\n"
+    ctx.agent.conversation.add_assistant(Message(role="assistant", content=content))
+    ctx.commands.dispatch("/copy", ctx)
+    assert out.read_text(encoding="utf-8") == "    print(1)\n    print(2)"
+    assert "2 строки" in capsys.readouterr().out

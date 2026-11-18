@@ -28,6 +28,7 @@ from gigacrew.ui.format import plural
 __all__ = ["COPY_USAGE", "OSC52", "clipboard_commands", "copy_command", "copy_text"]
 
 COPY_USAGE = "/copy [N]"
+_LEADING_BLANK_LINES = re.compile(r"\A(?:[ \t]*\n)+")
 
 # Способ копирования через терминал (возвращает copy_text).
 OSC52 = "OSC 52"
@@ -41,7 +42,8 @@ def clipboard_commands(environ: Mapping[str, str], platform: str) -> list[list[s
         return [["pbcopy"]]
     commands: list[list[str]] = []
     if environ.get("WAYLAND_DISPLAY"):
-        commands.append(["wl-copy"])
+        # Без --type wl-copy угадывает тип по содержимому и может выдать текст не текстом.
+        commands.append(["wl-copy", "--type", "text/plain;charset=utf-8"])
     if environ.get("DISPLAY"):
         commands.extend((["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]))
     return commands
@@ -104,19 +106,26 @@ def copy_text(
 
 
 def _answers(agent: Agent) -> list[str]:
-    """Тексты ответов модели в чате, от первого к последнему (без пустых)."""
-    return [
-        message.content
+    """Тексты ответов модели в чате, от первого к последнему (без пустых).
+
+    Ответ — любой текст модели, который видел пользователь, в том числе пояснение перед
+    вызовом инструментов. Управляющие символы убраны, как при выводе; ведущие пустые
+    строки и концевые пробелы — тоже, а отступ первой строки (код отступом) сохранён.
+    """
+    texts = (
+        sanitize(message.content)
         for message in agent.conversation.messages
-        if message.role == "assistant" and message.content.strip()
-    ]
+        if message.role == "assistant"
+    )
+    return [_LEADING_BLANK_LINES.sub("", text).rstrip() for text in texts if text.strip()]
 
 
 def _report(ui: Console, method: str | None, text: str) -> None:
     """Сообщает, чем скопирован ответ (``method`` — итог :func:`copy_text`)."""
     if method is None:
         ui.error(
-            "буфер обмена недоступен: нет pbcopy, wl-copy, xclip или xsel, а вывод — не терминал",
+            "не удалось скопировать: ни pbcopy, ни wl-copy, xclip или xsel не сработали, "
+            "а OSC 52 нужен вывод в терминал",
         )
     elif method == OSC52:
         ui.info(
@@ -131,7 +140,7 @@ def _report(ui: Console, method: str | None, text: str) -> None:
 
 def copy_command(agent: Agent, ui: Console, arg: str) -> bool:
     """``/copy [N]``: исходный Markdown ответа модели — в буфер (N-й с конца, 1 — последний)."""
-    if arg and not re.fullmatch(r"[1-9]\d*", arg):
+    if arg and not re.fullmatch(r"[1-9]\d{0,5}", arg):
         ui.error(f"использование: {COPY_USAGE}")
         return True
     answers = _answers(agent)
@@ -141,6 +150,6 @@ def copy_command(agent: Agent, ui: Console, arg: str) -> bool:
         word = plural(count, "ответ", "ответа", "ответов")
         ui.error(f"в чате {count} {word} модели" if count else "ответов модели ещё нет")
         return True
-    text = sanitize(answers[-number]).strip()
+    text = answers[-number]
     _report(ui, copy_text(text), text)
     return True
