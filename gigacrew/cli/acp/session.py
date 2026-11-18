@@ -71,10 +71,12 @@ def open_session(
     connection: RpcConnection,
     provider_factory: ProviderFactory,
     registry_factory: RegistryFactory,
+    form_questions: bool = False,
 ) -> AcpSession:
     """Новая сессия в каталоге ``cwd``: конфигурация, провайдер, агент; хуки SessionStart.
 
-    События агента уходят клиенту через ``connection``.
+    События агента уходят клиенту через ``connection``; ``form_questions`` — клиент
+    объявил формы ``elicitation/create`` (вопросы модели задаются через них).
     """
     config = _load_config(cwd)
     try:
@@ -84,7 +86,7 @@ def open_session(
     with ExitStack() as cleanup:
         cleanup.callback(provider.close)
         try:
-            events = AcpEvents(connection)
+            events = AcpEvents(connection, form_questions=form_questions)
             session = _assemble(config, provider, events, registry_factory, cleanup)
         except Exception as error:
             raise _as_session_error(error) from None

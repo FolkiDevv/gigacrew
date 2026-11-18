@@ -49,6 +49,7 @@ class AcpServer:
         self._lock = threading.Lock()
         self._sessions: dict[str, AcpSession] = {}
         self._closed = False
+        self._form_questions = False  # клиент объявил формы elicitation/create
 
     def serve(self, reader: BinaryIO, writer: BinaryIO) -> None:
         """Обслуживает клиента до конца ввода, затем закрывает все сессии."""
@@ -74,7 +75,9 @@ class AcpServer:
         return found
 
     def _initialize(self, params: Any) -> Message:
-        InitializeParams.model_validate(params)
+        request = InitializeParams.model_validate(params)
+        with self._lock:
+            self._form_questions = request.form_questions
         return initialize_response(metadata.version("gigacrew"))
 
     def _authenticate(self, params: Any) -> Message:
@@ -83,9 +86,12 @@ class AcpServer:
 
     def _new_session(self, connection: RpcConnection, params: Any) -> Message:
         request = NewSessionParams.model_validate(params)
+        with self._lock:
+            form_questions = self._form_questions
         session = open_session(
             request.cwd,
             connection=connection,
+            form_questions=form_questions,
             provider_factory=self._provider_factory,
             registry_factory=self._registry_factory,
         )

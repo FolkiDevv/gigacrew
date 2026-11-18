@@ -42,9 +42,19 @@ type Message = dict[str, Any]
 
 
 class InitializeParams(BaseModel):
-    """Параметры ``initialize``: возможности клиента пока не используются."""
+    """Параметры ``initialize``: версия протокола и возможности клиента."""
 
     protocol_version: int = Field(alias="protocolVersion", strict=True)
+    client_capabilities: Any = Field(default=None, alias="clientCapabilities")
+
+    @property
+    def form_questions(self) -> bool:
+        """Клиент объявил формы ``elicitation/create`` (``elicitation.form`` — объект)."""
+        capabilities = self.client_capabilities
+        if not isinstance(capabilities, dict):
+            return False
+        elicitation = capabilities.get("elicitation")
+        return isinstance(elicitation, dict) and isinstance(elicitation.get("form"), dict)
 
 
 class NewSessionParams(BaseModel):

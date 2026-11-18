@@ -113,7 +113,7 @@ class TurnRunner:
             if turn.cancel.is_set():
                 self._agent_free.release()
                 return False
-            self._events.open_turn()
+            self._events.open_turn(turn.cancel)
         threading.Thread(target=self._work, args=(turn,), name="acp-turn", daemon=True).start()
         return True
 
