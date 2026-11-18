@@ -18,6 +18,12 @@ from gigacrew.ui.console import Console
 from gigacrew.ui.settings_picker import SettingRow
 
 
+@pytest.fixture(autouse=True)
+def _project_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Текущая папка — проект теста: .env папки запуска (реквизиты разработчика) не мешает."""
+    monkeypatch.chdir(tmp_path)
+
+
 def _agent(tmp_path: Path, provider: ScriptedProvider | None = None) -> Agent:
     config = Config(access_key="x", project_root=tmp_path, stream=False)
     return Agent(provider or ScriptedProvider(), build_default_registry(), config, Console())
@@ -191,4 +197,8 @@ def test_default_model_must_be_in_catalogue(tmp_path: Path) -> None:
 def test_model_without_catalogue_is_free(tmp_path: Path) -> None:
     """Без каталога бэкенда (API v2) модель не проверяется: запуск её тоже не проверяет."""
     session = _session(_agent(tmp_path))
-    assert session.change(_row(session, "model.default"), "Новая").row.setting == "Новая"
+    row = _row(session, "model.default")
+    assert session.change(row, "Новая").row.setting == "Новая"
+    reset = session.change(_row(session, "model.default"), None)  # Del: модели не останется
+    assert reset.failed
+    assert _stored() == {"version": 1, "model": {"default": "Новая"}}
