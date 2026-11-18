@@ -37,6 +37,14 @@ and `uv pip check`. CI runs the same checks plus the offline tests on Python 3.1
 flake8, codespell and yamllint do not honour `.gitignore`: stray worktrees or venvs inside the
 repository (for example `.claude/worktrees/`) make `make lint` slow and noisy — remove them first.
 
+## Every change to main bumps the version
+
+Every change merged into `main` (every PR) raises the CLI version in `pyproject.toml` by one
+step: patch +1 (`0.9.3` → `0.9.4`) or minor +1 with the patch reset (`0.9.3` → `0.10.0`). Run
+`make lock` afterwards: `uv.lock` records the version too, and `uv lock --check` in `make lint`
+fails otherwise. If `main` moved to a newer
+version while the branch was open, bump from `main`'s version, not the branch's.
+
 ## Linter configuration is frozen
 
 Do not change linter or type-checker configuration without the user's explicit consent. This

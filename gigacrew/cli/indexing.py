@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
 
+from gigacrew.project import semantic
 from gigacrew.project.index import (
     INDEX_ERRORS,
     IndexStats,
@@ -172,3 +173,21 @@ def describe_index(refreshed: RefreshStats, stats: IndexStats, ty_status: str = 
         f"  {changes} ({refreshed.duration_s:.1f} с); "
         f"размер {_size(stats.db_bytes)}{ty_line}"
     )
+
+
+def reindex(
+    workspace: Workspace,
+    ui: Console,
+    interrupt: AbstractContextManager[object] | None,
+    *,
+    rebuild: bool,
+    ty: bool,
+) -> None:
+    """``/index``: обновить индекс (``rebuild`` — собрать заново) и показать сводку.
+
+    ``ty`` — включена ли навигация через ty (иначе её состояние не проверяется).
+    """
+    indexed = run_indexing(ProjectIndex(workspace), ui, interrupt, rebuild=rebuild)
+    if indexed is not None:
+        ty_status = semantic.status(workspace) if ty else "выключен (GIGACREW_TY=0)"
+        ui.info(describe_index(*indexed, ty_status=ty_status))
