@@ -112,11 +112,14 @@ class TurnRunner:
             turn = self._active
             if turn is None or turn.cancel.is_set():
                 return
-            turn.cancel.set()
-            self._events.close_turn()
+            # Прерывание — раньше флага: поток хода, ждущий ответа клиента, иначе увидел бы
+            # флаг и прервался сам, а отложенное прерывание сработало бы второй раз — в
+            # обработчиках агента, посреди починки истории.
             if turn.thread_id is not None and not turn.finished:
                 turn.interrupted = True
                 _raise_in_thread(turn.thread_id, KeyboardInterrupt)
+            turn.cancel.set()
+            self._events.close_turn()
         turn.wake.set()
 
     def _accept(self, work: _Work) -> _Turn:
@@ -228,14 +231,23 @@ def _model_turn(agent: Agent, text: str) -> TurnStats | None:
 def _compact(agent: Agent, events: AcpEvents, instructions: str) -> None:
     """Сжатие истории с пожеланиями ``instructions`` (``/compact``): хода модели нет.
 
-    Сжимать нечего — ничего не происходит; пригодного краткого содержания нет (например,
+    Итог — текстом ответа (сжато или сжимать нечего); пригодного краткого содержания нет (например,
     оно не короче истории) — сообщение об этом, а не сбой. Прочие ошибки модели — сбой
     хода. История в этих случаях не меняется.
     """
     try:
-        agent.compact(instructions)
+        compacted = agent.compact(instructions)
     except CompactionError as error:
         events.on_assistant_text(f"не удалось сжать контекст: {error} — история не изменилась")
+        return
+    # Ответ без текста T3 показывает как пустой ход: итог сжатия — текстом ответа.
+    if compacted is None:
+        events.on_assistant_text("сжимать нечего: история пуста или уже короткая")
+        return
+    events.on_assistant_text(
+        f"контекст сжат: ~{compacted.before_tokens} → ~{compacted.after_tokens} ток., "
+        f"в краткое содержание свёрнуто сообщений: {compacted.messages}",
+    )
 
 
 def _raise_in_thread(thread_id: int, exception: type[BaseException] | None) -> None:

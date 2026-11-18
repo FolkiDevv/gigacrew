@@ -542,6 +542,36 @@ def test_compact_with_empty_history_ends_turn_quietly(acp: AcpHarness, root: Pat
     assert not provider.summary_requests
 
 
+def _answer_text(acp: AcpHarness, session_id: str) -> str:
+    """Текст ответа агента за ход (куски ``agent_message_chunk``)."""
+    chunks = _of_kind(_updates(acp, session_id), "agent_message_chunk")
+    return "".join(chunk["content"]["text"] for chunk in chunks)
+
+
+@pytest.mark.parametrize(
+    ("history", "expected"),
+    [(True, "контекст сжат"), (False, "сжимать нечего")],
+    ids=["compacted", "empty-history"],
+)
+def test_compact_command_reports_its_result(
+    acp: AcpHarness,
+    root: Path,
+    *,
+    history: bool,
+    expected: str,
+) -> None:
+    """Пустой ответ на ``/compact`` в T3 выглядит как сбой: итог сжатия виден в ответе."""
+    # Краткое содержание должно выйти короче истории — иначе ядро откажется сжимать.
+    session_id = _open(acp, root, ScriptedProvider([text_turn("привет " * 200)]))
+    if history:
+        _ask(acp, session_id, "здравствуй " * 200)
+    _updates(acp, session_id)
+
+    assert _ask(acp, session_id, "/compact") == END_TURN
+
+    assert expected in _answer_text(acp, session_id)
+
+
 def test_compact_failure_is_rpc_error_and_session_recovers(acp: AcpHarness, root: Path) -> None:
     provider = ScriptedProvider(
         [text_turn("привет"), text_turn("снова тут")],

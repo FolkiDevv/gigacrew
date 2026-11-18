@@ -35,7 +35,7 @@ from typing import Any, Final, override
 
 import pytest
 from acp_harness import AcpHarness, ProviderFactory, acp_environment
-from fakes import CatalogueProvider, ScriptedProvider, text_turn, tools_turn
+from fakes import CatalogueProvider, ScriptedProvider, text_turn, tool_turn, tools_turn
 
 from gigacrew.agent.chat_store import ChatStore
 from gigacrew.agent.conversation import HOOK_CONTEXT_HEADER, Conversation, Summary
@@ -560,6 +560,25 @@ def test_close_session_closes_it(acp: AcpHarness, root: Path) -> None:
     assert error["code"] == INVALID_PARAMS
     _load(acp, session_id, root)  # чат сохранён: закрытую сессию можно загрузить снова
     assert _chunks(_history(acp, session_id), USER_CHUNK) == ["привет"]
+
+
+def test_close_session_stops_background_jobs(acp: AcpHarness, root: Path) -> None:
+    """Фоновая команда, запущенная в треде, не переживает закрытие его сессии.
+
+    Процесс ``gigacrew acp`` в T3 живёт дольше треда: без остановки dev-сервер, запущенный
+    агентом, работал бы до выхода всего процесса.
+    """
+    command = {"command": "exec sleep 60", "run_in_background": True}
+    script = [tool_turn("run_shell", command), text_turn("запущено")]
+    session_id = _open(acp, root, ScriptedProvider(script))
+    assert _ask(acp, session_id, "запусти") == "end_turn"
+    jobs = acp.server.session(session_id).agent.background
+    assert jobs is not None
+    assert jobs.active()
+
+    acp.call(CLOSE, {"sessionId": session_id})
+
+    assert not jobs.active()
 
 
 def test_close_of_unknown_session_is_quiet(acp: AcpHarness, root: Path) -> None:

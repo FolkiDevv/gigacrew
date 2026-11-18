@@ -44,6 +44,8 @@ type ProviderFactory = Callable[[Config], LLMProvider]
 type RegistryFactory = Callable[[], ToolRegistry]
 
 _log = logging.getLogger(__name__)
+# Почему остановлены фоновые задачи — увидит модель, если чат продолжат.
+_CLOSE_REASON = "сессия закрыта клиентом"
 
 
 @dataclass(frozen=True)
@@ -71,11 +73,21 @@ class AcpSession:
         replay_history(self.agent, self.events)
 
     def close(self) -> None:
-        """Отменяет ход и закрывает MCP-серверы и провайдер, даже если что-то упало."""
+        """Отменяет ход, останавливает фоновые задачи, закрывает MCP-серверы и провайдер.
+
+        Процесс ``gigacrew acp`` живёт дольше сессии: фоновая команда (dev-сервер) не должна
+        пережить тред, который её запустил. Закрытие идёт до конца, даже если что-то упало.
+        """
         with ExitStack() as stack:
             stack.callback(self.agent.provider.close)
             stack.callback(self.mcp.close)
+            stack.callback(self._stop_background)
             stack.callback(self.turns.cancel)
+
+    def _stop_background(self) -> None:
+        """Останавливает фоновые задачи; их итоги, записанные в историю, — в сохранённый чат."""
+        if self.agent.stop_background(_CLOSE_REASON):
+            autosave(self.chats, self.agent)
 
 
 def open_session(
