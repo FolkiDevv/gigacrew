@@ -16,6 +16,7 @@ import contextlib
 import os
 import threading
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
@@ -1960,6 +1961,9 @@ class Agent:
         finally:
             self._events.on_stream_end()
 
+        visible = turn.wants_tool or not quiet
+        if turn.message.reasoning.strip() and visible:
+            self._events.on_reasoning(turn.message.reasoning)
         shown = self._cfg.stream and not quiet  # текст уже показан потоком
         if not shown and turn.message.content.strip() and (turn.wants_tool or not quiet):
             self._events.on_assistant_text(turn.message.content)
@@ -2001,16 +2005,21 @@ class Agent:
         name = function_call.name
         tool = self._registry.get(name)
         note = check.warning
+        shown = ToolCallInfo(
+            name,
+            call_id=function_call.id or str(uuid.uuid4()),
+            arguments=function_call.arguments,
+        )
 
         if tool is None:
-            unknown = ToolCallInfo(name, "(неизвестный инструмент)")
+            unknown = replace(shown, summary="(неизвестный инструмент)")
             self._events.on_tool_call(unknown)
             return self._fail(unknown, f"инструмент '{name}' не существует.", note=note)
 
         # Отложенный инструмент, схему которого модель не загружала: аргументы — догадка.
         if self._deferred.pending(name):
             self._deferred.load((name,))
-            skipped = ToolCallInfo(name, "(схема не загружена)", tool.kind)
+            skipped = replace(shown, summary="(схема не загружена)", kind=tool.kind)
             self._events.on_tool_call(skipped)
             self._fail(
                 skipped,
@@ -2024,11 +2033,17 @@ class Agent:
         try:
             params = tool.parse(function_call.arguments)
         except Exception as exc:  # ошибка схемы — возвращаем модели
-            invalid = ToolCallInfo(name, "(неверные аргументы)")
+            invalid = replace(shown, summary="(неверные аргументы)")
             self._events.on_tool_call(invalid)
             return self._fail(invalid, f"валидация аргументов: {exc}", note=note)
 
-        call = ToolCallInfo(name, _describe(tool, params), tool.kind, read_only=tool.read_only)
+        call = replace(
+            shown,
+            summary=_describe(tool, params),
+            kind=tool.kind,
+            read_only=tool.read_only,
+            paths=self._call_paths(tool, params),
+        )
         self._events.on_tool_call(call)
         key = call_key(function_call)
 
@@ -2962,6 +2977,13 @@ class Agent:
             )
         with contextlib.suppress(Exception):
             self._decisions.outcome(journal.id, **fields)
+
+    def _call_paths(self, tool: Tool[Any], params: BaseModel) -> tuple[str, ...]:
+        """Абсолютные пути, с которыми работает вызов; путь вне проекта не называется."""
+        try:
+            return tuple(str(self._ctx.resolve(path)) for path in tool.paths(params))
+        except Exception:  # пути — для показа, не повод прерывать вызов: ошибку сообщит инструмент
+            return ()
 
     def _attach_instructions(self, tool: Tool[Any], params: BaseModel) -> None:
         """Подключить инструкции подкаталогов, которых коснулся вызов.

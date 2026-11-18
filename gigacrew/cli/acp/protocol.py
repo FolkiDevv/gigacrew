@@ -7,19 +7,36 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Final
+from types import MappingProxyType
+from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from gigacrew.agent.events import TurnStats
+
 __all__ = [
+    "CANCELLED",
     "PROTOCOL_VERSION",
+    "CancelParams",
     "InitializeParams",
     "NewSessionParams",
+    "PromptParams",
     "initialize_response",
+    "prompt_text",
+    "stop_reason",
 ]
 
 # Версия ACP, которую понимает gigacrew (и T3 Code).
 PROTOCOL_VERSION: Final = 1
+
+# stopReason ответа на session/prompt, если ход отменён.
+CANCELLED: Final = "cancelled"
+
+# Почему ограничитель остановил ход → stopReason ACP; прочие остановки — end_turn.
+_STOP_REASONS: Final = MappingProxyType({
+    "max_steps": "max_turn_requests",
+    "output_limit": "max_tokens",
+})
 
 type Message = dict[str, Any]
 
@@ -61,3 +78,81 @@ def initialize_response(version: str) -> Message:
         "agentInfo": {"name": "gigacrew", "title": "GigaCrew", "version": version},
         "authMethods": [],
     }
+
+
+class TextBlock(BaseModel):
+    """Текст запроса пользователя."""
+
+    kind: Literal["text"] = Field(alias="type")
+    text: str
+
+
+class ResourceLinkBlock(BaseModel):
+    """Ссылка на ресурс (файл): модель получает его адрес, а не содержимое."""
+
+    kind: Literal["resource_link"] = Field(alias="type")
+    uri: str
+    name: str = ""
+
+
+class EmbeddedResource(BaseModel):
+    """Содержимое встроенного ресурса; двоичное (``blob``) модели не передаётся."""
+
+    uri: str
+    text: str = ""
+
+
+class ResourceBlock(BaseModel):
+    """Встроенный ресурс: адрес и текст."""
+
+    kind: Literal["resource"] = Field(alias="type")
+    resource: EmbeddedResource
+
+
+# Блок запроса; картинок и звука агент не принимает (promptCapabilities).
+type ContentBlock = Annotated[
+    TextBlock | ResourceLinkBlock | ResourceBlock,
+    Field(discriminator="kind"),
+]
+
+
+class PromptParams(BaseModel):
+    """Параметры ``session/prompt``: id сессии и непустой запрос из блоков."""
+
+    session_id: str = Field(alias="sessionId")
+    prompt: list[ContentBlock] = Field(min_length=1)
+
+
+class CancelParams(BaseModel):
+    """Параметры уведомления ``session/cancel``."""
+
+    session_id: str = Field(alias="sessionId")
+
+
+def prompt_text(blocks: list[ContentBlock]) -> str:
+    """Запрос пользователя одним текстом: блоки по порядку, через пустую строку."""
+    return "\n\n".join(_block_text(block) for block in blocks)
+
+
+def stop_reason(stats: TurnStats | None) -> str:
+    """Причина конца хода (stopReason ответа) по его итогам."""
+    if stats is None or stats.stop_reason is None:
+        return "end_turn"
+    return _STOP_REASONS.get(stats.stop_reason, "end_turn")
+
+
+def _block_text(block: ContentBlock) -> str:
+    if isinstance(block, TextBlock):
+        return block.text
+    if isinstance(block, ResourceLinkBlock):
+        return f"@{_location(block.uri)}"
+    location = _location(block.resource.uri)
+    return "\n".join((f'<context ref="{location}">', block.resource.text, "</context>"))
+
+
+def _location(uri: str) -> str:
+    """Путь файла для ``file://``-адреса, иначе — адрес как есть."""
+    try:
+        return str(Path.from_uri(uri))
+    except ValueError:
+        return uri

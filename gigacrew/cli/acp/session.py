@@ -17,9 +17,10 @@ from importlib import metadata
 from pathlib import Path
 
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore
-from gigacrew.agent.events import AgentEvents
 from gigacrew.agent.loop import Agent
-from gigacrew.cli.acp.rpc import INTERNAL_ERROR, RpcError
+from gigacrew.cli.acp.events import AcpEvents
+from gigacrew.cli.acp.rpc import INTERNAL_ERROR, RpcConnection, RpcError
+from gigacrew.cli.acp.turn import TurnRunner
 from gigacrew.cli.assembly import (
     ModelChoiceError,
     build_agent,
@@ -44,11 +45,12 @@ _log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AcpSession:
-    """Сессия: агент, запись её чата и MCP-серверы; id сессии — id чата."""
+    """Сессия: агент, запись её чата, MCP-серверы и ходы; id сессии — id чата."""
 
     agent: Agent
     chats: ChatRecorder
     mcp: McpHub
+    turns: TurnRunner
 
     @property
     def session_id(self) -> str:
@@ -56,19 +58,24 @@ class AcpSession:
         return self.chats.chat_id
 
     def close(self) -> None:
-        """Закрывает MCP-серверы и провайдер — и тот, и другой, даже если один упал."""
+        """Отменяет ход и закрывает MCP-серверы и провайдер, даже если что-то упало."""
         with ExitStack() as stack:
             stack.callback(self.agent.provider.close)
             stack.callback(self.mcp.close)
+            stack.callback(self.turns.cancel)
 
 
 def open_session(
     cwd: Path,
     *,
+    connection: RpcConnection,
     provider_factory: ProviderFactory,
     registry_factory: RegistryFactory,
 ) -> AcpSession:
-    """Новая сессия в каталоге ``cwd``: конфигурация, провайдер, агент; хуки SessionStart."""
+    """Новая сессия в каталоге ``cwd``: конфигурация, провайдер, агент; хуки SessionStart.
+
+    События агента уходят клиенту через ``connection``.
+    """
     config = _load_config(cwd)
     try:
         provider = provider_factory(config)
@@ -77,7 +84,8 @@ def open_session(
     with ExitStack() as cleanup:
         cleanup.callback(provider.close)
         try:
-            session = _assemble(config, provider, registry_factory, cleanup)
+            events = AcpEvents(connection)
+            session = _assemble(config, provider, events, registry_factory, cleanup)
         except Exception as error:
             raise _as_session_error(error) from None
         cleanup.pop_all()
@@ -137,6 +145,7 @@ def _with_model(config: Config, provider: LLMProvider, known: list[str] | None) 
 def _assemble(
     config: Config,
     provider: LLMProvider,
+    events: AcpEvents,
     registry_factory: RegistryFactory,
     cleanup: ExitStack,
 ) -> AcpSession:
@@ -146,7 +155,6 @@ def _assemble(
         untrusted=config.untrusted_project,
         extra_dirs=config.add_dirs,
     )
-    events = AgentEvents()
     hooks = trusted_hooks(workspace, _warn)
     install_request_hook(provider, hooks, events, config)
     _connect(provider)
@@ -171,5 +179,6 @@ def _assemble(
     )
     chats = ChatRecorder(ChatStore(agent.workspace), enabled=config.save_chats)
     agent.chat_id = chats.chat_id  # файл плана назван по id чата
+    events.bind(chats.chat_id)
     agent.start_session("startup")
-    return AcpSession(agent, chats, mcp)
+    return AcpSession(agent, chats, mcp, TurnRunner(agent, events))

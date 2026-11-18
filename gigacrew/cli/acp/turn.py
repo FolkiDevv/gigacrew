@@ -1,0 +1,179 @@
+"""Ходы сессии ACP: агент работает в своём потоке, ``session/cancel`` его прерывает.
+
+Обработчик ``session/prompt`` запускает ход в отдельном потоке и ждёт его конца или
+отмены. Отмена поднимает флаг хода (процессы ``run_process`` убиваются, см.
+:func:`gigacrew.tools.cancel.cancellation`), закрывает ход для клиента (поздние события не
+отправляются) и посылает в поток хода асинхронный ``KeyboardInterrupt`` — не больше одного
+на ход. Поток, который исключения не видит (ждёт сеть без отрезков), ответ ``cancelled`` не
+задерживает дольше :data:`_CANCEL_GRACE`; следующий ход сессии дожидается его конца.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import threading
+from contextlib import ExitStack
+from dataclasses import dataclass, field
+from typing import Final
+
+from gigacrew.agent.context_window import DEFAULT_CONTEXT_WINDOW
+from gigacrew.agent.loop import Agent
+from gigacrew.cli.acp.events import AcpEvents
+from gigacrew.cli.acp.protocol import CANCELLED, stop_reason
+from gigacrew.cli.acp.rpc import INTERNAL_ERROR, INVALID_REQUEST, RpcError
+from gigacrew.llm.base import LLMError
+from gigacrew.tools.cancel import cancellation
+
+__all__ = ["TurnRunner"]
+
+# Сколько ответ cancelled ждёт, пока прерванный поток хода доработает, с.
+_CANCEL_GRACE: Final = 0.5
+# Как часто ожидающий своей очереди ход проверяет, не отменён ли он, с.
+_POLL_INTERVAL: Final = 0.05
+
+
+@dataclass
+class _Turn:
+    """Ход: запрос, флаг отмены и итог; поля потока меняются под блокировкой бегуна."""
+
+    text: str
+    cancel: threading.Event = field(default_factory=threading.Event)
+    wake: threading.Event = field(default_factory=threading.Event)  # конец хода или отмена
+    done: threading.Event = field(default_factory=threading.Event)  # поток хода завершился
+    thread_id: int | None = None  # поток, выполняющий агента (None — ещё не начал)
+    interrupted: bool = False  # в поток послано асинхронное исключение
+    finished: bool = False  # агент больше не выполняется: прерывать нечего
+    failure: BaseException | None = None
+
+
+class TurnRunner:
+    """Ходы одного агента: не больше одного одновременно."""
+
+    def __init__(self, agent: Agent, events: AcpEvents) -> None:
+        """Ходы агента ``agent``, события которого получает ``events``."""
+        self._agent = agent
+        self._events = events
+        self._lock = threading.Lock()
+        self._active: _Turn | None = None  # принятый и ещё не отвеченный ход
+        self._agent_free = threading.Semaphore(1)  # свободен: поток прошлого хода завершился
+
+    def prompt(self, text: str) -> str:
+        """Выполняет ход с запросом ``text``; stopReason ответа.
+
+        Идущий неотменённый ход — ошибка «Invalid Request»; ход упал — ошибка JSON-RPC
+        с текстом сбоя (сессия остаётся рабочей).
+        """
+        turn = self._accept(text)
+        with ExitStack() as stack:
+            stack.callback(self._forget, turn)
+            return self._answer(turn)
+
+    def cancel(self) -> None:
+        """Отменяет текущий ход (нет хода или уже отменён — ничего не делает)."""
+        with self._lock:
+            turn = self._active
+            if turn is None or turn.cancel.is_set():
+                return
+            turn.cancel.set()
+            self._events.close_turn()
+            if turn.thread_id is not None and not turn.finished:
+                turn.interrupted = True
+                _raise_in_thread(turn.thread_id, KeyboardInterrupt)
+        turn.wake.set()
+
+    def _accept(self, text: str) -> _Turn:
+        with self._lock:
+            if self._active is not None and not self._active.cancel.is_set():
+                raise RpcError(INVALID_REQUEST, "в сессии уже идёт ход")
+            turn = _Turn(text)
+            self._active = turn
+        return turn
+
+    def _forget(self, turn: _Turn) -> None:
+        """На ход ответили: он больше не текущий (если его не сменил следующий)."""
+        with self._lock:
+            if self._active is turn:
+                self._active = None
+
+    def _answer(self, turn: _Turn) -> str:
+        if not self._start(turn):
+            return CANCELLED
+        turn.wake.wait()
+        if turn.cancel.is_set():
+            turn.done.wait(_CANCEL_GRACE)
+            return CANCELLED
+        return self._outcome(turn)
+
+    def _start(self, turn: _Turn) -> bool:
+        """Дожидается конца прошлого хода и запускает поток; False — отменён раньше."""
+        while not self._agent_free.acquire(timeout=_POLL_INTERVAL):
+            if turn.cancel.is_set():
+                return False
+        with self._lock:
+            if turn.cancel.is_set():
+                self._agent_free.release()
+                return False
+            self._events.open_turn()
+        threading.Thread(target=self._work, args=(turn,), name="acp-turn", daemon=True).start()
+        return True
+
+    def _outcome(self, turn: _Turn) -> str:
+        """Ответ на завершившийся без отмены ход."""
+        failure = turn.failure
+        if failure is None:
+            stats = self._agent.last_turn
+            if stats is not None:
+                size = self._agent.context_window or DEFAULT_CONTEXT_WINDOW
+                self._events.report_usage(stats.context_tokens, size)
+            self._events.close_turn()
+            return stop_reason(stats)
+        self._events.close_turn()
+        if isinstance(failure, KeyboardInterrupt):
+            return CANCELLED
+        if isinstance(failure, LLMError):
+            raise RpcError(INTERNAL_ERROR, f"ошибка модели: {failure}")
+        raise RpcError(INTERNAL_ERROR, f"сбой хода: {type(failure).__name__}: {failure}")
+
+    def _work(self, turn: _Turn) -> None:
+        """Тело потока хода; асинхронное исключение отмены из него не выходит.
+
+        Исключение может прийти на любом шаге до :meth:`_settle`, поэтому все шаги до
+        него — внутри ``try`` этой функции, а не в вызываемых.
+        """
+        try:
+            self._run(turn)
+        # Любой итог хода, и KeyboardInterrupt отмены тоже, — обработчику запроса.
+        except BaseException as exc:  # noqa: WPS424
+            turn.failure = exc
+        settled = False
+        while not settled:
+            try:
+                settled = self._settle(turn)
+            except KeyboardInterrupt:
+                # Исключение отмены дошло только сейчас: оно было одно — повторяем.
+                settled = False
+        self._agent_free.release()
+        turn.done.set()
+        turn.wake.set()
+
+    def _run(self, turn: _Turn) -> None:
+        with self._lock:
+            if turn.cancel.is_set():
+                raise KeyboardInterrupt
+            turn.thread_id = threading.get_ident()
+        with cancellation(turn.cancel):
+            self._agent.run_turn(turn.text)
+
+    def _settle(self, turn: _Turn) -> bool:
+        """Агент закончил: прерывать нечего, недоставленное исключение отмены снимается."""
+        with self._lock:
+            turn.finished = True
+            if turn.interrupted and turn.thread_id is not None:
+                _raise_in_thread(turn.thread_id, None)
+        return True
+
+
+def _raise_in_thread(thread_id: int, exception: type[BaseException] | None) -> None:
+    """Асинхронное исключение в поток ``thread_id``; None — снять недоставленное."""
+    target = None if exception is None else ctypes.py_object(exception)
+    ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id), target)

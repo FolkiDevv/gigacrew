@@ -9,10 +9,18 @@ from __future__ import annotations
 
 import threading
 from contextlib import ExitStack
+from functools import partial
 from importlib import metadata
 from typing import Any, BinaryIO
 
-from gigacrew.cli.acp.protocol import InitializeParams, NewSessionParams, initialize_response
+from gigacrew.cli.acp.protocol import (
+    CancelParams,
+    InitializeParams,
+    NewSessionParams,
+    PromptParams,
+    initialize_response,
+    prompt_text,
+)
 from gigacrew.cli.acp.rpc import INTERNAL_ERROR, INVALID_PARAMS, RpcConnection, RpcError
 from gigacrew.cli.acp.session import AcpSession, ProviderFactory, RegistryFactory, open_session
 from gigacrew.tools.base import build_default_registry
@@ -23,7 +31,7 @@ type Message = dict[str, Any]
 
 
 class AcpServer:
-    """Агент ACP: ``initialize``, ``authenticate``, ``session/new``.
+    """Агент ACP: ``initialize``, ``authenticate``, ``session/new``, ``session/prompt``.
 
     ``provider_factory`` — провайдер LLM по конфигурации сессии; ``registry_factory`` —
     инструменты агента новой сессии.
@@ -51,9 +59,10 @@ class AcpServer:
                 requests={
                     "initialize": self._initialize,
                     "authenticate": self._authenticate,
-                    "session/new": self._new_session,
+                    "session/new": partial(self._new_session, connection),
+                    "session/prompt": self._prompt,
                 },
-                notifications={},
+                notifications={"session/cancel": self._cancel},
             )
 
     def session(self, session_id: str) -> AcpSession:
@@ -72,10 +81,11 @@ class AcpServer:
         # Реквизиты — в окружении инстанса: проверять у клиента нечего.
         return {}
 
-    def _new_session(self, params: Any) -> Message:
+    def _new_session(self, connection: RpcConnection, params: Any) -> Message:
         request = NewSessionParams.model_validate(params)
         session = open_session(
             request.cwd,
+            connection=connection,
             provider_factory=self._provider_factory,
             registry_factory=self._registry_factory,
         )
@@ -87,6 +97,18 @@ class AcpServer:
             session.close()
             raise RpcError(INTERNAL_ERROR, "сервер завершает работу")
         return {"sessionId": session.session_id}
+
+    def _prompt(self, params: Any) -> Message:
+        request = PromptParams.model_validate(params)
+        session = self.session(request.session_id)
+        return {"stopReason": session.turns.prompt(prompt_text(request.prompt))}
+
+    def _cancel(self, params: Any) -> None:
+        request = CancelParams.model_validate(params)
+        with self._lock:
+            found = self._sessions.get(request.session_id)
+        if found is not None:  # отмена неизвестной сессии — не ошибка: ответа на неё нет
+            found.turns.cancel()
 
     def _close_sessions(self) -> None:
         with self._lock:

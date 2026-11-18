@@ -13,10 +13,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from gigacrew.permissions import ToolKind
 from gigacrew.tools.base import Display, ToolResult
@@ -36,6 +36,10 @@ class ToolCallInfo:
     ``purpose`` — зачем вызов, со слов модели (показывается как её слова, не как факт),
     ``review`` — что сказала модель-рецензент (почему передала решение пользователю),
     ``turn_scope`` — что покроет ответ «до конца хода» (пусто — так ответить нельзя).
+
+    ``call_id`` — id вызова: от модели (``FunctionCall.id``) или выданный агентом, один на
+    все события вызова; ``arguments`` — аргументы вызова, как их прислала модель;
+    ``paths`` — абсолютные пути проекта, с которыми работает вызов (``Tool.paths``).
     """
 
     name: str
@@ -48,6 +52,9 @@ class ToolCallInfo:
     review: str = ""  # мнение модели-рецензента (режим «авто»)
     read_only: bool = False  # инструмент только смотрит проект (Tool.read_only)
     turn_scope: str = ""  # что разрешит ответ «t» до конца хода (:attr:`Approval.TURN`)
+    call_id: str = ""
+    arguments: Mapping[str, Any] = field(default_factory=dict, hash=False)
+    paths: tuple[str, ...] = ()
 
 
 class Approval(Enum):
@@ -170,6 +177,12 @@ class AgentEvents:
 
     def on_assistant_text(self, text: str) -> None:
         """Ответ модели целиком (непотоковый режим)."""
+
+    def on_reasoning(self, text: str) -> None:
+        """Рассуждения модели перед ответом — целиком, когда ответ получен.
+
+        Приходит после ``on_stream_end`` и раньше ``on_assistant_text`` (непотоковый режим).
+        """
 
     # --- инструменты ---
     def on_tool_call(self, call: ToolCallInfo) -> None:
