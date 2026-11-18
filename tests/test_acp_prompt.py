@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -651,6 +652,8 @@ def test_tool_kind_follows_tool_type(
     args: dict[str, Any],
     kind: str,
 ) -> None:
+    # Проект — репозиторий git: иначе `git status` вне репозитория — изменение с вопросом.
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
     session_id = _open(acp, root, ScriptedProvider([tool_turn(name, args)]))
 
     assert _ask(acp, session_id) == END_TURN
@@ -658,7 +661,7 @@ def test_tool_kind_follows_tool_type(
     call_updates = _single_call(_updates(acp, session_id))
     assert call_updates[0]["kind"] == kind
     assert call_updates[0]["rawInput"] == args
-    # Итог зависит от окружения (git-репозитория и LSP в проекте нет) — важно, что он есть.
+    # Итог зависит от окружения (LSP в проекте нет) — важно, что он есть.
     assert _statuses(call_updates)[-1] in {"completed", "failed"}
 
 
