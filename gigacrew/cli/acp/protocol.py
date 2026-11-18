@@ -18,7 +18,9 @@ __all__ = [
     "CANCELLED",
     "PROTOCOL_VERSION",
     "CancelParams",
+    "CloseSessionParams",
     "InitializeParams",
+    "LoadSessionParams",
     "NewSessionParams",
     "PromptParams",
     "initialize_response",
@@ -74,6 +76,12 @@ class NewSessionParams(BaseModel):
         return cwd
 
 
+class LoadSessionParams(NewSessionParams):
+    """Параметры ``session/load``: id сессии (чата) и её каталог."""
+
+    session_id: str = Field(alias="sessionId")
+
+
 def initialize_response(version: str) -> Message:
     """Ответ на ``initialize``: версия протокола, возможности и сведения об агенте.
 
@@ -82,8 +90,10 @@ def initialize_response(version: str) -> Message:
     return {
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
-            "loadSession": False,
+            "loadSession": True,
             "promptCapabilities": {"image": False, "audio": False, "embeddedContext": True},
+            # Только close: list, resume и delete клиент вызвал бы по наличию их ключей.
+            "sessionCapabilities": {"close": {}},
         },
         "agentInfo": {"name": "gigacrew", "title": "GigaCrew", "version": version},
         "authMethods": [],
@@ -137,6 +147,10 @@ class CancelParams(BaseModel):
     """Параметры уведомления ``session/cancel``."""
 
     session_id: str = Field(alias="sessionId")
+
+
+class CloseSessionParams(CancelParams):
+    """Параметры ``session/close``."""
 
 
 def prompt_text(blocks: list[ContentBlock]) -> str:

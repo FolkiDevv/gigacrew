@@ -1,8 +1,10 @@
 """ACP-сервер gigacrew: обработчики методов ACP поверх соединения JSON-RPC.
 
 Сессий в процессе может быть несколько, у каждой — свой каталог, конфигурация,
-провайдер и MCP-серверы (:mod:`gigacrew.cli.acp.session`). Конец ввода закрывает все
-сессии.
+провайдер и MCP-серверы (:mod:`gigacrew.cli.acp.session`). ``session/load`` продолжает
+сохранённый чат (id сессии — id чата), переигрывая клиенту его историю; загрузка уже
+открытой сессии переигрывает историю той же сессии. ``session/close`` и конец ввода
+закрывают сессии.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import threading
 from contextlib import ExitStack
 from functools import partial
 from importlib import metadata
+from pathlib import Path
 from typing import Any, BinaryIO
 
 from gigacrew.cli.acp.options import (
@@ -23,7 +26,9 @@ from gigacrew.cli.acp.options import (
 )
 from gigacrew.cli.acp.protocol import (
     CancelParams,
+    CloseSessionParams,
     InitializeParams,
+    LoadSessionParams,
     NewSessionParams,
     PromptParams,
     initialize_response,
@@ -69,6 +74,8 @@ class AcpServer:
                     "initialize": self._initialize,
                     "authenticate": self._authenticate,
                     "session/new": partial(self._new_session, connection),
+                    "session/load": partial(self._load_session, connection),
+                    "session/close": self._close_session,
                     "session/prompt": self._prompt,
                     "session/set_mode": self._set_mode,
                     "session/set_config_option": self._set_config_option,
@@ -97,30 +104,59 @@ class AcpServer:
 
     def _new_session(self, connection: RpcConnection, params: Any) -> Message:
         request = NewSessionParams.model_validate(params)
+        session = self._open(connection, request.cwd)
+        return {"sessionId": session.session_id, **session_setup(session.agent)}
+
+    def _load_session(self, connection: RpcConnection, params: Any) -> Message:
+        """История чата — уведомлениями до ответа; ответ — как у session/new, без id."""
+        request = LoadSessionParams.model_validate(params)
+        with self._lock:
+            session = self._sessions.get(request.session_id)
+        if session is None:
+            session = self._open(connection, request.cwd, resume=request.session_id)
+        session.replay()
+        return session_setup(session.agent)
+
+    def _open(self, connection: RpcConnection, cwd: Path, resume: str | None = None) -> AcpSession:
+        """Открывает сессию (``resume`` — продолжает чат) и регистрирует её."""
         with self._lock:
             form_questions = self._form_questions
         session = open_session(
-            request.cwd,
+            cwd,
             connection=connection,
             form_questions=form_questions,
             provider_factory=self._provider_factory,
             registry_factory=self._registry_factory,
+            resume=resume,
         )
         with self._lock:
             accepted = not self._closed
-            if accepted:
-                self._sessions[session.session_id] = session
+            registered = (
+                self._sessions.setdefault(session.session_id, session) if accepted else session
+            )
         if not accepted:  # ввод кончился, пока сессия собиралась: она уже никому не нужна
             session.close()
             raise RpcError(INTERNAL_ERROR, "сервер завершает работу")
+        if registered is not session:  # тот же чат параллельно загрузил другой запрос
+            session.close()
+            return registered
         # Сведения о сессии клиент принимает и до ответа на session/new (T3 их копит).
         session.turns.advertise_commands()
-        return {"sessionId": session.session_id, **session_setup(session.agent)}
+        return session
 
     def _prompt(self, params: Any) -> Message:
         request = PromptParams.model_validate(params)
         session = self.session(request.session_id)
-        return {"stopReason": session.turns.prompt(prompt_text(request.prompt))}
+        return {"stopReason": session.prompt(prompt_text(request.prompt))}
+
+    def _close_session(self, params: Any) -> Message:
+        """Закрывает сессию; неизвестная или уже закрытая — не ошибка."""
+        request = CloseSessionParams.model_validate(params)
+        with self._lock:
+            found = self._sessions.pop(request.session_id, None)
+        if found is not None:
+            found.close()
+        return {}
 
     def _set_mode(self, params: Any) -> Message:
         request = SetModeParams.model_validate(params)

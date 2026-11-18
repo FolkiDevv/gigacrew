@@ -25,6 +25,7 @@ __all__ = [
     "INVALID_REQUEST",
     "METHOD_NOT_FOUND",
     "PARSE_ERROR",
+    "RESOURCE_NOT_FOUND",
     "ConnectionClosedError",
     "RequestCancelledError",
     "RpcConnection",
@@ -37,6 +38,8 @@ INVALID_REQUEST: Final = -32600
 METHOD_NOT_FOUND: Final = -32601
 INVALID_PARAMS: Final = -32602
 INTERNAL_ERROR: Final = -32603
+# Код ошибки ACP «Resource not found»: нет запрошенного ресурса (чата сессии).
+RESOURCE_NOT_FOUND: Final = -32002
 
 _VERSION: Final = "2.0"
 # Как часто ожидание ответа проверяет отмену, с. Ожидание с таймаутом ещё и даёт доставить

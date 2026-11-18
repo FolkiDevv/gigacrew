@@ -63,10 +63,20 @@ class _Turn:
 class TurnRunner:
     """Ходы одного агента и его слэш-команды: не больше одного хода одновременно."""
 
-    def __init__(self, agent: Agent, events: AcpEvents) -> None:
-        """Ходы агента ``agent``, события которого получает ``events``."""
+    def __init__(
+        self,
+        agent: Agent,
+        events: AcpEvents,
+        after_turn: Callable[[], None],
+    ) -> None:
+        """Ходы агента ``agent``, события которого получает ``events``.
+
+        ``after_turn`` выполняется в потоке хода, когда агент закончил (и ход отменённый),
+        до ответа на ход: сохранение чата.
+        """
         self._agent = agent
         self._events = events
+        self._after_turn = after_turn
         self._lock = threading.Lock()
         self._active: _Turn | None = None  # принятый и ещё не отвеченный ход
         self._agent_free = threading.Semaphore(1)  # свободен: поток прошлого хода завершился
@@ -186,9 +196,11 @@ class TurnRunner:
             except KeyboardInterrupt:
                 # Исключение отмены дошло только сейчас: оно было одно — повторяем.
                 settled = False
-        self._agent_free.release()
-        turn.done.set()
-        turn.wake.set()
+        with ExitStack() as stack:
+            stack.callback(turn.wake.set)
+            stack.callback(turn.done.set)
+            stack.callback(self._agent_free.release)
+            self._after_turn()
 
     def _run(self, turn: _Turn) -> None:
         with self._lock:

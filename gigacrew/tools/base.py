@@ -33,6 +33,7 @@ from gigacrew.tools.jobs import BackgroundJobs
 from gigacrew.tools.questions import AskUser
 
 __all__ = [
+    "ERROR_PREFIX",
     "Assessment",
     "Display",
     "PlanFile",
@@ -43,7 +44,11 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "build_default_registry",
+    "is_error_text",
 ]
+
+# Пометка неудачного вызова в начале текста результата для модели.
+ERROR_PREFIX: Final = "ОШИБКА: "
 
 # Сколько символов команды показывает в UI описание вызова по умолчанию.
 _DESCRIBE_LIMIT = 70
@@ -203,10 +208,15 @@ class ToolResult:
     exit_code: int | None = None  # код возврата команды (для журнала решений)
 
     def as_function_content(self) -> str:
-        """Текст результата для модели: при неуспехе — с пометкой «ОШИБКА»."""
+        """Текст результата для модели: при неуспехе — с пометкой :data:`ERROR_PREFIX`."""
         if self.ok:
             return self.content
-        return f"ОШИБКА: {self.content}"
+        return f"{ERROR_PREFIX}{self.content}"
+
+
+def is_error_text(content: str) -> bool:
+    """Текст результата вызова для модели помечен как неудача (:data:`ERROR_PREFIX`)."""
+    return content.startswith(ERROR_PREFIX)
 
 
 def _normalize_property(prop: dict[str, Any], defs: dict[str, Any] | None = None) -> dict[str, Any]:

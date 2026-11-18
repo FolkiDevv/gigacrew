@@ -5,6 +5,10 @@
 подтверждённые раньше, предупреждения — в журнал (stderr), а не в stdout: stdout занят
 протоколом. Любая ошибка сборки — :class:`~gigacrew.cli.acp.rpc.RpcError` с понятным
 сообщением; уже созданные провайдер и MCP-серверы при этом закрываются.
+
+Чат сессии сохраняется после каждого хода, как в REPL. Сессия может продолжить
+сохранённый чат (``session/load``); тогда MCP-серверы проекта запускаются при первом ходе:
+сессию могли загрузить лишь ради истории.
 """
 
 from __future__ import annotations
@@ -12,13 +16,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass
-from importlib import metadata
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from gigacrew.agent.chat_store import ChatRecorder, ChatStore
+from gigacrew.agent.chat_store import ChatRecorder, SavedChat
 from gigacrew.agent.loop import Agent
+from gigacrew.cli.acp.chats import autosave, replay_history, saved_chat, start_chat
 from gigacrew.cli.acp.events import AcpEvents
+from gigacrew.cli.acp.project_mcp import ProjectMcp
 from gigacrew.cli.acp.rpc import INTERNAL_ERROR, RpcConnection, RpcError
 from gigacrew.cli.acp.turn import TurnRunner
 from gigacrew.cli.assembly import (
@@ -28,12 +33,10 @@ from gigacrew.cli.assembly import (
     select_model,
 )
 from gigacrew.cli.hooks import install_request_hook, trusted_hooks
-from gigacrew.cli.mcp import connect_trusted_mcp
 from gigacrew.config import Config, ConfigError
 from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import ToolRegistry
-from gigacrew.tools.mcp import McpHub
 
 __all__ = ["AcpSession", "ProviderFactory", "RegistryFactory", "open_session"]
 
@@ -45,17 +48,27 @@ _log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AcpSession:
-    """Сессия: агент, запись её чата, MCP-серверы и ходы; id сессии — id чата."""
+    """Сессия: агент, запись её чата, MCP-серверы, ходы и события; id сессии — id чата."""
 
     agent: Agent
     chats: ChatRecorder
-    mcp: McpHub
+    mcp: ProjectMcp
     turns: TurnRunner
+    events: AcpEvents
 
     @property
     def session_id(self) -> str:
         """Id сессии — id её чата."""
         return self.chats.chat_id
+
+    def prompt(self, text: str) -> str:
+        """Ход с запросом ``text`` (MCP-серверы проекта — к его началу); stopReason."""
+        self.mcp.start()
+        return self.turns.prompt(text)
+
+    def replay(self) -> None:
+        """Переигрывает клиенту историю чата сессии."""
+        replay_history(self.agent, self.events)
 
     def close(self) -> None:
         """Отменяет ход и закрывает MCP-серверы и провайдер, даже если что-то упало."""
@@ -72,11 +85,14 @@ def open_session(
     provider_factory: ProviderFactory,
     registry_factory: RegistryFactory,
     form_questions: bool = False,
+    resume: str | None = None,
 ) -> AcpSession:
     """Новая сессия в каталоге ``cwd``: конфигурация, провайдер, агент; хуки SessionStart.
 
     События агента уходят клиенту через ``connection``; ``form_questions`` — клиент
-    объявил формы ``elicitation/create`` (вопросы модели задаются через них).
+    объявил формы ``elicitation/create`` (вопросы модели задаются через них). ``resume`` —
+    id сохранённого чата проекта, который сессия продолжает: нет такого чата — ошибка
+    «Resource not found».
     """
     config = _load_config(cwd)
     try:
@@ -87,7 +103,7 @@ def open_session(
         cleanup.callback(provider.close)
         try:
             events = AcpEvents(connection, form_questions=form_questions)
-            session = _assemble(config, provider, events, registry_factory, cleanup)
+            session = _assemble(config, provider, events, registry_factory, cleanup, resume)
         except Exception as error:
             raise _as_session_error(error) from None
         cleanup.pop_all()
@@ -137,7 +153,15 @@ def _connect(provider: LLMProvider) -> None:
         raise _session_error(f"не удалось подключиться: {error}") from None
 
 
-def _with_model(config: Config, provider: LLMProvider, known: list[str] | None) -> Config:
+def _with_model(
+    config: Config,
+    provider: LLMProvider,
+    known: list[str] | None,
+    saved: SavedChat | None,
+) -> Config:
+    """Модель сессии; без каталога и без заданной модели — модель продолжаемого чата."""
+    if saved is not None and known is None and not config.model:
+        config = replace(config, model=saved.meta.model)
     try:
         return select_model(config, provider, known)
     except ModelChoiceError as error:
@@ -150,6 +174,7 @@ def _assemble(
     events: AcpEvents,
     registry_factory: RegistryFactory,
     cleanup: ExitStack,
+    resume: str | None,
 ) -> AcpSession:
     """Хуки, подключение, модель, MCP-серверы и агент; закрыть нужное — в ``cleanup``."""
     workspace = Workspace(
@@ -157,19 +182,17 @@ def _assemble(
         untrusted=config.untrusted_project,
         extra_dirs=config.add_dirs,
     )
+    saved = None if resume is None else saved_chat(workspace, resume)
     hooks = trusted_hooks(workspace, _warn)
     install_request_hook(provider, hooks, events, config)
     _connect(provider)
     windows, known = load_windows(config, provider, _warn)
-    config = _with_model(config, provider, known)
+    config = _with_model(config, provider, known, saved)
     registry = registry_factory()
-    mcp = connect_trusted_mcp(
-        workspace,
-        registry,
-        warn=_warn,
-        version=metadata.version("gigacrew"),
-    )
+    mcp = ProjectMcp(workspace, registry, _warn)
     cleanup.callback(mcp.close)
+    if saved is None:
+        mcp.start()
     agent = build_agent(
         config,
         provider,
@@ -179,8 +202,11 @@ def _assemble(
         registry=registry,
         warn=_warn,
     )
-    chats = ChatRecorder(ChatStore(agent.workspace), enabled=config.save_chats)
-    agent.chat_id = chats.chat_id  # файл плана назван по id чата
-    events.bind(chats.chat_id)
-    agent.start_session("startup")
-    return AcpSession(agent, chats, mcp, TurnRunner(agent, events))
+    chats = start_chat(agent, events, saved, enabled=config.save_chats)
+    return AcpSession(
+        agent,
+        chats,
+        mcp,
+        TurnRunner(agent, events, lambda: autosave(chats, agent)),
+        events,
+    )

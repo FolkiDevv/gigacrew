@@ -32,7 +32,14 @@ from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolResult
 from gigacrew.tools.questions import Answer, Question, QuestionsUnavailableError
 
-__all__ = ["AcpEvents"]
+__all__ = [
+    "AcpEvents",
+    "Update",
+    "call_update",
+    "text_chunk",
+    "text_content",
+    "tool_call_fields",
+]
 
 UPDATE: Final = "session/update"
 PERMISSION: Final = "session/request_permission"
@@ -88,7 +95,7 @@ class _TurnChannel:
         """Ход закончен или отменён: незавершённые вызовы — failed, дальше — тишина."""
         with self._lock:
             for call_id in self._open_calls:
-                self._send(_call_update(call_id, "failed"))
+                self._send(call_update(call_id, "failed"))
             self._open_calls.clear()
             self._live = False
 
@@ -103,6 +110,12 @@ class _TurnChannel:
     def report_commands(self, commands: list[Update]) -> None:
         """Слэш-команды сессии: ``available_commands_update``."""
         self._notify(_update("available_commands_update", {"availableCommands": commands}))
+
+    def report_history(self, updates: list[Update]) -> None:
+        """Переигранная история чата (``session/load``): идёт и вне хода."""
+        with self._lock:
+            for update in updates:
+                self._send(update)
 
     def _request(self, method: str, params: Update) -> Any:
         """Запрос клиенту от имени сессии; отмена хода во время ожидания прерывает ход."""
@@ -139,19 +152,19 @@ class AcpEvents(_TurnChannel, AgentEvents):
 
     @override
     def on_stream_delta(self, text: str) -> None:
-        self._emit(_chunk("agent_message_chunk", text))
+        self._emit(text_chunk("agent_message_chunk", text))
 
     @override
     def on_assistant_text(self, text: str) -> None:
-        self._emit(_chunk("agent_message_chunk", text))
+        self._emit(text_chunk("agent_message_chunk", text))
 
     @override
     def on_reasoning(self, text: str) -> None:
-        self._emit(_chunk("agent_thought_chunk", text))
+        self._emit(text_chunk("agent_thought_chunk", text))
 
     @override
     def on_tool_call(self, call: ToolCallInfo) -> None:
-        update = {"sessionUpdate": "tool_call", **_tool_call(call)}
+        update = {"sessionUpdate": "tool_call", **tool_call_fields(call)}
         with self._lock:
             if self._live:
                 self._open_calls[call.call_id] = update["kind"]
@@ -167,7 +180,7 @@ class AcpEvents(_TurnChannel, AgentEvents):
     ) -> bool | Approval | ConfirmResult:
         """Запрос ``session/request_permission``; ответ не из вариантов — отказ без ответа."""
         offered = permission.options(call, dangerous=dangerous)
-        tool_call = _tool_call(call)
+        tool_call = tool_call_fields(call)
         with self._lock:
             tool_call["kind"] = self._open_calls.get(call.call_id, tool_call["kind"])
         tool_call["content"] = _preview_content(call, preview)
@@ -198,7 +211,7 @@ class AcpEvents(_TurnChannel, AgentEvents):
     @override
     def on_tool_start(self, call: ToolCallInfo) -> None:
         self._running_call = call.call_id
-        self._emit(_call_update(call.call_id, "in_progress"))
+        self._emit(call_update(call.call_id, "in_progress"))
 
     @override
     def on_tool_result(
@@ -208,7 +221,7 @@ class AcpEvents(_TurnChannel, AgentEvents):
         *,
         previewed: bool,
     ) -> None:
-        update = _call_update(call.call_id, "completed" if tool_result.ok else "failed")
+        update = call_update(call.call_id, "completed" if tool_result.ok else "failed")
         update["content"] = _result_content(call, tool_result)
         with self._lock:
             if self._live:
@@ -221,11 +234,12 @@ class AcpEvents(_TurnChannel, AgentEvents):
         _log.log(_NOTICE_LEVELS[level], "%s", text)
 
 
-def _chunk(kind: str, text: str) -> Update:
+def text_chunk(kind: str, text: str) -> Update:
+    """Текстовый кусок реплики вида ``kind`` (``agent_message_chunk`` и подобные)."""
     return _update(kind, {"content": {"type": "text", "text": text}})
 
 
-def _tool_call(call: ToolCallInfo) -> Update:
+def tool_call_fields(call: ToolCallInfo) -> Update:
     """Поля вызова для ``tool_call`` и запроса подтверждения."""
     return {
         "toolCallId": call.call_id,
@@ -242,7 +256,8 @@ def _update(kind: str, fields: Update) -> Update:
     return {"sessionUpdate": kind, **fields}
 
 
-def _call_update(call_id: str, status: str) -> Update:
+def call_update(call_id: str, status: str) -> Update:
+    """``tool_call_update`` вызова ``call_id`` с новым статусом ``status``."""
     return _update("tool_call_update", {"toolCallId": call_id, "status": status})
 
 
@@ -265,7 +280,7 @@ def _result_content(call: ToolCallInfo, tool_result: ToolResult) -> list[Update]
     if diff is not None:
         content.append(diff)
     if tool_result.content:
-        content.append(_text_content(tool_result.content))
+        content.append(text_content(tool_result.content))
     return content
 
 
@@ -276,10 +291,11 @@ def _preview_content(call: ToolCallInfo, preview: Display | None) -> list[Update
     diff = _diff(call, preview)
     if diff is not None:
         return [diff]
-    return [_text_content(preview.text)]
+    return [text_content(preview.text)]
 
 
-def _text_content(text: str) -> Update:
+def text_content(text: str) -> Update:
+    """Текст в ``content`` вызова инструмента."""
     return {"type": "content", "content": {"type": "text", "text": text}}
 
 

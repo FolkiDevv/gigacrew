@@ -41,8 +41,8 @@ from gigacrew.ui.console import Console
 _SUGGESTION_CUTOFF = 0.6
 
 
-def save_chat(chats: ChatRecorder, agent: Agent, ui: Console) -> None:
-    """Сохранить чат.
+def store_chat(chats: ChatRecorder, agent: Agent) -> str | None:
+    """Сохранить чат; предупреждение (не сохранён, сохранён новым чатом) или None.
 
     Если файл чата изменила другая сессия, диалог сохраняется новым чатом — тогда и план
     этой сессии переезжает к нему (:meth:`Agent.continue_as`).
@@ -50,6 +50,12 @@ def save_chat(chats: ChatRecorder, agent: Agent, ui: Console) -> None:
     warning = chats.save(agent.conversation, model=agent.model)
     if chats.chat_id != agent.chat_id:
         agent.continue_as(chats.chat_id)
+    return warning
+
+
+def save_chat(chats: ChatRecorder, agent: Agent, ui: Console) -> None:
+    """Сохранить чат (:func:`store_chat`); предупреждение — в ``ui``."""
+    warning = store_chat(chats, agent)
     if warning:
         ui.warn(warning)
 

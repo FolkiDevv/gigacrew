@@ -129,7 +129,15 @@ from gigacrew.project.settings import HookEvent
 from gigacrew.project.workspace import Workspace
 from gigacrew.safety import CommandLevel, Verdict
 from gigacrew.security import RiskLevel, SandboxError
-from gigacrew.tools.base import PlanFile, Tool, ToolContext, ToolError, ToolRegistry, ToolResult
+from gigacrew.tools.base import (
+    ERROR_PREFIX,
+    PlanFile,
+    Tool,
+    ToolContext,
+    ToolError,
+    ToolRegistry,
+    ToolResult,
+)
 from gigacrew.tools.cancel import cancellation
 from gigacrew.tools.fs import write_atomic
 from gigacrew.tools.jobs import BackgroundJobs, Job, JobCancelledError, JobInfo, job_info
@@ -3011,6 +3019,6 @@ class Agent:
         summary = error.splitlines()[0] if error else "ошибка"
         failure = ToolResult(content=error, ok=False, summary=summary)
         self._events.on_tool_result(call, failure, previewed=False)
-        content = model_text or f"ОШИБКА: {error}"
+        content = model_text or f"{ERROR_PREFIX}{error}"
         self._conversation.add_function_result(call.name, _tool_text(content, note))
         return ToolOutcome(ok=False)
