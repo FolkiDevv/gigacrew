@@ -21,19 +21,18 @@ from gigacrew.agent.chat_store import ChatInfo, ChatRecorder, ChatStoreError, Sa
 from gigacrew.agent.loop import CHAT_SWITCH_REASON, Agent
 from gigacrew.agent.prompts import skill_invocation_prompt
 from gigacrew.cli.approvals import PERMISSIONS_USAGE, permissions_command
+from gigacrew.cli.clipboard import COPY_USAGE, copy_command
 from gigacrew.cli.hooks import (
     describe_hooks,
     install_request_hook,
     load_hooks,
     restart_session,
 )
-from gigacrew.cli.indexing import describe_index, run_indexing
+from gigacrew.cli.indexing import reindex
 from gigacrew.cli.models import ModelCatalog, describe_model, ensure_context_window
 from gigacrew.cli.prompt import KEY_HELP
 from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.permissions import MODE_CYCLE, PermissionMode, parse_mode
-from gigacrew.project import semantic
-from gigacrew.project.index import ProjectIndex
 from gigacrew.project.skills import COMMAND_NAME_PATTERN, SkillCatalog
 from gigacrew.ui.console import Console
 
@@ -455,12 +454,8 @@ def _index(ctx: CommandContext, arg: str) -> bool:
     if arg not in {"", "rebuild"}:
         ctx.ui.error("использование: /index [rebuild]")
         return True
-    workspace = ctx.agent.workspace
-    index = ProjectIndex(workspace)
-    indexed = run_indexing(index, ctx.ui, ctx.interrupt, rebuild=arg == "rebuild")
-    if indexed is not None:
-        ty = semantic.status(workspace) if ctx.agent.config.ty else "выключен (GIGACREW_TY=0)"
-        ctx.ui.info(describe_index(*indexed, ty_status=ty))
+    agent = ctx.agent
+    reindex(agent.workspace, ctx.ui, ctx.interrupt, rebuild=arg == "rebuild", ty=agent.config.ty)
     return True
 
 
@@ -533,6 +528,10 @@ def _mcp(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+def _copy(ctx: CommandContext, arg: str) -> bool:
+    return copy_command(ctx.agent, ctx.ui, arg)
+
+
 def _exit(ctx: CommandContext, _arg: str) -> bool:
     ctx.ui.system("до встречи!")
     return False
@@ -575,6 +574,7 @@ def default_commands() -> CommandRegistry:
         SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"),
         SlashCommand("/tasks", "фоновые задачи", _tasks, usage=TASKS_USAGE),
         SlashCommand("/mcp", "MCP-серверы и их инструменты", _mcp),
+        SlashCommand("/copy", "ответ модели в буфер (Markdown)", _copy, usage=COPY_USAGE),
         SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")),
     ):
         registry.register(command)
