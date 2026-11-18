@@ -48,6 +48,7 @@ __all__ = [
     "live_provider_kind",
     "open_live_provider",
     "openrouter_config",
+    "openrouter_key",
     "parse_catalogue",
 ]
 
@@ -89,7 +90,8 @@ def live_provider_kind(env: Mapping[str, str]) -> str:
     return kind
 
 
-def _openrouter_key(env: Mapping[str, str]) -> str:
+def openrouter_key(env: Mapping[str, str]) -> str:
+    """Ключ OpenRouter из :data:`KEY_ENVS`; не задан — :class:`LiveUnavailableError`."""
     for name in KEY_ENVS:
         key = env.get(name, "").strip()
         if key:
@@ -126,7 +128,7 @@ def open_live_provider(model: str, env: Mapping[str, str]) -> tuple[Config, LLMP
     :class:`LiveUnavailableError` с причиной для ``pytest.skip``.
     """
     if live_provider_kind(env) == OPENROUTER:
-        key = _openrouter_key(env)
+        key = openrouter_key(env)
         blank = dict.fromkeys(_GATEWAY_ENVS, "")
         loaded = Config.load(
             project_root=REPO_ROOT,
