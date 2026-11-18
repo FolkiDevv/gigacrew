@@ -74,8 +74,8 @@ def test_reviewer_model_rebuilds_reviewer(tmp_path: Path) -> None:
     assert agent.reviewer.model == "cat-b"
     assert not change.failed
     change = session.change(_row(session, "permissions.reviewerModel"), "нет-такой")
-    assert "нет" in change.message
-    assert not agent.reviewer.enabled
+    assert change.failed
+    assert agent.reviewer.model == "cat-b"
 
 
 def test_unwritable_file_fails_softly(tmp_path: Path) -> None:
@@ -178,11 +178,17 @@ def test_import_env_keeps_settings_of_project_env(
     assert _stored() == {"version": 1, "tools": {"ty": False}}
 
 
-def test_default_model_must_be_known(tmp_path: Path) -> None:
-    session = _session(_agent(tmp_path))
+def test_default_model_must_be_in_catalogue(tmp_path: Path) -> None:
+    session = _session(_agent(tmp_path, CatalogueProvider()))
     row = _row(session, "model.default")
     change = session.change(row, "нет-такой")
     assert change.failed
-    assert "доступны: A, B" in change.message
+    assert "доступны: cat-a, cat-b" in change.message
     assert not preferences_file().exists()
-    assert session.change(row, "a").row.setting == "A"  # регистр — как в списке
+    assert session.change(row, "CAT-B").row.setting == "cat-b"  # регистр — как в каталоге
+
+
+def test_model_without_catalogue_is_free(tmp_path: Path) -> None:
+    """Без каталога бэкенда (API v2) модель не проверяется: запуск её тоже не проверяет."""
+    session = _session(_agent(tmp_path))
+    assert session.change(_row(session, "model.default"), "Новая").row.setting == "Новая"

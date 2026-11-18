@@ -116,14 +116,14 @@ class SettingsSession:
     def change(self, row: SettingRow, setting: preferences.Setting) -> Change:
         """Сохранить новое значение и применить его, если оно действует сразу."""
         spec = row.spec
-        if spec.kind is preferences.SettingKind.MODEL and setting and self._models:
-            # Как /model: имена моделей регистрозависимы; неизвестная модель по умолчанию
-            # не дала бы gigacrew запуститься.
-            known = {name.lower(): name for name in self._models}
-            setting = known.get(str(setting).lower())
+        catalogue = self._agent.provider.known_models()
+        if spec.kind is preferences.SettingKind.MODEL and setting and catalogue is not None:
+            # Модель вне каталога бэкенда по умолчанию не дала бы gigacrew запуститься.
+            names = [model.id for model in catalogue]
+            setting = _catalogue_name(names, str(setting))
             if setting is None:
-                names = ", ".join(self._models)
-                return Change(row, f"такой модели нет; доступны: {names}", failed=True)
+                known = ", ".join(names)
+                return Change(row, f"такой модели нет в каталоге; доступны: {known}", failed=True)
         try:
             preferences.store_setting(spec, setting, self._path)
         except _STORE_ERRORS as error:
@@ -188,6 +188,13 @@ def _env_setting(spec: preferences.SettingSpec, raw: str) -> preferences.Setting
         return spec.default
 
 
+def _catalogue_name(names: Sequence[str], name: str) -> str | None:
+    """Имя модели из каталога, как у /model: точное, иначе без учёта регистра; None — нет."""
+    if name in names:
+        return name
+    return next((known for known in names if known.lower() == name.lower()), None)
+
+
 def _movable(entries: Mapping[str, str]) -> dict[str, str]:
     """Переменные поведения из ``.env``, которые можно перенести в файл настроек.
 
@@ -228,7 +235,9 @@ def import_env(
     """
     env_file = env_file or user_env_file()
     movable = _movable(read_dotenv(env_file))
-    for key in _movable(read_dotenv(root / ".env")).keys() & movable.keys():
+    project_file = root / ".env"
+    project = {} if project_file.resolve() == env_file.resolve() else read_dotenv(project_file)
+    for key in _movable(project).keys() & movable.keys():
         ui.warn(f"{key} остаётся в {USER_ENV_HINT}: её задаёт и .env проекта")
         movable.pop(key)
     if not movable:
