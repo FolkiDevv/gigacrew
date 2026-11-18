@@ -117,7 +117,8 @@ class SettingsSession:
         """Сохранить новое значение и применить его, если оно действует сразу."""
         spec = row.spec
         catalogue = self._agent.provider.known_models()
-        if spec.field == "model" and setting is None and catalogue is None and not row.source:
+        overridden = self._env.get(spec.env, "").strip()  # действующее значение переменной
+        if spec.field == "model" and setting is None and catalogue is None and not overridden:
             # У API v2 нет модели по умолчанию: без неё gigacrew не запустится.
             return Change(row, "у API v2 нет модели по умолчанию — укажите модель", failed=True)
         if spec.kind is preferences.SettingKind.MODEL and setting and catalogue is not None:
