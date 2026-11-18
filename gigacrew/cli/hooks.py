@@ -21,6 +21,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from gigacrew.agent.events import AgentEvents
 from gigacrew.agent.hooks import HookRunner
 from gigacrew.agent.loop import Agent
 from gigacrew.config import Config
@@ -87,6 +88,55 @@ def _pending_hooks(
     return pending
 
 
+def _hooks_to_confirm(
+    workspace: Workspace,
+    warn: Callable[[str], None],
+    *,
+    trust: bool,
+    store: TrustStore | None,
+) -> tuple[HookSettings, list[_Pending]]:
+    """Настройки хуков и неподтверждённые из них (с ``trust`` — ни одного)."""
+    settings, warnings = load_settings(workspace)
+    for warning in warnings:
+        warn(warning)
+    if settings.disabled or trust:
+        return settings, []
+    return settings, _pending_hooks(settings, workspace, TrustStore() if store is None else store)
+
+
+def _skip_pending(
+    settings: HookSettings,
+    pending: list[_Pending],
+    warn: Callable[[str], None],
+) -> HookRunner:
+    """Спросить некого: неподтверждённые хуки пропущены с предупреждением."""
+    if not pending:
+        return HookRunner(settings)
+    owners = " и ".join(entry.owner for entry in pending)
+    sources = tuple(source for entry in pending for source in entry.sources)
+    files = ", ".join(SOURCE_LABELS[source] for source in sources)
+    warn(
+        f"хуки {owners} ({files}) не подтверждены и пропущены: запустите gigacrew "
+        "интерактивно, чтобы подтвердить их, или передайте --trust-hooks",
+    )
+    return HookRunner(settings.without(*sources))
+
+
+def trusted_hooks(
+    workspace: Workspace,
+    warn: Callable[[str], None],
+    *,
+    store: TrustStore | None = None,
+) -> HookRunner:
+    """Хуки из файлов настроек без вопросов: только подтверждённые раньше.
+
+    Для запуска без терминала (ACP): неподтверждённые хуки пропускаются, о чём —
+    предупреждение через ``warn``.
+    """
+    settings, pending = _hooks_to_confirm(workspace, warn, trust=False, store=store)
+    return _skip_pending(settings, pending, warn)
+
+
 def load_hooks(
     workspace: Workspace,
     ui: Console,
@@ -101,23 +151,11 @@ def load_hooks(
     ``interactive`` — можно спросить пользователя; ``trust`` (``--trust-hooks``) — все хуки
     доверены на этот запуск, без вопроса и без записи отпечатков.
     """
-    settings, warnings = load_settings(workspace)
-    for warning in warnings:
-        ui.warn(warning)
-    if settings.disabled or trust:
-        return HookRunner(settings)
-    pending = _pending_hooks(settings, workspace, TrustStore() if store is None else store)
-    if not pending:
-        return HookRunner(settings)
+    settings, pending = _hooks_to_confirm(workspace, ui.warn, trust=trust, store=store)
+    if not pending or not interactive:
+        return _skip_pending(settings, pending, ui.warn)
     owners = " и ".join(entry.owner for entry in pending)
     sources = tuple(source for entry in pending for source in entry.sources)
-    if not interactive:
-        files = ", ".join(SOURCE_LABELS[source] for source in sources)
-        ui.warn(
-            f"хуки {owners} ({files}) не подтверждены и пропущены: запустите gigacrew "
-            "интерактивно, чтобы подтвердить их, или передайте --trust-hooks",
-        )
-        return HookRunner(settings.without(*sources))
     ui.warn(f"новые или изменённые хуки {owners} — gigacrew будет сам запускать эти команды:")
     groups = tuple(group for entry in pending for group in entry.groups)
     ui.print(describe_groups(groups), markup=False, highlight=False)
@@ -135,7 +173,7 @@ def load_hooks(
 def _request_hook(
     provider: GigaCodeProvider,
     runner: HookRunner,
-    ui: Console,
+    events: AgentEvents,
     root: Path,
     kind: str,
     reason: str,
@@ -152,14 +190,14 @@ def _request_hook(
         "url": url,
         "token_file": str(provider.token_file),
     }
-    outcome = runner.run(HookEvent.PRE_REQUEST, payload, cwd=root, events=ui, target=kind)
+    outcome = runner.run(HookEvent.PRE_REQUEST, payload, cwd=root, events=events, target=kind)
     return outcome.reason if outcome.blocked else None
 
 
 def install_request_hook(
     provider: LLMProvider,
     runner: HookRunner,
-    ui: Console,
+    events: AgentEvents,
     config: Config,
 ) -> None:
     """Хуки PreRequest — перед каждым запросом к бэкенду GigaCode и перед повтором после 401.
@@ -179,7 +217,7 @@ def install_request_hook(
         provider.request_hook = None
         return
     root = Path(config.project_root).resolve()
-    provider.request_hook = partial(_request_hook, provider, runner, ui, root)
+    provider.request_hook = partial(_request_hook, provider, runner, events, root)
 
 
 def _shown(text: str) -> str:

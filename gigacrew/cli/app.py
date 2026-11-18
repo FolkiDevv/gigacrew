@@ -32,17 +32,15 @@ MCP-серверы — из ``mcpServers`` тех же файлов и ``.mcp.js
 from __future__ import annotations
 
 import argparse
-import dataclasses
 from contextlib import closing
 from functools import partial
 from importlib import metadata
 from pathlib import Path
 
 from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
-from gigacrew.agent.decisions import DecisionMemory
 from gigacrew.agent.hooks import HookRunner, PromptBlockedError
 from gigacrew.agent.loop import Agent
-from gigacrew.agent.reviewer import check_reviewer
+from gigacrew.cli import assembly
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
 from gigacrew.cli.hooks import hook_session, install_request_hook, load_hooks
 from gigacrew.cli.mcp import connect_mcp, describe_hub
@@ -72,6 +70,19 @@ from gigacrew.tools.base import ToolRegistry, build_default_registry
 from gigacrew.tools.mcp import McpHub
 from gigacrew.ui.console import Console
 
+__all__ = [
+    "EXIT_ERROR",
+    "EXIT_INTERRUPTED",
+    "EXIT_LLM_ERROR",
+    "EXIT_OK",
+    "EXIT_STOPPED",
+    "build_parser",
+    "main",
+    "run_oneshot",
+    "run_test_context",
+    "tls_warning",
+]
+
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_LLM_ERROR = 2
@@ -79,7 +90,6 @@ EXIT_STOPPED = 3
 EXIT_INTERRUPTED = 130
 
 _STORE_TRUE = "store_true"
-NOT_IN_CATALOGUE = "модели {model} нет в каталоге бэкенда; доступны: {available}"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -209,15 +219,8 @@ def _mode_arg(text: str) -> PermissionMode:
 
 
 def tls_warning(config: Config) -> str | None:
-    """Предупреждение о выключенной проверке TLS (только явный GIGACREW_VERIFY_SSL=0)."""
-    if config.verify_ssl:
-        return None
-    what = "запросы и код проекта" if config.auth_mode == "mtls" else "ключ или токен"
-    return (
-        f"проверка TLS-сертификата сервера выключена (GIGACREW_VERIFY_SSL=0) — {what} можно "
-        "перехватить подменой сервера; если корень сертификата сервера не в стандартном "
-        "хранилище, задайте GIGACREW_CA_BUNDLE (PEM) вместо отключения проверки"
-    )
+    """Предупреждение о выключенной проверке TLS (:attr:`Config.tls_warning`)."""
+    return config.tls_warning
 
 
 def _make_provider(config: Config) -> LLMProvider:
@@ -388,37 +391,24 @@ def _build_agent(
     ``known`` — модели каталога бэкенда (None — каталога нет, модель любая). Ошибка
     выбора модели выводится здесь же. ``registry`` — инструменты агента.
     """
-    if known is not None:
-        if not config.model:  # модель по умолчанию — бэкенда
-            config = dataclasses.replace(config, model=provider.model)
-        elif config.model not in known:
-            missing = NOT_IN_CATALOGUE.format(model=config.model, available=", ".join(known))
-            ui.error(f"{missing} (список — --list-models)")
-            return None
-    if not config.model:
-        ui.error(
-            "не задана модель: укажите GIGACREW_MODEL или --model (список — --list-models)",
+    try:
+        config = assembly.select_model(
+            config,
+            provider,
+            known,
+            how_to_set="GIGACREW_MODEL или --model",
         )
+    except assembly.ModelChoiceError as error:
+        ui.error(f"{error} (список — --list-models)")
         return None
-    decisions, warning = DecisionMemory.load(
-        config.project_root,
-        remember=config.remember_approvals,
-        log=config.save_chats,
-    )
-    if warning:
-        ui.warn(warning)
-    reviewer, warning = check_reviewer(provider, config.reviewer_model)
-    if warning:
-        ui.warn(warning)
-    return Agent(
-        provider,
-        registry,
+    return assembly.build_agent(
         config,
+        provider,
         ui,
         windows=windows,
-        decisions=decisions,
-        reviewer=reviewer,
         hooks=hooks,
+        registry=registry,
+        warn=ui.warn,
     )
 
 
@@ -490,17 +480,11 @@ def _run(args: argparse.Namespace, ui: Console, config: Config, provider: LLMPro
     if args.list_models:
         return _list_models(provider, ui)
 
-    catalogue = provider.known_models()  # None — каталога нет, модель любая
-    known = None if catalogue is None else [entry.id for entry in catalogue]
-    windows, warning = ModelWindows.load(base_url=config.base_url)
-    if warning:
-        ui.warn(warning)
-    if catalogue is not None:
-        windows.report({entry.id: entry.context_window for entry in catalogue})
+    windows, known = assembly.load_windows(config, provider, ui.warn)  # known None — модель любая
     if args.test_context is not None:
         model = args.test_context.strip()
         if known is not None and model not in known:
-            ui.error(NOT_IN_CATALOGUE.format(model=model, available=", ".join(known)))
+            ui.error(assembly.NOT_IN_CATALOGUE.format(model=model, available=", ".join(known)))
             return EXIT_ERROR
         return run_test_context(provider, windows, model, ui, base_url=config.base_url)
 

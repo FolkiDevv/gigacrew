@@ -491,6 +491,18 @@ class Config:
         )
 
     @property
+    def tls_warning(self) -> str | None:
+        """Предупреждение о выключенной проверке TLS (только явный GIGACREW_VERIFY_SSL=0)."""
+        if self.verify_ssl:
+            return None
+        what = "запросы и код проекта" if self.auth_mode == "mtls" else "ключ или токен"
+        return (
+            f"проверка TLS-сертификата сервера выключена (GIGACREW_VERIFY_SSL=0) — {what} можно "
+            "перехватить подменой сервера; если корень сертификата сервера не в стандартном "
+            "хранилище, задайте GIGACREW_CA_BUNDLE (PEM) вместо отключения проверки"
+        )
+
+    @property
     def auth_mode(self) -> str:
         """Схема авторизации, выбранная по провайдеру и наличию реквизитов.
 

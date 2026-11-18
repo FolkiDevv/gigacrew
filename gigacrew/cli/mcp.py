@@ -34,6 +34,7 @@ __all__ = [
     "MCP_TRUST_FILE",
     "confirm_servers",
     "connect_mcp",
+    "connect_trusted_mcp",
     "describe_hub",
     "describe_servers",
     "mcp_trust_store",
@@ -89,6 +90,25 @@ def _pending_servers(
     return pending
 
 
+def _skip_pending(
+    settings: McpSettings,
+    pending: list[_Pending],
+    warn: Callable[[str], None],
+) -> McpSettings:
+    """Спросить некого: неподтверждённые серверы не запускаются, о чём — предупреждение."""
+    if not pending:
+        return settings
+    owners = " и ".join(entry.owner for entry in pending)
+    sources = tuple(source for entry in pending for source in entry.sources)
+    servers = tuple(server for entry in pending for server in entry.servers)
+    files = _listed(sorted({server.origin for server in servers}))
+    warn(
+        f"MCP-серверы {owners} ({files}) не подтверждены и не запущены: запустите "
+        "gigacrew интерактивно, чтобы подтвердить их, или передайте --trust-mcp",
+    )
+    return settings.without(*sources)
+
+
 def confirm_servers(
     settings: McpSettings,
     workspace: Workspace,
@@ -99,18 +119,11 @@ def confirm_servers(
 ) -> McpSettings:
     """Только подтверждённые серверы; новые и изменённые подтверждаются одним вопросом."""
     pending = _pending_servers(settings, workspace, store)
-    if not pending:
-        return settings
+    if not pending or not interactive:
+        return _skip_pending(settings, pending, ui.warn)
     owners = " и ".join(entry.owner for entry in pending)
     sources = tuple(source for entry in pending for source in entry.sources)
     servers = tuple(server for entry in pending for server in entry.servers)
-    if not interactive:
-        files = _listed(sorted({server.origin for server in servers}))
-        ui.warn(
-            f"MCP-серверы {owners} ({files}) не подтверждены и не запущены: запустите "
-            "gigacrew интерактивно, чтобы подтвердить их, или передайте --trust-mcp",
-        )
-        return settings.without(*sources)
     ui.warn(
         f"новые или изменённые MCP-серверы {owners} — gigacrew запустит эти программы "
         "(или подключится к этим адресам) и будет передавать им данные:",
@@ -155,17 +168,51 @@ def connect_mcp(
             store=mcp_trust_store() if store is None else store,
         )
     configs = settings.effective()
+    if configs:
+        names = _listed(config.name for config in configs)
+        ui.system(f"MCP-серверы: подключение ({names})…")
+    return _start(configs, workspace, registry, version=version, warn=ui.warn)
+
+
+def connect_trusted_mcp(
+    workspace: Workspace,
+    registry: ToolRegistry,
+    *,
+    warn: Callable[[str], None],
+    version: str = "",
+    store: TrustStore | None = None,
+) -> McpHub:
+    """Как :func:`connect_mcp`, но без вопросов: запущены только подтверждённые раньше.
+
+    Для запуска без терминала (ACP): о неподтверждённых и не запустившихся серверах —
+    предупреждение через ``warn``.
+    """
+    settings, warnings = load_mcp_settings(workspace)
+    for warning in warnings:
+        warn(warning)
+    pending = _pending_servers(settings, workspace, mcp_trust_store() if store is None else store)
+    configs = _skip_pending(settings, pending, warn).effective()
+    return _start(configs, workspace, registry, version=version, warn=warn)
+
+
+def _start(
+    configs: tuple[McpServerConfig, ...],
+    workspace: Workspace,
+    registry: ToolRegistry,
+    *,
+    version: str,
+    warn: Callable[[str], None],
+) -> McpHub:
+    """Запускает серверы ``configs`` и регистрирует их инструменты в ``registry``."""
     hub = McpHub([McpServer(config, workspace, version=version) for config in configs])
     if not configs:
         return hub
-    names = _listed(config.name for config in configs)
-    ui.system(f"MCP-серверы: подключение ({names})…")
     hub.connect()
     for server in hub.servers:
         if server.error:
-            ui.warn(f"MCP-сервер {server.name} не подключён: {server.error}")
+            warn(f"MCP-сервер {server.name} не подключён: {server.error}")
     for warning in hub.register(registry):
-        ui.warn(warning)
+        warn(warning)
     return hub
 
 
