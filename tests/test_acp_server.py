@@ -525,15 +525,16 @@ def test_session_providers_closed_when_input_ends(
     factory: ProviderFactory,
     project: Path,
 ) -> None:
-    provider = _ClosingProvider()
-    factory.add(provider)
+    providers = [_ClosingScripted(), _ClosingScripted()]
+    factory.add(*providers)
     acp.initialize()
-    acp.new_session(project)
-    assert not provider.closed
+    for _ in providers:
+        acp.new_session(project)
+    assert not any(provider.closed for provider in providers)
 
     acp.stop()
 
-    assert provider.closed
+    assert all(provider.closed for provider in providers)
 
 
 # --- хуки и MCP-серверы проекта: без вопросов, только подтверждённые ---
