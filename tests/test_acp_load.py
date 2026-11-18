@@ -671,7 +671,9 @@ def test_close_saves_report_of_finished_background_job(acp: AcpHarness, root: Pa
     jobs = acp.server.session(session_id).agent.background
     assert jobs is not None
     # Задача завершается только после хода: её итог модели ещё не доставлен.
-    (job,) = jobs.active()
+    running = jobs.active()
+    assert len(running) == 1
+    job = running[0]
     jobs.stop(job, "тест")
     assert job.wait(10)
     assert not _saved_background_report(root, session_id)
