@@ -18,6 +18,7 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Final
 
 from gigacrew.agent.chat_store import ChatRecorder, SavedChat
 from gigacrew.agent.loop import Agent
@@ -46,6 +47,8 @@ type RegistryFactory = Callable[[], ToolRegistry]
 _log = logging.getLogger(__name__)
 # Почему остановлены фоновые задачи — увидит модель, если чат продолжат.
 _CLOSE_REASON = "сессия закрыта клиентом"
+# Сколько закрытие сессии ждёт, пока отменённый ход доработает, с.
+_CLOSE_DRAIN: Final = 2.0
 
 
 @dataclass(frozen=True)
@@ -85,9 +88,23 @@ class AcpSession:
             stack.callback(self.turns.cancel)
 
     def _stop_background(self) -> None:
-        """Останавливает фоновые задачи; их итоги, записанные в историю, — в сохранённый чат."""
-        if self.agent.stop_background(_CLOSE_REASON):
-            autosave(self.chats, self.agent)
+        """Останавливает фоновые задачи; их итоги, записанные в историю, — в сохранённый чат.
+
+        Историю пишет и поток отменённого хода: она трогается, только когда он доработал.
+        Не доработал за :data:`_CLOSE_DRAIN` — процессы задач убиваются без записи итогов.
+        """
+        with self.turns.idle(_CLOSE_DRAIN) as free:
+            if free:
+                if self.agent.stop_background(_CLOSE_REASON):
+                    autosave(self.chats, self.agent)
+                return
+            jobs = self.agent.background
+            if jobs is not None:
+                jobs.stop_all(_CLOSE_REASON)
+            _log.warning(
+                "ход сессии %s не завершился: итоги фоновых задач не записаны",
+                self.session_id,
+            )
 
 
 def open_session(

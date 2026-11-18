@@ -5,19 +5,21 @@
 (``/<скилл> аргументы``) раскрывается в запрос, как в CLI. Режим, который
 агент сменил за ход (одобренный план), сообщается клиенту до ответа на ход.
 
-Отмена поднимает флаг хода (процессы ``run_process`` убиваются, см.
-:func:`gigacrew.tools.cancel.cancellation`), закрывает ход для клиента (поздние события не
-отправляются) и посылает в поток хода асинхронный ``KeyboardInterrupt`` — не больше одного
-на ход. Поток, который исключения не видит (ждёт сеть без отрезков), ответ ``cancelled`` не
-задерживает дольше :data:`_CANCEL_GRACE`; следующий ход сессии дожидается его конца.
+Отмена посылает в поток хода асинхронный ``KeyboardInterrupt`` (не больше одного на ход),
+затем поднимает флаг хода (процессы ``run_process`` убиваются, см.
+:func:`gigacrew.tools.cancel.cancellation`) и закрывает ход для клиента: поздние события не
+отправляются — кроме, возможно, нескольких, которые поток успел отправить между
+прерыванием и закрытием. Поток, который исключения не видит (ждёт сеть без отрезков),
+ответ ``cancelled`` не задерживает дольше :data:`_CANCEL_GRACE`; следующий ход сессии
+дожидается его конца.
 """
 
 from __future__ import annotations
 
 import ctypes
 import threading
-from collections.abc import Callable
-from contextlib import ExitStack
+from collections.abc import Callable, Generator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Final
@@ -121,6 +123,19 @@ class TurnRunner:
             turn.cancel.set()
             self._events.close_turn()
         turn.wake.set()
+
+    @contextmanager
+    def idle(self, timeout: float) -> Generator[bool]:
+        """Агент свободен внутри блока: поток прошлого хода доработал (ждём до ``timeout`` с).
+
+        False — не дождались (поток не видит прерывания): агента трогать нельзя.
+        """
+        free = self._agent_free.acquire(timeout=timeout)
+        try:
+            yield free
+        finally:
+            if free:
+                self._agent_free.release()
 
     def _accept(self, work: _Work) -> _Turn:
         with self._lock:

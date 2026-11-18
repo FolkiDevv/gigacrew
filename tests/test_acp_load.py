@@ -28,7 +28,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections.abc import Callable, Iterator
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, closing
 from pathlib import Path
 from typing import Any, Final, override
@@ -42,7 +43,7 @@ from gigacrew.agent.conversation import HOOK_CONTEXT_HEADER, Conversation, Summa
 from gigacrew.cli.acp.rpc import INTERNAL_ERROR, INVALID_PARAMS
 from gigacrew.cli.mcp import mcp_trust_store
 from gigacrew.llm.base import LLMProvider
-from gigacrew.llm.types import FunctionCall, Message
+from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec
 from gigacrew.project.mcp_config import load_mcp_settings, servers_fingerprint
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import ToolRegistry, build_default_registry
@@ -579,6 +580,61 @@ def test_close_session_stops_background_jobs(acp: AcpHarness, root: Path) -> Non
     acp.call(CLOSE, {"sessionId": session_id})
 
     assert not jobs.active()
+
+
+class _StuckAfterFirst(ScriptedProvider):
+    """Второе обращение хода ждёт без отрезков, как httpx до первого байта.
+
+    Прерывание отмены до потока хода не доходит, пока обращение не отпустят.
+    """
+
+    def __init__(self, turns: Sequence[AssistantTurn]) -> None:
+        super().__init__(turns)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    @override
+    def complete(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None = None,
+        **kwargs: Any,
+    ) -> AssistantTurn:
+        if tools is not None and self.calls == 1:
+            self.entered.set()
+            self.release.wait()
+        return super().complete(messages, tools, **kwargs)
+
+
+def test_close_during_stuck_turn_kills_jobs_without_touching_history(
+    acp: AcpHarness,
+    root: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Закрытие посреди хода не пишет в историю, пока поток хода её чинит.
+
+    Поток хода, который не видит прерывания, ещё работает с историей: запись итогов
+    фоновых задач из потока закрытия перемешала бы её. Процессы задач всё равно убиваются.
+    """
+    command = {"command": "exec sleep 60", "run_in_background": True}
+    provider = _StuckAfterFirst([tool_turn("run_shell", command), text_turn("поздно")])
+    request.addfinalizer(provider.release.set)
+    session_id = _open(acp, root, provider)
+    agent = acp.server.session(session_id).agent
+    jobs = agent.background
+    assert jobs is not None
+    prompt = [{"type": "text", "text": "go"}]
+    msg_id = acp.begin(PROMPT, {"sessionId": session_id, "prompt": prompt})
+    assert provider.entered.wait(10)
+    assert jobs.active()
+    history = list(agent.conversation.messages)
+
+    assert acp.call(CLOSE, {"sessionId": session_id}) == {}
+
+    assert not jobs.active()
+    assert list(agent.conversation.messages) == history
+    provider.release.set()
+    assert acp.reply(msg_id)["result"]["stopReason"] == "cancelled"
 
 
 def test_close_of_unknown_session_is_quiet(acp: AcpHarness, root: Path) -> None:
