@@ -56,6 +56,7 @@ def test_completes_commands_with_descriptions() -> None:
         "/hooks",
         "/tasks",
         "/mcp",
+        "/settings",
         "/copy",
         "/exit",
     }

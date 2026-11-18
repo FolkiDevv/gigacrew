@@ -86,10 +86,15 @@ importlib. `tests/test_layering.py` also checks at runtime that every module imp
 ### Request flow
 
 - `cli/app.py:main` parses arguments, loads `Config` (environment, then `~/.gigacode/.env`, then
-  the project `.env`; security settings such as API URLs and TLS options are never taken from a
-  project `.env`), builds the provider (`llm/api.py` for API v2, `llm/gigacode.py` for the GigaCode
+  the project `.env`, then `~/.gigacode/gigacrew.json`; security settings such as API URLs and TLS
+  options are never taken from a project `.env`), builds the provider (`llm/api.py` for API v2, `llm/gigacode.py` for the GigaCode
   backend), the tool registry and the `Agent`, then runs the REPL (`cli/repl.py`) or a one-shot
   `-p` turn.
+- `project/preferences.py` is the registry of user settings (`SETTINGS`: JSON key, environment
+  variable, `Config` field, bounds, live or restart-only) and reads/writes `gigacrew.json` — a file
+  of its own, because `~/.gigacode/settings.json` is shared with the official GigaCode CLI. The
+  `/settings` menu (`cli/settings.py`, `ui/settings_picker.py`) edits it and applies live settings
+  through `Agent.apply_config`. A new behaviour setting is one `SettingSpec` plus its `Config` field.
 - `agent/loop.py` — `Agent.run_turn` streams from the model and executes tool calls. Each call
   passes through `Tool.assess` → `permissions.decide` (modes `auto`/`plan`, tool kinds) → for
   shell commands the local classifier → saved decisions (`agent/decisions.py`, stored per project

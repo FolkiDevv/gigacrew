@@ -543,6 +543,11 @@ class Console(events.AgentEvents):  # noqa: WPS338
         """Вывод без цвета."""
         return self._no_color
 
+    def disable_color(self) -> None:
+        """Выключить цвет после создания консоли (настройка ``ui.color``)."""
+        self._no_color = True
+        self._console.no_color = True
+
     def interactive(self) -> bool:
         """Можно ли спросить пользователя: ввод идёт с терминала (не pipe/файл)."""
         return _stdin_is_terminal()

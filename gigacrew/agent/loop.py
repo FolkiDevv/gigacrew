@@ -723,6 +723,18 @@ class Agent:
         self.set_mode(next_mode(self.mode))
         return self.mode
 
+    def apply_config(self, config: Config, reviewer: Reviewer | None = None) -> None:
+        """Новые настройки в работе (меню ``/settings``): со следующего запроса.
+
+        То, что собрано при запуске (HTTP-клиент, очередь фоновых задач, MCP), не
+        перестраивается: такие настройки действуют со следующего запуска. ``reviewer`` —
+        новый рецензент (сменилась его модель); None — прежний.
+        """
+        self._cfg = config
+        if reviewer is not None:
+            self._reviewer = reviewer
+        self._ctx = self._tool_context()
+
     def request_subagent_stop(self) -> bool:
         """Остановить работающего суб-агента (Esc; вызывается из потока клавиш).
 

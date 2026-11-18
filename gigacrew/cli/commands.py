@@ -31,6 +31,7 @@ from gigacrew.cli.hooks import (
 from gigacrew.cli.indexing import reindex
 from gigacrew.cli.models import ModelCatalog, describe_model, ensure_context_window
 from gigacrew.cli.prompt import KEY_HELP
+from gigacrew.cli.settings import IMPORT_ENV, SETTINGS_USAGE, settings_command
 from gigacrew.llm.base import LLMError, LLMProvider
 from gigacrew.permissions import MODE_CYCLE, PermissionMode, parse_mode
 from gigacrew.project.skills import COMMAND_NAME_PATTERN, SkillCatalog
@@ -218,7 +219,9 @@ def _model(ctx: CommandContext, arg: str) -> bool:
     agent.set_model(arg)
     if known and arg not in known:
         ctx.ui.warn(f"модели {arg} нет в списке доступных чат-моделей")
-    ctx.ui.info(f"модель теперь: {arg} (применится со следующего запроса)")
+    ctx.ui.info(
+        f"модель теперь: {arg} (применится со следующего запроса; модель по умолчанию — /settings)",
+    )
     ensure_context_window(agent, ctx.ui, interrupt=ctx.interrupt, declined=ctx.declined_windows)
     if ctx.chats is not None:  # модель — часть чата: сохраняем, не дожидаясь хода
         save_chat(ctx.chats, agent, ctx.ui)
@@ -528,6 +531,18 @@ def _mcp(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+def settings_choices() -> list[tuple[str, str]]:
+    """Варианты аргумента ``/settings`` для автодополнения: (имя, пояснение)."""
+    return [(IMPORT_ENV, "перенести настройки из ~/.gigacode/.env в файл настроек")]
+
+
+def _settings(ctx: CommandContext, arg: str) -> bool:
+    known = catalogue_ids(ctx.agent.provider)
+    if known is None and ctx.models:
+        known = ctx.models.models
+    return settings_command(ctx.agent, ctx.ui, arg, known)
+
+
 def _copy(ctx: CommandContext, arg: str) -> bool:
     return copy_command(ctx.agent, ctx.ui, arg)
 
@@ -574,6 +589,13 @@ def default_commands() -> CommandRegistry:
         SlashCommand("/hooks", "хуки пользователя", _hooks, usage="/hooks [reload]"),
         SlashCommand("/tasks", "фоновые задачи", _tasks, usage=TASKS_USAGE),
         SlashCommand("/mcp", "MCP-серверы и их инструменты", _mcp),
+        SlashCommand(
+            "/settings",
+            "настройки gigacrew (~/.gigacode/gigacrew.json)",
+            _settings,
+            usage=SETTINGS_USAGE,
+            aliases=("/config",),
+        ),
         SlashCommand("/copy", "ответ модели в буфер (Markdown)", _copy, usage=COPY_USAGE),
         SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")),
     ):

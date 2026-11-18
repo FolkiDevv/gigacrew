@@ -549,6 +549,10 @@ def main(argv: list[str] | None = None) -> int:
     config = _load_config(args, ui)
     if config is None:
         return EXIT_ERROR
+    if not config.color:
+        ui.disable_color()
+    for notice in config.preference_warnings:
+        ui.warn(notice)
     # До первого запроса и во всех режимах: ключ уходит уже при подключении.
     warning = tls_warning(config)
     if warning:
