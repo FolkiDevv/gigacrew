@@ -143,3 +143,15 @@ def test_connection_lines() -> None:
     assert lines["авторизация"] == "токен официального CLI GigaCode"
     assert "ВЫКЛЮЧЕНА" in lines["TLS"]
     assert lines["User-Agent"] == "не задан"
+
+
+def test_import_env_ignores_empty_lines(capsys: pytest.CaptureFixture[str]) -> None:
+    """Пустая переменная (как в скопированном .env.example) не сбрасывает значение в файле."""
+    env_file = preferences_file().with_name(".env")
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("GIGACREW_TEMPERATURE=\n", encoding="utf-8")
+    preferences_file().write_text('{"model": {"temperature": 0.7}}', encoding="utf-8")
+    import_env(Console(no_color=True))
+    assert "нет настроек" in capsys.readouterr().out
+    assert _stored() == {"model": {"temperature": 0.7}}
+    assert env_file.read_text(encoding="utf-8") == "GIGACREW_TEMPERATURE=\n"

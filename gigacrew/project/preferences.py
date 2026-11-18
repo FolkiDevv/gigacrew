@@ -641,7 +641,11 @@ def _read_raw(path: Path) -> dict[str, object]:
 
 
 def write_text_atomic(path: Path, text: str) -> None:
-    """Запись через временный файл рядом: прерванная запись не портит настройки."""
+    """Запись через временный файл рядом: прерванная запись не портит настройки.
+
+    Символическая ссылка (файл из репозитория dotfiles) остаётся ссылкой: пишется её цель.
+    """
+    path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:

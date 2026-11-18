@@ -181,8 +181,11 @@ def _env_setting(spec: preferences.SettingSpec, raw: str) -> preferences.Setting
 
 
 def _movable(entries: Mapping[str, str]) -> dict[str, str]:
-    """Переменные поведения из ``.env``, которые можно перенести в файл настроек."""
-    return {key: raw for key, raw in entries.items() if key in _BY_ENV}
+    """Переменные поведения из ``.env``, которые можно перенести в файл настроек.
+
+    Пустые не в счёт: они ничего не перекрывают, а перенос сбросил бы значение в файле.
+    """
+    return {key: raw for key, raw in entries.items() if key in _BY_ENV and raw.strip()}
 
 
 def connection_lines(config: Config) -> list[tuple[str, str]]:

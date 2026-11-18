@@ -247,3 +247,12 @@ def test_env_sources(tmp_path: Path) -> None:
     assert sources["GIGACREW_TY"] == "~/.gigacode/.env"
     assert sources["GIGACREW_MODE"] == "переменная окружения"
     assert "GIGACREW_TIMEOUT" not in sources  # пустое значение не в счёт
+
+
+def test_store_keeps_symlink(tmp_path: Path) -> None:
+    target = _write(tmp_path / "dotfiles" / "gigacrew.json", {})
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    store_setting(COMPACT, 60, link)
+    assert link.is_symlink()
+    assert json.loads(target.read_text(encoding="utf-8"))["context"] == {"compactThreshold": 60}
