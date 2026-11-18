@@ -161,11 +161,13 @@ def _assert_session_error(error: dict[str, Any], fragments: Iterable[str]) -> No
 # --- initialize и authenticate ---
 
 
-@pytest.mark.parametrize("requested", [1, 7])
+@pytest.mark.parametrize("requested", [1, 2, 7])
 def test_initialize_answers_protocol_version_one(acp: AcpHarness, requested: int) -> None:
+    """T3 предлагает версию 2; ответ с ключом ``info`` переключил бы его на ACP v2."""
     response = acp.call("initialize", {"protocolVersion": requested})
 
     assert response["protocolVersion"] == 1
+    assert "info" not in response
 
 
 def test_initialize_describes_agent(acp: AcpHarness) -> None:
@@ -176,7 +178,9 @@ def test_initialize_describes_agent(acp: AcpHarness) -> None:
     assert agent_info["title"]
     assert agent_info["version"] == metadata.version("gigacrew")
     capabilities = response["agentCapabilities"]
-    assert capabilities["loadSession"] is False  # session/load — шаг 6
+    assert capabilities["loadSession"] is True  # session/load — шаг 6
+    # Только close: T3 вызывает session/list, resume и delete по наличию их ключей.
+    assert capabilities["sessionCapabilities"] == {"close": {}}  # session/close — шаг 6
     assert capabilities["promptCapabilities"]["image"] is False
     assert capabilities["promptCapabilities"]["embeddedContext"] is True
     assert response["authMethods"] == []
