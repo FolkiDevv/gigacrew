@@ -1,7 +1,8 @@
 """События агента → уведомления ACP ``session/update``.
 
-Уведомления идут, только пока ход «открыт» (:meth:`AcpEvents.open_turn`): события
-отменённого хода, который ещё доделывает свой поток, клиенту не отправляются.
+Уведомления о ходе идут, только пока он «открыт» (:meth:`AcpEvents.open_turn`): события
+отменённого хода, который ещё доделывает свой поток, клиенту не отправляются. Уведомления о
+состоянии сессии (режим, слэш-команды) от хода не зависят.
 Закрытие хода (:meth:`AcpEvents.close_turn`) сообщает о незавершённых вызовах
 инструментов как о неудавшихся — у клиента не остаётся вызовов «выполняется».
 
@@ -27,7 +28,7 @@ from gigacrew.cli.acp.rpc import (
     RpcConnection,
     RpcError,
 )
-from gigacrew.permissions import ToolKind
+from gigacrew.permissions import PermissionMode, ToolKind
 from gigacrew.tools.base import Display, ToolResult
 from gigacrew.tools.questions import Answer, Question, QuestionsUnavailableError
 
@@ -87,17 +88,21 @@ class _TurnChannel:
         """Ход закончен или отменён: незавершённые вызовы — failed, дальше — тишина."""
         with self._lock:
             for call_id in self._open_calls:
-                self._send({
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": call_id,
-                    "status": "failed",
-                })
+                self._send(_call_update(call_id, "failed"))
             self._open_calls.clear()
             self._live = False
 
     def report_usage(self, used: int, size: int) -> None:
         """Заполненность контекста после хода: ``used`` из ``size`` токенов."""
-        self._emit({"sessionUpdate": "usage_update", "used": used, "size": size})
+        self._emit(_update("usage_update", {"used": used, "size": size}))
+
+    def report_mode(self, mode: PermissionMode) -> None:
+        """Режим сменил сам агент (одобренный план): ``current_mode_update``."""
+        self._notify(_update("current_mode_update", {"currentModeId": mode.value}))
+
+    def report_commands(self, commands: list[Update]) -> None:
+        """Слэш-команды сессии: ``available_commands_update``."""
+        self._notify(_update("available_commands_update", {"availableCommands": commands}))
 
     def _request(self, method: str, params: Update) -> Any:
         """Запрос клиенту от имени сессии; отмена хода во время ожидания прерывает ход."""
@@ -114,6 +119,11 @@ class _TurnChannel:
         with self._lock:
             if self._live:
                 self._send(update)
+
+    def _notify(self, update: Update) -> None:
+        """Уведомление о состоянии сессии, а не о ходе: идёт и вне хода."""
+        with self._lock:
+            self._send(update)
 
     def _send(self, update: Update) -> None:
         """Отправляет уведомление (вызывается под блокировкой)."""
@@ -188,7 +198,7 @@ class AcpEvents(_TurnChannel, AgentEvents):
     @override
     def on_tool_start(self, call: ToolCallInfo) -> None:
         self._running_call = call.call_id
-        self._emit(_call_update(call, "in_progress"))
+        self._emit(_call_update(call.call_id, "in_progress"))
 
     @override
     def on_tool_result(
@@ -198,7 +208,7 @@ class AcpEvents(_TurnChannel, AgentEvents):
         *,
         previewed: bool,
     ) -> None:
-        update = _call_update(call, "completed" if tool_result.ok else "failed")
+        update = _call_update(call.call_id, "completed" if tool_result.ok else "failed")
         update["content"] = _result_content(call, tool_result)
         with self._lock:
             if self._live:
@@ -212,7 +222,7 @@ class AcpEvents(_TurnChannel, AgentEvents):
 
 
 def _chunk(kind: str, text: str) -> Update:
-    return {"sessionUpdate": kind, "content": {"type": "text", "text": text}}
+    return _update(kind, {"content": {"type": "text", "text": text}})
 
 
 def _tool_call(call: ToolCallInfo) -> Update:
@@ -227,8 +237,13 @@ def _tool_call(call: ToolCallInfo) -> Update:
     }
 
 
-def _call_update(call: ToolCallInfo, status: str) -> Update:
-    return {"sessionUpdate": "tool_call_update", "toolCallId": call.call_id, "status": status}
+def _update(kind: str, fields: Update) -> Update:
+    """Тело уведомления ``session/update`` вида ``kind``."""
+    return {"sessionUpdate": kind, **fields}
+
+
+def _call_update(call_id: str, status: str) -> Update:
+    return _update("tool_call_update", {"toolCallId": call_id, "status": status})
 
 
 def _kind(call: ToolCallInfo) -> str:

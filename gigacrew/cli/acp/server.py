@@ -13,6 +13,14 @@ from functools import partial
 from importlib import metadata
 from typing import Any, BinaryIO
 
+from gigacrew.cli.acp.options import (
+    SetConfigOptionParams,
+    SetModelParams,
+    SetModeParams,
+    choose_model,
+    config_options,
+    session_setup,
+)
 from gigacrew.cli.acp.protocol import (
     CancelParams,
     InitializeParams,
@@ -31,7 +39,7 @@ type Message = dict[str, Any]
 
 
 class AcpServer:
-    """Агент ACP: ``initialize``, ``authenticate``, ``session/new``, ``session/prompt``.
+    """Агент ACP: ``initialize``, ``authenticate``, сессии, их ходы, режим и модель.
 
     ``provider_factory`` — провайдер LLM по конфигурации сессии; ``registry_factory`` —
     инструменты агента новой сессии.
@@ -62,6 +70,9 @@ class AcpServer:
                     "authenticate": self._authenticate,
                     "session/new": partial(self._new_session, connection),
                     "session/prompt": self._prompt,
+                    "session/set_mode": self._set_mode,
+                    "session/set_config_option": self._set_config_option,
+                    "session/set_model": self._set_model,
                 },
                 notifications={"session/cancel": self._cancel},
             )
@@ -102,12 +113,30 @@ class AcpServer:
         if not accepted:  # ввод кончился, пока сессия собиралась: она уже никому не нужна
             session.close()
             raise RpcError(INTERNAL_ERROR, "сервер завершает работу")
-        return {"sessionId": session.session_id}
+        # Сведения о сессии клиент принимает и до ответа на session/new (T3 их копит).
+        session.turns.advertise_commands()
+        return {"sessionId": session.session_id, **session_setup(session.agent)}
 
     def _prompt(self, params: Any) -> Message:
         request = PromptParams.model_validate(params)
         session = self.session(request.session_id)
         return {"stopReason": session.turns.prompt(prompt_text(request.prompt))}
+
+    def _set_mode(self, params: Any) -> Message:
+        request = SetModeParams.model_validate(params)
+        self.session(request.session_id).agent.set_mode(request.mode_id)
+        return {}
+
+    def _set_config_option(self, params: Any) -> Message:
+        request = SetConfigOptionParams.model_validate(params)
+        agent = self.session(request.session_id).agent
+        choose_model(agent, request.choice)
+        return {"configOptions": config_options(agent)}
+
+    def _set_model(self, params: Any) -> Message:
+        request = SetModelParams.model_validate(params)
+        choose_model(self.session(request.session_id).agent, request.model_id)
+        return {}
 
     def _cancel(self, params: Any) -> None:
         request = CancelParams.model_validate(params)
