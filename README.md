@@ -422,6 +422,49 @@ gigacrew подключает серверы [Model Context Protocol](https://mo
 спросит снова. Без терминала и в `-p` неподтверждённые серверы не запускаются; `--trust-mcp` разрешает все
 серверы на один запуск (например, в CI). Настройки читаются при старте.
 
+## T3 Code (ACP)
+
+`gigacrew acp` — агент [Agent Client Protocol](https://agentclientprotocol.com): сообщения JSON-RPC
+по stdin/stdout, предупреждения и журнал — в stderr. Так gigacrew подключается к T3 Code: драйвер
+ACP Registry, источник «Local command», `commandPath` — путь к `gigacrew` (`which gigacrew`),
+`commandArgs` — `["acp"]`. Провайдер и реквизиты берутся из окружения инстанса, поэтому оба
+бэкенда работают параллельно двумя инстансами — в `settings.json` T3:
+
+```json
+{
+  "providerInstances": {
+    "gigacrew-api": {
+      "driver": "acpRegistry",
+      "displayName": "GigaCrew · API v2",
+      "environment": [
+        {"name": "GIGACREW_PROVIDER", "value": "api"},
+        {"name": "GIGACREW_ACCESS_KEY", "value": "…", "sensitive": true}
+      ],
+      "config": {"source": "local", "commandPath": "/home/me/.local/bin/gigacrew", "commandArgs": ["acp"]}
+    },
+    "gigacrew-gigacode": {
+      "driver": "acpRegistry",
+      "displayName": "GigaCrew · GigaCode",
+      "environment": [{"name": "GIGACREW_PROVIDER", "value": "gigacode"}],
+      "config": {"source": "local", "commandPath": "/home/me/.local/bin/gigacrew", "commandArgs": ["acp"]}
+    }
+  }
+}
+```
+
+Остальные настройки — как у CLI: `~/.gigacode/.env`, `.env` проекта (без настроек безопасности),
+`~/.gigacode/gigacrew.json`. Каждая сессия T3 — проект в своём каталоге со своей конфигурацией.
+
+Что поддерживается: режимы `auto` и `plan` (переключатель режима T3; одобренный план переводит сессию
+в `auto`), выбор модели из каталога бэкенда, подтверждения операций (один раз, всегда, до конца хода,
+отказ), вопросы модели (формы T3), отмена хода, слэш-команды `/compact` и скиллы проекта, продолжение
+сохранённых чатов (id сессии — id чата gigacrew). Хуки и MCP-серверы проекта запускаются, только
+если вы уже разрешили их в терминале: спросить об этом без терминала некому.
+
+Ограничения: картинки в запросе не принимаются; MCP-серверы, которые передаёт клиент, игнорируются —
+работают серверы из настроек gigacrew; план показывается обычным текстом ответа, а не панелью плана
+ACP.
+
 ## Разработка
 
 ```sh

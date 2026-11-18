@@ -4,6 +4,8 @@
   * интерактивный REPL (по умолчанию);
   * одноразовый запрос: ``gigacrew -p "сделай X"`` (или ``-p "/скилл аргументы"``);
   * диагностика: ``gigacrew --list-models`` (чат-модели);
+  * агент ACP для T3 Code и других клиентов: ``gigacrew acp`` (протокол на stdin/stdout,
+    :mod:`gigacrew.cli.acp`);
   * замер окна контекста: ``gigacrew --test-context МОДЕЛЬ`` — результат
     сохраняется в ``~/.gigacode/models.json``. Окно незамеренной модели
     замеряется и автоматически — при запуске и смене модели.
@@ -41,6 +43,7 @@ from gigacrew.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, S
 from gigacrew.agent.hooks import HookRunner, PromptBlockedError
 from gigacrew.agent.loop import Agent
 from gigacrew.cli import assembly
+from gigacrew.cli.acp.stdio import serve_stdio
 from gigacrew.cli.commands import RESUME_LIMIT, default_commands, expand_skill, resume_chat
 from gigacrew.cli.hooks import hook_session, install_request_hook, load_hooks
 from gigacrew.cli.mcp import connect_mcp, describe_hub
@@ -90,6 +93,7 @@ EXIT_STOPPED = 3
 EXIT_INTERRUPTED = 130
 
 _STORE_TRUE = "store_true"
+_ACP_COMMAND = "acp"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -147,6 +151,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--version",
         action="version",
         version=f"gigacrew {metadata.version('gigacrew')}",
+    )
+    commands = parser.add_subparsers(dest="command", title="подкоманды")
+    commands.add_parser(
+        _ACP_COMMAND,
+        help="Агент ACP (Agent Client Protocol) на stdin/stdout — для T3 Code",
+        description="Агент ACP на stdin/stdout: клиент (T3 Code) открывает сессии в "
+        "каталогах проектов. Провайдер и реквизиты — из окружения (GIGACREW_PROVIDER…), "
+        "stdout — только сообщения протокола, предупреждения и журнал — в stderr.",
     )
     return parser
 
@@ -529,6 +541,9 @@ def _run_agent(
 def main(argv: list[str] | None = None) -> int:
     """Точка входа ``gigacrew``; возвращает код выхода (``EXIT_*``)."""
     args = build_parser().parse_args(argv)
+    if args.command == _ACP_COMMAND:
+        # До разбора настроек и без вывода в stdout: он занят протоколом.
+        return EXIT_INTERRUPTED if serve_stdio(_make_provider) else EXIT_OK
     ui = Console(no_color=args.no_color)
     config = _load_config(args, ui)
     if config is None:
