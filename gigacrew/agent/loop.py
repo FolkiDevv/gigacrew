@@ -288,6 +288,8 @@ _LOCK_FILE_MODE = 0o600
 _MAX_ERROR_CHARS = 200
 # Столько разрешений пользователя без единого отказа — и команда запоминается («всегда»).
 AUTO_REMEMBER_AFTER = 3
+# Хвост подсказки о прошлых ответах (``ToolCallInfo.history``): клавиша «a» терминала.
+KEY_REMEMBER_HINT = "«a» запомнит выбор"
 # Длительность в журнале решений для вызова, который не выполнялся (заблокирован).
 _NO_DURATION = float(0)
 
@@ -2219,6 +2221,7 @@ class Agent:
                     kind=kind,
                     reason=reason,
                     remember=remember,
+                    can_remember=not hook_asks,
                     history=self._history_hint(verdict, auto_remember=auto_remember),
                     purpose=assessment.purpose,
                     review=review_note,
@@ -2890,7 +2893,7 @@ class Agent:
         if auto_remember and streak == AUTO_REMEMBER_AFTER - 1:
             return f"{hint} — после этого «да» разрешение запомнится"
         if allowed >= 2:
-            hint = f"{hint} — «a» запомнит выбор"
+            hint = f"{hint} — {KEY_REMEMBER_HINT}"
         return hint
 
     # Запись журнала собирается из всех сведений о решении: каждое — отдельный аргумент.

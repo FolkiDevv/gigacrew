@@ -58,6 +58,13 @@ class _Pending:
     remember: Callable[[], None]  # записать отпечаток в TrustStore (OSError)
 
 
+# Как подтвердить пропущенные хуки: при запуске из терминала и без него (ACP, флагов нет).
+_TRUST_FLAG_REMEDY = (
+    "запустите gigacrew интерактивно, чтобы подтвердить их, или передайте --trust-hooks"
+)
+_TERMINAL_REMEDY = "подтвердите их один раз, запустив gigacrew в терминале в этом проекте"
+
+
 def _pending_hooks(
     settings: HookSettings,
     workspace: Workspace,
@@ -108,17 +115,19 @@ def _skip_pending(
     settings: HookSettings,
     pending: list[_Pending],
     warn: Callable[[str], None],
+    *,
+    remedy: str = _TRUST_FLAG_REMEDY,
 ) -> HookRunner:
-    """Спросить некого: неподтверждённые хуки пропущены с предупреждением."""
+    """Спросить некого: неподтверждённые хуки пропущены с предупреждением.
+
+    ``remedy`` — как подтвердить их в этом способе запуска (в предупреждении).
+    """
     if not pending:
         return HookRunner(settings)
     owners = " и ".join(entry.owner for entry in pending)
     sources = tuple(source for entry in pending for source in entry.sources)
     files = ", ".join(SOURCE_LABELS[source] for source in sources)
-    warn(
-        f"хуки {owners} ({files}) не подтверждены и пропущены: запустите gigacrew "
-        "интерактивно, чтобы подтвердить их, или передайте --trust-hooks",
-    )
+    warn(f"хуки {owners} ({files}) не подтверждены и пропущены: {remedy}")
     return HookRunner(settings.without(*sources))
 
 
@@ -134,7 +143,7 @@ def trusted_hooks(
     предупреждение через ``warn``.
     """
     settings, pending = _hooks_to_confirm(workspace, warn, trust=False, store=store)
-    return _skip_pending(settings, pending, warn)
+    return _skip_pending(settings, pending, warn, remedy=_TERMINAL_REMEDY)
 
 
 def load_hooks(

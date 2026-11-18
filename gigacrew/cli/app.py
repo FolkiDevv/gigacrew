@@ -94,6 +94,10 @@ EXIT_INTERRUPTED = 130
 
 _STORE_TRUE = "store_true"
 _ACP_COMMAND = "acp"
+_ACP_RUN_OPTIONS = (
+    f"подкоманда {_ACP_COMMAND} не принимает параметры запуска (--no-save, -y, --mode…): "
+    "настройки сессий берутся из окружения инстанса и .env"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -540,8 +544,12 @@ def _run_agent(
 
 def main(argv: list[str] | None = None) -> int:
     """Точка входа ``gigacrew``; возвращает код выхода (``EXIT_*``)."""
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.command == _ACP_COMMAND:
+        # Параметры запуска до подкоманды сессии ACP не получат: не теряем их молча.
+        if args != parser.parse_args([_ACP_COMMAND]):
+            parser.error(_ACP_RUN_OPTIONS)
         # До разбора настроек и без вывода в stdout: он занят протоколом.
         return EXIT_INTERRUPTED if serve_stdio(_make_provider) else EXIT_OK
     ui = Console(no_color=args.no_color)

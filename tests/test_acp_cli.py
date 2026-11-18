@@ -425,6 +425,25 @@ def test_acp_rejects_foreign_arguments(user_home: Path, workdir: Path) -> None:
     assert "-p" in error_line, completed.stderr
 
 
+@pytest.mark.parametrize(
+    "run_options",
+    [["--no-save", "--untrusted-project"], ["-y"], ["--mode", "plan"]],
+    ids=["no-save-untrusted", "yes", "mode"],
+)
+def test_acp_rejects_run_options_before_subcommand(
+    user_home: Path,
+    workdir: Path,
+    run_options: list[str],
+) -> None:
+    """Параметры запуска перед acp сессиям не передаются: молча их не теряем — ошибка (код 2)."""
+    completed = _run_cli([*run_options, "acp"], user_home, workdir)
+
+    assert completed.returncode == USAGE_ERROR, completed.stderr
+    assert not completed.stdout
+    error_line = completed.stderr.strip().splitlines()[-1]
+    assert "acp не принимает параметры запуска" in error_line, completed.stderr
+
+
 def _hooked_project(root: Path, scripts: Path, port: int) -> None:
     """Проект с подтверждённым хуком UserPromptSubmit, который ждёт, пока его не убьют."""
     hook = scripts / "hook.py"

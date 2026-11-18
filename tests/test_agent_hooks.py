@@ -220,6 +220,8 @@ def test_pre_tool_use_ask_confirms_every_time(tmp_path: Path) -> None:
     agent.run_turn("пиши")
     # «всегда» не запоминается: хук требует спрашивать каждый раз
     assert len(events.confirms) == 2
+    # «всегда» не предлагают
+    assert not any(confirm[0].can_remember for confirm in events.confirms)
     assert tool.runs == 2
 
 

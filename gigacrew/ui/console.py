@@ -1964,7 +1964,7 @@ def _confirm_question(call: events.ToolCallInfo, *, dangerous: bool) -> str:
 
 def _always_note(call: events.ToolCallInfo, *, dangerous: bool) -> str | None:
     """Что запомнит ответ «всегда»; None — так ответить нельзя."""
-    if dangerous:  # опасное «навсегда» не разрешается
+    if dangerous or not call.can_remember:  # опасное «навсегда» не разрешается
         return None
     if call.remember:
         return sanitize(call.remember)

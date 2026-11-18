@@ -427,8 +427,8 @@ gigacrew подключает серверы [Model Context Protocol](https://mo
 `gigacrew acp` — агент [Agent Client Protocol](https://agentclientprotocol.com): сообщения JSON-RPC
 по stdin/stdout, предупреждения и журнал — в stderr. Так gigacrew подключается к T3 Code: драйвер
 ACP Registry, источник «Local command», `commandPath` — путь к `gigacrew` (`which gigacrew`),
-`commandArgs` — `["acp"]`. Провайдер и реквизиты берутся из окружения инстанса, поэтому оба
-бэкенда работают параллельно двумя инстансами — в `settings.json` T3:
+`commandArgs` — `["acp"]`. Провайдер, адрес бэкенда и реквизиты берутся из окружения инстанса, поэтому
+оба бэкенда работают параллельно двумя инстансами — в `settings.json` T3:
 
 ```json
 {
@@ -438,6 +438,7 @@ ACP Registry, источник «Local command», `commandPath` — путь к 
       "displayName": "GigaCrew · API v2",
       "environment": [
         {"name": "GIGACREW_PROVIDER", "value": "api"},
+        {"name": "GIGACREW_API_URL", "value": "https://<хост API v2>/…/v1"},
         {"name": "GIGACREW_ACCESS_KEY", "value": "…", "sensitive": true}
       ],
       "config": {"source": "local", "commandPath": "/home/me/.local/bin/gigacrew", "commandArgs": ["acp"]}
@@ -445,15 +446,20 @@ ACP Registry, источник «Local command», `commandPath` — путь к 
     "gigacrew-gigacode": {
       "driver": "acpRegistry",
       "displayName": "GigaCrew · GigaCode",
-      "environment": [{"name": "GIGACREW_PROVIDER", "value": "gigacode"}],
+      "environment": [
+        {"name": "GIGACREW_PROVIDER", "value": "gigacode"},
+        {"name": "GIGACREW_API_URL", "value": "https://<хост GigaCode>"}
+      ],
       "config": {"source": "local", "commandPath": "/home/me/.local/bin/gigacrew", "commandArgs": ["acp"]}
     }
   }
 }
 ```
 
-Остальные настройки — как у CLI: `~/.gigacode/.env`, `.env` проекта (без настроек безопасности),
-`~/.gigacode/gigacrew.json`. Каждая сессия T3 — проект в своём каталоге со своей конфигурацией.
+`GIGACREW_API_URL` задайте у каждого инстанса свой: адрес — настройка безопасности, `.env` проекта его
+не задаёт, а адрес из общего `~/.gigacode/.env` достался бы обоим инстансам, и один из них ходил бы не в
+свой бэкенд. Остальные настройки — как у CLI: `~/.gigacode/.env`, `.env` проекта (без настроек
+безопасности), `~/.gigacode/gigacrew.json`. Каждая сессия T3 — проект в своём каталоге со своей конфигурацией.
 
 Что поддерживается: режимы `auto` и `plan` (переключатель режима T3; одобренный план переводит сессию
 в `auto`), выбор модели из каталога бэкенда, подтверждения операций (один раз, всегда, до конца хода,

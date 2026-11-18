@@ -18,7 +18,7 @@ from gigacrew.agent.chat_store import ChatRecorder, ChatStore
 from gigacrew.agent.loop import Agent
 from gigacrew.cli import app
 from gigacrew.cli.commands import CommandContext, default_commands
-from gigacrew.cli.hooks import describe_groups, describe_hooks, load_hooks
+from gigacrew.cli.hooks import describe_groups, describe_hooks, load_hooks, trusted_hooks
 from gigacrew.cli.repl import run_repl
 from gigacrew.config import Config
 from gigacrew.llm.gigacode import GigaCodeProvider
@@ -148,6 +148,20 @@ def test_oneshot_skips_untrusted_user_hooks(
     assert _main(tmp_path) == 0
     out = _text(capsys.readouterr().out)
     assert "хуки пользователя (~/.gigacode/settings.json) не подтверждены" in out
+    assert _log(tmp_path) == []
+
+
+def test_trusted_hooks_warning_names_the_remedy_without_terminal(tmp_path: Path) -> None:
+    """Без терминала (ACP) флага --trust-hooks нет: совет — подтвердить хуки в терминале."""
+    _write(user_settings_file(), _logging_hooks(tmp_path))
+    warnings: list[str] = []
+
+    trusted_hooks(Workspace(tmp_path), warnings.append)
+
+    skipped = [warning for warning in warnings if "не подтверждены" in warning]
+    assert len(skipped) == 1, warnings
+    assert "--trust-hooks" not in skipped[0]
+    assert "в терминале в этом проекте" in skipped[0]
     assert _log(tmp_path) == []
 
 

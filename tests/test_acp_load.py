@@ -40,13 +40,14 @@ from fakes import CatalogueProvider, ScriptedProvider, text_turn, tool_turn, too
 
 from gigacrew.agent.chat_store import ChatStore
 from gigacrew.agent.conversation import HOOK_CONTEXT_HEADER, Conversation, Summary
-from gigacrew.cli.acp.rpc import INTERNAL_ERROR, INVALID_PARAMS
+from gigacrew.cli.acp.rpc import INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, RpcError
 from gigacrew.cli.mcp import mcp_trust_store
 from gigacrew.llm.base import LLMProvider
 from gigacrew.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec
 from gigacrew.project.mcp_config import load_mcp_settings, servers_fingerprint
 from gigacrew.project.workspace import Workspace
 from gigacrew.tools.base import ToolRegistry, build_default_registry
+from gigacrew.tools.mcp import McpHub
 
 # Исключение в любом потоке сервера роняет тест, а не теряется.
 pytestmark = pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
@@ -639,6 +640,23 @@ def test_close_during_stuck_turn_kills_jobs_without_touching_history(
     assert acp.reply(msg_id)["result"]["stopReason"] == "cancelled"
 
 
+def test_closed_session_rejects_prompt_that_found_it_before_close(
+    acp: AcpHarness,
+    root: Path,
+) -> None:
+    """Prompt нашёл сессию до session/close и дошёл до хода после: ход не начинается."""
+    provider = _ClosingProvider()
+    session_id = _open(acp, root, provider)
+    session = acp.server.session(session_id)
+
+    assert acp.call(CLOSE, {"sessionId": session_id}) == {}
+
+    with pytest.raises(RpcError) as caught:
+        session.prompt("ещё")
+    assert caught.value.code == INVALID_REQUEST
+    assert not provider.requests
+
+
 def test_close_of_unknown_session_is_quiet(acp: AcpHarness, root: Path) -> None:
     """T3 закрывает сессию при остановке треда и ошибку игнорирует: повтор — не ошибка."""
     session_id = _open(acp, root)
@@ -703,3 +721,35 @@ def test_loaded_session_starts_project_mcp_at_first_prompt(
     assert [PROBE_ECHO in registry for registry in registries] == [True]
     assert harness.call(CLOSE, {"sessionId": session_id}) == {}
     assert not _alive(pid)  # session/close останавливает и дожидается сервер MCP
+
+
+def test_cancel_while_loaded_session_starts_mcp(
+    acp: AcpHarness,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Отмена, пока первый ход загруженной сессии запускает MCP-серверы, отменяет ход."""
+    entered = threading.Event()
+    release = threading.Event()
+    request.addfinalizer(release.set)
+
+    def slow_connect(*_args: Any, **_kwargs: Any) -> McpHub:
+        entered.set()
+        assert release.wait(10), "запуск MCP не отпустили"
+        return McpHub()
+
+    session_id = _save_chat(root, Conversation([Message(role="user", content="вопрос")]))
+    provider = ScriptedProvider([text_turn("поздно")])
+    _load(acp, session_id, root, provider)
+    monkeypatch.setattr("gigacrew.cli.acp.project_mcp.connect_trusted_mcp", slow_connect)
+    prompt = [{"type": "text", "text": "ещё"}]
+    msg_id = acp.begin(PROMPT, {"sessionId": session_id, "prompt": prompt})
+    assert entered.wait(10)
+
+    acp.client.notify("session/cancel", {"sessionId": session_id})
+    acp.call("authenticate", {"methodId": "none"})  # отмена обработана: она раньше в потоке ввода
+    release.set()
+
+    assert acp.reply(msg_id)["result"]["stopReason"] == "cancelled"
+    assert not provider.requests

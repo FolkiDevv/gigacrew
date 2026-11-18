@@ -68,7 +68,6 @@ class AcpSession:
 
     def prompt(self, text: str) -> str:
         """Ход с запросом ``text`` (MCP-серверы проекта — к его началу); stopReason."""
-        self.mcp.start()
         return self.turns.prompt(text)
 
     def replay(self) -> None:
@@ -76,7 +75,7 @@ class AcpSession:
         replay_history(self.agent, self.events)
 
     def close(self) -> None:
-        """Отменяет ход, останавливает фоновые задачи, закрывает MCP-серверы и провайдер.
+        """Закрывает ходы (текущий отменяется), останавливает фоновые задачи, MCP и провайдер.
 
         Процесс ``gigacrew acp`` живёт дольше сессии: фоновая команда (dev-сервер) не должна
         пережить тред, который её запустил. Закрытие идёт до конца, даже если что-то упало.
@@ -85,7 +84,7 @@ class AcpSession:
             stack.callback(self.agent.provider.close)
             stack.callback(self.mcp.close)
             stack.callback(self._stop_background)
-            stack.callback(self.turns.cancel)
+            stack.callback(self.turns.close)
 
     def _stop_background(self) -> None:
         """Останавливает фоновые задачи; их итоги, записанные в историю, — в сохранённый чат.
@@ -236,6 +235,6 @@ def _assemble(
         agent,
         chats,
         mcp,
-        TurnRunner(agent, events, lambda: autosave(chats, agent)),
+        TurnRunner(agent, events, lambda: autosave(chats, agent), before_turn=mcp.start),
         events,
     )

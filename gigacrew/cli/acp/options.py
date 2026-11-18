@@ -72,14 +72,16 @@ def session_setup(agent: Agent) -> Message:
 
 def config_options(agent: Agent) -> list[Message]:
     """Параметры сессии (``configOptions``): выбор модели."""
+    # Модель читается один раз: её могут сменить параллельно, а текущая — среди вариантов.
+    model = agent.model
     return [
         {
             "id": _MODEL,
             "name": "Модель",
             "category": _MODEL,
             "type": "select",
-            "currentValue": agent.model,
-            "options": [{"value": model, "name": model} for model in _models(agent)],
+            "currentValue": model,
+            "options": [{"value": choice, "name": choice} for choice in _models(agent, model)],
         },
     ]
 
@@ -96,9 +98,9 @@ def choose_model(agent: Agent, model: str) -> None:
         raise RpcError(INVALID_PARAMS, str(error)) from None
 
 
-def _models(agent: Agent) -> list[str]:
-    """Варианты модели: каталог бэкенда, без него — настроенная и текущая модели."""
+def _models(agent: Agent, current: str) -> list[str]:
+    """Варианты модели: каталог бэкенда, без него — настроенная и текущая ``current``."""
     catalogue = catalogue_ids(agent.provider)
     if catalogue is not None:
         return catalogue
-    return list(dict.fromkeys((agent.config.model, agent.model)))
+    return list(dict.fromkeys((agent.config.model, current)))

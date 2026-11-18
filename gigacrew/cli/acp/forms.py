@@ -49,7 +49,7 @@ def answers(response: Any, questions: Sequence[Question]) -> list[Answer] | None
     решит сама, а не примет выдуманный ответ.
     """
     action = response.get("action") if isinstance(response, dict) else None
-    if action in _DECLINED:
+    if isinstance(action, str) and action in _DECLINED:
         return None
     content = response.get("content") if action == "accept" else None
     if not isinstance(content, dict):
@@ -101,8 +101,7 @@ def _other_field(number: int, question: Question) -> Json:
 
 def _answer(content: Json, key: str, question: Question) -> Answer:
     """Ответ на вопрос: известные варианты — выбор, прочее (и ``qN__other``) — свой ответ."""
-    chosen = content.get(key)
-    picked = chosen if isinstance(chosen, list) else [chosen]
+    picked = _picked(content.get(key), question)
     labels = {option.label for option in question.options}
     texts = [entry.strip() for entry in picked if isinstance(entry, str) and entry.strip()]
     selected = tuple(dict.fromkeys(text for text in texts if text in labels))
@@ -111,3 +110,14 @@ def _answer(content: Json, key: str, question: Question) -> Answer:
     if isinstance(other, str) and other.strip():
         custom.append(other.strip())
     return Answer(selected, "; ".join(custom))
+
+
+def _picked(chosen: Any, question: Question) -> list[Any]:
+    """Выбранное в поле вопроса; массив в поле одиночного выбора — непонятный ответ."""
+    if not isinstance(chosen, list):
+        return [chosen]
+    if not question.multi_select:
+        raise QuestionsUnavailableError(
+            "клиент прислал несколько ответов на вопрос с одним выбором",
+        )
+    return chosen

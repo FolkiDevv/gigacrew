@@ -39,6 +39,7 @@ from acp_harness import AcpHarness, ProviderFactory, acp_environment
 from fakes import CatalogueProvider, ScriptedProvider, text_turn, tool_turn
 
 from gigacrew.agent.loop import PLAN_BLOCKED_NOTE, Agent
+from gigacrew.cli.acp.options import config_options
 from gigacrew.cli.acp.rpc import INTERNAL_ERROR, INVALID_PARAMS
 from gigacrew.llm.base import LLMError
 from gigacrew.llm.types import AssistantTurn, Message, ToolSpec
@@ -378,6 +379,21 @@ def test_model_option_without_catalogue_is_current_model(acp: AcpHarness, root: 
 
     assert option["currentValue"] == "M-default"
     assert _option_values(option) == ["M-default"]
+
+
+def test_model_option_reads_current_model_once(
+    acp: AcpHarness,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Модель сменили, пока собирались варианты: текущее значение — среди вариантов."""
+    session_id = _open(acp, root)
+    switching = iter(("M-first", "M-second", "M-third"))
+    monkeypatch.setattr(Agent, "model", property(lambda _agent: next(switching)))
+
+    option = _model_option(config_options(_agent(acp, session_id)))
+
+    assert option["currentValue"] in _option_values(option)
 
 
 @pytest.mark.usefixtures("backend_default")

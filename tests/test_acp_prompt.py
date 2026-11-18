@@ -1002,3 +1002,28 @@ def test_prompts_of_different_sessions_run_in_parallel(
     for params in acp.client.take_notifications(UPDATE):
         by_session.setdefault(params["sessionId"], []).extend(_chunks([params["update"]]))
     assert by_session == {sessions[0]: ["Ответ A"], sessions[1]: ["Ответ B"]}
+
+
+def test_failed_turn_thread_start_leaves_session_usable(
+    acp: AcpHarness,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Поток хода не запустился: ошибка на этот prompt, следующий ход идёт как обычно."""
+    session_id = _open(acp, root, ScriptedProvider([text_turn("ответ")]))
+    start = threading.Thread.start
+    refused: list[str] = []
+
+    def refuse_once(thread: threading.Thread) -> None:
+        if thread.name == "acp-turn" and not refused:
+            refused.append(thread.name)
+            raise RuntimeError("can't start new thread")
+        start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", refuse_once)
+
+    error = acp.call_error(PROMPT, _prompt_params(session_id, _text("раз")))
+
+    assert error["code"] == INTERNAL_ERROR
+    assert refused
+    assert _ask(acp, session_id, "два") == END_TURN

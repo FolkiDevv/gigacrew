@@ -3,7 +3,9 @@
 Варианты — по порядку: «да» (``allow_once``; T3 на «Разрешить» выбирает первый вариант
 этого вида), «до конца хода» (тоже ``allow_once``; только если агент назвал, что он покроет),
 «всегда» (``allow_always``) и «нет» (``reject_once``). Опасное «до конца хода» и «всегда» не
-предлагается. Ответ, который не выбирает ни один из предложенных вариантов, — отказ без
+предлагается, «всегда» — и когда его нельзя запомнить (хук PreToolUse спрашивает каждый раз).
+История ответов на такую команду — в названии «да»: в режиме «авто» оно может запомнить
+команду. Ответ, который не выбирает ни один из предложенных вариантов, — отказ без
 ответа пользователя.
 """
 
@@ -13,6 +15,7 @@ from types import MappingProxyType
 from typing import Any, Final
 
 from gigacrew.agent.events import Approval, ConfirmResult, ToolCallInfo
+from gigacrew.agent.loop import KEY_REMEMBER_HINT
 
 __all__ = ["ALLOW_ALWAYS", "ALLOW_ONCE", "ALLOW_TURN", "REJECT_ONCE", "confirm_result", "options"]
 
@@ -36,13 +39,18 @@ type Json = dict[str, Any]
 
 def options(call: ToolCallInfo, *, dangerous: bool) -> list[Json]:
     """Варианты ответа на подтверждение вызова ``call`` по порядку."""
-    offered = [_option(ALLOW_ONCE, "Да", ALLOW_ONCE)]
+    # История ответов — при «да»: в «авто» это «да» может запомнить команду, как в CLI.
+    # Подсказка про клавишу терминала «a» в T3 бессмысленна: вместо неё — «Всегда».
+    history = call.history.removesuffix(f" — {KEY_REMEMBER_HINT}")
+    once = f"Да ({history})" if history else "Да"
+    offered = [_option(ALLOW_ONCE, once, ALLOW_ONCE)]
     if not dangerous:
         if call.turn_scope:
             name = f"Да, до конца хода: {call.turn_scope}"
             offered.append(_option(ALLOW_TURN, name, ALLOW_ONCE))
-        remember = call.remember or _DEFAULT_ALWAYS
-        offered.append(_option(ALLOW_ALWAYS, f"Всегда: {remember}", ALLOW_ALWAYS))
+        if call.can_remember:
+            remember = call.remember or _DEFAULT_ALWAYS
+            offered.append(_option(ALLOW_ALWAYS, f"Всегда: {remember}", ALLOW_ALWAYS))
     offered.append(_option(REJECT_ONCE, "Нет", REJECT_ONCE))
     return offered
 

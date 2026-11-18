@@ -70,16 +70,22 @@ class TurnRunner:
         agent: Agent,
         events: AcpEvents,
         after_turn: Callable[[], None],
+        *,
+        before_turn: Callable[[], None],
     ) -> None:
         """Ходы агента ``agent``, события которого получает ``events``.
 
+        ``before_turn`` выполняется в потоке хода до работы хода (запуск MCP-серверов
+        загруженной сессии): отмена в это время его не прерывает, а отменяет ход до начала.
         ``after_turn`` выполняется в потоке хода, когда агент закончил (и ход отменённый),
         до ответа на ход: сохранение чата.
         """
         self._agent = agent
         self._events = events
+        self._before_turn = before_turn
         self._after_turn = after_turn
         self._lock = threading.Lock()
+        self._closed = False  # сессия закрыта: новых ходов нет
         self._active: _Turn | None = None  # принятый и ещё не отвеченный ход
         self._agent_free = threading.Semaphore(1)  # свободен: поток прошлого хода завершился
         self._commands = SlashCommands(agent.workspace)
@@ -88,8 +94,8 @@ class TurnRunner:
         """Выполняет ход с запросом ``text``; stopReason ответа.
 
         ``/compact [пожелания]`` сжимает историю без хода модели, ``/<скилл> аргументы``
-        уходит модели раскрытым скиллом. Идущий неотменённый ход — ошибка «Invalid Request»;
-        ход упал — ошибка JSON-RPC с текстом сбоя (сессия остаётся рабочей).
+        уходит модели раскрытым скиллом. Идущий неотменённый ход и закрытая сессия — ошибка
+        «Invalid Request»; ход упал — ошибка JSON-RPC с текстом сбоя (сессия остаётся рабочей).
         """
         instructions = compact_instructions(text)
         work: _Work
@@ -124,6 +130,12 @@ class TurnRunner:
             self._events.close_turn()
         turn.wake.set()
 
+    def close(self) -> None:
+        """Сессия закрыта: новые ходы отклоняются, текущий отменяется."""
+        with self._lock:
+            self._closed = True
+        self.cancel()
+
     @contextmanager
     def idle(self, timeout: float) -> Generator[bool]:
         """Агент свободен внутри блока: поток прошлого хода доработал (ждём до ``timeout`` с).
@@ -139,6 +151,8 @@ class TurnRunner:
 
     def _accept(self, work: _Work) -> _Turn:
         with self._lock:
+            if self._closed:
+                raise RpcError(INVALID_REQUEST, "сессия закрыта")
             if self._active is not None and not self._active.cancel.is_set():
                 raise RpcError(INVALID_REQUEST, "в сессии уже идёт ход")
             turn = _Turn(work)
@@ -161,10 +175,16 @@ class TurnRunner:
         if not self._start(turn):
             return CANCELLED
         turn.wake.wait()
-        if turn.cancel.is_set():
+        # Канал событий закрывается под блокировкой, с проверкой отмены: иначе этот ход,
+        # отменённый после проверки, закрыл бы канал следующего, уже открывшего его.
+        with self._lock:
+            cancelled = turn.cancel.is_set()
+            if not cancelled:
+                self._close_turn(turn)
+        if cancelled:
             turn.done.wait(_CANCEL_GRACE)
             return CANCELLED
-        return self._outcome(turn)
+        return _outcome(turn)
 
     def _start(self, turn: _Turn) -> bool:
         """Дожидается конца прошлого хода и запускает поток; False — отменён раньше."""
@@ -176,25 +196,23 @@ class TurnRunner:
                 self._agent_free.release()
                 return False
             self._events.open_turn(turn.cancel)
-        threading.Thread(target=self._work, args=(turn,), name="acp-turn", daemon=True).start()
+        worker = threading.Thread(target=self._work, args=(turn,), name="acp-turn", daemon=True)
+        with ExitStack() as rollback:
+            # Поток не запустился: канал закрыт, агент свободен — иначе ходы сессии ждали бы
+            # навсегда. Запустился — их освобождает он сам (_work).
+            rollback.callback(self._agent_free.release)
+            rollback.callback(self._events.close_turn)
+            worker.start()
+            rollback.pop_all()
         return True
 
-    def _outcome(self, turn: _Turn) -> str:
-        """Ответ на завершившийся без отмены ход."""
-        failure = turn.failure
-        if failure is None:
-            stats = turn.stats
-            if stats is not None:
-                size = self._agent.context_window or DEFAULT_CONTEXT_WINDOW
-                self._events.report_usage(stats.context_tokens, size)
-            self._events.close_turn()
-            return stop_reason(stats)
+    def _close_turn(self, turn: _Turn) -> None:
+        """Ход завершился без отмены: заполненность контекста и конец хода для клиента."""
+        stats = turn.stats
+        if turn.failure is None and stats is not None:
+            size = self._agent.context_window or DEFAULT_CONTEXT_WINDOW
+            self._events.report_usage(stats.context_tokens, size)
         self._events.close_turn()
-        if isinstance(failure, KeyboardInterrupt):
-            return CANCELLED
-        if isinstance(failure, LLMError):
-            raise RpcError(INTERNAL_ERROR, f"ошибка модели: {failure}")
-        raise RpcError(INTERNAL_ERROR, f"сбой хода: {type(failure).__name__}: {failure}")
 
     def _work(self, turn: _Turn) -> None:
         """Тело потока хода; асинхронное исключение отмены из него не выходит.
@@ -221,6 +239,9 @@ class TurnRunner:
             self._after_turn()
 
     def _run(self, turn: _Turn) -> None:
+        # До thread_id: отмена не прерывает подготовку (запуск MCP-серверов), а ход после
+        # неё не начинается — флаг проверяется ниже.
+        self._before_turn()
         with self._lock:
             if turn.cancel.is_set():
                 raise KeyboardInterrupt
@@ -235,6 +256,18 @@ class TurnRunner:
             if turn.interrupted and turn.thread_id is not None:
                 _raise_in_thread(turn.thread_id, None)
         return True
+
+
+def _outcome(turn: _Turn) -> str:
+    """Ответ на завершившийся без отмены ход: stopReason или ошибка JSON-RPC."""
+    failure = turn.failure
+    if failure is None:
+        return stop_reason(turn.stats)
+    if isinstance(failure, KeyboardInterrupt):
+        return CANCELLED
+    if isinstance(failure, LLMError):
+        raise RpcError(INTERNAL_ERROR, f"ошибка модели: {failure}")
+    raise RpcError(INTERNAL_ERROR, f"сбой хода: {type(failure).__name__}: {failure}")
 
 
 def _model_turn(agent: Agent, text: str) -> TurnStats | None:

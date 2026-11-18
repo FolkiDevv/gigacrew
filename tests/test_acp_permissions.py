@@ -27,6 +27,9 @@
 
 from __future__ import annotations
 
+import json
+import shlex
+import sys
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
@@ -36,9 +39,18 @@ import pytest
 from acp_harness import AcpHarness, ProviderFactory, acp_environment
 from fakes import ScriptedProvider, text_turn, tool_turn
 
-from gigacrew.agent.loop import NO_ANSWER_NOTE, REJECTED_NOTE
+from gigacrew.agent.events import ToolCallInfo
+from gigacrew.agent.loop import (
+    AUTO_REMEMBER_AFTER,
+    KEY_REMEMBER_HINT,
+    NO_ANSWER_NOTE,
+    REJECTED_NOTE,
+)
+from gigacrew.cli.acp.permission import options
 from gigacrew.cli.acp.rpc import INTERNAL_ERROR
 from gigacrew.llm.types import AssistantTurn
+from gigacrew.project.settings import TrustStore, load_settings, project_fingerprint
+from gigacrew.project.workspace import Workspace
 from gigacrew.tools.ask_user import DECLINED_NOTE, format_answer
 from gigacrew.tools.questions import Answer
 
@@ -345,6 +357,75 @@ def test_dangerous_command_preview_shows_the_command(acp: AcpHarness, root: Path
     assert _stop_reason(acp, msg_id) == END_TURN
 
 
+def test_permission_warns_when_yes_will_remember_the_command(
+    acp: AcpHarness,
+    root: Path,
+) -> None:
+    """В «авто» очередное «да» запомнит команду — запрос говорит об этом, как подсказка CLI."""
+    turns = [
+        turn
+        for _ in range(AUTO_REMEMBER_AFTER)
+        for turn in (_shell(UNKNOWN_COMMAND), text_turn("Готово"))
+    ]
+    session_id = _open(acp, root, ScriptedProvider(turns))
+    names: list[str] = []
+    for _ in range(AUTO_REMEMBER_AFTER):
+        msg_id = _begin(acp, session_id)
+        request_id, params = _wait_server_request(acp, PERMISSION, session_id, msg_id)
+        names.append(_option_name(params, ALLOW_ONCE))
+        _choose(acp, request_id, ALLOW_ONCE)
+        assert _stop_reason(acp, msg_id) == END_TURN
+
+    assert names[0] == "Да"  # истории ещё нет
+    assert "разрешение запомнится" in names[-1]
+    assert all("разрешение запомнится" not in name for name in names[:-1])
+
+
+_ASK_HOOK = (
+    "import json\n"
+    'print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", '
+    '"permissionDecision": "ask"}}))\n'
+)
+
+
+def _trust_ask_hook(project: Path, script_dir: Path) -> None:
+    """Подтверждённый раньше хук PreToolUse проекта, который требует спрашивать каждый раз."""
+    script = script_dir / "ask_hook.py"
+    script.write_text(_ASK_HOOK, encoding="utf-8")
+    command = shlex.join([sys.executable, str(script)])
+    hooks = {
+        "PreToolUse": [
+            {"matcher": "write_file", "hooks": [{"type": "command", "command": command}]},
+        ],
+    }
+    (project / ".gigacode").mkdir(exist_ok=True)
+    (project / ".gigacode" / "settings.json").write_text(
+        json.dumps({"hooks": hooks}),
+        encoding="utf-8",
+    )
+    workspace = Workspace(project)
+    settings, _ = load_settings(workspace)
+    TrustStore().trust(workspace.root, project_fingerprint(settings))
+
+
+def test_hook_confirmation_offers_no_always(
+    acp: AcpHarness,
+    root: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Хук PreToolUse спрашивает каждый раз: «всегда» запомнить нельзя — и не предлагается."""
+    _trust_ask_hook(root, tmp_path_factory.mktemp("hook"))
+    write = tool_turn("write_file", {"path": "notes.txt", "content": "x"})
+    session_id = _open(acp, root, ScriptedProvider([write, text_turn("Готово")]))
+    msg_id = _begin(acp, session_id)
+
+    request_id, params = _wait_server_request(acp, PERMISSION, session_id, msg_id)
+
+    assert _options(params) == [(ALLOW_ONCE, "allow_once"), (REJECT_ONCE, "reject_once")]
+    _choose(acp, request_id, REJECT_ONCE)
+    assert _stop_reason(acp, msg_id) == END_TURN
+
+
 # --- подтверждения: ответ ---
 
 
@@ -592,6 +673,37 @@ def test_form_answers_reach_model_in_question_order(
     assert _last_status(call_updates) == "completed"
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"action": ["accept"]},
+        {"action": {"accept": True}},
+        # Одиночный выбор — строка: массив в нём — не «выбрал оба».
+        {"action": "accept", "content": {"q1": ["SQLite", "Postgres"]}},
+    ],
+    ids=["list-action", "dict-action", "array-in-single-choice"],
+)
+def test_malformed_form_answer_fails_for_model(
+    acp: AcpHarness,
+    root: Path,
+    response: Json,
+) -> None:
+    """Непонятный ответ на форму — ответов нет: модель решает сама, а не принимает выдумку."""
+    provider = ScriptedProvider([_ask_user(), text_turn("Решу сам")])
+    session_id = _open(acp, root, provider)
+    msg_id = _begin(acp, session_id)
+    request_id, _ = _wait_server_request(acp, ELICITATION, session_id, msg_id)
+
+    acp.client.respond(request_id, response)
+
+    assert _stop_reason(acp, msg_id) == END_TURN
+    seen = _model_results(provider)
+    assert QUESTIONS_UNAVAILABLE in seen
+    assert "Postgres" not in seen
+    _, call_updates = _single_call(acp, session_id)
+    assert _last_status(call_updates) == "failed"
+
+
 @pytest.mark.parametrize("action", ["decline", "cancel"])
 def test_declined_form_is_refusal_to_answer(acp: AcpHarness, root: Path, action: str) -> None:
     provider = ScriptedProvider([_ask_user(), text_turn("Решу сам")])
@@ -653,3 +765,13 @@ def test_cancel_while_question_is_open(acp: AcpHarness, root: Path) -> None:
     acp.client.take_notifications(UPDATE)
     assert _ask(acp, session_id, "ещё") == END_TURN
     assert f"→ {format_answer(Answer(('Postgres',)))}" not in _model_results(provider)
+
+
+def test_once_option_has_no_terminal_key_hint() -> None:
+    """Подсказка CLI про клавишу «a» в T3 бессмысленна: в названии «да» её нет."""
+    history = f"раньше: разрешали 2 — {KEY_REMEMBER_HINT}"
+    call = ToolCallInfo(name="run_shell", history=history)
+
+    names = [option["name"] for option in options(call, dangerous=False)]
+
+    assert names[0] == "Да (раньше: разрешали 2)"

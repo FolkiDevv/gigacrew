@@ -261,7 +261,7 @@ def test_command_shows_last_line_or_tail_of_failure() -> None:
 
 def test_confirm_question_includes_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     ui, buf = _console()
-    answers = iter(["д", "", "a", "a"])
+    answers = iter(["д", "", "a", "a", "a"])
     monkeypatch.setattr(ui._console, "input", _echoing_input(ui, answers))
     edit = ToolCallInfo("edit_file", "a.py", ToolKind.EDIT)
     assert ui.confirm(edit, None, dangerous=False).approval is Approval.YES
@@ -294,6 +294,10 @@ def test_confirm_question_includes_summary(monkeypatch: pytest.MonkeyPatch) -> N
     assert (
         ui.confirm(danger, None, dangerous=True).approval is Approval.NO
     )  # «a» для опасного — нет
+    asked_by_hook = ToolCallInfo("write_file", "a.txt", ToolKind.EDIT, can_remember=False)
+    # хук спрашивает каждый раз: «a» не предлагается и не принимается
+    assert ui.confirm(asked_by_hook, None, dangerous=False).approval is Approval.NO
+    assert "▌ ? Применить правку? [y/N] " in buf.getvalue().splitlines()[-1]
 
 
 def test_reviewer_lines(monkeypatch: pytest.MonkeyPatch) -> None:
