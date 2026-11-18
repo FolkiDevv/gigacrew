@@ -39,7 +39,12 @@ from acp_harness import AcpHarness, ProviderFactory, acp_environment
 from fakes import CatalogueProvider, ScriptedProvider, text_turn, tool_turn, tools_turn
 
 from gigacrew.agent.chat_store import ChatStore
-from gigacrew.agent.conversation import HOOK_CONTEXT_HEADER, Conversation, Summary
+from gigacrew.agent.conversation import (
+    BACKGROUND_HEADER,
+    HOOK_CONTEXT_HEADER,
+    Conversation,
+    Summary,
+)
 from gigacrew.cli.acp.rpc import INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, RpcError
 from gigacrew.cli.mcp import mcp_trust_store
 from gigacrew.llm.base import LLMProvider
@@ -657,6 +662,22 @@ def test_closed_session_rejects_prompt_that_found_it_before_close(
     assert not provider.requests
 
 
+def test_close_saves_report_of_finished_background_job(acp: AcpHarness, root: Path) -> None:
+    """Итог задачи, завершившейся после хода, попадает в сохранённый чат при закрытии."""
+    command = {"command": "exit 0", "run_in_background": True}
+    script = [tool_turn("run_shell", command), text_turn("запущено")]
+    session_id = _open(acp, root, ScriptedProvider(script))
+    assert _ask(acp, session_id, "запусти") == "end_turn"
+    jobs = acp.server.session(session_id).agent.background
+    assert jobs is not None
+    assert jobs.wait(10)  # задача завершилась, её итог модели ещё не доставлен
+
+    acp.call(CLOSE, {"sessionId": session_id})
+
+    saved = _store(root).load(session_id).conversation
+    assert any(BACKGROUND_HEADER in (message.content or "") for message in saved.messages)
+
+
 def test_close_of_unknown_session_is_quiet(acp: AcpHarness, root: Path) -> None:
     """T3 закрывает сессию при остановке треда и ошибку игнорирует: повтор — не ошибка."""
     session_id = _open(acp, root)
@@ -721,6 +742,34 @@ def test_loaded_session_starts_project_mcp_at_first_prompt(
     assert [PROBE_ECHO in registry for registry in registries] == [True]
     assert harness.call(CLOSE, {"sessionId": session_id}) == {}
     assert not _alive(pid)  # session/close останавливает и дожидается сервер MCP
+
+
+def test_loaded_session_restores_mcp_schemas_after_mcp_starts(
+    servers: ExitStack,
+    root: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Схема MCP-инструмента, загруженная в продолженном чате, снова загружена.
+
+    История восстанавливается до запуска MCP-серверов (они запускаются при первом ходе):
+    без повторного восстановления модель получила бы «схема не загружена».
+    """
+    _trusted_mcp_project(root, tmp_path_factory.mktemp("scripts"))
+    harness = servers.enter_context(closing(AcpHarness(ProviderFactory())))
+    harness.initialize()
+    call = FunctionCall(name=PROBE_ECHO, arguments={"text": "x"}, id="c1")
+    history = Conversation([
+        Message(role="user", content="вопрос"),
+        Message(role="assistant", content="", function_calls=[call]),
+        Message(role="function", content="x", name=PROBE_ECHO, call_id="c1"),
+        Message(role="assistant", content="готово"),
+    ])
+    session_id = _save_chat(root, history)
+    _load(harness, session_id, root)
+
+    assert _ask(harness, session_id, "ещё") == END_TURN
+
+    assert PROBE_ECHO in harness.server.session(session_id).agent.loaded_tools
 
 
 def test_cancel_while_loaded_session_starts_mcp(

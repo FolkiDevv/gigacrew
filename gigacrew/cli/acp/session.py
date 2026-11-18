@@ -94,8 +94,9 @@ class AcpSession:
         """
         with self.turns.idle(_CLOSE_DRAIN) as free:
             if free:
-                if self.agent.stop_background(_CLOSE_REASON):
-                    autosave(self.chats, self.agent)
+                # Сохраняем всегда: итог задачи, завершившейся после хода, тоже попал в историю.
+                self.agent.stop_background(_CLOSE_REASON)
+                autosave(self.chats, self.agent)
                 return
             jobs = self.agent.background
             if jobs is not None:
@@ -235,6 +236,17 @@ def _assemble(
         agent,
         chats,
         mcp,
-        TurnRunner(agent, events, lambda: autosave(chats, agent), before_turn=mcp.start),
+        TurnRunner(
+            agent,
+            events,
+            lambda: autosave(chats, agent),
+            before_turn=lambda: _start_mcp(mcp, agent),
+        ),
         events,
     )
+
+
+def _start_mcp(mcp: ProjectMcp, agent: Agent) -> None:
+    """MCP-серверы проекта — к первому ходу; схемы их инструментов из истории — загружены."""
+    if mcp.start():
+        agent.refresh_loaded_tools()

@@ -35,16 +35,18 @@ class ProjectMcp:
         self._hub: McpHub | None = None
         self._closed = False
 
-    def start(self) -> None:
-        """Запускает серверы, если они ещё не запущены и не закрыты."""
+    def start(self) -> bool:
+        """Запускает серверы, если они ещё не запущены и не закрыты; True — запустил сейчас."""
         with self._lock:
-            if self._hub is None and not self._closed:
-                self._hub = connect_trusted_mcp(
-                    self._workspace,
-                    self._registry,
-                    warn=self._warn,
-                    version=metadata.version("gigacrew"),
-                )
+            if self._hub is not None or self._closed:
+                return False
+            self._hub = connect_trusted_mcp(
+                self._workspace,
+                self._registry,
+                warn=self._warn,
+                version=metadata.version("gigacrew"),
+            )
+            return True
 
     def close(self) -> None:
         """Останавливает запущенные серверы; запустить их потом уже нельзя."""
