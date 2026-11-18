@@ -35,7 +35,10 @@ __all__ = [
     "render",
 ]
 
-WINDOW = 14  # сколько строк списка видно одновременно
+WINDOW = 14  # сколько строк списка видно одновременно (меньше, если терминал низкий)
+_MIN_WINDOW = 3
+# Строки меню вне списка: заголовки, «ещё N», пояснение, сообщение, подсказка клавиш.
+_RESERVED_ROWS = 10
 HINT = "↑↓ выбор · Enter — изменить · ←→ — варианты · Del — по умолчанию · Esc — выход"
 EDIT_HINT = "Enter — сохранить · Esc — отмена · пусто — значение по умолчанию"
 _ESC_TIMEOUT = 0.05
@@ -160,15 +163,10 @@ class SettingsState:
         if self.editing is not None:
             self.editing += text
 
-    def erase(self) -> None:
-        """Backspace в строке ввода."""
+    def erase(self, *, whole: bool = False) -> None:
+        """Backspace в строке ввода; ``whole`` (Ctrl+U) — стереть всё."""
         if self.editing:
-            self.editing = self.editing[:-1]
-
-    def clear(self) -> None:
-        """Ctrl+U: очистить строку ввода."""
-        if self.editing is not None:
-            self.editing = ""
+            self.editing = "" if whole else self.editing[:-1]
 
     def commit(self) -> None:
         """Enter в строке ввода: проверить и сохранить; ошибка — ввод остаётся."""
@@ -180,14 +178,21 @@ class SettingsState:
             self.status = str(error)
             self.failed = True
             return
-        self.editing = None
         self._change(setting)
+        if not self.failed:  # не сохранилось — ввод остаётся для повтора
+            self.editing = None
 
     def cancel(self) -> None:
         """Esc в строке ввода: выйти из ввода без изменений."""
         self.editing = None
         self.status = ""
         self.failed = False
+
+    def fit(self, rows: int) -> None:
+        """Окно списка по высоте терминала: остальное место — заголовку, подключению, пояснению."""
+        reserved = len(self.connection) + _RESERVED_ROWS
+        self.window = min(max(rows - reserved, _MIN_WINDOW), WINDOW)
+        self._scroll()
 
     def _change(self, setting: Setting) -> None:
         change = self.on_change(self.selected, setting)
@@ -298,8 +303,13 @@ def _details(state: SettingsState, width: int) -> list[tuple[str, str]]:
     return out
 
 
-def render(state: SettingsState, width: int = 80) -> list[tuple[str, str]]:
-    """Отрисовка меню: список пар (стиль prompt_toolkit, текст)."""
+def render(state: SettingsState, width: int = 80, height: int = 0) -> list[tuple[str, str]]:
+    """Отрисовка меню: список пар (стиль prompt_toolkit, текст).
+
+    ``height`` — высота терминала: окно списка подгоняется под неё (0 — не подгонять).
+    """
+    if height:
+        state.fit(height)
     width = max(width - 1, _MIN_WIDTH)  # последний столбец — без автопереноса строки
     out: list[tuple[str, str]] = [("class:question.counter", f" {state.title}"), _NEWLINE]
     out += _connection(state, width)
@@ -340,7 +350,7 @@ class _SettingsKeys:
         _bind(kb, self._type, Keys.BracketedPaste, Keys.Any)
         _on(kb, state.erase, "backspace")
         _on(kb, state.reset, "delete")
-        _on(kb, state.clear, "c-u")
+        _on(kb, partial(state.erase, whole=True), "c-u")
         kb.add("enter")(self._enter)
         _bind(kb, self._close, "c-d", "c-c")
         kb.add("escape", eager=True)(self._escape)
@@ -393,7 +403,7 @@ def edit_settings(
     """
     kb = _SettingsKeys(state).bindings()
     control = FormattedTextControl(
-        lambda: list(render(state, get_app().output.get_size().columns)),
+        lambda: list(render(state, *reversed(get_app().output.get_size()))),  # (ширина, высота)
         focusable=True,
         show_cursor=False,
     )

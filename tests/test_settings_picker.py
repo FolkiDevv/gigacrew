@@ -67,7 +67,7 @@ def test_number_input_validates_before_saving() -> None:
     state, recorder = _state("context.compactThreshold")
     state.activate()
     assert state.editing == "80"
-    state.clear()
+    state.erase(whole=True)
     state.type_text("5")
     state.commit()
     assert state.failed
@@ -139,3 +139,25 @@ def test_keyboard_session() -> None:
         ("model.reasoning", "off"),
         ("network.timeout", 120),
     ]
+
+
+def test_failed_save_keeps_draft() -> None:
+    def refuse(row: SettingRow, setting: Setting) -> Change:
+        return Change(row, "не сохранено", failed=True)
+
+    state = SettingsState(_rows("network.timeout"), refuse)
+    state.activate()
+    state.commit()
+    assert state.editing == "120"
+    assert state.failed
+
+
+def test_window_fits_short_terminal() -> None:
+    state, _ = _state()
+    state.fit(12)
+    assert state.window == 3
+    state.jump(len(state.rows))
+    line = state.lines.index(state.selected)
+    assert state.offset <= line < state.offset + state.window
+    state.fit(60)
+    assert state.window == 14

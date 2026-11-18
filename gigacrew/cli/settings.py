@@ -54,7 +54,7 @@ def settings_command(agent: Agent, ui: Console, arg: str, models: Sequence[str] 
     """``/settings``: меню настроек; ``/settings import-env`` — перенос из ``.env``."""
     action = arg.strip().lower()
     if action == IMPORT_ENV:
-        import_env(ui)
+        import_env(ui, agent.config.project_root)
         return True
     if action:
         ui.error(f"использование: {SETTINGS_USAGE}")
@@ -116,6 +116,14 @@ class SettingsSession:
     def change(self, row: SettingRow, setting: preferences.Setting) -> Change:
         """Сохранить новое значение и применить его, если оно действует сразу."""
         spec = row.spec
+        if spec.kind is preferences.SettingKind.MODEL and setting and self._models:
+            # Как /model: имена моделей регистрозависимы; неизвестная модель по умолчанию
+            # не дала бы gigacrew запуститься.
+            known = {name.lower(): name for name in self._models}
+            setting = known.get(str(setting).lower())
+            if setting is None:
+                names = ", ".join(self._models)
+                return Change(row, f"такой модели нет; доступны: {names}", failed=True)
         try:
             preferences.store_setting(spec, setting, self._path)
         except _STORE_ERRORS as error:
@@ -206,6 +214,7 @@ def connection_lines(config: Config) -> list[tuple[str, str]]:
 
 def import_env(
     ui: Console,
+    root: Path,
     *,
     env_file: Path | None = None,
     path: Path | None = None,
@@ -213,10 +222,15 @@ def import_env(
     """Перенести настройки поведения из ``~/.gigacode/.env`` в ``gigacrew.json``.
 
     Перенесённые строки удаляются из ``.env``; значение с ошибкой остаётся там
-    (предупреждение). Подключение и секреты не трогаются. ``.env`` проекта — тоже.
+    (предупреждение). Подключение и секреты не трогаются. ``.env`` проекта ``root`` —
+    тоже, а то, что он задаёт, остаётся и в ``~/.gigacode/.env``: файл настроек младше
+    ``.env`` проекта, и после переноса действовало бы значение проекта.
     """
     env_file = env_file or user_env_file()
     movable = _movable(read_dotenv(env_file))
+    for key in _movable(read_dotenv(root / ".env")).keys() & movable.keys():
+        ui.warn(f"{key} остаётся в {USER_ENV_HINT}: её задаёт и .env проекта")
+        movable.pop(key)
     if not movable:
         ui.info(f"в {USER_ENV_HINT} нет настроек, которые можно перенести")
         return
