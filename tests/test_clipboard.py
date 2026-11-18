@@ -37,6 +37,7 @@ def _fake_tool(bin_dir: Path, name: str, *, code: int = 0) -> Path:
     out = bin_dir / f"{name}.out"
     script = bin_dir / name
     cat = shutil.which("cat")  # PATH в тестах — только каталог поддельных утилит
+    assert cat is not None
     command = f"{shlex.quote(str(cat))} > {shlex.quote(str(out))}"
     script.write_text(f"#!/bin/sh\n{command}\nexit {code}\n", encoding="utf-8")
     script.chmod(0o755)
@@ -48,7 +49,7 @@ def test_clipboard_commands_follow_platform_and_display() -> None:
     assert clipboard_commands({}, "linux") == []
     wayland = clipboard_commands({"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}, "linux")
     assert [command[0] for command in wayland] == ["wl-copy", "xclip", "xsel"]
-    assert "text/plain;charset=utf-8" in wayland[0]
+    assert wayland[0] == ["wl-copy", "--type", "text/plain;charset=utf-8"]
 
 
 def test_copy_text_pipes_to_tool_and_falls_back(tmp_path: Path) -> None:
@@ -109,6 +110,9 @@ def test_copy_puts_raw_markdown_of_answers(
     call = FunctionCall(name="read_file", arguments={"path": "a.py"})
     conversation.add_assistant(Message(role="assistant", function_calls=[call]))
     conversation.add_function_result("read_file", "x = 1")
+    note = Message(role="assistant", content="Смотрю файл", function_calls=[call])
+    conversation.add_assistant(note)
+    conversation.add_function_result("read_file", "x = 1")
     conversation.add_assistant(Message(role="assistant", content="\a"))  # пусто после очистки
     conversation.add_assistant(Message(role="assistant", content=f"\n{ANSWER}\n"))
 
@@ -116,7 +120,10 @@ def test_copy_puts_raw_markdown_of_answers(
     assert out.read_text(encoding="utf-8") == ANSWER  # разметка как есть, без отрисовки
     assert "ответ скопирован (xclip): 8 строк" in capsys.readouterr().out
 
-    ctx.commands.dispatch("/copy 2", ctx)  # вызов инструмента без текста — не ответ
+    ctx.commands.dispatch("/copy 2", ctx)  # пояснение перед вызовом — тоже ответ
+    assert out.read_text(encoding="utf-8") == "Смотрю файл"
+    capsys.readouterr()
+    ctx.commands.dispatch("/copy 3", ctx)  # вызов без текста и «\a» — не ответы
     assert out.read_text(encoding="utf-8") == "Первый **ответ**"
     assert "1 строка" in capsys.readouterr().out
 
