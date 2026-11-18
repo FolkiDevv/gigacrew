@@ -610,12 +610,14 @@ def test_close_during_stuck_turn_kills_jobs_without_touching_history(
     acp: AcpHarness,
     root: Path,
     request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Закрытие посреди хода не пишет в историю, пока поток хода её чинит.
 
     Поток хода, который не видит прерывания, ещё работает с историей: запись итогов
     фоновых задач из потока закрытия перемешала бы её. Процессы задач всё равно убиваются.
     """
+    monkeypatch.setattr("gigacrew.cli.acp.session._CLOSE_DRAIN", 0.2)  # ход не доработает
     command = {"command": "exec sleep 60", "run_in_background": True}
     provider = _StuckAfterFirst([tool_turn("run_shell", command), text_turn("поздно")])
     request.addfinalizer(provider.release.set)
