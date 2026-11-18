@@ -44,6 +44,8 @@ step: patch +1 (`0.9.3` â†’ `0.9.4`) or minor +1 with the patch reset (`0.9.3` â
 `make lock` afterwards: `uv.lock` records the version too, and `uv lock --check` in `make lint`
 fails otherwise. If `main` moved to a newer
 version while the branch was open, bump from `main`'s version, not the branch's.
+Dependabot PRs are the exception: they do not bump the version (a push to a Dependabot branch
+stops Dependabot from rebasing it); the next regular PR carries the bump.
 
 ## Linter configuration is frozen
 
