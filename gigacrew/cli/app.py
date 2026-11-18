@@ -34,6 +34,7 @@ MCP-серверы — из ``mcpServers`` тех же файлов и ``.mcp.js
 from __future__ import annotations
 
 import argparse
+import sys
 from contextlib import closing
 from functools import partial
 from importlib import metadata
@@ -547,8 +548,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == _ACP_COMMAND:
-        # Параметры запуска до подкоманды сессии ACP не получат: не теряем их молча.
-        if args != parser.parse_args([_ACP_COMMAND]):
+        # Параметры запуска до подкоманды сессии ACP не получат: не теряем их молча. Важен
+        # сам параметр, а не значение (-C . совпадает со значением по умолчанию).
+        given = sys.argv[1:] if argv is None else argv
+        if given[:1] != [_ACP_COMMAND]:
             parser.error(_ACP_RUN_OPTIONS)
         # До разбора настроек и без вывода в stdout: он занят протоколом.
         return EXIT_INTERRUPTED if serve_stdio(_make_provider) else EXIT_OK

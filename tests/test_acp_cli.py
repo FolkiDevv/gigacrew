@@ -427,8 +427,9 @@ def test_acp_rejects_foreign_arguments(user_home: Path, workdir: Path) -> None:
 
 @pytest.mark.parametrize(
     "run_options",
-    [["--no-save", "--untrusted-project"], ["-y"], ["--mode", "plan"]],
-    ids=["no-save-untrusted", "yes", "mode"],
+    # -C . совпадает со значением по умолчанию: важен сам параметр, а не его значение.
+    [["--no-save", "--untrusted-project"], ["-y"], ["--mode", "plan"], ["-C", "."]],
+    ids=["no-save-untrusted", "yes", "mode", "default-valued-dir"],
 )
 def test_acp_rejects_run_options_before_subcommand(
     user_home: Path,
