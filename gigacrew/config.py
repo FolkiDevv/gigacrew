@@ -6,7 +6,9 @@
   3. Файл пользователя ``~/.gigacode/.env`` (общий для всех проектов).
   4. Файл .env в корне проекта.
   5. Файл .env в текущей директории (если она не корень проекта).
-  6. Значения по умолчанию.
+  6. Настройки пользователя ``~/.gigacode/gigacrew.json`` (меню ``/settings``,
+     :mod:`gigacrew.project.preferences`) — только поведение агента, без подключения.
+  7. Значения по умолчанию.
 
 Файлы .env проекта и текущей директории — содержимое репозитория, поэтому настройки
 безопасности (адреса API, проверка TLS, корневые сертификаты, каталог GigaCode,
@@ -25,34 +27,26 @@ import os
 import re
 import ssl
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from gigacrew.permissions import PermissionMode, parse_mode
+from gigacrew.project.preferences import (
+    SETTINGS,
+    Preferences,
+    Setting,
+    SettingKind,
+    SettingSpec,
+    load_preferences,
+)
 from gigacrew.project.workspace import user_data_dir
 from gigacrew.security import system_ssl_context
 
-# Значения по умолчанию и границы числовых настроек (время — в секундах, доли — в процентах).
-_DEFAULT_TIMEOUT = 120
-_DEFAULT_READ_TIMEOUT = 600
-_DEFAULT_REVIEWER_TIMEOUT = 60
-_DEFAULT_RATE_LIMIT_WAIT = 120
-_DEFAULT_TEMPERATURE = 0.2
-_MIN_TEMPERATURE = float(0)
-_MAX_TEMPERATURE = 2.0
-_MIN_CONTEXT_TOKENS = 4_000
-_DEFAULT_SHARE_PERCENT = 80
-_MIN_SHARE_PERCENT = 10
-_MAX_SHARE_PERCENT = 95
+# Доли в настройках — в процентах, в Config — дробью.
 _PERCENT = 100
-_DEFAULT_SUBAGENT_MAX_STEPS = 25
-_DEFAULT_SUBAGENT_TIMEOUT = 600
-_MIN_SUBAGENT_TIMEOUT = 10
-# Фоновые суб-агенты: сколько работают одновременно и сколько ждут в очереди.
-_DEFAULT_BACKGROUND_SUBAGENTS = 2
-_MAX_BACKGROUND_SUBAGENTS = 8
-_DEFAULT_BACKGROUND_QUEUE = 4
-_MAX_BACKGROUND_QUEUE = 16
+_ENV_SOURCE = "переменная окружения"
+_DOTENV = ".env"
 
 
 class ConfigError(ValueError):
@@ -128,7 +122,7 @@ USER_ENV_HINT = "~/.gigacode/.env"
 
 def user_env_file() -> Path:
     """``~/.gigacode/.env`` — настройки пользователя, общие для всех проектов (доверенные)."""
-    return user_data_dir() / ".env"
+    return user_data_dir() / _DOTENV
 
 
 @dataclass(frozen=True)
@@ -160,7 +154,7 @@ def collect_environment(
     # Пропущенные настройки безопасности: (ключ, файл .env, значение).
     skipped: list[tuple[str, str, str]] = []
     # От младшего источника к старшему: каждый следующий перекрывает предыдущий.
-    for path in (root / ".env",) if cwd == root else (cwd / ".env", root / ".env"):
+    for path in _project_dotenv_files(root, cwd):
         if path == user_file:
             continue  # проект — сам ~/.gigacode: файл прочитается ниже, как доверенный
         project_settings = read_dotenv(path)
@@ -209,45 +203,6 @@ def _env_bool(env: Mapping[str, str], name: str, *, default: bool = False) -> bo
     raise ConfigError(f"{name}: ожидается 1/0, true/false, yes/no или on/off, получено {raw!r}")
 
 
-def _env_int(
-    env: Mapping[str, str],
-    name: str,
-    default: int,
-    *,
-    minimum: int = 1,
-    maximum: int | None = None,
-) -> int:
-    raw = env.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        number = int(raw.strip())
-    except ValueError as exc:
-        raise ConfigError(f"{name}: ожидается целое число, получено {raw!r}") from exc
-    if number < minimum:
-        raise ConfigError(f"{name}: значение должно быть не меньше {minimum}, получено {number}")
-    if maximum is not None and number > maximum:
-        raise ConfigError(f"{name}: значение должно быть не больше {maximum}, получено {number}")
-    return number
-
-
-def _env_optional_int(env: Mapping[str, str], name: str, *, minimum: int = 1) -> int | None:
-    raw = env.get(name)
-    if raw is None or not raw.strip():
-        return None
-    return _env_int(env, name, 0, minimum=minimum)
-
-
-def _env_mode(env: Mapping[str, str], name: str) -> PermissionMode:
-    raw = env.get(name)
-    if raw is None or not raw.strip():
-        return PermissionMode.AUTO
-    try:
-        return parse_mode(raw)
-    except ValueError as exc:
-        raise ConfigError(f"{name}: {exc}") from exc
-
-
 def _env_choice(env: Mapping[str, str], name: str, choices: tuple[str, ...]) -> str:
     """Значение из списка (первое — по умолчанию)."""
     raw = (env.get(name) or "").strip().lower()
@@ -275,19 +230,58 @@ def _env_header(env: Mapping[str, str], name: str) -> str | None:
     return header
 
 
-def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, hi: float) -> float:
-    raw = env.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        number = float(raw.strip())
-    except ValueError as exc:
-        raise ConfigError(f"{name}: ожидается число, получено {raw!r}") from exc
-    if not lo <= number <= hi:
-        raise ConfigError(
-            f"{name}: значение должно быть в диапазоне [{lo}; {hi}], получено {number}",
-        )
-    return number
+def _setting(env: Mapping[str, str], preferences: Preferences, spec: SettingSpec) -> Setting:
+    """Значение настройки: окружение и .env, затем ~/.gigacode/gigacrew.json, затем умолчание."""
+    raw = env.get(spec.env)
+    if raw is not None and raw.strip():
+        try:
+            return spec.parse(raw)
+        except ValueError as exc:
+            raise ConfigError(f"{spec.env}: {exc}") from exc
+    return preferences.settings.get(spec.key, spec.default)
+
+
+def setting_field(spec: SettingSpec, setting: Setting) -> Any:
+    """Значение поля Config для настройки: режим — :class:`PermissionMode`, доли — дробью."""
+    if spec.kind is SettingKind.MODE:
+        return parse_mode(str(setting))
+    if spec.percent and isinstance(setting, int | float):
+        return setting / _PERCENT
+    if spec.field == "model":
+        return setting or ""
+    return setting
+
+
+def env_sources(
+    root: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+) -> dict[str, str]:
+    """Откуда берутся переменные (для ``/settings``): окружение, файл пользователя, .env проекта.
+
+    Старший источник перекрывает младший, как в :func:`collect_environment`; пустые
+    значения не считаются.
+    """
+    cwd = (cwd or Path.cwd()).resolve()
+    root = root.resolve()
+    named = [(str(path), read_dotenv(path)) for path in _project_dotenv_files(root, cwd)]
+    named += [
+        (USER_ENV_HINT, read_dotenv(user_env_file())),
+        (_ENV_SOURCE, dict(os.environ if environ is None else environ)),
+    ]
+    sources: dict[str, str] = {}
+    for label, variables in named:
+        sources.update((key, label) for key, raw in variables.items() if raw.strip())
+    return sources
+
+
+def _project_dotenv_files(root: Path, cwd: Path) -> tuple[Path, ...]:
+    """Файлы .env проекта и текущей папки — от младшего к старшему."""
+    project_file = root / _DOTENV
+    if cwd == root:
+        return (project_file,)
+    return (cwd / _DOTENV, project_file)
 
 
 @dataclass(frozen=True)
@@ -328,13 +322,13 @@ class Config:
     # Каталог официального CLI GigaCode (GIGACODE_HOME, иначе ~/.gigacode): оттуда
     # читается токен бэкенда (gigacode_token.json).
     gigacode_home: str | None = None
-    timeout: int = _DEFAULT_TIMEOUT
+    timeout: int = 120
     # Ожидание ответа модели в запросах чата, с (не меньше timeout): вызовы инструментов
     # приходят целиком в конце ответа, и пока модель пишет длинный аргумент (план, файл),
     # байты не идут — обычный timeout оборвал бы такой ответ.
-    read_timeout: int = _DEFAULT_READ_TIMEOUT
+    read_timeout: int = 600
     # Сколько ждать при 429 (лимит запросов шлюза) на один запрос, с; 0 — не ждать.
-    rate_limit_wait: int = _DEFAULT_RATE_LIMIT_WAIT
+    rate_limit_wait: int = 120
 
     # --- Агент / окружение ---
     project_root: Path = field(default_factory=Path.cwd)
@@ -356,7 +350,7 @@ class Config:
     # выбрана сейчас, в том числе после /model).
     reviewer_model: str | None = None
     # Сколько ждать ответа рецензента, с: не дождались — команду подтверждает пользователь.
-    reviewer_timeout: int = _DEFAULT_REVIEWER_TIMEOUT
+    reviewer_timeout: int = 60
     max_steps: int = 50  # предохранитель агентного цикла
     # На сколько шагов лимит продлевается один раз за ход, если агент в режиме «авто»
     # что-то изменил и не идёт серия ошибок; 0 — не продлевать.
@@ -365,8 +359,9 @@ class Config:
     # Одинаковый вызов без изменений между повторами: на N-м — предупреждение
     # модели, следующий не выполняется и ход останавливается (анти-зацикливание).
     max_tool_repeats: int = 3
-    temperature: float = _DEFAULT_TEMPERATURE
+    temperature: float = 0.2
     stream: bool = True  # потоковый (посимвольный) вывод ответа модели
+    color: bool = True  # цветной вывод (ui.color; --no-color и NO_COLOR главнее)
     # Возвращать ли модели её рассуждения: "turn" — в пределах хода (до следующего
     # запроса пользователя), как советуют вендоры моделей с рассуждениями; "off" — нет.
     # Модели без рассуждений это не касается: возвращать нечего, запрос тот же.
@@ -396,16 +391,18 @@ class Config:
     # Ограничители одного запуска суб-агента (инструмент task): шаги, доля окна
     # контекста модели, которую может занять его контекст, и время, с. На исчерпании
     # суб-агент подводит итог.
-    subagent_max_steps: int = _DEFAULT_SUBAGENT_MAX_STEPS
+    subagent_max_steps: int = 25
     subagent_context_share: float = 0.8
-    subagent_timeout: int = _DEFAULT_SUBAGENT_TIMEOUT
+    subagent_timeout: int = 600
     # Фоновые суб-агенты (task с run_in_background): сколько работают одновременно и
     # сколько могут ждать в очереди; сверх — запуск отклоняется.
-    background_subagents: int = _DEFAULT_BACKGROUND_SUBAGENTS
-    background_queue: int = _DEFAULT_BACKGROUND_QUEUE
+    background_subagents: int = 2
+    background_queue: int = 4
     # Настройки безопасности, которые .env проекта задавал, но они пропущены:
     # (ключ, файл) — для предупреждения при запуске (:attr:`ignored_env_warning`).
     ignored_env: tuple[tuple[str, str], ...] = ()
+    # Ошибки в ~/.gigacode/gigacrew.json — для предупреждения при запуске.
+    preference_warnings: tuple[str, ...] = ()
 
     @classmethod
     # Параметры — только по имени: флаги командной строки поверх окружения и .env.
@@ -440,112 +437,45 @@ class Config:
         )
         env = collected.variables
 
-        access_key = env.get("GIGACREW_ACCESS_KEY") or None
-        cert = env.get("GIGACREW_CERT") or None
-        key = env.get("GIGACREW_KEY") or None
-
-        base_url = env.get("GIGACREW_API_URL") or ""
+        preferences = load_preferences()
+        settings = {
+            spec.field: setting_field(spec, _setting(env, preferences, spec)) for spec in SETTINGS
+        }
         ca_bundle = env.get("GIGACREW_CA_BUNDLE") or None
         if ca_bundle and not Path(ca_bundle).expanduser().is_file():
             raise ConfigError(f"GIGACREW_CA_BUNDLE: файл не найден: {ca_bundle}")
-
-        provider = _env_choice(env, "GIGACREW_PROVIDER", ("api", "gigacode"))
+        settings.update(
+            model=model or settings["model"],
+            mode=mode or settings["mode"],
+            stream=stream and settings["stream"],
+            save_chats=save_chats and settings["save_chats"],
+        )
         return cls(
-            provider=provider,
-            access_key=access_key,
-            cert=cert,
-            key=key,
+            provider=_env_choice(env, "GIGACREW_PROVIDER", ("api", "gigacode")),
+            access_key=env.get("GIGACREW_ACCESS_KEY") or None,
+            cert=env.get("GIGACREW_CERT") or None,
+            key=env.get("GIGACREW_KEY") or None,
             scope=env.get("GIGACREW_SCOPE") or None,
-            model=model or env.get("GIGACREW_MODEL") or "",
             auth_url=env.get("GIGACREW_AUTH_URL") or None,
-            base_url=base_url.rstrip("/"),
+            base_url=(env.get("GIGACREW_API_URL") or "").rstrip("/"),
             verify_ssl=_env_bool(env, "GIGACREW_VERIFY_SSL", default=True),
             ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             user_agent=_env_header(env, "GIGACREW_USER_AGENT"),
             gigacode_home=env.get("GIGACODE_HOME") or None,
-            timeout=_env_int(env, "GIGACREW_TIMEOUT", _DEFAULT_TIMEOUT),
-            read_timeout=_env_int(env, "GIGACREW_READ_TIMEOUT", _DEFAULT_READ_TIMEOUT),
-            rate_limit_wait=_env_int(
-                env,
-                "GIGACREW_RATE_LIMIT_WAIT",
-                _DEFAULT_RATE_LIMIT_WAIT,
-                minimum=0,
-            ),
             project_root=root,
             auto_approve=auto_approve or yes_all,
             yes_all=yes_all,
-            mode=mode or _env_mode(env, "GIGACREW_MODE"),
-            stream=stream,
-            temperature=_env_float(
-                env,
-                "GIGACREW_TEMPERATURE",
-                _DEFAULT_TEMPERATURE,
-                lo=_MIN_TEMPERATURE,
-                hi=_MAX_TEMPERATURE,
-            ),
-            reasoning=_env_choice(env, "GIGACREW_REASONING", ("turn", "off")),
-            context_budget_tokens=_env_optional_int(
-                env,
-                "GIGACREW_CONTEXT_TOKENS",
-                minimum=_MIN_CONTEXT_TOKENS,
-            ),
-            auto_compact=_env_bool(env, "GIGACREW_AUTO_COMPACT", default=True),
-            compact_threshold=_env_int(
-                env,
-                "GIGACREW_COMPACT_THRESHOLD",
-                _DEFAULT_SHARE_PERCENT,
-                minimum=_MIN_SHARE_PERCENT,
-                maximum=_MAX_SHARE_PERCENT,
-            )
-            / _PERCENT,
-            save_chats=save_chats and _env_bool(env, "GIGACREW_SAVE_CHATS", default=True),
             untrusted_project=untrusted_project,
             add_dirs=add_dirs,
-            auto_measure=_env_bool(env, "GIGACREW_AUTO_MEASURE", default=True),
-            ty=_env_bool(env, "GIGACREW_TY", default=True),
-            safe_commands=_env_bool(env, "GIGACREW_SAFE_COMMANDS", default=True),
-            remember_approvals=_env_bool(env, "GIGACREW_REMEMBER_APPROVALS", default=True),
-            mcp_defer=_env_bool(env, "GIGACREW_MCP_DEFER", default=True),
-            reviewer_model=(env.get("GIGACREW_REVIEWER_MODEL") or "").strip() or None,
-            reviewer_timeout=_env_int(
-                env,
-                "GIGACREW_REVIEWER_TIMEOUT",
-                _DEFAULT_REVIEWER_TIMEOUT,
-            ),
-            subagent_max_steps=_env_int(
-                env,
-                "GIGACREW_SUBAGENT_MAX_STEPS",
-                _DEFAULT_SUBAGENT_MAX_STEPS,
-            ),
-            subagent_context_share=_env_int(
-                env,
-                "GIGACREW_SUBAGENT_CONTEXT",
-                _DEFAULT_SHARE_PERCENT,
-                minimum=_MIN_SHARE_PERCENT,
-                maximum=_MAX_SHARE_PERCENT,
-            )
-            / _PERCENT,
-            subagent_timeout=_env_int(
-                env,
-                "GIGACREW_SUBAGENT_TIMEOUT",
-                _DEFAULT_SUBAGENT_TIMEOUT,
-                minimum=_MIN_SUBAGENT_TIMEOUT,
-            ),
-            background_subagents=_env_int(
-                env,
-                "GIGACREW_BACKGROUND_SUBAGENTS",
-                _DEFAULT_BACKGROUND_SUBAGENTS,
-                maximum=_MAX_BACKGROUND_SUBAGENTS,
-            ),
-            background_queue=_env_int(
-                env,
-                "GIGACREW_BACKGROUND_QUEUE",
-                _DEFAULT_BACKGROUND_QUEUE,
-                minimum=0,
-                maximum=_MAX_BACKGROUND_QUEUE,
-            ),
             ignored_env=collected.ignored,
+            preference_warnings=preferences.warnings,
+            **settings,
         )
+
+    def with_setting(self, spec: SettingSpec, setting: Setting) -> Config:
+        """Конфигурация с новым значением настройки (меню ``/settings`` в работе)."""
+        changes: dict[str, Any] = {spec.field: setting_field(spec, setting)}
+        return replace(self, **changes)
 
     @property
     def ignored_env_warning(self) -> str | None:

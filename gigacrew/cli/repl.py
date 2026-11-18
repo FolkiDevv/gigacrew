@@ -36,6 +36,7 @@ from gigacrew.cli.commands import (
     is_repl_command,
     mode_choices,
     save_chat,
+    settings_choices,
 )
 from gigacrew.cli.hooks import hook_session
 from gigacrew.cli.indexing import ensure_index
@@ -283,7 +284,10 @@ def _make_reader(
     skills: SkillCatalog,
 ) -> InputReader:
     """Настоящая строка ввода: автодополнение команд, аргументов и скиллов, статус-строка."""
-    arg_choices: dict[str, ArgChoices] = {"/mode": lambda: mode_choices(agent.mode)}
+    arg_choices: dict[str, ArgChoices] = {
+        "/mode": lambda: mode_choices(agent.mode),
+        "/settings": settings_choices,
+    }
     if catalog is not None:
         arg_choices["/model"] = lambda: catalog.choices(agent.windows, agent.model)
     return make_input_reader(
