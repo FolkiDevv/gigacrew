@@ -664,18 +664,27 @@ def test_closed_session_rejects_prompt_that_found_it_before_close(
 
 def test_close_saves_report_of_finished_background_job(acp: AcpHarness, root: Path) -> None:
     """Итог задачи, завершившейся после хода, попадает в сохранённый чат при закрытии."""
-    command = {"command": "exit 0", "run_in_background": True}
+    command = {"command": "exec sleep 60", "run_in_background": True}
     script = [tool_turn("run_shell", command), text_turn("запущено")]
     session_id = _open(acp, root, ScriptedProvider(script))
     assert _ask(acp, session_id, "запусти") == "end_turn"
     jobs = acp.server.session(session_id).agent.background
     assert jobs is not None
-    assert jobs.wait(10)  # задача завершилась, её итог модели ещё не доставлен
+    # Задача завершается только после хода: её итог модели ещё не доставлен.
+    (job,) = jobs.active()
+    jobs.stop(job, "тест")
+    assert job.wait(10)
+    assert not _saved_background_report(root, session_id)
 
     acp.call(CLOSE, {"sessionId": session_id})
 
+    assert _saved_background_report(root, session_id)
+
+
+def _saved_background_report(root: Path, session_id: str) -> bool:
+    """В сохранённом чате есть итоги фоновых задач."""
     saved = _store(root).load(session_id).conversation
-    assert any(BACKGROUND_HEADER in (message.content or "") for message in saved.messages)
+    return any(BACKGROUND_HEADER in (message.content or "") for message in saved.messages)
 
 
 def test_close_of_unknown_session_is_quiet(acp: AcpHarness, root: Path) -> None:
@@ -769,6 +778,11 @@ def test_loaded_session_restores_mcp_schemas_after_mcp_starts(
 
     assert _ask(harness, session_id, "ещё") == END_TURN
 
+    # Схема — уже в первом запросе к модели загруженной сессии.
+    provider = harness.factory.issued[-1]
+    assert isinstance(provider, ScriptedProvider)
+    first_tools = [spec.name for spec in provider.requests[0]["tools"]]
+    assert PROBE_ECHO in first_tools
     assert PROBE_ECHO in harness.server.session(session_id).agent.loaded_tools
 
 
