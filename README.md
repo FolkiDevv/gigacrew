@@ -409,6 +409,9 @@ ruff и wemake-python-styleguide (стиль и сложность), mypy `--str
 `.importlinter`), codespell и typos, yamllint, dotenv-linter, deptry; `make audit` — известные уязвимости
 зависимостей (pip-audit). Настройки — в `pyproject.toml` и `setup.cfg`.
 
+Dependabot (`.github/dependabot.yml`) раз в неделю предлагает обновления `uv.lock` в пределах
+ограничений `pyproject.toml` и версий действий GitHub Actions.
+
 ## Лицензия
 
 MIT, см. [LICENSE](LICENSE).

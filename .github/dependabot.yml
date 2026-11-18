@@ -1,0 +1,43 @@
+---
+# Dependabot: еженедельные обновления зависимостей Python (uv.lock) и действий GitHub Actions.
+# https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+version: 2
+
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Moscow
+    # Только uv.lock в пределах ограничений pyproject.toml: точные пины и верхние границы
+    # (ty, tree-sitter, tree-sitter-bash) выставлены осознанно и поднимаются вручную.
+    versioning-strategy: lockfile-only
+    # Новый релиз неделю отлёживается: успевают отозвать сломанный или вредоносный.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # Минорные и патч-обновления — одним PR в неделю; мажорные — отдельными PR.
+      python:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Moscow
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]
