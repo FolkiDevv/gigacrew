@@ -132,6 +132,16 @@ class AcpHarness:
         """Следующее сообщение сервера (ответ, уведомление или запрос к клиенту)."""
         return self.client.receive()
 
+    def wait_request(self, method: str) -> Message:
+        """Запрос сервера к клиенту с методом ``method`` (ответ на него — ``client.respond``).
+
+        Прочие сообщения, встреченные по пути (уведомления, ответы на ``begin``), остаются
+        в ``client.backlog``: :meth:`reply` найдёт ответ и там.
+        """
+        return self.client.wait_for(
+            lambda message: message.get("method") == method and "id" in message,
+        )
+
     def send(self, method: str, params: Any = None) -> Message:
         """Запрос и ответ сервера целиком (``result`` или ``error``)."""
         return self.reply(self.begin(method, params))

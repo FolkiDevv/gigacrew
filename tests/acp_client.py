@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import threading
+from collections.abc import Callable
 from typing import Any, BinaryIO
 
 import pytest
@@ -92,10 +93,23 @@ class AcpClient:
         return message
 
     def response(self, msg_id: int | str, timeout: float = TIMEOUT) -> Message:
-        """Ответ сервера на запрос ``msg_id``; встреченные по пути сообщения — в ``backlog``."""
+        """Ответ сервера на запрос ``msg_id``; встреченные по пути сообщения — в ``backlog``.
+
+        Ответ, уже отложенный в ``backlog`` (например, :meth:`wait_for`), забирается оттуда.
+        """
+        return self.wait_for(lambda message: _is_response(message, msg_id), timeout)
+
+    def wait_for(self, matches: Callable[[Message], bool], timeout: float = TIMEOUT) -> Message:
+        """Первое сообщение, для которого ``matches`` истинно; прочие — в ``backlog``.
+
+        Сначала ищется в ``backlog`` (найденное забирается оттуда), затем — среди новых.
+        """
+        for index, pending in enumerate(self.backlog):
+            if matches(pending):
+                return self.backlog.pop(index)
         while True:
             message = self.receive(timeout)
-            if message.get("id") == msg_id and "method" not in message:
+            if matches(message):
                 return message
             self.backlog.append(message)
 
@@ -125,3 +139,8 @@ class AcpClient:
     def _read_lines(self) -> None:
         for line in iter(self._reader.readline, b""):
             self._lines.put(line)
+
+
+def _is_response(message: Message, msg_id: int | str) -> bool:
+    """Ответ (результат или ошибка) на запрос ``msg_id``, а не запрос сервера."""
+    return message.get("id") == msg_id and "method" not in message
