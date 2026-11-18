@@ -288,10 +288,16 @@ def root(project: Path) -> Path:
 
 
 def _open(acp: AcpHarness, cwd: Path, provider: ScriptedProvider | None = None) -> str:
-    """Сессия в ``cwd`` (с провайдером ``provider``, если задан)."""
+    """Сессия в ``cwd`` (с провайдером ``provider``, если задан).
+
+    Уведомления о настройке сессии (``available_commands_update`` до ответа на session/new)
+    отбрасываются: проверки этого модуля — об уведомлениях хода.
+    """
     if provider is not None:
         acp.factory.add(provider)
-    return acp.new_session(cwd)
+    session_id = acp.new_session(cwd)
+    acp.client.take_notifications(UPDATE)
+    return session_id
 
 
 def _text(text: str) -> dict[str, Any]:
