@@ -93,14 +93,18 @@ class AcpSession:
         Не доработал за :data:`_CLOSE_DRAIN` — процессы задач убиваются без записи итогов.
         """
         with self.turns.idle(_CLOSE_DRAIN) as free:
-            if free:
-                # Сохраняем всегда: итог задачи, завершившейся после хода, тоже попал в историю.
-                self.agent.stop_background(_CLOSE_REASON)
-                autosave(self.chats, self.agent)
-                return
             jobs = self.agent.background
-            if jobs is not None:
-                jobs.stop_all(_CLOSE_REASON)
+            if jobs is None:
+                return
+            if free:
+                # Сохраняем, только если остановка допишет итоги (в том числе задачи,
+                # завершившейся после хода): иначе чат, продолженный в CLI, разветвился бы.
+                reports = bool(jobs.active()) or jobs.pending()
+                self.agent.stop_background(_CLOSE_REASON)
+                if reports:
+                    autosave(self.chats, self.agent)
+                return
+            jobs.stop_all(_CLOSE_REASON)
             _log.warning(
                 "ход сессии %s не завершился: итоги фоновых задач не записаны",
                 self.session_id,

@@ -683,6 +683,26 @@ def test_close_saves_report_of_finished_background_job(acp: AcpHarness, root: Pa
     assert _saved_background_report(root, session_id)
 
 
+def test_close_without_background_reports_leaves_saved_chat_alone(
+    acp: AcpHarness,
+    root: Path,
+) -> None:
+    """Закрытие, которому нечего дописать, чат не перезаписывает.
+
+    Иначе продолженный в CLI чат при закрытии треда T3 разветвился бы копией из ACP.
+    """
+    session_id = _open(acp, root, ScriptedProvider([text_turn("ответ")]))
+    assert _ask(acp, session_id, "вопрос") == "end_turn"
+    saved_version = _store(root).version(session_id)
+    assert saved_version is not None
+    chats = len(_store(root).recent(None))
+
+    acp.call(CLOSE, {"sessionId": session_id})
+
+    assert _store(root).version(session_id) == saved_version
+    assert len(_store(root).recent(None)) == chats
+
+
 def _saved_background_report(root: Path, session_id: str) -> bool:
     """В сохранённом чате есть итоги фоновых задач."""
     saved = _store(root).load(session_id).conversation
