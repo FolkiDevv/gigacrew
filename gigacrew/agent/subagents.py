@@ -157,6 +157,8 @@ class SubagentEvents(AgentEvents):
         """События суб-агента ``subagent`` передаются в события ``parent``."""
         self._parent = parent
         self._subagent = subagent
+        # Спрашивает интерфейс основного агента — и запоминать ли «да», решает он.
+        self.remembers_repeated_approvals = parent.remembers_repeated_approvals
         self._wrapping = False
         self.trail = SubagentTrail()
 

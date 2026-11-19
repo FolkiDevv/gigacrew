@@ -2225,7 +2225,7 @@ class Agent:
                     bool(remember)
                     and not hook_asks
                     and self.mode is PermissionMode.AUTO
-                    and self._events.remembers_repeated_approvals()
+                    and self._events.remembers_repeated_approvals
                 )
                 asked = replace(
                     call,

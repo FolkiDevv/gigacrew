@@ -150,6 +150,10 @@ class _TurnChannel:
 class AcpEvents(_TurnChannel, AgentEvents):
     """Получатель событий агента одной сессии ACP; id сессии задаёт :meth:`bind`."""
 
+    # T3 показывает свои кнопки, а не названия вариантов: предупреждение о запоминании не
+    # увидеть, поэтому «Разрешить» — всегда один раз, запоминает только «всегда».
+    remembers_repeated_approvals = False
+
     @override
     def on_stream_delta(self, text: str) -> None:
         self._emit(text_chunk("agent_message_chunk", text))
@@ -193,12 +197,6 @@ class AcpEvents(_TurnChannel, AgentEvents):
     @override
     def can_confirm(self) -> bool:
         return True
-
-    @override
-    def remembers_repeated_approvals(self) -> bool:
-        # T3 показывает свои кнопки, а не названия вариантов: предупреждение о запоминании
-        # не увидеть, поэтому «Разрешить» — всегда один раз, запоминает только «всегда».
-        return False
 
     @override
     def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:

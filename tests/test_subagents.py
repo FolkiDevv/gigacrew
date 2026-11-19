@@ -1230,3 +1230,16 @@ def test_successful_output_mentioning_rejection_is_not_a_rejection() -> None:
         previewed=False,
     )
     assert events.trail.rejected == ["search_content отклонено"]
+
+
+class _OneTimeApprovals(RecordingEvents):
+    """Интерфейс, где «да» всегда значит «один раз» (как ACP)."""
+
+    remembers_repeated_approvals = False
+
+
+def test_subagent_follows_parent_approval_memory_policy() -> None:
+    """Суб-агент спрашивает через интерфейс основного: и правило запоминания — его."""
+    events = SubagentEvents(_OneTimeApprovals(), SubagentInfo("general", "задача"))
+
+    assert events.remembers_repeated_approvals is False
