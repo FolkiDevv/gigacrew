@@ -217,6 +217,14 @@ class AgentEvents:
         """
         return True
 
+    def remembers_repeated_approvals(self) -> bool:
+        """Можно ли после нескольких «да» подряд запомнить команду (режим «авто»).
+
+        Интерфейс, который показывает предупреждение об этом в вопросе (CLI), — True;
+        интерфейс, где «да» всегда значит «один раз», — False.
+        """
+        return True
+
     def on_review_start(self, call: ToolCallInfo) -> None:
         """Модель-рецензент проверяет команду (режим «авто»)."""
 

@@ -2222,7 +2222,10 @@ class Agent:
                 remember = "" if dangerous else self._remember_label(kind, verdict)
                 # Этот ответ «да» может запомнить команду (_remember_repeated).
                 auto_remember = (
-                    bool(remember) and not hook_asks and self.mode is PermissionMode.AUTO
+                    bool(remember)
+                    and not hook_asks
+                    and self.mode is PermissionMode.AUTO
+                    and self._events.remembers_repeated_approvals()
                 )
                 asked = replace(
                     call,

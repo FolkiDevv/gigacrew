@@ -357,28 +357,26 @@ def test_dangerous_command_preview_shows_the_command(acp: AcpHarness, root: Path
     assert _stop_reason(acp, msg_id) == END_TURN
 
 
-def test_permission_warns_when_yes_will_remember_the_command(
-    acp: AcpHarness,
-    root: Path,
-) -> None:
-    """В «авто» очередное «да» запомнит команду — запрос говорит об этом, как подсказка CLI."""
-    turns = [
-        turn
-        for _ in range(AUTO_REMEMBER_AFTER)
-        for turn in (_shell(UNKNOWN_COMMAND), text_turn("Готово"))
-    ]
+def test_allow_once_never_becomes_standing_permission(acp: AcpHarness, root: Path) -> None:
+    """«Разрешить» в ACP — всегда один раз, даже после многих «да» подряд в режиме «авто».
+
+    CLI после нескольких «да» запоминает команду и предупреждает об этом в вопросе; T3
+    названия вариантов не показывает (кнопки у него свои), так что предупреждение не
+    увидеть — запоминает только явное «всегда».
+    """
+    rounds = AUTO_REMEMBER_AFTER + 1
+    turns = [turn for _ in range(rounds) for turn in (_shell(UNKNOWN_COMMAND), text_turn("Готово"))]
     session_id = _open(acp, root, ScriptedProvider(turns))
     names: list[str] = []
-    for _ in range(AUTO_REMEMBER_AFTER):
+    for _ in range(rounds):
         msg_id = _begin(acp, session_id)
         request_id, params = _wait_server_request(acp, PERMISSION, session_id, msg_id)
         names.append(_option_name(params, ALLOW_ONCE))
         _choose(acp, request_id, ALLOW_ONCE)
         assert _stop_reason(acp, msg_id) == END_TURN
 
-    assert names[0] == "Да"  # истории ещё нет
-    assert "разрешение запомнится" in names[-1]
-    assert all("разрешение запомнится" not in name for name in names[:-1])
+    assert len(names) == rounds  # спрашивали каждый раз
+    assert all("запомнится" not in name for name in names)
 
 
 _ASK_HOOK = (

@@ -195,6 +195,12 @@ class AcpEvents(_TurnChannel, AgentEvents):
         return True
 
     @override
+    def remembers_repeated_approvals(self) -> bool:
+        # T3 показывает свои кнопки, а не названия вариантов: предупреждение о запоминании
+        # не увидеть, поэтому «Разрешить» — всегда один раз, запоминает только «всегда».
+        return False
+
+    @override
     def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
         """Форма ``elicitation/create``; клиент без форм — спросить некого."""
         if not self._form_questions:
