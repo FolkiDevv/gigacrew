@@ -27,7 +27,7 @@ jobs:
       - name: Install uv
         # Exact version, not @v9: setup-uv publishes releases past v7 but stops maintaining
         # moving major tags there, so @v9 does not resolve.
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
@@ -105,7 +105,7 @@ jobs:
       - name: Install uv
         # Exact version, not @v9: setup-uv publishes releases past v7 but stops maintaining
         # moving major tags there, so @v9 does not resolve.
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
